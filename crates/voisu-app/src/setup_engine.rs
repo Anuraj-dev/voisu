@@ -5,7 +5,7 @@
 use voisu_core::{AsrMode, KeyDiagnosis, KeyLocation, Provider};
 
 use crate::local_model::{
-    CONSENTED_ENTRY, DISTIL_MODEL_ID, HostHardware, LocalSuggestion, suggest_local,
+    ConsentedCatalogEntry, HostHardware, LocalSuggestion, consented_entry, suggest_local,
     suggestion_line, warnings,
 };
 use crate::setup::WizardIo;
@@ -17,15 +17,16 @@ const GROQ_ONLY_HINT: &str =
     "No Deepgram key configured — run `voisu deepgram off` for the faster Groq-only path.";
 const LOCAL_AVAILABILITY: &str =
     "Availability: not installed — no Local model can be installed by setup in this release yet.";
+#[cfg(test)]
 pub const INSTALLED_AVAILABILITY: &str =
-    "Availability: installed — distil-large-v3.5-int8 (Consented Install)";
+    "Availability: installed — distil-large-v3.5-int8 (Consented Install, cuda:0)";
 const LOCAL_SWITCH_CONFIRM: &str = "Local has no installed model yet; Voisu will refuse to dictate until one is installed. Switch to Local anyway?";
 const MAX_ENGINE_ATTEMPTS: u32 = 3;
 
 /// Injected Consented Install status. Tests never open the model store.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConsentedStatus {
-    Installed,
+    Installed { entry_id: String, device: String },
     NotInstalled,
     Unknown(String),
 }
@@ -54,7 +55,7 @@ pub fn run_engine_screen(
     consented: ConsentedStatus,
 ) -> EngineChoice {
     write_engine_screen(io, hw, deepgram, groq, &manifest_exists, &consented);
-    let switch_needs_no_confirm = matches!(consented, ConsentedStatus::Installed)
+    let switch_needs_no_confirm = matches!(consented, ConsentedStatus::Installed { .. })
         || consent_confirms_local_switch(hw, &consented);
     choose_engine(io, current, interactive, switch_needs_no_confirm)
 }
@@ -65,7 +66,8 @@ pub fn run_engine_screen(
 /// keep Cloud if that prompt is declined.
 #[must_use]
 pub fn consent_confirms_local_switch(hw: &HostHardware, consented: &ConsentedStatus) -> bool {
-    matches!(consented, ConsentedStatus::NotInstalled) && distil_is_suggested(&suggest_local(hw))
+    matches!(consented, ConsentedStatus::NotInstalled)
+        && suggested_consented_entry(&suggest_local(hw)).is_some()
 }
 
 fn write_engine_screen(
@@ -112,24 +114,28 @@ fn write_engine_screen(
 
 fn availability_line(suggestion: &LocalSuggestion, consented: &ConsentedStatus) -> String {
     match consented {
-        ConsentedStatus::Installed => INSTALLED_AVAILABILITY.to_owned(),
+        ConsentedStatus::Installed { entry_id, device } => {
+            format!("Availability: installed — {entry_id} (Consented Install, {device})")
+        }
         ConsentedStatus::Unknown(reason) => format!("Availability: unknown — {reason}"),
-        ConsentedStatus::NotInstalled if distil_is_suggested(suggestion) => {
+        ConsentedStatus::NotInstalled if suggested_consented_entry(suggestion).is_some() => {
             format!(
                 "Availability: not installed — setup can download it ({}) after you agree.",
-                format_size(CONSENTED_ENTRY.total_download_bytes)
+                format_size(
+                    suggested_consented_entry(suggestion)
+                        .expect("catalog entry")
+                        .total_download_bytes
+                )
             )
         }
         ConsentedStatus::NotInstalled => LOCAL_AVAILABILITY.to_owned(),
     }
 }
 
-#[must_use]
-pub(crate) fn distil_is_suggested(suggestion: &LocalSuggestion) -> bool {
-    matches!(
-        suggestion,
-        LocalSuggestion::Gpu { model_id, .. } if *model_id == DISTIL_MODEL_ID
-    )
+pub(crate) fn suggested_consented_entry(
+    suggestion: &LocalSuggestion,
+) -> Option<&'static ConsentedCatalogEntry> {
+    consented_entry(suggested_model_id(suggestion)).filter(|entry| entry.consent_installable)
 }
 
 /// Human byte size in binary units, one decimal: `2.8 GiB`, `25.3 MiB`.
@@ -260,6 +266,7 @@ pub(crate) fn ask_yes_no(io: &mut dyn WizardIo, question: &str, default_yes: boo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::local_model::{CONSENTED_ENTRY, DISTIL_MODEL_ID};
     use crate::local_model::{GpuProbe, NvidiaGpu};
     use voisu_core::Credential;
 
@@ -531,22 +538,25 @@ mod tests {
         ));
         assert!(!consent_confirms_local_switch(
             &hw,
-            &ConsentedStatus::Installed
+            &ConsentedStatus::Installed {
+                entry_id: CONSENTED_ENTRY.id.into(),
+                device: "cuda:0".into()
+            }
         ));
         assert!(!consent_confirms_local_switch(
             &hw,
             &ConsentedStatus::Unknown("busy".into())
         ));
-        assert!(!consent_confirms_local_switch(
+        assert!(consent_confirms_local_switch(
             &host(GpuProbe::NoneFound),
             &ConsentedStatus::NotInstalled
         ));
     }
 
     #[test]
-    fn switching_to_local_without_an_installable_model_requires_confirm() {
+    fn switching_to_local_with_unknown_install_status_requires_confirm() {
         let hw = host(GpuProbe::NoneFound);
-        let (yes, io) = run(
+        let (yes, io) = run_with(
             &hw,
             AsrMode::Cloud,
             &absent(),
@@ -554,6 +564,7 @@ mod tests {
             true,
             vec![Some("2"), Some("y")],
             |_| false,
+            ConsentedStatus::Unknown("store unavailable".into()),
         );
         assert_eq!(yes, EngineChoice::Switch(AsrMode::Local));
         assert!(
@@ -563,7 +574,7 @@ mod tests {
             "{}",
             io.transcript()
         );
-        let (no, _) = run(
+        let (no, _) = run_with(
             &hw,
             AsrMode::Cloud,
             &absent(),
@@ -571,9 +582,10 @@ mod tests {
             true,
             vec![Some("2"), Some("n")],
             |_| false,
+            ConsentedStatus::Unknown("store unavailable".into()),
         );
         assert_eq!(no, EngineChoice::Keep(AsrMode::Cloud));
-        let (already_local, io) = run(
+        let (already_local, io) = run_with(
             &hw,
             AsrMode::Local,
             &absent(),
@@ -581,6 +593,7 @@ mod tests {
             true,
             vec![Some("2")],
             |_| false,
+            ConsentedStatus::Unknown("store unavailable".into()),
         );
         assert_eq!(already_local, EngineChoice::Keep(AsrMode::Local));
         assert_eq!(io.prompts, 1);
@@ -710,7 +723,7 @@ mod tests {
     #[test]
     fn local_confirm_three_invalid_answers_keep_current_and_leave_later_input() {
         let hw = host(GpuProbe::NoneFound);
-        let (choice, io) = run(
+        let (choice, io) = run_with(
             &hw,
             AsrMode::Cloud,
             &absent(),
@@ -724,6 +737,7 @@ mod tests {
                 Some("y"),
             ],
             |_| false,
+            ConsentedStatus::Unknown("store unavailable".into()),
         );
         assert_eq!(choice, EngineChoice::Keep(AsrMode::Cloud));
         assert_eq!(
@@ -874,7 +888,7 @@ mod tests {
     }
 
     #[test]
-    fn parakeet_keeps_the_closed_availability_wording() {
+    fn parakeet_offers_consented_download_with_real_size() {
         for hw in [
             host(GpuProbe::Nvidia(vec![gpu(0, 2048)])),
             host(GpuProbe::NoneFound),
@@ -889,10 +903,9 @@ mod tests {
                 |_| false,
             );
             let text = io.transcript();
-            assert!(text.contains(LOCAL_AVAILABILITY), "{text}");
             assert!(
-                !text.contains("setup can download"),
-                "parakeet has no Consented Install: {text}"
+                text.contains("setup can download it (734.1 MiB) after you agree"),
+                "{text}"
             );
         }
     }
@@ -908,7 +921,10 @@ mod tests {
             true,
             vec![Some("2")],
             |_| false,
-            ConsentedStatus::Installed,
+            ConsentedStatus::Installed {
+                entry_id: CONSENTED_ENTRY.id.into(),
+                device: "cuda:0".into(),
+            },
         );
         assert_eq!(choice, EngineChoice::Switch(AsrMode::Local));
         let text = io.transcript();

@@ -10,7 +10,12 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::consented_catalog::{CONSENTED_ENTRY, ConsentedCatalogEntry, DownloadPin, WORKER_FILES};
+#[cfg(test)]
+use super::consented_catalog::PARAKEET_ENTRY;
+use super::consented_catalog::{
+    CONSENTED_ENTRY, ConsentedCatalogEntry, DownloadPin, WORKER_FILES, consented_catalog_entries,
+    consented_entry,
+};
 use super::consented_runtime::{
     ConsentedRuntimeBuilder, RuntimeBuild, audit_runtime_tree, executable, sync_tree,
 };
@@ -24,6 +29,8 @@ use super::{
 #[derive(Debug)]
 pub enum ConsentedError {
     Consent,
+    DifferentEntry(String),
+    PendingRemoval(String),
     Maintenance,
     NoSpace,
     Deadline,
@@ -60,9 +67,13 @@ pub struct ConsentedConsent {
 impl ConsentedConsent {
     /// The caller records this only after the user explicitly accepts CONSENT_TEXT.
     pub fn accepted(unix_time: u64) -> Self {
+        Self::accepted_entry(&CONSENTED_ENTRY, unix_time)
+    }
+
+    pub fn accepted_entry(entry: &ConsentedCatalogEntry, unix_time: u64) -> Self {
         Self {
-            text: CONSENTED_ENTRY.consent_text.into(),
-            license_spdx: CONSENTED_ENTRY.license_spdx.into(),
+            text: entry.consent_text.into(),
+            license_spdx: entry.license_spdx.into(),
             unix_time,
         }
     }
@@ -132,7 +143,11 @@ impl ConsentedLayout {
 /// Phase 4 implements the isolated CUDA health run. Installation commits only
 /// after this probe accepts the published paths and expected known-audio text.
 pub trait ConsentedHealth {
-    fn check(&self, layout: &ConsentedLayout) -> Result<(), ConsentedError>;
+    fn check(
+        &self,
+        layout: &ConsentedLayout,
+        receipt: &ConsentedReceipt,
+    ) -> Result<(), ConsentedError>;
 }
 
 /// Holds an OS shared lease until dropped. No constructible verification token:
@@ -276,7 +291,7 @@ pub(crate) fn observe_with_entry(
 
 #[cfg(not(test))]
 pub(crate) fn observe_consented_install(store: &ModelStore) -> Option<ConsentedObservation> {
-    observe_with_entry(store, &CONSENTED_ENTRY)
+    observe_with_entry(store, installed_entry(store).ok()?)
 }
 
 /// The caller keeps this shared lease across transient-unit startup and stop.
@@ -324,7 +339,14 @@ pub struct ConsentedInstallRequest<'a> {
 pub fn install_consented_install(
     request: ConsentedInstallRequest<'_>,
 ) -> Result<ConsentedReceipt, ConsentedError> {
-    install_with_entry(request, &CONSENTED_ENTRY)
+    let entry = consented_catalog_entries()
+        .into_iter()
+        .find(|entry| {
+            request.consent.text == entry.consent_text
+                && request.consent.license_spdx == entry.license_spdx
+        })
+        .ok_or(ConsentedError::Consent)?;
+    install_with_entry(request, entry)
 }
 
 fn install_with_entry(
@@ -357,8 +379,21 @@ fn install_with_receipt_sync(
         .store
         .lock_exclusive()
         .map_err(ConsentedError::Store)?;
-    resume_removal(request.store, entry, || Ok(()))?;
-    remove_unreceipted_publish(request.store, entry)?;
+    match load_receipt(request.store) {
+        Ok(prior) if prior.entry_id != entry.id => {
+            return Err(ConsentedError::DifferentEntry(prior.entry_id));
+        }
+        Ok(_) | Err(ConsentedError::Missing) => {}
+        Err(error) => return Err(error),
+    }
+    if let Ok(bytes) = read_record(request.store, "consented.removal.json") {
+        let prior: ConsentedReceipt =
+            serde_json::from_slice(&bytes).map_err(|_| ConsentedError::Receipt)?;
+        if prior.entry_id != entry.id {
+            return Err(ConsentedError::PendingRemoval(prior.entry_id));
+        }
+    }
+    cleanup_catalog_namespaces(request.store, entry)?;
     abort(&request, InstallAbort::AfterLock)?;
     let required = 2 * (entry.total_download_bytes + entry.estimated_extracted_runtime_bytes);
     if request
@@ -387,6 +422,9 @@ fn install_with_receipt_sync(
     }
     download(&request, &(entry.health_clip)(), &staging.root)?;
     download(&request, &entry.python, &staging.root.join("inputs"))?;
+    if let Some(pin) = &entry.native_runtime {
+        download(&request, pin, &staging.root.join("inputs"))?;
+    }
     for pin in entry.wheels {
         download(&request, pin, &staging.root.join("inputs/wheels"))?;
     }
@@ -450,8 +488,12 @@ fn install_with_receipt_sync(
     let result = (|| {
         abort(&request, InstallAbort::AfterPublish)?;
         verify_layout_full(&published, &receipt)?;
-        request.progress.phase(InstallPhase::CheckingGpu);
-        request.health.check(&published)?;
+        request.progress.phase(if entry.device == "cpu" {
+            InstallPhase::CheckingCpu
+        } else {
+            InstallPhase::CheckingGpu
+        });
+        request.health.check(&published, &receipt)?;
         verify_layout(&published, &receipt)?;
         check_deadline(&request.clock)?;
         abort(&request, InstallAbort::AfterHealth)?;
@@ -489,8 +531,30 @@ fn install_with_receipt_sync(
 pub fn verify_consented_install(
     store: &ModelStore,
 ) -> Result<VerifiedConsentedInstall, ConsentedError> {
-    verify_with_entry(store, &CONSENTED_ENTRY)
+    verify_consented_install_notifying(store, || {})
 }
+pub(crate) fn installed_entry(
+    store: &ModelStore,
+) -> Result<&'static ConsentedCatalogEntry, ConsentedError> {
+    let receipt = load_receipt(store).or_else(|error| {
+        if matches!(error, ConsentedError::Missing) {
+            let bytes = read_record(store, "consented.removal.json")?;
+            serde_json::from_slice(&bytes).map_err(|_| ConsentedError::Receipt)
+        } else {
+            Err(error)
+        }
+    })?;
+    consented_entry(&receipt.entry_id).ok_or(ConsentedError::Receipt)
+}
+
+pub(crate) fn verify_consented_install_notifying(
+    store: &ModelStore,
+    on_verifying: impl FnOnce(),
+) -> Result<VerifiedConsentedInstall, ConsentedError> {
+    verify_with_entry_notifying(store, installed_entry(store)?, on_verifying)
+}
+
+#[cfg(test)]
 pub(crate) fn verify_with_entry(
     store: &ModelStore,
     entry: &ConsentedCatalogEntry,
@@ -513,7 +577,7 @@ pub(crate) fn verify_with_entry_notifying(
 pub fn verify_consented_install_full(
     store: &ModelStore,
 ) -> Result<VerifiedConsentedInstall, ConsentedError> {
-    verify_with_entry_mode(store, &CONSENTED_ENTRY, true, || {})
+    verify_with_entry_mode(store, installed_entry(store)?, true, || {})
 }
 
 fn verify_with_entry_mode(
@@ -564,7 +628,19 @@ pub enum ConsentedRemoveOutcome {
 pub fn remove_consented_install(
     store: &ModelStore,
 ) -> Result<ConsentedRemoveOutcome, ConsentedError> {
-    remove_with_entry(store, &CONSENTED_ENTRY)
+    match installed_entry(store) {
+        Ok(entry) => remove_with_entry(store, entry),
+        Err(ConsentedError::Missing) => {
+            let mut outcome = ConsentedRemoveOutcome::Absent;
+            for entry in consented_catalog_entries() {
+                if remove_with_entry(store, entry)? == ConsentedRemoveOutcome::Removed {
+                    outcome = ConsentedRemoveOutcome::Removed;
+                }
+            }
+            Ok(outcome)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Whether a Consented Install receipt file is present. Does not parse it.
@@ -584,12 +660,11 @@ fn remove_with_delete_hook(
     after_receipt_delete: impl FnOnce() -> Result<(), ConsentedError>,
 ) -> Result<ConsentedRemoveOutcome, ConsentedError> {
     let _lock = store.lock_exclusive().map_err(ConsentedError::Store)?;
-    let resumed = resume_removal(store, entry, || Ok(()))?;
-    let cleaned = remove_unreceipted_publish(store, entry)?;
+    let cleaned = cleanup_catalog_namespaces(store, entry)?;
     // Cleanup already parsed any present receipt. The lock keeps this absence
     // check and the completed recovery work in the same namespace snapshot.
     if !super::consented_receipt_exists(store) {
-        return Ok(if resumed || cleaned {
+        return Ok(if cleaned {
             ConsentedRemoveOutcome::Removed
         } else {
             ConsentedRemoveOutcome::Absent
@@ -640,6 +715,9 @@ fn resume_removal(
     };
     let receipt: ConsentedReceipt =
         serde_json::from_slice(&bytes).map_err(|_| ConsentedError::Receipt)?;
+    if receipt.entry_id != entry.id {
+        return Ok(false);
+    }
     validate_removal_target(entry, &receipt)?;
     let lease = lease_file(store, &receipt.content_hash)?;
     flock(&lease, libc::LOCK_EX)?;
@@ -665,7 +743,24 @@ fn resume_removal(
     Ok(true)
 }
 
-/// Only the current entry's exact publication can be an orphan. The store
+fn cleanup_catalog_namespaces(
+    store: &ModelStore,
+    current: &ConsentedCatalogEntry,
+) -> Result<bool, ConsentedError> {
+    let mut cleaned = false;
+    cleaned |= resume_removal(store, current, || Ok(()))?;
+    cleaned |= remove_unreceipted_publish(store, current)?;
+    for entry in consented_catalog_entries() {
+        if entry.id == current.id {
+            continue;
+        }
+        cleaned |= resume_removal(store, entry, || Ok(()))?;
+        cleaned |= remove_unreceipted_publish(store, entry)?;
+    }
+    Ok(cleaned)
+}
+
+/// An unreceipted publication in any catalog namespace is an orphan. The store
 /// lock serializes namespace changes; the lease excludes a surviving unit.
 fn remove_unreceipted_publish(
     store: &ModelStore,
@@ -790,7 +885,7 @@ fn make_receipt(
     }
     let mut runtime_inputs = BTreeMap::new();
     runtime_inputs.insert(entry.python.name.into(), pin(&entry.python));
-    for item in entry.wheels {
+    for item in entry.wheels.iter().chain(entry.native_runtime.iter()) {
         runtime_inputs.insert(item.name.into(), pin(item));
     }
     ConsentedReceipt {
@@ -805,21 +900,22 @@ fn make_receipt(
         runtime_manifest: BTreeMap::new(),
         python_path: layout.python.join("bin/python3"),
         venv_path: layout.venv_python(),
-        device: "cuda:0".into(),
-        compute_type: "int8_float16".into(),
+        device: entry.device.into(),
+        compute_type: entry.compute_type.into(),
         receipt_hash: String::new(),
     }
 }
 fn content_hash(entry: &ConsentedCatalogEntry) -> String {
     let mut bytes = format!(
-        "consented-builder-v2\n{}\n{}\ncuda:0\nint8_float16\n",
-        entry.id, entry.revision
+        "consented-builder-v2\n{}\n{}\n{}\n{}\n",
+        entry.id, entry.revision, entry.device, entry.compute_type
     );
     for item in entry
         .weights
         .iter()
         .chain(std::iter::once(&entry.python))
         .chain(entry.wheels)
+        .chain(entry.native_runtime.iter())
     {
         bytes.push_str(&format!("{}:{}:{}\n", item.name, item.bytes, item.sha256));
     }
@@ -1415,6 +1511,9 @@ pub(crate) mod install_tests {
     pub(crate) fn entry() -> ConsentedCatalogEntry {
         ConsentedCatalogEntry {
             id: "consented-test",
+            device: "cuda:0",
+            compute_type: "int8_float16",
+            native_runtime: None,
             revision: "1",
             license_spdx: "MIT",
             consent_installable: true,
@@ -1516,7 +1615,11 @@ pub(crate) mod install_tests {
         expected_root: PathBuf,
     }
     impl ConsentedHealth for FakeHealth {
-        fn check(&self, layout: &ConsentedLayout) -> Result<(), ConsentedError> {
+        fn check(
+            &self,
+            layout: &ConsentedLayout,
+            _receipt: &ConsentedReceipt,
+        ) -> Result<(), ConsentedError> {
             self.called.set(true);
             assert!(layout.root.exists());
             assert!(!layout.root.join("inputs").exists());
@@ -1554,16 +1657,18 @@ pub(crate) mod install_tests {
         }
     }
     pub(crate) fn install(store: &ModelStore) -> ConsentedReceipt {
-        install_with_entry(
-            request(
-                store,
-                &fetcher(),
-                &FakeBuilder::default(),
-                &health(store, &entry(), false),
-            ),
-            &entry(),
-        )
-        .unwrap()
+        install_fixture_entry(store, &entry())
+    }
+    pub(crate) fn install_fixture_entry(
+        store: &ModelStore,
+        entry: &ConsentedCatalogEntry,
+    ) -> ConsentedReceipt {
+        let fetcher = fetcher();
+        let builder = FakeBuilder::default();
+        let health = health(store, entry, false);
+        let mut request = request(store, &fetcher, &builder, &health);
+        request.consent = ConsentedConsent::accepted_entry(entry, 42);
+        install_with_entry(request, entry).unwrap()
     }
     pub(crate) fn replace_fixture_receipt(store: &ModelStore) -> ConsentedReceipt {
         let mut receipt = load_receipt(store).unwrap();
@@ -1885,7 +1990,11 @@ pub(crate) mod install_tests {
     fn consented_unreaped_health_retains_unreceipted_publish_and_next_install_resumes() {
         struct Unreaped;
         impl ConsentedHealth for Unreaped {
-            fn check(&self, _: &ConsentedLayout) -> Result<(), ConsentedError> {
+            fn check(
+                &self,
+                _: &ConsentedLayout,
+                _: &ConsentedReceipt,
+            ) -> Result<(), ConsentedError> {
                 Err(ConsentedError::HealthUnreaped)
             }
         }
@@ -1910,7 +2019,11 @@ pub(crate) mod install_tests {
         use std::cell::RefCell;
         struct LeasedHealth(RefCell<Option<ConsentedLease>>);
         impl ConsentedHealth for LeasedHealth {
-            fn check(&self, layout: &ConsentedLayout) -> Result<(), ConsentedError> {
+            fn check(
+                &self,
+                layout: &ConsentedLayout,
+                _: &ConsentedReceipt,
+            ) -> Result<(), ConsentedError> {
                 *self.0.borrow_mut() = Some(consented_install_lease(layout)?);
                 Err(ConsentedError::Health(
                     "ordinary failure while still leased".into(),
@@ -2343,7 +2456,11 @@ pub(crate) mod install_tests {
             expected: PathBuf,
         }
         impl ConsentedHealth for PrefixHealth {
-            fn check(&self, layout: &ConsentedLayout) -> Result<(), ConsentedError> {
+            fn check(
+                &self,
+                layout: &ConsentedLayout,
+                _: &ConsentedReceipt,
+            ) -> Result<(), ConsentedError> {
                 assert_eq!(layout.root, self.expected);
                 assert!(!layout.root.join("inputs").exists());
                 let output = Command::new(layout.venv_python())
@@ -2368,6 +2485,174 @@ pub(crate) mod install_tests {
         install_with_entry(request(&store, &fetcher(), &HostVenv, &health), &entry()).unwrap();
         assert!(verify_with_entry(&store, &entry()).is_ok());
     }
+    #[test]
+    fn cpu_receipt_is_entry_keyed_and_cuda_entry_cannot_admit_it() {
+        let (_temp, store) = store();
+        let mut cpu = entry();
+        cpu.id = "parakeet-tdt-0.6b-v3";
+        cpu.device = "cpu";
+        cpu.compute_type = "q8_0";
+        let receipt = install_fixture_entry(&store, &cpu);
+        assert_eq!(receipt.entry_id, "parakeet-tdt-0.6b-v3");
+        assert_eq!(receipt.device, "cpu");
+        assert!(
+            receipt
+                .python_path
+                .to_str()
+                .unwrap()
+                .contains("/parakeet-tdt-0.6b-v3/")
+        );
+        assert!(verify_with_entry(&store, &cpu).is_ok());
+        assert!(matches!(
+            verify_with_entry(&store, &entry()),
+            Err(ConsentedError::Receipt)
+        ));
+        // Removal remains available through the public catalog lookup even
+        // when runtime verification cannot admit an old or fixture install.
+        assert_eq!(
+            remove_consented_install(&store).unwrap(),
+            ConsentedRemoveOutcome::Removed
+        );
+    }
+
+    #[test]
+    fn different_entry_refuses_install_before_fetch_or_build() {
+        let (_temp, store) = store();
+        let mut prior_entry = entry();
+        prior_entry.id = CONSENTED_ENTRY.id;
+        let prior = install_fixture_entry(&store, &prior_entry);
+        let builder = FakeBuilder::default();
+        let fetcher = ScriptedFetcher::default();
+        let health = health(&store, &PARAKEET_ENTRY, false);
+        let mut request = request(&store, &fetcher, &builder, &health);
+        request.consent = ConsentedConsent::accepted_entry(&PARAKEET_ENTRY, 42);
+        let error = install_consented_install(request).unwrap_err();
+        assert!(
+            matches!(&error, ConsentedError::DifferentEntry(id) if id == "distil-large-v3.5-int8")
+        );
+        assert_eq!(
+            crate::setup_consented::consented_error_line(&error),
+            "distil-large-v3.5-int8 is already installed; run `voisu local remove` first."
+        );
+        assert!(!builder.called.get());
+        assert_eq!(load_receipt(&store).unwrap(), prior);
+        assert!(verify_with_entry(&store, &prior_entry).is_ok());
+    }
+
+    #[test]
+    fn pending_removal_of_another_entry_tells_the_user_to_re_run_remove() {
+        let (_temp, store) = store();
+        let mut prior_entry = entry();
+        prior_entry.id = CONSENTED_ENTRY.id;
+        let prior = install_fixture_entry(&store, &prior_entry);
+        fs::write(
+            store.root().join("private/consented.removal.json"),
+            serde_json::to_vec(&prior).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(receipt_path(&store)).unwrap();
+        let builder = FakeBuilder::default();
+        let fetcher = ScriptedFetcher::default();
+        let health = health(&store, &PARAKEET_ENTRY, false);
+        let mut request = request(&store, &fetcher, &builder, &health);
+        request.consent = ConsentedConsent::accepted_entry(&PARAKEET_ENTRY, 42);
+        let error = install_consented_install(request).unwrap_err();
+        assert!(
+            matches!(&error, ConsentedError::PendingRemoval(id) if id == "distil-large-v3.5-int8")
+        );
+        assert_eq!(
+            crate::setup_consented::consented_error_line(&error),
+            "A removal of distil-large-v3.5-int8 is still in progress; re-run `voisu local remove`."
+        );
+        assert!(!builder.called.get());
+        assert!(store.root().join("private/consented.removal.json").exists());
+    }
+
+    #[test]
+    fn install_and_remove_clean_orphaned_publish_of_the_other_catalog_entry() {
+        for orphan in consented_catalog_entries() {
+            let (_temp, store) = store();
+            let root = install_root(&store, orphan.id, &content_hash(orphan));
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("stale"), b"orphan").unwrap();
+            install(&store);
+            assert!(!root.exists(), "{}", orphan.id);
+            assert!(verify_with_entry(&store, &entry()).is_ok());
+        }
+        let (_temp, store) = store();
+        install(&store);
+        let root = install_root(&store, PARAKEET_ENTRY.id, &content_hash(&PARAKEET_ENTRY));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("stale"), b"orphan").unwrap();
+        assert_eq!(
+            remove_with_entry(&store, &entry()).unwrap(),
+            ConsentedRemoveOutcome::Removed
+        );
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn validate_receipt_rejects_device_and_compute_type_only_tampering() {
+        let (_temp, store) = store();
+        let mut cpu = entry();
+        cpu.device = "cpu";
+        cpu.compute_type = "q8_0";
+        install_fixture_entry(&store, &cpu);
+        let original = load_receipt(&store).unwrap();
+        for (device, compute_type) in [("cuda:0", "q8_0"), ("cpu", "int8_float16")] {
+            let mut receipt = original.clone();
+            receipt.device = device.into();
+            receipt.compute_type = compute_type.into();
+            receipt.receipt_hash = receipt_hash(&receipt).unwrap();
+            assert!(
+                matches!(
+                    validate_receipt(&store, &cpu, &receipt),
+                    Err(ConsentedError::Receipt)
+                ),
+                "{device} {compute_type}"
+            );
+        }
+        assert!(verify_with_entry(&store, &cpu).is_ok());
+    }
+
+    #[test]
+    fn parakeet_catalog_has_cpu_pins_and_exact_download_total() {
+        let entry =
+            super::super::consented_catalog::consented_entry("parakeet-tdt-0.6b-v3").unwrap();
+        assert_eq!(entry.device, "cpu");
+        assert_eq!(entry.license_spdx, "CC-BY-4.0");
+        assert_eq!(entry.wheels.len(), 1);
+        assert_eq!(entry.total_download_bytes, 769_772_225);
+        let sum = entry
+            .weights
+            .iter()
+            .chain(std::iter::once(&entry.python))
+            .chain(entry.wheels)
+            .chain(entry.native_runtime.iter())
+            .map(|pin| pin.bytes)
+            .sum::<u64>()
+            + (entry.health_clip)().bytes;
+        assert_eq!(sum, entry.total_download_bytes);
+        assert_eq!(entry.native_runtime.unwrap().bytes, 4_583_913);
+        for pin in entry
+            .weights
+            .iter()
+            .chain(std::iter::once(&entry.python))
+            .chain(entry.wheels)
+            .chain(entry.native_runtime.iter())
+        {
+            super::super::validate_catalog_url(pin.url, pin.hosts).unwrap();
+            assert_eq!(pin.sha256.len(), 64);
+        }
+        assert!(
+            super::super::validate_catalog_url(
+                "https://evil.us.aws.cdn.hf.co/model",
+                entry.weights[0].hosts
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn consented_catalog_pins_are_complete_and_group_scoped() {
         assert_eq!(CONSENTED_ENTRY.weights.len(), 5);

@@ -107,18 +107,24 @@ reasoning behind each check.
 
 ### Local (Consented Install)
 
-`voisu setup` shows Cloud and Local on one screen. Local is **Suggested for
-this hardware**, with development evidence from one host and one speaker (not
-the release gate); Cloud stays selected until you pick Local. English only;
-Hinglish stays on Cloud.
+`voisu setup` shows Cloud and Local on one screen. Local shows
+**Recommended for this computer: <model>**, with development evidence from one
+host and one speaker (not the release gate); Cloud stays selected until you pick
+Local. English only; Hinglish stays on Cloud.
 
-On NVIDIA GPU 0 with at least 3584 MiB total VRAM, setup can install
-`distil-large-v3.5-int8` as a Consented Install after you agree to the download
-size (about 2.98 GB), MIT licence, English-only limits, and that this is
-development evidence rather than a Bakeoff Winner. Nothing is fetched until
-that explicit yes. Once installed it runs offline on the GPU, with no automatic
-CPU or Cloud fallback. Decline keeps Local selected with no model. Remove it with
-`voisu local remove` (non-interactive: `voisu local remove --yes`).
+- NVIDIA GPU 0 with at least 3584 MiB total VRAM: `distil-large-v3.5-int8` on
+  the GPU (about 2.98 GB download, MIT licence).
+- Any other computer, including one with a smaller GPU: `parakeet-tdt-0.6b-v3`
+  on CPU (about 770 MB download, CC-BY-4.0 licence, no GPU needed).
+- If the GPU probe fails, setup says "GPU status unknown" and shows the CPU
+  model; it never switches silently.
+
+Nothing is fetched until you agree to the download size, licence, English-only
+limits, and that this is development evidence rather than a Bakeoff Winner.
+Once installed the model runs offline in a sandboxed worker, with no automatic
+GPU, CPU or Cloud fallback; Local fails closed until the model is Ready. Decline
+keeps Local selected with no model. Remove it with `voisu local remove`
+(non-interactive: `voisu local remove --yes`).
 
 ### Ubuntu GNOME troubleshooting
 

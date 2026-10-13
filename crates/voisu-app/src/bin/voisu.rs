@@ -962,7 +962,7 @@ fn setup() -> ExitCode {
     if local {
         // Consented Install offer first; the Bakeoff-catalog repair flow
         // after this stays evidence-gated and never offers a second download.
-        let installed = matches!(consented, ConsentedStatus::Installed);
+        let installed = matches!(consented, ConsentedStatus::Installed { .. });
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_secs())

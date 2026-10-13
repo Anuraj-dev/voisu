@@ -44,8 +44,8 @@ pub use consented::{
 };
 pub use consented_catalog::{
     CONSENT_TEXT, CONSENTED_ENTRY, ConsentedCatalogEntry, DownloadPin,
-    ESTIMATED_EXTRACTED_RUNTIME_BYTES, EXPECTED_HEALTH_TEXT, REQUIRED_FREE_BYTES,
-    consented_health_clip,
+    ESTIMATED_EXTRACTED_RUNTIME_BYTES, EXPECTED_HEALTH_TEXT, NEMO_LIBRARY, PARAKEET_ENTRY,
+    REQUIRED_FREE_BYTES, consented_entry, consented_health_clip,
 };
 pub use consented_pins::TOTAL_DOWNLOAD_BYTES;
 pub use consented_runtime::{

@@ -136,11 +136,45 @@ impl OfflineRuntimeBuilder {
             root,
             build.clock,
         )?;
+        if let Some(pin) = &build.entry.native_runtime {
+            let unpack = runtime.join("native-unpack");
+            fs::create_dir(&unpack)?;
+            prepared_run(
+                runner,
+                Command::new(build.staging.python.join("bin/python3"))
+                    .args(["-I", "-c", SAFE_NATIVE_EXTRACT])
+                    .arg(root.join("inputs").join(pin.name))
+                    .arg(&unpack),
+                root,
+                build.clock,
+            )?;
+            audit_runtime_tree(&unpack)?;
+            fs::rename(
+                unpack.join("nemo-speech-0.1.0-linux-x86_64-cpu"),
+                runtime.join("nemo-speech-0.1.0-linux-x86_64-cpu"),
+            )?;
+            fs::remove_dir(&unpack)?;
+        }
         relocate_venv(build)?;
         audit_runtime_tree(&runtime)?;
         Ok(())
     }
 }
+
+// Extract into an empty directory before publication. Python's data filter
+// rejects special files and escaping links; validate names and size up front.
+const SAFE_NATIVE_EXTRACT: &str = r#"
+import pathlib, sys, tarfile
+with tarfile.open(sys.argv[1], "r:gz") as archive:
+    members = archive.getmembers()
+    if len(members) > 4096 or sum(m.size for m in members) > 16 * 1024 * 1024:
+        raise ValueError("native archive exceeds extraction cap")
+    for member in members:
+        path = pathlib.PurePosixPath(member.name)
+        if path.is_absolute() or ".." in path.parts or not path.parts or path.parts[0] != "nemo-speech-0.1.0-linux-x86_64-cpu":
+            raise ValueError("unsafe native archive path")
+    archive.extractall(sys.argv[2], members=members, filter="data")
+"#;
 
 // venv records absolute paths even with --copies. Rewrite pyvenv.cfg and text
 // entrypoints before atomic rename, so the runtime never depends on staging.

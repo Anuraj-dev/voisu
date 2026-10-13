@@ -13,6 +13,9 @@ pub struct DownloadPin {
 #[derive(Debug)]
 pub struct ConsentedCatalogEntry {
     pub id: &'static str,
+    pub device: &'static str,
+    pub compute_type: &'static str,
+    pub native_runtime: Option<DownloadPin>,
     pub revision: &'static str,
     pub license_spdx: &'static str,
     pub consent_installable: bool,
@@ -78,6 +81,9 @@ const WEIGHTS: &[DownloadPin] = &[
 pub const CONSENT_TEXT: &str = "Download 2,980,914,661 bytes for distil-large-v3.5-int8 and its pinned Python/CTranslate2/CUDA runtime. Licence: MIT. Development evidence: one host, one speaker, scripted prompts — not the release gate. English only. NVIDIA GPU required. Runs offline on cuda:0 with int8_float16; no automatic CPU or Cloud fallback. This is a Consented Install, not a Bakeoff Winner, and is never selected by default.";
 pub const CONSENTED_ENTRY: ConsentedCatalogEntry = ConsentedCatalogEntry {
     id: "distil-large-v3.5-int8",
+    device: "cuda:0",
+    compute_type: "int8_float16",
+    native_runtime: None,
     revision: "9793ccc07920e0f830e1dba0343efcdf0ef8c903",
     // HF model card for distil-whisper/distil-large-v3.5-ct2 declares `license: mit`.
     license_spdx: "MIT",
@@ -154,3 +160,36 @@ pub(super) const WORKER_FILES: &[(&str, &[u8])] = &[
         include_bytes!("../../../../tools/local-asr/voisu_asr/windowing.py"),
     ),
 ];
+
+/// Catalog lookup is exact; receipts cannot authorize arbitrary entries.
+pub fn consented_catalog_entries() -> [&'static ConsentedCatalogEntry; 2] {
+    [&CONSENTED_ENTRY, &PARAKEET_ENTRY]
+}
+
+pub fn consented_entry(id: &str) -> Option<&'static ConsentedCatalogEntry> {
+    consented_catalog_entries()
+        .into_iter()
+        .find(|entry| entry.id == id)
+}
+
+pub const NEMO_LIBRARY: &str =
+    "runtime/nemo-speech-0.1.0-linux-x86_64-cpu/lib/libnemo_speech_asr_c.so.1";
+pub const PARAKEET_ENTRY: ConsentedCatalogEntry = ConsentedCatalogEntry {
+    id: "parakeet-tdt-0.6b-v3",
+    device: "cpu",
+    compute_type: "q8_0",
+    revision: "541d1f99c6b0c3cd0b11a95167540bb8edefd82b",
+    license_spdx: "CC-BY-4.0",
+    consent_installable: true,
+    weights: &[super::consented_pins::PARAKEET_WEIGHTS],
+    native_runtime: Some(super::consented_pins::NEMO_CPU),
+    python: PYTHON,
+    wheels: super::consented_pins::CPU_WHEELS,
+    health_clip: clip_pin,
+    total_download_bytes: 769_772_225,
+    // CPython: 98,070,981 extracted bytes; venv copies Python executables,
+    // plus pip, NumPy (~70 MiB), bytecode and the 12,238,405-byte native
+    // archive. Reserve 384 MiB including metadata and publication headroom.
+    estimated_extracted_runtime_bytes: 384 * 1024 * 1024,
+    consent_text: "Download 769,772,225 bytes for parakeet-tdt-0.6b-v3 and its pinned Python/NumPy/NeMo-Speech.cpp v0.1.0 CPU runtime. Licence: CC-BY-4.0. English only. Runs offline on CPU. Development evidence: EN WER 12.8%, warm p50 0.61 s on 4 cores, peak RAM 0.9 GB; one host, one speaker — not the release gate. No automatic GPU or Cloud fallback. This is a Consented Install, not a Bakeoff Winner, and is never selected by default.",
+};

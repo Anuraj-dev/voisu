@@ -389,16 +389,12 @@ impl Gate {
         }
         #[cfg(not(test))]
         {
-            use crate::local_model::{CONSENTED_ENTRY, ConsentedError, models_dir_from_state};
+            use crate::local_model::{ConsentedError, models_dir_from_state};
             let dir =
                 models_dir_from_state(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
                     .map_err(ConsentedError::Store)?;
             let store = ModelStore::open(dir).map_err(ConsentedError::Store)?;
-            crate::local_model::consented::verify_with_entry_notifying(
-                &store,
-                &CONSENTED_ENTRY,
-                on_verifying,
-            )
+            crate::local_model::consented::verify_consented_install_notifying(&store, on_verifying)
         }
     }
 
@@ -517,8 +513,9 @@ impl Gate {
         self.runtime = Some(selected.runtime_abi.clone());
         #[cfg(test)]
         {
-            let _ = selected;
-            self.requested_device = Some("cpu".into());
+            self.requested_device = consented_device(selected)
+                .map(str::to_owned)
+                .or_else(|| Some("cpu".into()));
         }
         #[cfg(not(test))]
         {
@@ -535,8 +532,15 @@ impl Gate {
                     self.runtime = Some(entry.runtime.as_str().to_owned());
                 }
             } else if is_consented_receipt(selected) {
-                self.requested_device = Some("cuda:0".into());
-                self.runtime = Some("CTranslate2".into());
+                self.requested_device = consented_device(selected).map(str::to_owned);
+                self.runtime = Some(
+                    if self.requested_device.as_deref() == Some("cpu") {
+                        "native"
+                    } else {
+                        "CTranslate2"
+                    }
+                    .into(),
+                );
             } else {
                 self.requested_device = Some("cpu".into());
             }
@@ -809,10 +813,26 @@ fn development_model_changed(
 
 fn local_model_identity(receipt: &ActiveReceipt) -> String {
     if is_consented_receipt(receipt) {
-        format!("{} (Consented Install)", receipt.catalog_id)
+        format!(
+            "{} (Consented Install, {})",
+            receipt.catalog_id,
+            consented_device(receipt).unwrap_or("unknown")
+        )
     } else {
         receipt.catalog_id.clone()
     }
+}
+
+// This in-memory identity is built only from a freshly verified receipt.
+fn consented_device(receipt: &ActiveReceipt) -> Option<&str> {
+    if !is_consented_receipt(receipt) {
+        return None;
+    }
+    receipt
+        .runtime_abi
+        .rsplit_once('@')
+        .map(|(_, device)| device)
+        .filter(|device| matches!(*device, "cpu" | "cuda:0"))
 }
 
 fn is_consented_receipt(receipt: &ActiveReceipt) -> bool {
@@ -1540,6 +1560,41 @@ mod tests {
             ..Default::default()
         });
         (state, gate, receipt)
+    }
+
+    #[test]
+    fn status_and_doctor_report_device_from_verified_consented_receipt() {
+        for device in ["cpu", "cuda:0"] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = crate::local_model::ModelStore::open(temp.path().join("models")).unwrap();
+            let mut entry = crate::local_model::consented::install_tests::entry();
+            entry.device = device;
+            let receipt =
+                crate::local_model::consented::install_tests::install_fixture_entry(&store, &entry);
+            let install = crate::local_model::consented::verify_with_entry(&store, &entry).unwrap();
+            let active = crate::local_worker::consented_active_receipt(&install);
+            let identity = local_model_identity(&active);
+            assert_eq!(consented_device(&active), Some(receipt.device.as_str()));
+            let status = voisu_core::AsrModeStatus {
+                pending: Some(AsrMode::Local),
+                local_readiness: LocalReadiness::Ready {
+                    model_identity: Some(identity),
+                },
+                active: None,
+                revision: None,
+                admission_error: None,
+                audio_retention: None,
+                local_path_clean: Some(true),
+            };
+            assert!(
+                crate::local_status::format_cli_status("status", Some(&status)).contains(device)
+            );
+            assert!(
+                crate::local_doctor::rows_from_status(&status)
+                    .iter()
+                    .any(|row| row.value.contains(device))
+            );
+        }
     }
 
     #[test]
