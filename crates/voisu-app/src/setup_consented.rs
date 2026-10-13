@@ -25,12 +25,13 @@ use crate::local_model::{
 use crate::local_setup::SetupMaintenance;
 use crate::local_worker::ConsentedWorkerHealth;
 use crate::setup::{SETUP_COMPLETE_MESSAGE, WizardIo};
-use crate::setup_engine::{ConsentedStatus, ask_yes_no, distil_is_suggested, format_size};
+use crate::setup_engine::{ConsentedStatus, ask_yes_no, format_size, suggested_consented_entry};
 
 pub use crate::local_model::{DEVELOPMENT_ROOT_NAME, SystemCommandRunner, probe_hardware};
 
 const INSTALL_PROMPT: &str = "Download and install now?";
 const INSTALL_DURATION_HINT: &str = "This can take several minutes.";
+#[cfg(test)]
 const INSTALL_SUCCESS: &str = "Installed distil-large-v3.5-int8 (Consented Install).";
 const DAEMON_RESTARTED: &str = "Restarted the Voisu daemon; Local dictation is ready.";
 const CLOUD_PROMPT: &str = "Also set up Cloud?";
@@ -43,10 +44,10 @@ const BUILDING_RUNTIME: &str = "Building runtime…";
 const CHECKING_GPU: &str = "Checking GPU…";
 const INSTALL_RETRY: &str =
     "Run `voisu setup` to retry or `voisu mode cloud` to dictate with Cloud.";
-const REMOVE_CONFIRM: &str = "Remove distil-large-v3.5-int8 (Consented Install)?";
+const REMOVE_CONFIRM: &str = "Remove the installed Consented model?";
 const REMOVE_USAGE: &str = "usage: voisu local remove [--yes]";
 pub const REMOVE_REQUIRES_YES: &str = "Non-interactive `voisu local remove` requires `--yes`.";
-const REMOVED: &str = "Removed distil-large-v3.5-int8 (Consented Install).";
+const REMOVED: &str = "Removed the Consented Install.";
 const NOTHING_TO_REMOVE: &str = "No Consented Install is installed.";
 const IN_USE: &str =
     "The Consented Install is in use; stop dictation or run `voisu service stop` first.";
@@ -99,11 +100,25 @@ pub fn consent_summary() -> [String; 4] {
     ]
 }
 
+fn consent_summary_for(entry: &crate::local_model::ConsentedCatalogEntry) -> Vec<String> {
+    if entry.device == "cpu" {
+        vec![
+            format!("Download size: {}", format_size(entry.total_download_bytes)),
+            "English only".into(),
+            format!("Licence: {}", entry.license_spdx),
+            "Runs offline on CPU".into(),
+            "Development evidence: one host, one speaker — not the release gate.".into(),
+        ]
+    } else {
+        consent_summary().into()
+    }
+}
+
 /// Shows the consent summary and installs only after an explicit yes. A
 /// successful install then restarts the daemon through `restart_daemon`; a
 /// failed restart is a warning, never a failed install.
 ///
-/// Non-interactive, parakeet, and an already-verified install never fetch.
+/// Non-interactive and an already-verified install never fetch.
 pub fn run_consented_install_step(
     io: &mut dyn WizardIo,
     hw: &HostHardware,
@@ -113,20 +128,23 @@ pub fn run_consented_install_step(
     install: impl FnOnce(ConsentedConsent) -> Result<(), ConsentedError>,
     restart_daemon: impl FnOnce() -> Result<(), String>,
 ) -> ConsentedInstallStep {
-    if installed || !interactive || !distil_is_suggested(&suggest_local(hw)) {
+    if installed || !interactive {
         return ConsentedInstallStep::Skipped;
     }
+    let Some(entry) = suggested_consented_entry(&suggest_local(hw)) else {
+        return ConsentedInstallStep::Skipped;
+    };
     io.writeln("");
-    for fact in consent_summary() {
+    for fact in consent_summary_for(entry) {
         io.writeln(&fact);
         io.writeln("");
     }
     match ask_yes_no(io, INSTALL_PROMPT, false) {
         Some(true) => {
             io.writeln(INSTALL_DURATION_HINT);
-            match install(ConsentedConsent::accepted(now_unix)) {
+            match install(ConsentedConsent::accepted_entry(entry, now_unix)) {
                 Ok(()) => {
-                    io.writeln(INSTALL_SUCCESS);
+                    io.writeln(&format!("Installed {} (Consented Install).", entry.id));
                     match restart_daemon() {
                         Ok(()) => io.writeln(DAEMON_RESTARTED),
                         Err(reason) => io.writeln(&format!(
@@ -367,6 +385,7 @@ impl<W: Write> ProgressRenderer<W> {
             match phase {
                 InstallPhase::BuildingRuntime => BUILDING_RUNTIME,
                 InstallPhase::CheckingGpu => CHECKING_GPU,
+                InstallPhase::CheckingCpu => "Checking CPU…",
             }
         );
         let _ = self.out.flush();
@@ -563,12 +582,18 @@ pub fn consented_error_line(error: &ConsentedError) -> String {
             "The download failed (network or deadline).".into()
         }
         ConsentedError::Leased => IN_USE.into(),
+        ConsentedError::DifferentEntry(id) => {
+            format!("{id} is already installed; run `voisu local remove` first.")
+        }
+        ConsentedError::PendingRemoval(id) => {
+            format!("A removal of {id} is still in progress; re-run `voisu local remove`.")
+        }
         ConsentedError::Consent => "Consent did not match the catalog.".into(),
         ConsentedError::Missing => NOTHING_TO_REMOVE.into(),
         ConsentedError::Receipt => "The Consented Install receipt is invalid.".into(),
         ConsentedError::Digest(_) => "A downloaded file failed its checksum.".into(),
         ConsentedError::Tree(_) => "The install tree is invalid.".into(),
-        ConsentedError::Build(_) => "The Python/CUDA runtime failed to build.".into(),
+        ConsentedError::Build(_) => "The pinned runtime failed to build.".into(),
         ConsentedError::Store(_) => "The model store is busy or unavailable.".into(),
         ConsentedError::Fs(_) | ConsentedError::Io(_) => {
             "A filesystem error stopped the operation.".into()
@@ -596,7 +621,10 @@ pub fn production_consented_status() -> ConsentedStatus {
         Err(_) => return ConsentedStatus::Unknown("the model store is unavailable".into()),
     };
     match verify_consented_install(&store) {
-        Ok(_) => ConsentedStatus::Installed,
+        Ok(install) => ConsentedStatus::Installed {
+            entry_id: install.receipt().entry_id.clone(),
+            device: install.receipt().device.clone(),
+        },
         Err(ConsentedError::Missing) => ConsentedStatus::NotInstalled,
         Err(error) => ConsentedStatus::Unknown(consented_error_line(&error)),
     }
@@ -606,7 +634,10 @@ pub fn production_consented_status() -> ConsentedStatus {
 #[must_use]
 pub fn production_local_complete_message() -> String {
     local_complete_message(
-        matches!(production_consented_status(), ConsentedStatus::Installed),
+        matches!(
+            production_consented_status(),
+            ConsentedStatus::Installed { .. }
+        ),
         crate::local_model::development_local_enabled(),
     )
 }
@@ -621,9 +652,15 @@ pub fn production_install(consent: ConsentedConsent) -> Result<(), ConsentedErro
         .map_err(|message| ConsentedError::Io(std::io::Error::other(message)))?;
     let fetcher = ProductionHttps;
     let builder = OfflineRuntimeBuilder;
-    let health = ConsentedWorkerHealth::new(state);
+    let entry = [&CONSENTED_ENTRY, &crate::local_model::PARAKEET_ENTRY]
+        .into_iter()
+        .find(|entry| {
+            entry.consent_text == consent.text && entry.license_spdx == consent.license_spdx
+        })
+        .ok_or(ConsentedError::Consent)?;
+    let health = ConsentedWorkerHealth::for_entry(state, entry);
     let maintenance = SetupMaintenance::default();
-    let progress = TerminalProgress::stdout(CONSENTED_ENTRY.total_download_bytes);
+    let progress = TerminalProgress::stdout(entry.total_download_bytes);
     crate::local_model::install_consented_install(ConsentedInstallRequest {
         store: &store,
         consent,
@@ -834,21 +871,35 @@ mod tests {
     }
 
     #[test]
-    fn small_gpu_and_absent_nvidia_never_offer_install() {
+    fn cpu_suggestion_offers_exact_parakeet_consent_and_decline_does_not_fetch() {
         for hw in [
             host(GpuProbe::Nvidia(vec![gpu(0, 2048)])),
             host(GpuProbe::NoneFound),
         ] {
-            let leftover = vec![Some("y")];
-            let (step, io) = offer(&hw, true, false, leftover, Ok(()));
-            assert_eq!(step, ConsentedInstallStep::Skipped);
-            assert_eq!(io.prompts, 0);
+            let (step, io) = offer(&hw, true, false, vec![Some("n")], Ok(()));
+            assert_eq!(step, ConsentedInstallStep::Declined);
             assert!(io.install_calls.is_empty());
-            assert!(
-                !io.transcript().contains("Download size"),
-                "{}",
-                io.transcript()
+            let text = io.transcript();
+            for expected in [
+                "734.1 MiB",
+                "English only",
+                "CC-BY-4.0",
+                "Runs offline on CPU",
+                "Development evidence",
+                "not the release gate",
+            ] {
+                assert!(text.contains(expected), "{text}");
+            }
+            let (step, io) = offer(&hw, true, false, vec![Some("y")], Ok(()));
+            assert_eq!(step, ConsentedInstallStep::Installed);
+            assert_eq!(
+                io.install_calls,
+                vec![ConsentedConsent::accepted_entry(
+                    &crate::local_model::PARAKEET_ENTRY,
+                    NOW
+                )]
             );
+            assert!(io.transcript().contains("Installed parakeet-tdt-0.6b-v3"));
         }
     }
 
@@ -864,7 +915,10 @@ mod tests {
             &KeyDiagnosis::Absent,
             false,
             |_| false,
-            ConsentedStatus::Installed,
+            ConsentedStatus::Installed {
+                entry_id: CONSENTED_ENTRY.id.into(),
+                device: "cuda:0".into(),
+            },
         );
         assert_eq!(choice, EngineChoice::Keep(AsrMode::Cloud));
         assert!(
@@ -1509,7 +1563,7 @@ mod tests {
         assert!(!removed);
         assert!(
             io.transcript()
-                .contains("Remove distil-large-v3.5-int8 (Consented Install)? [y/N]"),
+                .contains("Remove the installed Consented model? [y/N]"),
             "{}",
             io.transcript()
         );

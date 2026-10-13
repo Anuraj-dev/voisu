@@ -30,6 +30,9 @@ use super::whisper_cli::WhisperCppWorker;
 const FLOCK: &str = "/usr/bin/flock";
 const GPU_LOCK_CONFLICT: i32 = 73;
 pub(crate) const GPU_BUSY: &str = "another Local worker holds the GPU";
+const CPU_BUSY: &str = "another Local worker holds the CPU";
+const GPU_LOCK_NAME: &str = "local-gpu-worker.lock";
+const CPU_LOCK_NAME: &str = "local-cpu-worker.lock";
 const SYSTEMD_RUN: &str = "systemd-run";
 const SYSTEMCTL: &str = "systemctl";
 const MAX_REPLY_BYTES: usize = MAX_JSON_FRAME_BYTES;
@@ -159,20 +162,30 @@ impl DevWorker {
         install_root: Option<&Path>,
         lease_path: Option<&Path>,
     ) -> Result<Self, SupervisorError> {
-        // Only one transient worker may hold the model/GPU at a time,
-        // including one that is still starting or being stopped.
+        // CUDA workers serialize GPU ownership through the GPU lock and refuse
+        // overlapping development units. CPU workers take a separate exclusive
+        // CPU lock so two CPU units cannot overlap; they stay independent of CUDA.
         if !Path::new(FLOCK).is_file() {
             return Err(SupervisorError::Unavailable(
                 "/usr/bin/flock is required for Local worker locks",
             ));
         }
-        let gpu_lock = prepare_gpu_lock()?;
+        let gpu_lock = if manifest.device == "cuda:0" {
+            prepare_gpu_lock()?
+        } else {
+            prepare_cpu_lock()?
+        };
         // This early probe gives a clear refusal. The transient unit's atomic
         // nonblocking flock is authoritative when two launches race this probe.
         let probe = open_gpu_lock(&gpu_lock)?;
-        lock_gpu(&probe)?;
-        drop(probe);
-        refuse_if_development_worker_loaded()?;
+        if manifest.device == "cuda:0" {
+            lock_gpu(&probe)?;
+            drop(probe);
+            refuse_if_development_worker_loaded()?;
+        } else {
+            lock_cpu(&probe)?;
+            drop(probe);
+        }
         let prefix = if install_root.is_some() {
             "voisu-consented-worker"
         } else {
@@ -191,7 +204,7 @@ impl DevWorker {
             &manifest,
             manifest_path,
             install_root,
-            &gpu_lock,
+            Some(&gpu_lock),
             lease_path,
         )?;
         let mut command = Command::new(SYSTEMD_RUN);
@@ -841,7 +854,7 @@ fn systemd_run_args(
         manifest,
         manifest_path,
         None,
-        Path::new("/run/user/1000/voisu/local-gpu-worker.lock"),
+        Some(Path::new("/run/user/1000/voisu/local-gpu-worker.lock")),
         None,
     )
     .unwrap()
@@ -853,7 +866,7 @@ fn isolated_systemd_run_args(
     manifest: &DevManifest,
     manifest_path: &Path,
     install_root: Option<&Path>,
-    gpu_lock: &Path,
+    gpu_lock: Option<&Path>,
     lease_path: Option<&Path>,
 ) -> Result<Vec<String>, SupervisorError> {
     for path in [
@@ -913,7 +926,11 @@ fn isolated_systemd_run_args(
             literal_path(library)?
         ));
     }
-    let mut read_only = vec![systemd_path(gpu_lock)?];
+    let mut read_only = vec![systemd_path(gpu_lock.ok_or(SupervisorError::LoadAborted)?)?];
+    if manifest.device == "cpu" && install_root.is_some() {
+        args.push("--setenv=CUDA_VISIBLE_DEVICES=".into());
+        args.push("--property=PrivateDevices=yes".into());
+    }
     if let Some(root) = install_root {
         read_only.extend([systemd_path(root)?, systemd_path(manifest_path)?]);
     }
@@ -923,7 +940,10 @@ fn isolated_systemd_run_args(
     args.push(format!("--property=ReadOnlyPaths={}", read_only.join(" ")));
     args.push("--expand-environment=no".into());
     args.push("--".into());
-    args.extend(gpu_guard_args(gpu_lock, lease_path)?);
+    args.extend(gpu_guard_args(
+        gpu_lock.ok_or(SupervisorError::LoadAborted)?,
+        lease_path,
+    )?);
     args.extend([
         manifest.runtime.python.clone(),
         "-I".into(),
@@ -979,18 +999,41 @@ fn gpu_guard_args(gpu_lock: &Path, lease: Option<&Path>) -> Result<Vec<String>, 
 }
 
 fn prepare_gpu_lock() -> Result<PathBuf, SupervisorError> {
+    prepare_exclusive_lock(
+        GPU_LOCK_NAME,
+        "XDG_RUNTIME_DIR is required for the Local GPU lock",
+        "cannot create private Local GPU lock directory",
+        "Local GPU lock must have mode 0600",
+        "cannot open Local GPU lock",
+    )
+}
+
+fn prepare_cpu_lock() -> Result<PathBuf, SupervisorError> {
+    prepare_exclusive_lock(
+        CPU_LOCK_NAME,
+        "XDG_RUNTIME_DIR is required for the Local CPU lock",
+        "cannot create private Local CPU lock directory",
+        "Local CPU lock must have mode 0600",
+        "cannot open Local CPU lock",
+    )
+}
+
+fn prepare_exclusive_lock(
+    name: &str,
+    missing_runtime: &'static str,
+    missing_dir: &'static str,
+    bad_mode: &'static str,
+    open_error: &'static str,
+) -> Result<PathBuf, SupervisorError> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
-        .ok_or(SupervisorError::Unavailable(
-            "XDG_RUNTIME_DIR is required for the Local GPU lock",
-        ))?;
+        .ok_or(SupervisorError::Unavailable(missing_runtime))?;
     literal_path(&runtime)?;
     let directory = runtime.join("voisu");
-    crate::local_model::ensure_private_dir(&directory).map_err(|_| {
-        SupervisorError::Unavailable("cannot create private Local GPU lock directory")
-    })?;
-    let path = directory.join("local-gpu-worker.lock");
-    let file = open_gpu_lock(&path)?;
+    crate::local_model::ensure_private_dir(&directory)
+        .map_err(|_| SupervisorError::Unavailable(missing_dir))?;
+    let path = directory.join(name);
+    let file = open_exclusive_lock(&path, open_error)?;
     if file
         .metadata()
         .map_err(|_| SupervisorError::LoadAborted)?
@@ -999,14 +1042,16 @@ fn prepare_gpu_lock() -> Result<PathBuf, SupervisorError> {
         & 0o777
         != 0o600
     {
-        return Err(SupervisorError::Unavailable(
-            "Local GPU lock must have mode 0600",
-        ));
+        return Err(SupervisorError::Unavailable(bad_mode));
     }
     Ok(path)
 }
 
 fn open_gpu_lock(path: &Path) -> Result<File, SupervisorError> {
+    open_exclusive_lock(path, "cannot open Local GPU lock")
+}
+
+fn open_exclusive_lock(path: &Path, error: &'static str) -> Result<File, SupervisorError> {
     OpenOptions::new()
         .read(true)
         .write(true)
@@ -1015,17 +1060,29 @@ fn open_gpu_lock(path: &Path) -> Result<File, SupervisorError> {
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
-        .map_err(|_| SupervisorError::Unavailable("cannot open Local GPU lock"))
+        .map_err(|_| SupervisorError::Unavailable(error))
 }
 
 fn lock_gpu(file: &File) -> Result<(), SupervisorError> {
+    lock_exclusive(file, GPU_BUSY, "cannot lock Local GPU")
+}
+
+fn lock_cpu(file: &File) -> Result<(), SupervisorError> {
+    lock_exclusive(file, CPU_BUSY, "cannot lock Local CPU")
+}
+
+fn lock_exclusive(
+    file: &File,
+    busy: &'static str,
+    fail: &'static str,
+) -> Result<(), SupervisorError> {
     // SAFETY: flock borrows a valid owned descriptor and dereferences no memory.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
         Ok(())
     } else if std::io::Error::last_os_error().kind() == ErrorKind::WouldBlock {
-        Err(SupervisorError::Unavailable(GPU_BUSY))
+        Err(SupervisorError::Unavailable(busy))
     } else {
-        Err(SupervisorError::Unavailable("cannot lock Local GPU"))
+        Err(SupervisorError::Unavailable(fail))
     }
 }
 
@@ -1033,6 +1090,61 @@ fn lock_gpu(file: &File) -> Result<(), SupervisorError> {
 mod tests {
     use super::*;
     use crate::local_model::{DevLimits, DevRuntimeManifest};
+
+    #[test]
+    fn cpu_consented_unit_takes_exclusive_cpu_lock_and_shared_lease() {
+        let mut manifest = test_manifest("cpu");
+        manifest.limits.cpu_cores = 4;
+        let cpu_lock = Path::new("/run/user/1000/voisu/local-cpu-worker.lock");
+        let gpu_lock = Path::new("/run/user/1000/voisu/local-gpu-worker.lock");
+        let lease = Path::new("/state/install.lease");
+        let args = isolated_systemd_run_args(
+            "cpu-test",
+            Path::new("/state/cache"),
+            &manifest,
+            Path::new("/state/manifest.json"),
+            Some(Path::new("/state/install")),
+            Some(cpu_lock),
+            Some(lease),
+        )
+        .unwrap();
+        for expected in [
+            "--property=PrivateNetwork=yes",
+            "--property=RestrictAddressFamilies=AF_UNIX",
+            "--property=ProtectSystem=strict",
+            "--property=PrivateDevices=yes",
+            "--setenv=CUDA_VISIBLE_DEVICES=",
+        ] {
+            assert!(args.iter().any(|arg| arg == expected), "{args:?}");
+        }
+        assert_eq!(exclusive_lock_path(&args), cpu_lock.to_str().unwrap());
+        assert!(args.iter().any(|arg| arg == "--exclusive"));
+        assert!(args.iter().any(|arg| arg == "--shared"));
+        assert!(args.iter().any(|arg| arg == lease.to_str().unwrap()));
+        assert!(!args.iter().any(|arg| arg.contains("gpu-worker.lock")));
+        assert!(args.iter().any(|arg| arg == "--property=CPUQuota=400%"));
+        let cuda = isolated_systemd_run_args(
+            "cuda-test",
+            Path::new("/state/cache"),
+            &test_manifest("cuda:0"),
+            Path::new("/state/manifest.json"),
+            Some(Path::new("/state/install")),
+            Some(gpu_lock),
+            Some(lease),
+        )
+        .unwrap();
+        assert_eq!(exclusive_lock_path(&cuda), gpu_lock.to_str().unwrap());
+        assert_ne!(exclusive_lock_path(&args), exclusive_lock_path(&cuda));
+    }
+
+    fn exclusive_lock_path(args: &[String]) -> &str {
+        let index = args
+            .iter()
+            .position(|arg| arg == "--conflict-exit-code=73")
+            .expect("exclusive flock");
+        assert_eq!(args[index + 1], "--no-fork");
+        &args[index + 2]
+    }
 
     #[test]
     fn consented_path_properties_preserve_literal_special_characters() {
@@ -1058,7 +1170,7 @@ mod tests {
                 &manifest,
                 Path::new("/state/manifest"),
                 None,
-                Path::new("/run/gpu"),
+                Some(Path::new("/run/gpu")),
                 None,
             )
             .unwrap_err();
@@ -1210,7 +1322,7 @@ mod tests {
                 &manifest,
                 Path::new("/state/manifest.json"),
                 Some(Path::new("/state/install")),
-                Path::new("/run/user/1000/voisu/local-gpu-worker.lock"),
+                Some(Path::new("/run/user/1000/voisu/local-gpu-worker.lock")),
                 Some(Path::new("/state/models/private/hash.lease")),
             )
             .unwrap(),

@@ -9,6 +9,7 @@ use std::io::{self, Write};
 pub enum InstallPhase {
     BuildingRuntime,
     CheckingGpu,
+    CheckingCpu,
 }
 
 pub trait InstallProgress {

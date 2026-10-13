@@ -129,14 +129,7 @@ pub const WHEELS: &[DownloadPin] = &[
         hosts: &["files.pythonhosted.org"],
         requirement: Some("idna==3.20"),
     },
-    DownloadPin {
-        name: "numpy-2.5.3-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
-        url: "https://files.pythonhosted.org/packages/65/af/aa78d1a88805456e212b65461354cd943197fb9acecc4c90fd12295123a3/numpy-2.5.3-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
-        sha256: "b7e18c623bb5c95acb3b3328861272816ba199fb531921c5d6d0b675f1fde9e3",
-        bytes: 16717410,
-        hosts: &["files.pythonhosted.org"],
-        requirement: Some("numpy==2.5.3"),
-    },
+    NUMPY,
     DownloadPin {
         name: "nvidia_cublas_cu12-12.8.4.1-py3-none-manylinux_2_27_x86_64.whl",
         url: "https://files.pythonhosted.org/packages/dc/61/e24b560ab2e2eaeb3c839129175fb330dfcfc29e5203196e5541a4c44682/nvidia_cublas_cu12-12.8.4.1-py3-none-manylinux_2_27_x86_64.whl",
@@ -219,3 +212,30 @@ pub const WHEELS: &[DownloadPin] = &[
     },
 ];
 pub const TOTAL_DOWNLOAD_BYTES: u64 = 2980914661;
+
+pub const NUMPY: DownloadPin = DownloadPin {
+    name: "numpy-2.5.3-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+    url: "https://files.pythonhosted.org/packages/65/af/aa78d1a88805456e212b65461354cd943197fb9acecc4c90fd12295123a3/numpy-2.5.3-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+    sha256: "b7e18c623bb5c95acb3b3328861272816ba199fb531921c5d6d0b675f1fde9e3",
+    bytes: 16717410,
+    hosts: &["files.pythonhosted.org"],
+    requirement: Some("numpy==2.5.3"),
+};
+pub const CPU_WHEELS: &[DownloadPin] = &[NUMPY];
+
+pub const PARAKEET_WEIGHTS: DownloadPin = DownloadPin {
+    name: "parakeet-tdt-0.6b-v3.q8_0.gguf",
+    url: "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/resolve/541d1f99c6b0c3cd0b11a95167540bb8edefd82b/parakeet-tdt-0.6b-v3.q8_0.gguf",
+    sha256: "e3880d0aaaaf2c308ea2c35016b2b895c423eb3fda924c1b463d1c19b7f4d32e",
+    bytes: 713975456,
+    hosts: &["huggingface.co", "us.aws.cdn.hf.co"],
+    requirement: None,
+};
+pub const NEMO_CPU: DownloadPin = DownloadPin {
+    name: "nemo-speech-0.1.0-linux-x86_64-cpu.tar.gz",
+    url: "https://github.com/NVIDIA/NeMo-Speech.cpp/releases/download/v0.1.0/nemo-speech-0.1.0-linux-x86_64-cpu.tar.gz",
+    sha256: "0f74131d631ad2c694cf0ec53490866bb6461147959589a69fb6fc231944065b",
+    bytes: 4583913,
+    hosts: &["github.com", "release-assets.githubusercontent.com"],
+    requirement: None,
+};
