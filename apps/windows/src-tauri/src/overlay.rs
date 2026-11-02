@@ -11,7 +11,6 @@
 //! window. `SetWindowPos(.., SWP_NOACTIVATE | SWP_SHOWWINDOW)` does not.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -247,36 +246,125 @@ fn apply(app: &AppHandle, step: Step) {
     }
 }
 
-static PREVIEW_RUNNING: AtomicBool = AtomicBool::new(false);
+/// Generation of the running tray preview. A real Recording bumps it, and
+/// the preview emits only while holding this lock with its own generation
+/// current, so none of its fake events can land after the real `recording`.
+static PREVIEW: Mutex<PreviewGate> = Mutex::new(PreviewGate::new());
+
+/// Pure state behind [`PREVIEW`].
+#[derive(Debug)]
+struct PreviewGate {
+    generation: u64,
+    running: bool,
+}
+
+impl PreviewGate {
+    const fn new() -> Self {
+        Self {
+            generation: 0,
+            running: false,
+        }
+    }
+
+    /// Starts a preview and returns its token, or `None` if one is running.
+    fn begin(&mut self) -> Option<u64> {
+        if self.running {
+            return None;
+        }
+        self.running = true;
+        self.generation += 1;
+        Some(self.generation)
+    }
+
+    /// Whether the preview holding `token` may still emit.
+    fn is_current(&self, token: u64) -> bool {
+        self.running && self.generation == token
+    }
+
+    /// Ends whatever preview is running; its token goes stale.
+    fn end(&mut self) {
+        self.running = false;
+        self.generation += 1;
+    }
+
+    /// Ends the preview holding `token`, unless it was already superseded.
+    fn finish(&mut self, token: u64) {
+        if self.is_current(token) {
+            self.running = false;
+        }
+    }
+}
+
+fn preview_gate() -> std::sync::MutexGuard<'static, PreviewGate> {
+    PREVIEW
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Called by the engine as a real Recording starts: stops any preview.
+pub fn end_preview() {
+    preview_gate().end();
+}
+
+/// Emits only while the preview holding `token` is current; false once a
+/// real Recording has taken over.
+fn emit_preview<S: Serialize + Clone>(
+    app: &AppHandle,
+    token: u64,
+    event: &str,
+    payload: S,
+) -> bool {
+    let gate = preview_gate();
+    if !gate.is_current(token) {
+        return false;
+    }
+    let _ = app.emit(event, payload);
+    true
+}
+
+fn play_preview(app: &AppHandle, token: u64) -> bool {
+    let state = |state| {
+        let payload = RecordingStatePayload {
+            state,
+            message: None,
+        };
+        emit_preview(app, token, RECORDING_STATE, payload)
+    };
+    if !state(RecordingState::Recording) {
+        return false;
+    }
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(3) {
+        let level = preview_level(started.elapsed().as_secs_f64());
+        if !emit_preview(app, token, AUDIO_LEVEL, AudioLevelPayload { level }) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(33));
+    }
+    if !state(RecordingState::Processing) {
+        return false;
+    }
+    std::thread::sleep(Duration::from_secs(1));
+    state(RecordingState::Idle)
+}
 
 /// Tray diagnostic: plays recording (~3 s of fake levels) → processing (~1 s)
 /// → idle through the same events W2 emits. It does nothing while the capsule
-/// is already up (a real Recording) or another preview runs.
+/// is already up (a real Recording) or another preview runs, and stops at
+/// once when a real Recording starts.
 pub fn preview(app: &AppHandle) {
-    if presenter(app).is_visible() || PREVIEW_RUNNING.swap(true, Ordering::SeqCst) {
+    if presenter(app).is_visible() {
         return;
     }
+    let Some(token) = preview_gate().begin() else {
+        return;
+    };
     tracing::info!("overlay preview");
     let app = app.clone();
     std::thread::spawn(move || {
-        let state = |state| {
-            let payload = RecordingStatePayload {
-                state,
-                message: None,
-            };
-            let _ = app.emit(RECORDING_STATE, payload);
-        };
-        state(RecordingState::Recording);
-        let started = Instant::now();
-        while started.elapsed() < Duration::from_secs(3) {
-            let level = preview_level(started.elapsed().as_secs_f64());
-            let _ = app.emit(AUDIO_LEVEL, AudioLevelPayload { level });
-            std::thread::sleep(Duration::from_millis(33));
+        if play_preview(&app, token) {
+            preview_gate().finish(token);
         }
-        state(RecordingState::Processing);
-        std::thread::sleep(Duration::from_secs(1));
-        state(RecordingState::Idle);
-        PREVIEW_RUNNING.store(false, Ordering::SeqCst);
     });
 }
 
@@ -541,5 +629,22 @@ mod tests {
             levels.iter().any(|&l| l < 0.1),
             "preview should have quiet frames"
         );
+    }
+
+    #[test]
+    fn a_real_recording_silences_a_running_preview() {
+        let mut gate = PreviewGate::new();
+        let token = gate.begin().unwrap();
+        assert!(gate.is_current(token));
+        assert_eq!(gate.begin(), None, "one preview at a time");
+
+        gate.end();
+        assert!(!gate.is_current(token), "stale preview must stop emitting");
+        // Its late finish must not end a newer preview.
+        let next = gate.begin().unwrap();
+        gate.finish(token);
+        assert!(gate.is_current(next));
+        gate.finish(next);
+        assert!(gate.begin().is_some());
     }
 }

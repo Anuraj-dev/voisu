@@ -24,7 +24,8 @@ use voisu_core::{
 
 use crate::gesture::Action;
 use crate::overlay::{
-    AUDIO_LEVEL, AudioLevelPayload, RECORDING_STATE, RecordingState as Phase, RecordingStatePayload,
+    self, AUDIO_LEVEL, AudioLevelPayload, RECORDING_STATE, RecordingState as Phase,
+    RecordingStatePayload,
 };
 use crate::platform::capture::{CpalCapture, LevelSink};
 use crate::platform::secrets::CredentialManagerStore;
@@ -150,6 +151,9 @@ impl Engine {
     }
 
     async fn record(&self, id: u64, actions: &mut UnboundedReceiver<Action>) {
+        // A tray preview still playing must not hide or feed this session's
+        // capsule.
+        overlay::end_preview();
         if !crate::keys_ready() {
             tracing::info!(id, "Recording refused: keys missing");
             self.emit_state(Phase::Error, Some(KEYS_MISSING.to_owned()));
