@@ -123,6 +123,16 @@ fn controlled_key_status(mode: &str) -> ProviderKeyStatus {
 /// path that curl fails to create.
 const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
 
+/// The key probe's budget. Windows' inbox curl.exe (Schannel) can spend over
+/// two seconds on a cold TLS handshake with revocation checks, which would
+/// read as "unreachable" during setup; Linux keeps its historic two seconds.
+const AUTH_PROBE_MAX_TIME: &str = if cfg!(windows) { "8" } else { "2" };
+const AUTH_PROBE_DEADLINE: Duration = if cfg!(windows) {
+    Duration::from_secs(9)
+} else {
+    PROCESS_DEADLINE
+};
+
 fn authenticated_status(
     credential: Credential,
     request: ProviderHttpRequest,
@@ -136,7 +146,7 @@ fn authenticated_status(
     // and swallows the status, collapsing 401/403/429/5xx into one opaque error.
     // Without it curl completes with exit 0 and writes the code, so the caller
     // can classify. A non-zero exit now means a genuine transport failure.
-    let outcome = run_restricted(
+    let outcome = run_restricted_with_deadline(
         "curl",
         &[
             "-q",
@@ -149,10 +159,12 @@ fn authenticated_status(
             "--write-out",
             "%{http_code}\t%header{retry-after}",
             "--max-time",
-            "2",
+            AUTH_PROBE_MAX_TIME,
         ],
         Some(config.as_bytes()),
         true,
+        AUTH_PROBE_DEADLINE,
+        None,
     )
     .map_err(provider_authentication_error)?;
     if !outcome.success {
