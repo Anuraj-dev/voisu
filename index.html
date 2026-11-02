@@ -2,8 +2,8 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Voisu — dictation for Linux</title>
-<meta name="description" content="Voisu is dictation for Linux: press a key, speak, and your words land in the app you're using. Install on Fedora, Arch, or Debian/Ubuntu with one command.">
+<title>Voisu — dictation for Linux and Windows</title>
+<meta name="description" content="Voisu is dictation for Linux and Windows: press a key, speak, and your words land in the app you're using. Install on Fedora, Arch, or Debian/Ubuntu with one command, or download the Windows installer.">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark light">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230d0f12'/%3E%3Cg fill='none' stroke='%23f0b429' stroke-width='2.4' stroke-linecap='round'%3E%3Cline x1='8' y1='16' x2='8' y2='16.2'/%3E%3Cline x1='12' y1='12' x2='12' y2='20'/%3E%3Cline x1='16' y1='7' x2='16' y2='25'/%3E%3Cline x1='20' y1='11' x2='20' y2='21'/%3E%3Cline x1='24' y1='14' x2='24' y2='18'/%3E%3C/g%3E%3C/svg%3E">
@@ -122,20 +122,39 @@
   .seg label:hover { color: var(--ink); }
   #t-fedora:checked ~ .seg label[for="t-fedora"],
   #t-arch:checked   ~ .seg label[for="t-arch"],
-  #t-debian:checked ~ .seg label[for="t-debian"] {
+  #t-debian:checked ~ .seg label[for="t-debian"],
+  #t-windows:checked ~ .seg label[for="t-windows"] {
     color: var(--bg); background: var(--amber);
     border-color: var(--amber);
   }
   #t-fedora:focus-visible ~ .seg label[for="t-fedora"],
   #t-arch:focus-visible   ~ .seg label[for="t-arch"],
-  #t-debian:focus-visible ~ .seg label[for="t-debian"] {
+  #t-debian:focus-visible ~ .seg label[for="t-debian"],
+  #t-windows:focus-visible ~ .seg label[for="t-windows"] {
     outline: 2px solid var(--amber); outline-offset: 2px;
   }
 
   /* Panels: all visible if CSS fails; otherwise only the checked one shows. */
   #t-fedora:checked ~ .panels .panel[data-d="fedora"],
   #t-arch:checked   ~ .panels .panel[data-d="arch"],
-  #t-debian:checked ~ .panels .panel[data-d="debian"] { display: block; }
+  #t-debian:checked ~ .panels .panel[data-d="debian"],
+  #t-windows:checked ~ .panels .panel[data-d="windows"] { display: block; }
+  @media (max-width: 460px) {
+    .seg label { font-size: .76rem; padding: 9px 3px; }
+    .dl small { display: none; }
+  }
+
+  /* ---- Windows download ---- */
+  .dl {
+    display: inline-flex; align-items: center; gap: 10px;
+    font-family: var(--mono); font-size: .92rem; font-weight: 700;
+    color: var(--bg); background: var(--amber); border: 1px solid var(--amber);
+    border-radius: 10px; padding: 12px 20px; margin: 0 0 12px;
+    text-decoration: none; transition: filter .12s;
+  }
+  .dl:hover { filter: brightness(1.08); }
+  .dl:focus-visible { outline: 2px solid var(--amber); outline-offset: 3px; }
+  .dl small { font-weight: 500; opacity: .75; font-size: .76rem; }
   .css-tabs .panel { display: none; }
 
   .meta {
@@ -226,18 +245,20 @@
   <section class="hero">
     <a class="wordmark" href="https://github.com/Anuraj-Dev/voisu"><span class="dot"></span>voisu</a>
     <h1>Press a key, speak, and your words land in the <span class="amber">app you're using</span>.</h1>
-    <p class="promise"><b>Press. Speak. Inserted.</b> — dictation for Linux.</p>
+    <p class="promise"><b>Press. Speak. Inserted.</b> — dictation for Linux and Windows.</p>
   </section>
 
   <section class="install css-tabs">
     <input class="seg-radio" type="radio" name="distro" id="t-fedora" checked>
     <input class="seg-radio" type="radio" name="distro" id="t-arch">
     <input class="seg-radio" type="radio" name="distro" id="t-debian">
+    <input class="seg-radio" type="radio" name="distro" id="t-windows">
 
-    <div class="seg" role="tablist" aria-label="Choose your distribution">
+    <div class="seg" role="tablist" aria-label="Choose your system">
       <label for="t-fedora">Fedora</label>
       <label for="t-arch">Arch</label>
       <label for="t-debian">Debian / Ubuntu</label>
+      <label for="t-windows">Windows</label>
     </div>
 
     <div class="panels">
@@ -321,6 +342,17 @@
             <button class="copy" type="button">copy</button>
 <pre><span class="p">$ </span>voisu setup</pre>
           </div>
+        </div>
+      </div>
+
+      <!-- Windows -->
+      <div class="panel" data-d="windows">
+        <p class="meta">Windows 10 / 11 · x64 · installs for your user, no admin needed</p>
+        <a class="dl" href="https://github.com/Anuraj-dev/voisu/releases/latest/download/Voisu-Setup-x64.exe">Download for Windows <small>Voisu-Setup-x64.exe</small></a>
+        <p class="after-note">The installer isn't code-signed yet, so SmartScreen may warn on first run: choose <b>More info</b> → <b>Run anyway</b>.</p>
+        <div class="after">
+          <p class="after-title">Finish setup</p>
+          <p class="after-note">Voisu opens its settings on first launch: paste your Groq and Deepgram API keys. Then hold <code>Ctrl+Win</code>, speak, and release. Voisu lives in the tray and updates itself when a new version is out.</p>
         </div>
       </div>
     </div>
