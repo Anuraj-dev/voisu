@@ -2,6 +2,7 @@
 //! (from W2 on) the Recording → Transcript engine.
 
 mod logging;
+pub mod overlay;
 mod paths;
 pub mod platform;
 pub mod settings;
@@ -242,6 +243,7 @@ pub fn run() {
             let ready = keys_ready();
             let tray = tray::build(handle, ready, autostart_enabled(handle))?;
             let _ = app.state::<AppState>().tray.set(tray);
+            overlay::init(handle)?;
             let at_login = std::env::args().any(|arg| arg == AUTOSTART_ARG);
             tracing::info!(keys_ready = ready, at_login, "startup");
             if setup::should_open_window(at_login, ready) {

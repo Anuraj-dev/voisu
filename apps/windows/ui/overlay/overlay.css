@@ -1,0 +1,77 @@
+/* The recording Overlay capsule. Values follow DESIGN.md and the Linux GTK
+   overlay (crates/voisu-app/src/bin/voisu-overlay.rs). The window is 8 px
+   larger than the capsule on every side so the error glow is not clipped. */
+:root {
+  --surface: rgba(23, 25, 29, 0.96);
+  --failure: #ff8a8a;
+  --text: #f4f5f7;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: transparent;
+  user-select: none;
+  cursor: default;
+}
+
+body {
+  display: grid;
+  place-items: center;
+  font-family: 'Segoe UI Variable', 'Segoe UI', system-ui, sans-serif;
+}
+
+.capsule {
+  width: 280px;
+  height: 64px;
+  padding: 12px 8px;
+  border-radius: 32px;
+  border: 1px solid transparent;
+  background: var(--surface);
+  display: grid;
+  place-items: center;
+}
+
+.meter {
+  /* The capsule's content box: 280x64 less the 12px/8px padding and 1px border. */
+  width: 262px;
+  height: 38px;
+  display: block;
+}
+
+.message {
+  margin: 0;
+  padding: 0 16px;
+  max-width: 100%;
+  color: var(--failure);
+  font-size: 11pt;
+  font-weight: 600;
+  line-height: 1.2;
+  text-align: center;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.message[hidden] {
+  display: none;
+}
+
+.capsule.error {
+  border-color: rgba(255, 138, 138, 0.9);
+  box-shadow: 0 0 8px rgba(255, 138, 138, 0.35);
+}
+
+.capsule.error .meter {
+  display: none;
+}
