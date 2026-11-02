@@ -1147,10 +1147,10 @@ mod native {
     ) -> LRESULT {
         match message {
             WM_RENDERFORMAT => {
-                if wparam.0 as u32 == CF_UNICODETEXT {
-                    if let Some(target) = with_published(|state| state.target) {
-                        render(Some(reader(target)));
-                    }
+                if wparam.0 as u32 == CF_UNICODETEXT
+                    && let Some(target) = with_published(|state| state.target)
+                {
+                    render(Some(reader(target)));
                 }
                 LRESULT(0)
             }
