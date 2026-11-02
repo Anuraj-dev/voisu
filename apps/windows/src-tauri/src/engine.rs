@@ -5,7 +5,9 @@
 //!
 //! The engine is one actor task. It reports every lifecycle change as a
 //! `recording-state` event and the mic level as `audio-level`, which the
-//! overlay (W4) listens to. The final Transcript is held in memory only.
+//! overlay (W4) listens to. The final Transcript is pasted into the window
+//! that was focused when the Recording started, and held in memory only so
+//! "Last transcript" can copy it when the paste does not land.
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -29,6 +31,7 @@ use crate::overlay::{
     RecordingStatePayload,
 };
 use crate::platform::capture::{CpalCapture, LevelSink};
+use crate::platform::delivery::{self, DeliveryTarget};
 use crate::platform::secrets::CredentialManagerStore;
 
 /// Both providers must deliver within this after stop, as on Linux.
@@ -140,6 +143,7 @@ enum Captured {
         capture: Box<dyn ActiveCapture>,
         providers: ProviderCoordinator,
         limit: Option<CaptureLimit>,
+        target: DeliveryTarget,
     },
     /// Cancelled (`None`) or failed: release the mic and provider streams.
     Abort {
@@ -175,6 +179,9 @@ impl Engine {
     /// The capture phase: opens the mic and providers and streams until the
     /// trigger or the capture ends it.
     async fn record(&self, id: u64, actions: &mut UnboundedReceiver<Action>) -> Captured {
+        // First, before any Voisu window (settings on missing keys) can take
+        // focus: the Transcript goes where the user was typing.
+        let target = DeliveryTarget::capture();
         // A tray preview still playing must not hide or feed this session's
         // capsule.
         overlay::end_preview();
@@ -217,6 +224,7 @@ impl Engine {
                 capture,
                 providers,
                 limit,
+                target,
             },
             Outcome::Cancel => {
                 tracing::info!(id, "Recording cancelled");
@@ -237,7 +245,7 @@ impl Engine {
     /// The processing phase: a Transcript from a stopped Recording, or the
     /// teardown of a cancelled or failed one.
     async fn settle(&self, id: u64, captured: Captured) {
-        let (mut capture, providers, limit) = match captured {
+        let (mut capture, providers, limit, target) = match captured {
             Captured::Done => return,
             Captured::Abort {
                 capture,
@@ -254,7 +262,8 @@ impl Engine {
                 capture,
                 providers,
                 limit,
-            } => (capture, providers, limit),
+                target,
+            } => (capture, providers, limit, target),
         };
         self.emit_state(Phase::Processing, None);
         let audio = match capture.finish().await {
@@ -271,16 +280,36 @@ impl Engine {
         match self.decide(providers, audio).await {
             Ok(text) => {
                 tracing::info!(id, chars = text.chars().count(), "Transcript ready");
+                // Stored first: "Last transcript" + Copy is the fallback
+                // whenever the paste does not land.
                 *self
                     .app
                     .state::<EngineState>()
                     .last_transcript
                     .lock()
-                    .unwrap() = Some(text);
-                self.emit_state(Phase::Idle, None);
+                    .unwrap() = Some(text.clone());
                 let _ = self.app.emit(crate::STATE_CHANGED, ());
+                self.deliver(id, target, text).await;
             }
             Err(error) => self.fail(id, &error),
+        }
+    }
+
+    /// Pastes the Transcript into `target`. Delivery blocks and pumps its
+    /// own messages, so it runs on a blocking thread.
+    async fn deliver(&self, id: u64, target: DeliveryTarget, text: String) {
+        let delivered =
+            tokio::task::spawn_blocking(move || delivery::deliver(&target, &text)).await;
+        let message = match delivered {
+            Ok(result) => delivery::notice(&result),
+            Err(join) => {
+                tracing::warn!(id, %join, "delivery task failed");
+                Some("Couldn't paste the Transcript".to_owned())
+            }
+        };
+        match message {
+            None => self.emit_state(Phase::Idle, None),
+            Some(message) => self.emit_state(Phase::Error, Some(message)),
         }
     }
 

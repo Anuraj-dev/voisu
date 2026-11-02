@@ -424,9 +424,10 @@ pub fn test_paste(app: &AppHandle) {
     });
 }
 
-/// Logs the result and shows anything short of a paste on the Overlay.
-pub fn report(app: &AppHandle, result: &Result<DeliveryOutcome, DeliveryError>) {
-    let message = match result {
+/// Logs the result and returns what to tell the user: `None` when the text
+/// landed.
+pub fn notice(result: &Result<DeliveryOutcome, DeliveryError>) -> Option<String> {
+    match result {
         Ok(outcome) => {
             tracing::info!(?outcome, "delivery finished");
             outcome.notice().map(str::to_owned)
@@ -435,8 +436,12 @@ pub fn report(app: &AppHandle, result: &Result<DeliveryOutcome, DeliveryError>) 
             tracing::warn!(%error, "delivery failed");
             Some(error.to_string())
         }
-    };
-    if let Some(message) = message {
+    }
+}
+
+/// Logs the result and shows anything short of a paste on the Overlay.
+pub fn report(app: &AppHandle, result: &Result<DeliveryOutcome, DeliveryError>) {
+    if let Some(message) = notice(result) {
         let payload = RecordingStatePayload {
             state: RecordingState::Error,
             message: Some(message),
