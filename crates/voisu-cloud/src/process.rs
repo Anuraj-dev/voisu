@@ -68,6 +68,9 @@ pub fn restricted_command(program: &str) -> Command {
     if let Some(path) = std::env::var_os("PATH") {
         command.env("PATH", path);
     }
+    // The Linux helpers (pw-record, wl-copy, xclip, hyprctl) need the session
+    // variables below; a Windows child (curl.exe) has no use for them.
+    #[cfg(unix)]
     for name in [
         "XDG_RUNTIME_DIR",
         "DBUS_SESSION_BUS_ADDRESS",
@@ -91,8 +94,15 @@ pub fn restricted_command(program: &str) -> Command {
     // Windows: a child with no SystemRoot cannot initialize Winsock, so curl
     // could never open a socket. It names the OS directory, not a credential.
     #[cfg(windows)]
-    if let Some(value) = std::env::var_os("SystemRoot") {
-        command.env("SystemRoot", value);
+    {
+        use std::os::windows::process::CommandExt;
+        if let Some(value) = std::env::var_os("SystemRoot") {
+            command.env("SystemRoot", value);
+        }
+        // A GUI-subsystem host (the Tauri shell) spawning a console program
+        // would otherwise flash a console window for every curl request.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
     }
     command
 }

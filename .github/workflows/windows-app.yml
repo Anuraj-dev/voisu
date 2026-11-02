@@ -1,0 +1,68 @@
+name: Windows app
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - apps/windows/**
+      - crates/voisu-core/**
+      - crates/voisu-cloud/**
+      - Cargo.toml
+      - .github/workflows/windows-app.yml
+  pull_request:
+    paths:
+      - apps/windows/**
+      - crates/voisu-core/**
+      - crates/voisu-cloud/**
+      - Cargo.toml
+      - .github/workflows/windows-app.yml
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  installer:
+    name: Windows shell + NSIS installer
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: apps/windows
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/windows/package-lock.json
+      # Floats on @stable like ci.yml. The Tauri crate is its own workspace
+      # (own Cargo.lock), so it never joins the Linux root build.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/windows/src-tauri
+      - name: Install UI dependencies
+        run: npm ci
+      # generate_context! embeds ../dist, so the UI must exist before clippy.
+      - name: Build UI
+        run: npm run build
+      - name: Clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+      - name: Build NSIS installer
+        run: npx tauri build --bundles nsis -- --locked
+      - name: Name the installer
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe
+          if ($setup.Count -ne 1) { throw "expected one installer, found $($setup.Count)" }
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item $setup.FullName out/Voisu-Setup-x64.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Voisu-Setup-x64
+          path: apps/windows/out/Voisu-Setup-x64.exe
+          if-no-files-found: error
