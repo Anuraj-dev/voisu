@@ -115,13 +115,16 @@ fn with_dot(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
             }
             let in_dot = (radius - distance + 0.5).clamp(0.0, 1.0);
             let i = ((y * width + x) * 4) as usize;
+            // Straight-alpha "over": a soft edge over a transparent pixel
+            // keeps the dot's colour instead of fading towards black.
+            let below = out[i + 3] as f32 / 255.0 * (1.0 - in_outer);
+            let alpha = in_outer + below;
             for c in 0..3 {
                 let colour = RING[c] as f32 * (1.0 - in_dot) + DOT[c] as f32 * in_dot;
-                let below = out[i + c] as f32;
-                out[i + c] = (below * (1.0 - in_outer) + colour * in_outer).round() as u8;
+                let under = out[i + c] as f32;
+                out[i + c] = ((colour * in_outer + under * below) / alpha).round() as u8;
             }
-            let alpha = out[i + 3] as f32;
-            out[i + 3] = (alpha + (255.0 - alpha) * in_outer).round() as u8;
+            out[i + 3] = (alpha * 255.0).round() as u8;
         }
     }
     out
@@ -253,5 +256,11 @@ mod tests {
         // The opposite corner is untouched.
         assert_eq!(pixel(0, h - 1), [0, 0, 0, 0]);
         assert_eq!(pixel(w / 4, h / 2), [0, 0, 0, 0]);
+        // Soft edges over transparency keep the ring's colour, not black.
+        for px in dotted.chunks(4).filter(|px| px[3] > 0) {
+            for c in 0..3 {
+                assert!(px[c] >= RING[c].min(DOT[c]), "edge darkened: {px:?}");
+            }
+        }
     }
 }

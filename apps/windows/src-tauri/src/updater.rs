@@ -6,6 +6,7 @@
 //! Clicking it installs and relaunches; Quit installs without relaunching.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use tauri::{AppHandle, Manager};
@@ -30,6 +31,8 @@ struct Ready {
 #[derive(Default)]
 pub struct UpdaterState {
     ready: Mutex<Option<Ready>>,
+    /// Set by the pre-install hook, which hides windows and drops the tray.
+    torn_down: AtomicBool,
 }
 
 /// Whether this build carries a real updater public key.
@@ -55,9 +58,10 @@ pub fn start(app: &AppHandle) {
         let mut last = None;
         loop {
             let now = SystemTime::now();
-            if is_due(last, now) {
+            // A failed check (often no network yet at login) retries on the
+            // next tick instead of waiting out the full interval.
+            if is_due(last, now) && check(&app).await {
                 last = Some(now);
-                check(&app).await;
             }
             tokio::time::sleep(TICK).await;
         }
@@ -74,15 +78,21 @@ fn is_due(last: Option<SystemTime>, now: SystemTime) -> bool {
     }
 }
 
-async fn check(app: &AppHandle) {
+/// Whether the endpoint answered; a download failure still counts, since
+/// the next due check retries it.
+async fn check(app: &AppHandle) -> bool {
     let handle = app.clone();
     let updater = app
         .updater_builder()
-        // Replaces the plugin's hook, so it repeats its cleanup and then
-        // flushes the log: the install ends the process with `exit(0)`.
+        // Replaces the plugin's hook: repeats its cleanup and records that
+        // the app is torn down, which `install` needs if the installer then
+        // fails to start.
         .on_before_exit(move || {
             handle.cleanup_before_exit();
-            crate::flush_logs();
+            handle
+                .state::<UpdaterState>()
+                .torn_down
+                .store(true, Ordering::SeqCst);
         })
         .build();
     let found = match updater {
@@ -93,16 +103,16 @@ async fn check(app: &AppHandle) {
         Ok(Some(update)) => update,
         Ok(None) => {
             tracing::info!("up to date");
-            return;
+            return true;
         }
         Err(error) => {
             tracing::warn!(%error, "update check failed");
-            return;
+            return false;
         }
     };
     let version = update.version.clone();
     if pending_version(app).as_deref() == Some(version.as_str()) {
-        return;
+        return true;
     }
     tracing::info!(%version, "update found; downloading");
     match update.download(|_, _| {}, || {}).await {
@@ -115,6 +125,7 @@ async fn check(app: &AppHandle) {
         }
         Err(error) => tracing::warn!(%error, %version, "update download failed"),
     }
+    true
 }
 
 fn pending_version(app: &AppHandle) -> Option<String> {
@@ -124,8 +135,10 @@ fn pending_version(app: &AppHandle) -> Option<String> {
 }
 
 /// Runs the downloaded installer, which ends this process on Windows. Does
-/// nothing when no update is pending; an installer that fails to start
-/// keeps the update pending so the menu item can retry it.
+/// nothing when no update is pending. An installer that fails before the
+/// app is torn down stays pending so the menu item can retry it; one that
+/// fails after leaves no tray, so the app exits and the next launch finds
+/// the update again.
 pub fn install(app: &AppHandle, relaunch: bool) {
     let state = app.state::<UpdaterState>();
     let Some(ready) = state.ready.lock().unwrap().take() else {
@@ -135,7 +148,12 @@ pub fn install(app: &AppHandle, relaunch: bool) {
     let update = ready.update.clone().restart_after_install(relaunch);
     if let Err(error) = update.install(&ready.bytes) {
         tracing::warn!(%error, "update install failed");
-        *state.ready.lock().unwrap() = Some(ready);
+        if state.torn_down.load(Ordering::SeqCst) {
+            app.exit(1);
+            return;
+        }
+        // A newer download that landed meanwhile wins.
+        state.ready.lock().unwrap().get_or_insert(ready);
     }
 }
 

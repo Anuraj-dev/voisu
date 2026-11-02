@@ -27,7 +27,6 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, WindowEvent};
 use tauri_plugin_autostart::ManagerExt as _;
 use tauri_plugin_opener::OpenerExt as _;
-use tracing_appender::non_blocking::WorkerGuard;
 use voisu_cloud::ProviderHttpClient;
 use voisu_core::{Provider, SecretStore};
 
@@ -39,14 +38,6 @@ const SETTINGS_WINDOW: &str = "settings";
 const STATE_CHANGED: &str = "state-changed";
 /// Passed by the HKCU Run entry so a login launch stays in the tray.
 const AUTOSTART_ARG: &str = "--autostart";
-
-/// Held for the process lifetime; taken to flush the log before an exit
-/// that skips `RunEvent::Exit` (the updater's `exit(0)`).
-static LOG_GUARD: Mutex<Option<WorkerGuard>> = Mutex::new(None);
-
-pub(crate) fn flush_logs() {
-    drop(LOG_GUARD.lock().unwrap().take());
-}
 
 pub struct AppState {
     settings: Mutex<Settings>,
@@ -273,7 +264,7 @@ fn start_dictation(app: &AppHandle) {
 }
 
 pub fn run() {
-    *LOG_GUARD.lock().unwrap() = logging::init(&paths::log_dir());
+    logging::init(&paths::log_dir());
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "Voisu starting");
 
     let app = tauri::Builder::default()
@@ -332,12 +323,7 @@ pub fn run() {
         RunEvent::ExitRequested {
             code: None, api, ..
         } => api.prevent_exit(),
-        // `run` exits the process without returning on Windows, so the log
-        // writer is flushed here.
-        RunEvent::Exit => {
-            tracing::info!("Voisu exiting");
-            flush_logs();
-        }
+        RunEvent::Exit => tracing::info!("Voisu exiting"),
         _ => {}
     });
 }
