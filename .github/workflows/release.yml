@@ -399,14 +399,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install UI dependencies
         run: npm ci
-      # createUpdaterArtifacts stays off in tauri.conf.json so PR builds need
-      # no key; only this job turns it on, producing <setup>.exe.sig.
-      - name: Build the signed NSIS installer
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: npx tauri build --bundles nsis --config '{"bundle":{"createUpdaterArtifacts":true}}' -- --locked
-      - name: Collect the installer and its signature
+      # The build runs npm/vite and every crate's build.rs, so it never sees
+      # the signing key; only the signer step below does.
+      - name: Build the NSIS installer
+        run: npx tauri build --bundles nsis -- --locked
+      - name: Collect the installer
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -415,10 +412,17 @@ jobs:
             echo "expected one installer, found ${#setup[@]}" >&2
             exit 1
           fi
-          test -s "${setup[0]}.sig"
           mkdir -p out
           cp "${setup[0]}" out/Voisu-Setup-x64.exe
-          cp "${setup[0]}.sig" out/Voisu-Setup-x64.exe.sig
+      # Writes out/Voisu-Setup-x64.exe.sig, the signature latest.json carries.
+      - name: Sign the installer for the updater
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          npx --no-install tauri signer sign out/Voisu-Setup-x64.exe
+          test -s out/Voisu-Setup-x64.exe.sig
       - uses: actions/upload-artifact@v4
         with:
           name: windows-release
