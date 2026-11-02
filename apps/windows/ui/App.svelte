@@ -17,6 +17,10 @@
   let banner = $state('');
   let error = $state('');
   let autostartBusy = $state(false);
+  // Held in the backend's memory only; never written to disk.
+  let transcript = $state(null);
+  let dictationError = $state('');
+  let copied = $state(false);
 
   const saved = $derived({ groq: app.groqSaved, deepgram: app.deepgramSaved });
   const blank = $derived(!values.groq.trim() && !values.deepgram.trim());
@@ -30,17 +34,55 @@
     }
   }
 
+  async function refreshTranscript() {
+    try {
+      const next = await invoke('last_transcript');
+      if (next !== transcript) copied = false;
+      transcript = next;
+    } catch (e) {
+      // Leave the last shown transcript in place.
+    }
+  }
+
+  function onRecordingState(event) {
+    const { state, message } = event.payload;
+    if (state === 'error') {
+      dictationError = message ?? 'Dictation failed.';
+    } else if (state === 'recording') {
+      dictationError = '';
+    } else if (state === 'idle') {
+      refreshTranscript();
+    }
+  }
+
+  async function copyTranscript() {
+    if (!transcript) return;
+    try {
+      await navigator.clipboard.writeText(transcript);
+      copied = true;
+    } catch (e) {
+      error = 'Could not copy to the clipboard.';
+    }
+  }
+
   onMount(() => {
     refresh();
-    let unlisten;
+    refreshTranscript();
+    const unlisteners = [];
     let disposed = false;
-    listen('state-changed', refresh).then((fn) => {
-      if (disposed) fn();
-      else unlisten = fn;
+    const subscribe = (name, handler) =>
+      listen(name, handler).then((fn) => {
+        if (disposed) fn();
+        else unlisteners.push(fn);
+      });
+    subscribe('state-changed', () => {
+      refresh();
+      refreshTranscript();
     });
+    subscribe('recording-state', onRecordingState);
     return () => {
       disposed = true;
-      if (unlisten) unlisten();
+      unlisteners.forEach((fn) => fn());
     };
   });
 
@@ -172,7 +214,20 @@
     </label>
   </div>
 
-  <p class="note">Dictation arrives in the next update.</p>
+  <section class="card transcript" aria-labelledby="transcript-title">
+    <div class="transcript-head">
+      <h2 id="transcript-title">Last transcript</h2>
+      <button type="button" class="copy" onclick={copyTranscript} disabled={!transcript}>
+        {copied ? 'Copied' : 'Copy'}
+      </button>
+    </div>
+    {#if transcript}
+      <p class="transcript-text">{transcript}</p>
+    {:else}
+      <p class="note">Hold Ctrl+Win and speak. Release to transcribe; double-tap for hands-free, Esc to cancel.</p>
+    {/if}
+    {#if dictationError}<p class="error" role="alert"><span aria-hidden="true">✕</span> {dictationError}</p>{/if}
+  </section>
 
   <footer>
     <div>Version {app.version}</div>
@@ -384,6 +439,40 @@
   .note {
     margin: 0;
     color: var(--text-2);
+  }
+  .transcript {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .transcript-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  h2 {
+    margin: 0;
+    font-size: 14px;
+    font-weight: 600;
+  }
+  .copy {
+    background: var(--overlay-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 32px;
+    padding: 3px 12px;
+    cursor: pointer;
+  }
+  .copy:disabled {
+    color: var(--text-2);
+    cursor: not-allowed;
+  }
+  .transcript-text {
+    margin: 0;
+    white-space: pre-wrap;
+    user-select: text;
+    max-height: 160px;
+    overflow-y: auto;
   }
   footer {
     margin-top: auto;

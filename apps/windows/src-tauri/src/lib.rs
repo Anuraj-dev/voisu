@@ -1,6 +1,15 @@
 //! Voisu for Windows: one process hosting the tray, the setup window and
 //! (from W2 on) the Recording → Transcript engine.
 
+// Pure and tested on every platform; only the Windows hotkey and capture
+// drive them.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod audio;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod chord;
+mod engine;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod gesture;
 mod logging;
 pub mod overlay;
 mod paths;
@@ -8,6 +17,8 @@ pub mod platform;
 pub mod settings;
 pub mod setup;
 mod tray;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod trigger;
 
 use std::sync::{Mutex, OnceLock};
 
@@ -35,7 +46,7 @@ pub struct AppState {
     tray: OnceLock<tray::TrayHandles>,
 }
 
-fn keys_ready() -> bool {
+pub(crate) fn keys_ready() -> bool {
     let mut store = CredentialManagerStore;
     store.has_key(Provider::Groq) && store.has_key(Provider::Deepgram)
 }
@@ -211,6 +222,46 @@ fn open_key_page(app: AppHandle, provider: KeyPage) -> Result<(), String> {
         .map_err(|_| "Couldn't open the browser.".to_owned())
 }
 
+/// Wires hook → gesture thread → engine. The engine reports each finished
+/// Recording back to the gesture thread, which is created after it, so the
+/// sink reads the trigger from a cell filled once both exist.
+fn start_dictation(app: &AppHandle) {
+    let hotkey = app
+        .state::<AppState>()
+        .settings
+        .lock()
+        .unwrap()
+        .hotkey
+        .clone();
+    if hotkey != settings::DEFAULT_HOTKEY {
+        tracing::warn!(%hotkey, "only Ctrl+Win is supported; using it");
+    }
+    let trigger_cell: std::sync::Arc<OnceLock<trigger::Trigger>> = Default::default();
+    let sink_cell = std::sync::Arc::clone(&trigger_cell);
+    let engine = engine::start(
+        app,
+        std::sync::Arc::new(move |id| {
+            if let Some(trigger) = sink_cell.get() {
+                trigger.ended(id);
+            }
+        }),
+    );
+    let trigger = match trigger::spawn(engine) {
+        Ok(trigger) => trigger,
+        Err(error) => {
+            tracing::error!(%error, "gesture thread failed to start");
+            return;
+        }
+    };
+    let _ = trigger_cell.set(trigger.clone());
+    #[cfg(windows)]
+    if let Err(error) = platform::hotkey::install(trigger) {
+        tracing::error!(%error, "keyboard hook failed to start");
+    }
+    #[cfg(not(windows))]
+    drop(trigger);
+}
+
 pub fn run() {
     let mut log_guard = logging::init(&paths::log_dir());
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "Voisu starting");
@@ -236,7 +287,8 @@ pub fn run() {
             get_state,
             save_keys,
             set_autostart,
-            open_key_page
+            open_key_page,
+            engine::last_transcript
         ])
         .setup(|app| {
             let handle = app.handle();
@@ -249,6 +301,7 @@ pub fn run() {
             if setup::should_open_window(at_login, ready) {
                 show_settings(handle);
             }
+            start_dictation(handle);
             Ok(())
         })
         .on_window_event(|window, event| {

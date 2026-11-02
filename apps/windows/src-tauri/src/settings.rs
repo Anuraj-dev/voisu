@@ -7,13 +7,28 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// The only Trigger Key the hook supports today.
+pub const DEFAULT_HOTKEY: &str = "Ctrl+Win";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
 pub struct Settings {
     /// Start at login is switched on once, after the first successful setup.
     /// Later the user's own choice (stored by Windows in HKCU Run) wins, so a
     /// re-save never re-enables what they turned off.
     pub autostart_default_applied: bool,
+    /// The Trigger Key chord. Stored so a later release can offer a choice;
+    /// the hook only recognises Ctrl+Win.
+    pub hotkey: String,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            autostart_default_applied: false,
+            hotkey: DEFAULT_HOTKEY.to_owned(),
+        }
+    }
 }
 
 impl Settings {
@@ -66,6 +81,7 @@ mod tests {
         let path = dir.path().join("Voisu").join("settings.json");
         let settings = Settings {
             autostart_default_applied: true,
+            ..Settings::default()
         };
         settings.save(&path).unwrap();
         assert_eq!(Settings::load(&path), settings);
@@ -86,5 +102,15 @@ mod tests {
         let path = dir.path().join("settings.json");
         fs::write(&path, br#"{"autostart_default_applied":true,"future":1}"#).unwrap();
         assert!(Settings::load(&path).autostart_default_applied);
+    }
+
+    #[test]
+    fn file_from_before_the_hotkey_field_gets_ctrl_win() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, br#"{"autostart_default_applied": true}"#).unwrap();
+        let settings = Settings::load(&path);
+        assert!(settings.autostart_default_applied);
+        assert_eq!(settings.hotkey, DEFAULT_HOTKEY);
     }
 }

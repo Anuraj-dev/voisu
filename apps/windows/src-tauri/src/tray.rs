@@ -17,7 +17,7 @@ const MENU_QUIT: &str = "quit";
 
 pub fn status_text(keys_ready: bool) -> &'static str {
     if keys_ready {
-        "Voisu: keys saved (dictation comes in the next update)"
+        "Voisu: ready (hold Ctrl+Win to dictate)"
     } else {
         "Voisu: setup needed (add your API keys)"
     }
@@ -32,6 +32,13 @@ pub struct TrayHandles {
 impl TrayHandles {
     pub fn set_ready(&self, keys_ready: bool) {
         if let Err(error) = self.status.set_text(status_text(keys_ready)) {
+            tracing::warn!(%error, "tray status update failed");
+        }
+    }
+
+    /// Shows a transient engine state such as "recording".
+    pub fn set_status(&self, text: &str) {
+        if let Err(error) = self.status.set_text(text) {
             tracing::warn!(%error, "tray status update failed");
         }
     }
@@ -121,6 +128,6 @@ mod tests {
     #[test]
     fn status_line_tells_ready_from_setup_needed() {
         assert!(status_text(false).contains("setup needed"));
-        assert!(status_text(true).contains("keys saved"));
+        assert!(status_text(true).contains("ready"));
     }
 }
