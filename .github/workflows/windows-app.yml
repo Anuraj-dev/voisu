@@ -7,12 +7,14 @@ on:
       - apps/windows/**
       - crates/voisu-core/**
       - crates/voisu-cloud/**
+      - Cargo.toml
       - .github/workflows/windows-app.yml
   pull_request:
     paths:
       - apps/windows/**
       - crates/voisu-core/**
       - crates/voisu-cloud/**
+      - Cargo.toml
       - .github/workflows/windows-app.yml
 
 env:
