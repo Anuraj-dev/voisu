@@ -140,6 +140,21 @@ jobs:
       - name: cargo doc (warnings are errors)
         run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked
 
+  windows:
+    name: Windows portability gate (voisu-core + voisu-cloud)
+    # Only the portable crates: voisu-app is the Linux daemon (pw-record,
+    # Unix sockets, secret-tool, libei, portal) and does not build here.
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check portable crates (all targets, --locked)
+        run: cargo check -p voisu-core -p voisu-cloud --all-targets --locked
+      - name: Test portable crates (--locked)
+        run: cargo test -p voisu-core -p voisu-cloud --locked
+
   msrv:
     name: MSRV gate (1.92.0 workspace check)
     # Same native-dependency reason as the clippy job: the overlay check needs

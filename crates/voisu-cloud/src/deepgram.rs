@@ -1,72 +1,52 @@
 // Deepgram transcript provider: streaming WebSocket connection and transcript accumulation.
 //
-// Split out of system.rs as a pure move; module-global items come from `super`.
+// Moved from voisu-app's system module; crate-global items come from `super`.
 
 use super::*;
 
 pub struct DeepgramProvider {
-    reaper: ProviderReaper,
+    host: Arc<dyn CloudHost>,
     /// nova-3 `keyterm` boosting terms, repeated as query params on the
-    /// streaming URL. Ticket 04's shared dictionary is wired in here by the
-    /// driver at merge; until then the list defaults to empty.
+    /// streaming URL.
     keyterms: Vec<String>,
-    /// The Recording's resolved transcription-language snapshot. `None` falls
-    /// back to the shared config resolution at stream start; the daemon
-    /// supplies the same resolved value it declared to EnglishEligibility so
-    /// the request's language can never drift from the declaration.
-    language: Option<String>,
+    /// The Recording's resolved transcription-language snapshot — the same
+    /// value the daemon declared to EnglishEligibility, so the request's
+    /// language can never drift from the declaration.
+    language: String,
 }
 
 impl DeepgramProvider {
-    /// Builds a Deepgram provider whose streams share the actor-owned `reaper`,
-    /// so a stream dropped mid-abort hands its websocket I/O task to the
-    /// supervisor the actor drains before Idle. No keyterm boosting.
-    pub fn new(reaper: ProviderReaper) -> Self {
-        Self::with_keyterms(reaper, Vec::new())
-    }
-
-    /// Same as [`DeepgramProvider::new`] but with nova-3 `keyterm` boosting
-    /// terms appended to every streaming connection URL.
-    pub fn with_keyterms(reaper: ProviderReaper, keyterms: Vec<String>) -> Self {
-        Self {
-            reaper,
-            keyterms,
-            language: None,
-        }
-    }
-
     /// Builds a Deepgram provider from the Recording's resolved language
     /// snapshot — the same value the daemon declares to EnglishEligibility and
-    /// hands to Groq, so both providers transcribe one declared language.
+    /// hands to Groq, so both providers transcribe one declared language. Its
+    /// streams share the host's cleanup supervisor, so a stream dropped
+    /// mid-abort hands its websocket I/O task to the supervisor the owner
+    /// drains before Idle.
     pub fn with_keyterms_and_language(
-        reaper: ProviderReaper,
+        host: impl CloudHost,
         keyterms: Vec<String>,
         language: String,
     ) -> Self {
         Self {
-            reaper,
+            host: Arc::new(host),
             keyterms,
-            language: Some(language),
+            language,
         }
     }
 }
 
 impl TranscriptProvider for DeepgramProvider {
     fn start(&mut self, _recording_id: u64) -> Result<Box<dyn ProviderStream>, BoundaryError> {
-        let credential = SecretStore::load(&mut SecretToolStore, Provider::Deepgram)?;
+        let credential = self.host.load_credential(Provider::Deepgram)?;
         let base = std::env::var("VOISU_DEEPGRAM_TRANSCRIPTION_URL")
             .unwrap_or_else(|_| "wss://api.deepgram.com/v1/listen".to_owned());
-        let language = self
-            .language
-            .clone()
-            .unwrap_or_else(crate::config::transcription_language);
-        let url = deepgram_streaming_url(&base, &self.keyterms, &language)?;
+        let url = deepgram_streaming_url(&base, &self.keyterms, &self.language)?;
         Ok(Box::new(DeepgramStream::connect(
             url,
             credential,
             DEEPGRAM_KEEPALIVE_INTERVAL,
             DEEPGRAM_CLOSE_GRACE,
-            self.reaper.clone(),
+            self.host.cleanup().clone(),
         )))
     }
 }
@@ -97,7 +77,7 @@ fn deepgram_streaming_params(language: &str) -> Vec<(&'static str, String)> {
 /// `wss`/`ws` so the existing endpoint override env var keeps working;
 /// plaintext `ws` is allowed only on loopback, mirroring the HTTPS policy of
 /// the batch endpoints.
-pub(super) fn deepgram_streaming_url(
+pub fn deepgram_streaming_url(
     base: &str,
     keyterms: &[String],
     language: &str,
@@ -291,7 +271,7 @@ pub(super) struct DeepgramStream {
     /// Actor-owned supervisor that adopts the I/O task if the stream is
     /// dropped mid-abort, so the websocket teardown is retained and awaited
     /// rather than detached.
-    pub(super) reaper: ProviderReaper,
+    pub(super) reaper: CleanupSupervisor,
 }
 
 impl DeepgramStream {
@@ -303,7 +283,7 @@ impl DeepgramStream {
         credential: Credential,
         keepalive: Duration,
         close_grace: Duration,
-        reaper: ProviderReaper,
+        reaper: CleanupSupervisor,
     ) -> Self {
         let (outbound_tx, outbound_rx) = tokio::sync::mpsc::unbounded_channel();
         let transcript = Arc::new(Mutex::new(TranscriptAccumulator::default()));

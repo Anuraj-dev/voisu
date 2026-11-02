@@ -1,57 +1,38 @@
 // Groq transcript provider: chunked upload/streaming and Groq-specific HTTP helpers.
 //
-// Split out of system.rs as a pure move; module-global items come from `super`.
+// Moved from voisu-app's system module; crate-global items come from `super`.
+
+use std::io::Write;
 
 use super::*;
 
 pub struct GroqProvider {
-    reaper: ProviderReaper,
-    prompt: Option<String>,
-    language: Option<String>,
+    host: Arc<dyn CloudHost>,
+    prompt: String,
+    language: String,
 }
 
 impl GroqProvider {
-    /// Builds a Groq provider whose streams share the actor-owned `reaper`, so a
-    /// stream dropped mid-abort hands its curl reap to the supervisor the actor
-    /// drains before Idle.
-    pub fn new(reaper: ProviderReaper) -> Self {
-        Self {
-            reaper,
-            prompt: None,
-            language: None,
-        }
-    }
-
-    /// Builds a provider with a Recording-start dictionary snapshot. Supplying
-    /// the prompt keeps every Groq request for that Recording on the same
-    /// glossary as its Deepgram stream.
-    pub fn with_prompt(reaper: ProviderReaper, prompt: String) -> Self {
-        Self {
-            reaper,
-            prompt: Some(prompt),
-            language: None,
-        }
-    }
-
-    /// Builds a provider from the exact Recording-start language snapshot that
-    /// EnglishEligibility also records. This prevents later environment changes
-    /// from making the declaration differ from what the request sends.
+    /// Builds a provider from the exact Recording-start dictionary prompt and
+    /// language snapshot that EnglishEligibility also records. Its streams
+    /// share the host's cleanup supervisor, so a stream dropped mid-abort hands
+    /// its curl reap to the supervisor the owner drains before Idle.
     pub fn with_prompt_and_language(
-        reaper: ProviderReaper,
+        host: impl CloudHost,
         prompt: String,
         language: String,
     ) -> Self {
         Self {
-            reaper,
-            prompt: Some(prompt),
-            language: Some(language),
+            host: Arc::new(host),
+            prompt,
+            language,
         }
     }
 }
 
 impl TranscriptProvider for GroqProvider {
     fn start(&mut self, _recording_id: u64) -> Result<Box<dyn ProviderStream>, BoundaryError> {
-        let credential = SecretStore::load(&mut SecretToolStore, Provider::Groq)?;
+        let credential = self.host.load_credential(Provider::Groq)?;
         let endpoint = std::env::var("VOISU_GROQ_TRANSCRIPTION_URL")
             .unwrap_or_else(|_| "https://api.groq.com/openai/v1/audio/transcriptions".to_owned());
         // Hand curl the GATED serialization, never the raw string: the policy
@@ -71,18 +52,14 @@ impl TranscriptProvider for GroqProvider {
             credential,
             endpoint,
             params: GroqRequestParams::from_config_with_language(
-                self.prompt
-                    .clone()
-                    .unwrap_or_else(crate::dictionary::whisper_prompt),
-                self.language
-                    .clone()
-                    .unwrap_or_else(crate::config::transcription_language),
+                self.prompt.clone(),
+                self.language.clone(),
             ),
             buffer: Vec::new(),
             streamed_bytes: 0,
             chunks: VecDeque::new(),
             cancel: CancelRegistry::new(),
-            reaper: self.reaper.clone(),
+            reaper: self.host.cleanup().clone(),
             word_confidence_evidence: Vec::new(),
         }))
     }
@@ -187,17 +164,12 @@ pub(super) struct GroqStream {
     /// Actor-owned supervisor that adopts this stream's chunk tasks if the
     /// stream is dropped mid-abort, so their curl reap is retained and awaited
     /// rather than detached.
-    pub(super) reaper: ProviderReaper,
+    pub(super) reaper: CleanupSupervisor,
     /// Word-confidence evidence from the completed chunks (slice B4). Empty
     /// until `complete()` merges the chunk responses, and empty for any
     /// response that carried no word list.
     pub(super) word_confidence_evidence: Vec<(String, f64)>,
 }
-
-/// A retained provider-stream cleanup: a future that awaits an adopted chunk
-/// task deque until every chunk task — and therefore every nested
-/// `spawn_blocking` curl reap those tasks own — has completed.
-pub(super) type ReapTask = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
 impl Drop for GroqStream {
     fn drop(&mut self) {

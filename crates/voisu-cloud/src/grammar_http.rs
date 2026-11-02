@@ -17,7 +17,7 @@ use std::fmt;
 use std::sync::Once;
 use std::time::Duration;
 
-use crate::system::{
+use crate::{
     endpoint_authority_is_allowed, endpoint_raw_string_is_allowed, parsed_host_is_loopback,
 };
 

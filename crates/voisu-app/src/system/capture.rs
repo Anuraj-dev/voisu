@@ -4,20 +4,6 @@
 
 use super::*;
 
-pub(super) struct ProcessOutcome {
-    pub(super) success: bool,
-    pub(super) stdout: Vec<u8>,
-    pub(super) stderr: Vec<u8>,
-}
-
-pub(super) enum ProcessError {
-    Unavailable,
-    Input,
-    TimedOut,
-    Wait,
-    Output,
-}
-
 pub struct PipeWireCapture {
     reaper: ProviderReaper,
     levels: LevelRegistry,

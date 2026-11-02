@@ -143,11 +143,9 @@ pub(super) fn resolve_with_cache(
 /// curl/capture cleanup futures. See `CredentialPreparationOwner`.
 #[derive(Clone, Default)]
 pub struct ProviderReaper {
-    tasks: Arc<std::sync::Mutex<Vec<ReapTask>>>,
-    /// Serializes `drain` calls. While one drain temporarily holds cleanup
-    /// futures out of `tasks`, a concurrent drain must wait here instead of
-    /// reading `tasks` as empty and reporting a completed drain over live work.
-    serial: Arc<tokio::sync::Mutex<()>>,
+    /// Retained provider and capture cleanup futures (voisu-cloud owns the
+    /// drain machinery; this reaper adds the Linux capture adoption paths).
+    cleanup: CleanupSupervisor,
     /// Dedicated lane for Smart Writing credential preparation cleanup (SW7).
     credential_lane: CredentialLane,
 }
@@ -1821,36 +1819,10 @@ impl ProviderReaper {
         self.credential_lane.drain_all().await;
     }
 
-    /// Adopts the still-live chunk tasks of a dropped stream. Cancellation MUST
-    /// already be signalled so each task's owning bounded wait observes the
-    /// flag, kills and reaps its curl child, and returns. Synchronous and
-    /// runtime-free: the handles are wrapped in a future and retained; only a
-    /// later `drain` polls them, so adopting from a non-runtime thread or a
-    /// shutting-down runtime can never detach or abort the cleanup.
-    /// Retains one cleanup future. Called from `Drop` (capture and
-    /// provider-stream adoption), so it must never unwind: a poisoned lock is
-    /// recovered rather than `expect`ed. The lock is only ever held for a
-    /// push/take/len, so its guarded state stays consistent under recovery.
-    fn retain(&self, task: ReapTask) {
-        let mut guard = match self.tasks.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard.push(task);
-    }
-
-    pub(super) fn adopt<T: Send + 'static>(
-        &self,
-        mut chunks: VecDeque<tokio::task::JoinHandle<T>>,
-    ) {
-        if chunks.is_empty() {
-            return;
-        }
-        self.retain(Box::pin(async move {
-            while let Some(chunk) = chunks.pop_front() {
-                let _ = chunk.await;
-            }
-        }));
+    /// Adopts the still-live chunk tasks of a dropped stream; see
+    /// [`CleanupSupervisor::adopt`].
+    pub(super) fn adopt<T: Send + 'static>(&self, chunks: VecDeque<tokio::task::JoinHandle<T>>) {
+        self.cleanup.adopt(chunks);
     }
 
     pub(super) fn adopt_capture(
@@ -1884,64 +1856,72 @@ impl ProviderReaper {
             let _ = stop_child_blocking(child, reader, stderr_reader, false);
             let _ = done_tx.send(());
         });
-        self.retain(Box::pin(async move {
+        self.cleanup.retain(Box::pin(async move {
             let _ = done_rx.await;
         }));
     }
 
     /// Number of cleanup futures currently retained and not being drained.
-    /// Test-observability only — production callers gate on `drain` /
-    /// `drain_to_completion`, never on this count, because a cleanup being
-    /// awaited by an in-flight `drain` is not counted.
+    /// Test-observability only.
     #[cfg(test)]
     pub(super) fn pending(&self) -> usize {
-        self.tasks
-            .lock()
-            .expect("provider reaper mutex poisoned")
-            .len()
+        self.cleanup.pending()
     }
 
-    /// Awaits every retained cleanup future, bounded by `within`. Returns
-    /// `true` when the supervisor fully drained, re-checking for cleanup adopted
-    /// while draining. On timeout it puts every unfinished future back — so
-    /// cleanup is retained, never detached — and returns `false`. Serialized
-    /// with every other drain.
-    /// Drains to completion in bounded passes, returning only once the
-    /// supervisor is empty. A single bounded `drain` that times out RETAINS the
-    /// unfinished cleanup — but a caller about to tear down the runtime would
-    /// then drop the supervisor and detach that cleanup after all, so teardown
-    /// paths must use this instead and keep draining. Each retained cleanup is
-    /// internally bounded (capture and provider waits kill and reap their child
-    /// within their own poll bounds), so this terminates; the service unit's
-    /// explicit TimeoutStopSec is the external last-resort backstop.
+    /// See [`CleanupSupervisor::drain_to_completion`].
     pub async fn drain_to_completion(&self, pass: Duration) {
-        while !self.drain(pass).await {
-            // Guaranteed-completion callers gate the Idle transition on this
-            // drain; a failed stderr write must not panic it (`eprintln!` does).
-            let _ = writeln!(std::io::stderr(), "provider cleanup still draining");
-        }
+        self.cleanup.drain_to_completion(pass).await;
     }
 
+    /// See [`CleanupSupervisor::drain`].
     pub async fn drain(&self, within: Duration) -> bool {
-        let _serial = self.serial.lock().await;
-        let deadline = tokio::time::Instant::now() + within;
-        loop {
-            let mut batch: Vec<ReapTask> = {
-                let mut guard = self.tasks.lock().expect("provider reaper mutex poisoned");
-                std::mem::take(&mut *guard)
-            };
-            if batch.is_empty() {
-                return true;
-            }
-            while let Some(mut task) = batch.pop() {
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                if tokio::time::timeout(remaining, &mut task).await.is_err() {
-                    let mut guard = self.tasks.lock().expect("provider reaper mutex poisoned");
-                    guard.push(task);
-                    guard.append(&mut batch);
-                    return false;
+        self.cleanup.drain(within).await
+    }
+}
+
+/// The Linux host for the cloud pipeline: Secret Service credentials, this
+/// reaper's cleanup supervisor, and the SW7 credential lane for Intent
+/// Reconstruction.
+impl CloudHost for ProviderReaper {
+    fn cleanup(&self) -> &CleanupSupervisor {
+        &self.cleanup
+    }
+
+    fn load_credential(&self, provider: Provider) -> Result<Credential, BoundaryError> {
+        SecretStore::load(&mut SecretToolStore, provider)
+    }
+
+    fn prepare_intent_credential(
+        &self,
+        cancel: Arc<CancelRegistry>,
+    ) -> BoundaryFuture<'static, Credential> {
+        let lane = self.credential_lane.clone();
+        Box::pin(async move {
+            let entry = lane.register();
+            let mut owner = CredentialPreparationOwner::new(entry, lane, Provider::Groq);
+            let capability = tokio::select! {
+                capability = owner.poll_outcome() => capability,
+                _ = wait_for_reconstruction_cancel(Arc::clone(&cancel)) => {
+                    owner.cancel_and_drive_terminal().await;
+                    return Err(BoundaryError::new(
+                        BoundaryKind::Validation,
+                        "Intent Reconstruction request cancelled",
+                    ));
                 }
-            }
-        }
+            };
+            let GrammarCapability::Ready(ready) = capability else {
+                return Err(BoundaryError::new(
+                    BoundaryKind::Validation,
+                    "Groq credential unavailable for Intent Reconstruction",
+                ));
+            };
+            Ok(ready.credential().clone())
+        })
+    }
+}
+
+async fn wait_for_reconstruction_cancel(cancel: Arc<CancelRegistry>) {
+    while !cancel.is_cancelled() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }

@@ -594,7 +594,7 @@ async fn actor_loop(
             reaper.clone(),
         )))
     } else {
-        Some(Box::new(MergeResultValidator::new()))
+        Some(Box::new(MergeResultValidator::new(reaper.clone())))
     };
     let mut delivery: Option<Box<dyn DeliveryAdapter>> = Some(initial_delivery);
     // The desktop-approved Trigger Key binding, once the portal listener reports
@@ -3080,7 +3080,7 @@ fn rebuild_recording_adapters(
             if intent_reconstruction {
                 Box::new(MergeResultValidator::intent_reconstruction(reaper.clone()))
             } else {
-                Box::new(MergeResultValidator::new())
+                Box::new(MergeResultValidator::new(reaper.clone()))
             },
             build_delivery_adapter(false, delivery_mode, focus_probe).0,
         )
@@ -3381,7 +3381,11 @@ fn rebuild_replay_adapters(
     if !deepgram_enabled && keyterms.is_empty() && whisper_prompt.is_empty() && language.is_empty()
     {
         let (deepgram, groq) = local_routing::cloud_free_slots();
-        return (deepgram, groq, Box::new(MergeResultValidator::new()));
+        return (
+            deepgram,
+            groq,
+            Box::new(MergeResultValidator::new(reaper.clone())),
+        );
     }
     let deepgram =
         build_deepgram_provider(deepgram_enabled, controlled, keyterms, language, reaper);
@@ -3405,7 +3409,7 @@ fn rebuild_replay_adapters(
             if voisu_app::config::intent_reconstruction_enabled() {
                 Box::new(MergeResultValidator::intent_reconstruction(reaper.clone()))
             } else {
-                Box::new(MergeResultValidator::new())
+                Box::new(MergeResultValidator::new(reaper.clone()))
             },
         )
     }

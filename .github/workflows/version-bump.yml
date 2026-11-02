@@ -8,7 +8,8 @@ name: Version bump
 #
 # The version lives in FIVE synchronized places and they move together here:
 #   1. crates/voisu-app/Cargo.toml   version = "X.Y.Z"
-#   2. crates/voisu-core/Cargo.toml  version = "X.Y.Z" (lockstep)
+#   2. crates/voisu-core/Cargo.toml and crates/voisu-cloud/Cargo.toml
+#                                    version = "X.Y.Z" (lockstep)
 #   3. packaging/voisu.spec          Version:        X.Y.Z (column-aligned)
 #   4. Cargo.lock                    (regenerated via `cargo update`)
 #   5. tools/transcript-quality/Cargo.lock  (voisu-core path-dep entry synced
@@ -201,12 +202,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 1 + 2: the two workspace crate versions (package version starts at
+          # 1 + 2: the workspace crate versions (package version starts at
           # column 0; dependency `version = "..."` specs are indented, untouched).
           sed -i -E 's/^version = "[0-9]+\.[0-9]+\.[0-9]+"/version = "'"$NEW_VERSION"'"/' \
             crates/voisu-app/Cargo.toml
           sed -i -E 's/^version = "[0-9]+\.[0-9]+\.[0-9]+"/version = "'"$NEW_VERSION"'"/' \
             crates/voisu-core/Cargo.toml
+          sed -i -E 's/^version = "[0-9]+\.[0-9]+\.[0-9]+"/version = "'"$NEW_VERSION"'"/' \
+            crates/voisu-cloud/Cargo.toml
 
           # 3: spec Version. \1 captures "Version:" plus its exact run of spaces,
           # so the value column stays aligned regardless of digit count.
@@ -265,11 +268,11 @@ jobs:
           } > packaging/voisu.spec.new
           mv packaging/voisu.spec.new packaging/voisu.spec
 
-          # 4: regenerate the two workspace crates' Cargo.lock version entries.
+          # 4: regenerate the workspace crates' Cargo.lock version entries.
           # No --offline: a fresh runner has no crates.io index and offline
           # resolution exits 101 there (reproduced in review); the runner has
-          # network and only the two path-local workspace crates move.
-          cargo update -p voisu-app -p voisu-core
+          # network and only the path-local workspace crates move.
+          cargo update -p voisu-app -p voisu-core -p voisu-cloud
 
           # 5: tools/transcript-quality path-depends on voisu-core, so its own
           # lockfile records the version this bump just moved; a stale entry
@@ -284,7 +287,7 @@ jobs:
         if: steps.detect.outputs.bump_type != ''
         run: |
           set -euo pipefail
-          allowed=$'crates/voisu-app/Cargo.toml\ncrates/voisu-core/Cargo.toml\nCargo.lock\npackaging/voisu.spec\ntools/transcript-quality/Cargo.lock'
+          allowed=$'crates/voisu-app/Cargo.toml\ncrates/voisu-core/Cargo.toml\ncrates/voisu-cloud/Cargo.toml\nCargo.lock\npackaging/voisu.spec\ntools/transcript-quality/Cargo.lock'
           bad=0
           while IFS= read -r f; do
             [ -n "$f" ] || continue
@@ -324,7 +327,7 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
           git add crates/voisu-app/Cargo.toml crates/voisu-core/Cargo.toml \
-                  Cargo.lock packaging/voisu.spec \
+                  crates/voisu-cloud/Cargo.toml Cargo.lock packaging/voisu.spec \
                   tools/transcript-quality/Cargo.lock
           git commit -m "chore(release): bump version to ${NEW_VERSION}"
           # No tag — tags stay manual and deliberate. A plain push to main; the
