@@ -16,6 +16,10 @@ const SWEEP_SIGMA = 4.4;
 const SWEEP_BASE = 0.35;
 const REDUCED_BRIGHTNESS = 0.6;
 const FRAME_MS = 1000 / 30;
+// The native side keeps an error up for 3 s even if `idle` follows at once
+// (overlay.rs ERROR_DISPLAY); the page holds it a little longer so it never
+// blanks before the window hides.
+const ERROR_HOLD_MS = 3500;
 // Hands-free shows a Recording-green dot in place of the leftmost bars, so the
 // state is told by shape and position, not colour alone.
 const HANDS_FREE_RGB = '101, 214, 160';
@@ -40,6 +44,7 @@ let smoothed = 0;
 let frame = 0;
 let lastFrame = 0;
 let sweepStart = 0;
+let errorTimer = 0;
 
 function fitCanvas() {
   const dpr = window.devicePixelRatio || 1;
@@ -133,6 +138,8 @@ function stopDrawing() {
 }
 
 function setState(next, text) {
+  if (next === 'idle' && state === 'error') return;
+  clearTimeout(errorTimer);
   const wasMetering = state === 'recording' || state === 'handsFree';
   const metering = next === 'recording' || next === 'handsFree';
   if (metering && !wasMetering) {
@@ -151,12 +158,19 @@ function setState(next, text) {
     messageText.textContent = text || 'Something went wrong';
     message.hidden = false;
     capsule.setAttribute('aria-label', `Error: ${messageText.textContent}`);
+    errorTimer = setTimeout(() => {
+      state = 'cleared';
+      setState('idle');
+    }, ERROR_HOLD_MS);
     return;
   }
   message.hidden = true;
   capsule.setAttribute('aria-label', LABELS[next] ?? '');
   if (next === 'idle') {
+    // Leave nothing behind for the next show to flash before its first frame.
     stopDrawing();
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    messageText.textContent = '';
   } else {
     requestDraw();
   }

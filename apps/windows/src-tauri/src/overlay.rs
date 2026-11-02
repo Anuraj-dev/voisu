@@ -10,8 +10,8 @@
 //! `WS_EX_TOOLWINDOW`) and calls `ShowWindow(SW_SHOW)`, which activates the
 //! window. `SetWindowPos(.., SWP_NOACTIVATE | SWP_SHOWWINDOW)` does not.
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -75,29 +75,41 @@ pub enum Step {
 pub struct Presenter {
     visible: bool,
     generation: u64,
+    error_showing: bool,
 }
 
 impl Presenter {
     /// Returns the window step and, for `error`, the generation a delayed
     /// [`Presenter::on_hide_timer`] call must carry to still apply.
     pub fn on_state(&mut self, state: RecordingState) -> (Step, Option<u64>) {
-        // Any new state supersedes a pending error hide.
+        // The engine goes idle right after a failure; the error stays up until
+        // its own timer hides it so the message can be read.
+        if state == RecordingState::Idle && self.error_showing {
+            return (Step::Nothing, None);
+        }
+        // Any other new state supersedes a pending error hide.
         self.generation += 1;
+        self.error_showing = state == RecordingState::Error;
         if state == RecordingState::Idle {
             return (self.hide(), None);
         }
         let place = !self.visible;
         self.visible = true;
-        let timer = (state == RecordingState::Error).then_some(self.generation);
+        let timer = self.error_showing.then_some(self.generation);
         (Step::Show { place }, timer)
     }
 
     pub fn on_hide_timer(&mut self, generation: u64) -> Step {
         if generation == self.generation {
+            self.error_showing = false;
             self.hide()
         } else {
             Step::Nothing
         }
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.visible
     }
 
     fn hide(&mut self) -> Step {
@@ -149,8 +161,13 @@ pub fn preview_level(seconds: f64) -> f32 {
     (syllable * phrase * pause).clamp(0.0, 1.0) as f32
 }
 
+/// The app's one [`Presenter`]. It is only touched on the main thread, so
+/// decisions and the native calls they produce keep the order events arrived.
+struct OverlayPresenter(Mutex<Presenter>);
+
 /// Creates the hidden overlay window and starts listening for `recording-state`.
 pub fn init(app: &AppHandle) -> tauri::Result<()> {
+    app.manage(OverlayPresenter(Mutex::new(Presenter::default())));
     let window = WebviewWindowBuilder::new(
         app,
         OVERLAY_WINDOW,
@@ -175,60 +192,68 @@ pub fn init(app: &AppHandle) -> tauri::Result<()> {
     // through to the window underneath.
     window.set_ignore_cursor_events(true)?;
 
-    let presenter = Arc::new(Mutex::new(Presenter::default()));
     let handle = app.clone();
     app.listen(RECORDING_STATE, move |event| {
         match serde_json::from_str::<RecordingStatePayload>(event.payload()) {
-            Ok(payload) => on_state(&handle, &presenter, payload.state),
+            Ok(payload) => on_main_thread(&handle, move |app| on_state(app, payload.state)),
             Err(error) => tracing::warn!(%error, "overlay ignored a recording-state payload"),
         }
     });
     Ok(())
 }
 
-fn on_state(app: &AppHandle, presenter: &Arc<Mutex<Presenter>>, state: RecordingState) {
-    let (step, timer) = presenter.lock().unwrap().on_state(state);
+/// Queues `work` on the main (window-owning) thread. The queue is FIFO, so
+/// state changes apply in the order they were posted, and the emitter (W2's
+/// engine thread, or the error timer) never blocks on the UI.
+fn on_main_thread(app: &AppHandle, work: impl FnOnce(&AppHandle) + Send + 'static) {
+    let handle = app.clone();
+    if let Err(error) = app.run_on_main_thread(move || work(&handle)) {
+        tracing::warn!(%error, "overlay update not posted");
+    }
+}
+
+fn on_state(app: &AppHandle, state: RecordingState) {
+    let (step, timer) = presenter(app).on_state(state);
     apply(app, step);
     if let Some(generation) = timer {
         let app = app.clone();
-        let presenter = Arc::clone(presenter);
         std::thread::spawn(move || {
             std::thread::sleep(ERROR_DISPLAY);
-            let step = presenter.lock().unwrap().on_hide_timer(generation);
-            apply(&app, step);
+            on_main_thread(&app, move |app| {
+                let step = presenter(app).on_hide_timer(generation);
+                apply(app, step);
+            });
         });
     }
 }
 
-/// Runs the native call on the main (window-owning) thread. Posting keeps the
-/// emitter, which may be W2's engine thread, from ever blocking on the UI.
+fn presenter(app: &AppHandle) -> std::sync::MutexGuard<'_, Presenter> {
+    let state = app.state::<OverlayPresenter>().inner();
+    state
+        .0
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Main thread only.
 fn apply(app: &AppHandle, step: Step) {
-    if step == Step::Nothing {
+    let Some(window) = app.get_webview_window(OVERLAY_WINDOW) else {
         return;
-    }
-    let handle = app.clone();
-    let posted = app.run_on_main_thread(move || {
-        let Some(window) = handle.get_webview_window(OVERLAY_WINDOW) else {
-            return;
-        };
-        match step {
-            Step::Show { place } => native::show(&window, place),
-            Step::Hide => native::hide(&window),
-            Step::Nothing => {}
-        }
-    });
-    if let Err(error) = posted {
-        tracing::warn!(%error, "overlay update not posted");
+    };
+    match step {
+        Step::Show { place } => native::show(&window, place),
+        Step::Hide => native::hide(&window),
+        Step::Nothing => {}
     }
 }
 
 static PREVIEW_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// Tray diagnostic: plays recording (~3 s of fake levels) → processing (~1 s)
-/// → idle through the same events W2 emits. A second click while one runs is
-/// ignored.
+/// → idle through the same events W2 emits. It does nothing while the capsule
+/// is already up (a real Recording) or another preview runs.
 pub fn preview(app: &AppHandle) {
-    if PREVIEW_RUNNING.swap(true, Ordering::SeqCst) {
+    if presenter(app).is_visible() || PREVIEW_RUNNING.swap(true, Ordering::SeqCst) {
         return;
     }
     tracing::info!("overlay preview");
@@ -324,6 +349,10 @@ mod native {
     /// Re-applied before every show because tao rewrites GWL_EXSTYLE from its
     /// own flags whenever one of them changes, and it has no tool-window flag.
     /// The showing `SetWindowPos` carries SWP_FRAMECHANGED so the change lands.
+    ///
+    /// tao still believes this window is hidden. Calling a tao setter that
+    /// changes its window flags (always-on-top, resizable, …) while the capsule
+    /// is up would rewrite the styles without WS_VISIBLE; don't.
     fn assert_styles(hwnd: HWND) {
         let add = (WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT | WS_EX_LAYERED).0;
         // SAFETY: reading and writing our own window's extended style.
@@ -451,6 +480,20 @@ mod tests {
         assert_eq!(
             presenter.on_state(RecordingState::Processing).0,
             Step::Show { place: false }
+        );
+    }
+
+    #[test]
+    fn idle_right_after_an_error_leaves_the_message_up_until_its_timer() {
+        let mut presenter = Presenter::default();
+        let (_, timer) = presenter.on_state(RecordingState::Error);
+        assert_eq!(presenter.on_state(RecordingState::Idle).0, Step::Nothing);
+        assert!(presenter.is_visible());
+        assert_eq!(presenter.on_hide_timer(timer.unwrap()), Step::Hide);
+        assert_eq!(presenter.on_state(RecordingState::Idle).0, Step::Nothing);
+        assert_eq!(
+            presenter.on_state(RecordingState::Recording).0,
+            Step::Show { place: true }
         );
     }
 

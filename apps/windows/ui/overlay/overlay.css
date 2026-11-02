@@ -42,8 +42,9 @@ body {
 }
 
 .meter {
-  width: 264px;
-  height: 40px;
+  /* The capsule's content box: 280x64 less the 12px/8px padding and 1px border. */
+  width: 262px;
+  height: 38px;
   display: block;
 }
 
