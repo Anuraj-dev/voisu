@@ -1,5 +1,5 @@
 //! The notification-area icon and its menu: a status line, Settings…,
-//! Preview overlay, Start at login, Quit.
+//! Preview overlay, Test paste, Start at login, Quit.
 
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -12,6 +12,7 @@ pub const TRAY_ID: &str = "voisu";
 
 const MENU_SETTINGS: &str = "settings";
 const MENU_PREVIEW_OVERLAY: &str = "preview-overlay";
+const MENU_TEST_PASTE: &str = "test-paste";
 const MENU_AUTOSTART: &str = "autostart";
 const MENU_QUIT: &str = "quit";
 
@@ -60,6 +61,13 @@ pub fn build(app: &AppHandle, keys_ready: bool, autostart: bool) -> tauri::Resul
         true,
         None::<&str>,
     )?;
+    let test_paste = MenuItem::with_id(
+        app,
+        MENU_TEST_PASTE,
+        "Test paste (in 3 s)",
+        true,
+        None::<&str>,
+    )?;
     let autostart = CheckMenuItem::with_id(
         app,
         MENU_AUTOSTART,
@@ -76,6 +84,7 @@ pub fn build(app: &AppHandle, keys_ready: bool, autostart: bool) -> tauri::Resul
             &PredefinedMenuItem::separator(app)?,
             &settings,
             &preview,
+            &test_paste,
             &autostart,
             &PredefinedMenuItem::separator(app)?,
             &quit,
@@ -89,6 +98,7 @@ pub fn build(app: &AppHandle, keys_ready: bool, autostart: bool) -> tauri::Resul
         .on_menu_event(|app, event| match event.id().as_ref() {
             MENU_SETTINGS => crate::show_settings(app),
             MENU_PREVIEW_OVERLAY => crate::overlay::preview(app),
+            MENU_TEST_PASTE => crate::platform::delivery::test_paste(app),
             MENU_AUTOSTART => {
                 // The menu has already flipped the check mark; apply what it
                 // now shows, then let `set_autostart` resync it to the truth.
