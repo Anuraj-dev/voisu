@@ -12,7 +12,7 @@ use voisu_core::{
     Command, PACKAGE_MANAGERS, PROTOCOL_VERSION, Request, Response, VersionEnvelope, socket_path,
 };
 
-use crate::process::guard_external_child;
+use voisu_cloud::process::guard_external_child;
 
 const UNIT_NAME: &str = "voisu.service";
 const OVERLAY_UNIT_NAME: &str = "voisu-overlay.service";

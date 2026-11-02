@@ -1,6 +1,6 @@
 // Reconciliation: Groq merge-result validation and intent reconstruction requests.
 //
-// Split out of system.rs as a pure move; module-global items come from `super`.
+// Moved from voisu-app's system module; crate-global items come from `super`.
 
 use super::*;
 
@@ -9,31 +9,24 @@ pub struct MergeResultValidator {
 }
 
 impl MergeResultValidator {
-    pub fn new() -> Self {
+    /// Legacy reconciliation: the pipeline never runs Intent Reconstruction.
+    pub fn new(host: impl CloudHost) -> Self {
         Self {
             pipeline: TranscriptDecisionPipeline::new(
-                GroqReconciliationModel::legacy(),
+                GroqReconciliationModel::new(host),
                 RECONCILIATION_DEADLINE,
             ),
         }
     }
 
-    pub fn intent_reconstruction(reaper: ProviderReaper) -> Self {
+    pub fn intent_reconstruction(host: impl CloudHost) -> Self {
         Self {
             pipeline: TranscriptDecisionPipeline::with_intent_reconstruction(
-                GroqReconciliationModel {
-                    reaper: Some(reaper),
-                },
+                GroqReconciliationModel::new(host),
                 INTENT_RECONSTRUCTION_DEADLINE,
                 Vec::new(),
             ),
         }
-    }
-}
-
-impl Default for MergeResultValidator {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -72,13 +65,17 @@ impl TranscriptValidator for MergeResultValidator {
     }
 }
 
-pub(super) struct GroqReconciliationModel {
-    pub(super) reaper: Option<ProviderReaper>,
+/// The Groq reconciliation and Intent Reconstruction model. Credentials come
+/// from the host so the request path itself stays platform-neutral.
+pub struct GroqReconciliationModel {
+    host: Arc<dyn CloudHost>,
 }
 
 impl GroqReconciliationModel {
-    fn legacy() -> Self {
-        Self { reaper: None }
+    pub fn new(host: impl CloudHost) -> Self {
+        Self {
+            host: Arc::new(host),
+        }
     }
 }
 
@@ -90,6 +87,7 @@ impl ReconciliationModel for GroqReconciliationModel {
         candidate: Option<MergeResult>,
         cancel: Arc<CancelRegistry>,
     ) -> BoundaryFuture<'_, MergeResult> {
+        let host = Arc::clone(&self.host);
         Box::pin(async move {
             // The whole operation — including the potentially slow synchronous
             // Secret Service lookup — runs inside ONE owned blocking task, so
@@ -101,7 +99,7 @@ impl ReconciliationModel for GroqReconciliationModel {
             // becomes observable. The post-lookup check guarantees no curl is
             // spawned once the deadline has already cancelled the request.
             tokio::task::spawn_blocking(move || {
-                let credential = SecretStore::load(&mut SecretToolStore, Provider::Groq)?;
+                let credential = host.load_credential(Provider::Groq)?;
                 if cancel.is_cancelled() {
                     return Err(BoundaryError::new(
                         BoundaryKind::Validation,
@@ -125,28 +123,9 @@ impl ReconciliationModel for GroqReconciliationModel {
         request: IntentReconstructionRequest,
         cancel: Arc<CancelRegistry>,
     ) -> BoundaryFuture<'_, MergeResult> {
-        let reaper = self.reaper.clone().expect("intent validator has a reaper");
+        let prepare = self.host.prepare_intent_credential(Arc::clone(&cancel));
         Box::pin(async move {
-            let lane = reaper.credential_lane().clone();
-            let entry = lane.register();
-            let mut owner = CredentialPreparationOwner::new(entry, lane, Provider::Groq);
-            let capability = tokio::select! {
-                capability = owner.poll_outcome() => capability,
-                _ = wait_for_reconstruction_cancel(Arc::clone(&cancel)) => {
-                    owner.cancel_and_drive_terminal().await;
-                    return Err(BoundaryError::new(
-                        BoundaryKind::Validation,
-                        "Intent Reconstruction request cancelled",
-                    ));
-                }
-            };
-            let GrammarCapability::Ready(ready) = capability else {
-                return Err(BoundaryError::new(
-                    BoundaryKind::Validation,
-                    "Groq credential unavailable for Intent Reconstruction",
-                ));
-            };
-            let credential = ready.credential().clone();
+            let credential = prepare.await?;
             tokio::task::spawn_blocking(move || {
                 request_groq_intent_reconstruction(credential, request, &cancel)
             })
@@ -158,12 +137,6 @@ impl ReconciliationModel for GroqReconciliationModel {
                 )
             })?
         })
-    }
-}
-
-async fn wait_for_reconstruction_cancel(cancel: Arc<CancelRegistry>) {
-    while !cancel.is_cancelled() {
-        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 

@@ -34,15 +34,18 @@ fn history_file(store_dir: &std::path::Path) -> std::path::PathBuf {
 /// on a new inode; an append writes into the file already there and keeps its
 /// inode. That makes the inode an exact witness for which path a store operation
 /// took — no clocks, no sleeps, nothing timing-dependent.
+#[cfg(unix)]
 fn history_inode(store_dir: &std::path::Path) -> u64 {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata(history_file(store_dir)).unwrap().ino()
 }
 
+#[cfg(unix)]
 fn history_len(store_dir: &std::path::Path) -> u64 {
     std::fs::metadata(history_file(store_dir)).unwrap().len()
 }
 
+#[cfg(unix)]
 #[test]
 fn a_read_does_not_rewrite_a_history_it_did_not_prune() {
     // `Command::History` runs load-prune-rewrite-fsync INLINE in the lifecycle
@@ -70,6 +73,7 @@ fn a_read_does_not_rewrite_a_history_it_did_not_prune() {
     assert_eq!(history_len(&store_dir), before_len);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_recording_appends_its_record_instead_of_rewriting_the_whole_log() {
     // The rewrite's cost scales with the ENTIRE retained history, not with the
@@ -1003,6 +1007,7 @@ fn export_allowlist_passes_the_groq_model_name_through() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_preplanted_colliding_temp_file_does_not_lose_the_record() {
     let dir = TempDir::new().unwrap();

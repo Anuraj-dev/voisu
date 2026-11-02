@@ -5,11 +5,9 @@ pub mod cloud_ownership;
 pub mod config;
 pub mod daemon_lock;
 pub mod dictionary;
-pub mod dpr_cloud;
 pub mod dpr_pipeline;
 pub mod feedback;
 pub mod focus;
-pub mod grammar_http;
 pub mod history_view;
 pub mod hyprland_bindings;
 pub mod journal;
@@ -27,7 +25,6 @@ pub mod local_tail;
 pub mod local_worker;
 pub mod minimal_grammar;
 pub mod overlay;
-mod process;
 pub mod secret_file;
 pub mod service;
 pub mod setup;
@@ -37,3 +34,7 @@ pub mod setup_profile;
 pub mod smart_writing;
 pub mod system;
 pub mod ubuntu_gnome;
+
+// The portable cloud pipeline lives in voisu-cloud; these re-exports keep the
+// existing `voisu_app::dpr_cloud` / `voisu_app::grammar_http` paths working.
+pub use voisu_cloud::{dpr_cloud, grammar_http};

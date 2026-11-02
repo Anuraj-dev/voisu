@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::future::Future;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -154,6 +155,12 @@ pub fn runtime_dir() -> Result<PathBuf, String> {
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err("XDG_RUNTIME_DIR must be a real directory".to_owned());
     }
+    ensure_private_runtime_dir(&metadata)?;
+    Ok(path)
+}
+
+#[cfg(unix)]
+fn ensure_private_runtime_dir(metadata: &std::fs::Metadata) -> Result<(), String> {
     // SAFETY: geteuid has no preconditions and does not mutate memory.
     let effective_uid = unsafe { libc::geteuid() };
     if metadata.uid() != effective_uid {
@@ -162,7 +169,15 @@ pub fn runtime_dir() -> Result<PathBuf, String> {
     if metadata.mode() & 0o777 != 0o700 {
         return Err("XDG_RUNTIME_DIR must have mode 0700".to_owned());
     }
-    Ok(path)
+    Ok(())
+}
+
+// TODO(windows): the daemon socket lives in XDG_RUNTIME_DIR only on Unix. The
+// Windows host needs its own IPC endpoint (a per-user named pipe); until then
+// the runtime directory fails closed rather than trusting an unverified owner.
+#[cfg(not(unix))]
+fn ensure_private_runtime_dir(_metadata: &std::fs::Metadata) -> Result<(), String> {
+    Err("XDG_RUNTIME_DIR ownership cannot be verified on this platform".to_owned())
 }
 
 /// Voisu's durable per-user state directory: `$XDG_STATE_HOME/voisu`, falling

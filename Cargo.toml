@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/voisu-app", "crates/voisu-core"]
+members = ["crates/voisu-app", "crates/voisu-cloud", "crates/voisu-core"]
 exclude = ["tools/transcript-quality"]
 resolver = "2"
 

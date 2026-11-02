@@ -2094,14 +2094,10 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "voisu-app"
 version = "0.65.0"
 dependencies = [
- "bytes",
- "flacenc",
  "futures-util",
  "gtk4",
  "gtk4-layer-shell",
- "http-body",
  "libc",
- "reqwest",
  "rustls",
  "serde",
  "serde_json",
@@ -2111,10 +2107,31 @@ dependencies = [
  "tokio-tungstenite",
  "tungstenite",
  "url",
+ "voisu-cloud",
  "voisu-core",
  "webpki-roots 1.0.11",
  "xkbcommon",
  "zbus",
+]
+
+[[package]]
+name = "voisu-cloud"
+version = "0.65.0"
+dependencies = [
+ "bytes",
+ "flacenc",
+ "futures-util",
+ "http-body",
+ "libc",
+ "reqwest",
+ "rustls",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite",
+ "tungstenite",
+ "url",
+ "voisu-core",
 ]
 
 [[package]]

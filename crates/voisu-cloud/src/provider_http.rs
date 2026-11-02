@@ -1,6 +1,6 @@
 // Provider HTTP client: curl-based authenticated probes for Groq/Deepgram endpoints.
 //
-// Split out of system.rs as a pure move; module-global items come from `super`.
+// Moved from voisu-app's system module; crate-global items come from `super`.
 
 use super::*;
 
@@ -199,19 +199,6 @@ fn provider_authentication_error(error: ProcessError) -> BoundaryError {
     BoundaryError::new(BoundaryKind::ProviderAuthentication, detail)
 }
 
-/// Resolve the current display session from the live environment. Detection is
-/// pure logic in `voisu-core`; this only reads the environment for it.
-pub(super) fn current_session() -> SessionResolution {
-    let wayland_display = std::env::var("WAYLAND_DISPLAY").ok();
-    let x11_display = std::env::var("DISPLAY").ok();
-    let session_type = std::env::var("XDG_SESSION_TYPE").ok();
-    resolve_session(
-        wayland_display.as_deref(),
-        x11_display.as_deref(),
-        session_type.as_deref(),
-    )
-}
-
 impl ProviderHttpClient {
     pub(super) async fn transcribe_groq_chunk(
         &self,
@@ -220,7 +207,7 @@ impl ProviderHttpClient {
         params: GroqRequestParams,
         pcm: Vec<u8>,
         cancel: Arc<CancelRegistry>,
-    ) -> Result<super::GroqChunkTranscript, BoundaryError> {
+    ) -> Result<GroqChunkTranscript, BoundaryError> {
         tokio::task::spawn_blocking(move || {
             request_groq_chunk(credential, endpoint, &params, pcm, &cancel)
         })
