@@ -2017,12 +2017,20 @@ mod tests {
         fs::create_dir(&history).unwrap();
         fs::write(history.join("retained-marker"), b"must survive").unwrap();
 
+        // Unix opens the directory and the `is_file` check rejects it; Windows
+        // refuses to open a directory as a file at all (ERROR_ACCESS_DENIED).
+        // Either way the history is reported unavailable, never treated as empty.
+        let expected = if cfg!(windows) {
+            io::ErrorKind::PermissionDenied
+        } else {
+            io::ErrorKind::InvalidData
+        };
         let error = store.cleanup_expired().unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.kind(), expected);
         let record_error = store
             .record(DiagnosticRecord::new("must-not-rewrite".to_owned(), 2))
             .unwrap_err();
-        assert_eq!(record_error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(record_error.kind(), expected);
         assert!(
             history.is_dir(),
             "failed cleanup must not rename over history"
