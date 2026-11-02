@@ -562,6 +562,8 @@ where
             }
             let control = match error.kind() {
                 // Glitches and refused real-time priority: keep recording.
+                // `DeviceChanged` means cpal already rerouted the stream; a
+                // WASAPI default-mic switch arrives as `StreamInvalidated`.
                 ErrorKind::Xrun | ErrorKind::RealtimeDenied | ErrorKind::DeviceChanged => return,
                 ErrorKind::StreamInvalidated | ErrorKind::DeviceNotAvailable => Control::Reopen,
                 _ => Control::Fatal(classify("input stream failed", &error)),
