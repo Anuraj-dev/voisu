@@ -7,6 +7,7 @@
 //! `recording-state` event and the mic level as `audio-level`, which the
 //! overlay (W4) listens to. The final Transcript is held in memory only.
 
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -131,17 +132,38 @@ enum Outcome {
     Failed(BoundaryError),
 }
 
+/// What the capture phase leaves for the processing phase.
+enum Captured {
+    /// Nothing left to do; the state is already reported.
+    Done,
+    Process {
+        capture: Box<dyn ActiveCapture>,
+        providers: ProviderCoordinator,
+        limit: Option<CaptureLimit>,
+    },
+    /// Cancelled (`None`) or failed: release the mic and provider streams.
+    Abort {
+        capture: Box<dyn ActiveCapture>,
+        providers: ProviderCoordinator,
+        error: Option<BoundaryError>,
+    },
+}
+
 impl Engine {
     async fn run(self, mut actions: UnboundedReceiver<Action>) {
         self.emit_state(Phase::Idle, None);
         while let Some(action) = actions.recv().await {
             match action {
                 Action::Start(id) => {
-                    self.record(id, &mut actions).await;
+                    let captured = self.record(id, &mut actions).await;
+                    // The gesture is free as soon as capture ends, so Esc and
+                    // the chord are not swallowed while this one processes.
                     (self.ended)(id);
+                    while_busy(self.settle(id, captured), &mut actions, &self.ended).await;
                     // Dropped streams finish tearing down before the next
                     // Recording can start.
-                    if !self.host.cleanup.drain(CLEANUP_DRAIN).await {
+                    let drain = self.host.cleanup.drain(CLEANUP_DRAIN);
+                    if !while_busy(drain, &mut actions, &self.ended).await {
                         tracing::warn!("provider cleanup still running");
                     }
                 }
@@ -150,7 +172,9 @@ impl Engine {
         }
     }
 
-    async fn record(&self, id: u64, actions: &mut UnboundedReceiver<Action>) {
+    /// The capture phase: opens the mic and providers and streams until the
+    /// trigger or the capture ends it.
+    async fn record(&self, id: u64, actions: &mut UnboundedReceiver<Action>) -> Captured {
         // A tray preview still playing must not hide or feed this session's
         // capsule.
         overlay::end_preview();
@@ -158,7 +182,7 @@ impl Engine {
             tracing::info!(id, "Recording refused: keys missing");
             self.emit_state(Phase::Error, Some(KEYS_MISSING.to_owned()));
             crate::show_settings(&self.app);
-            return;
+            return Captured::Done;
         }
         self.emit_state(Phase::Recording, None);
 
@@ -166,36 +190,71 @@ impl Engine {
         let begun = tokio::task::spawn_blocking(move || CpalCapture::new(levels).begin(id)).await;
         let mut capture = match begun {
             Ok(Ok(capture)) => capture,
-            Ok(Err(error)) => return self.fail(id, &error),
+            Ok(Err(error)) => {
+                self.fail(id, &error);
+                return Captured::Done;
+            }
             Err(join) => {
                 let error = BoundaryError::new(
                     BoundaryKind::Capture,
                     format!("capture start failed: {join}"),
                 );
-                return self.fail(id, &error);
+                self.fail(id, &error);
+                return Captured::Done;
             }
         };
         let streams = match self.start_providers(id) {
             Ok(streams) => streams,
             Err(error) => {
                 let _ = capture.abort().await;
-                return self.fail(id, &error);
+                self.fail(id, &error);
+                return Captured::Done;
             }
         };
         let mut providers = ProviderCoordinator::start(PROVIDER_DEADLINE, ABORT_DEADLINE, streams);
-        let outcome = self.pump(id, &mut capture, &mut providers, actions).await;
-
-        let limit = match outcome {
-            Outcome::Stop(limit) => limit,
+        match self.pump(id, &mut capture, &mut providers, actions).await {
+            Outcome::Stop(limit) => Captured::Process {
+                capture,
+                providers,
+                limit,
+            },
             Outcome::Cancel => {
                 tracing::info!(id, "Recording cancelled");
-                abort(capture, providers).await;
-                return self.emit_state(Phase::Idle, None);
+                Captured::Abort {
+                    capture,
+                    providers,
+                    error: None,
+                }
             }
-            Outcome::Failed(error) => {
+            Outcome::Failed(error) => Captured::Abort {
+                capture,
+                providers,
+                error: Some(error),
+            },
+        }
+    }
+
+    /// The processing phase: a Transcript from a stopped Recording, or the
+    /// teardown of a cancelled or failed one.
+    async fn settle(&self, id: u64, captured: Captured) {
+        let (mut capture, providers, limit) = match captured {
+            Captured::Done => return,
+            Captured::Abort {
+                capture,
+                providers,
+                error,
+            } => {
                 abort(capture, providers).await;
-                return self.fail(id, &error);
+                return match error {
+                    Some(error) => self.fail(id, &error),
+                    None => self.emit_state(Phase::Idle, None),
+                };
             }
+            Captured::Process {
+                capture,
+                providers,
+                limit,
+            } => (capture, providers, limit),
         };
         self.emit_state(Phase::Processing, None);
         let audio = match capture.finish().await {
@@ -377,9 +436,67 @@ impl Engine {
     }
 }
 
+/// Runs `work` while refusing every trigger action, so a chord pressed
+/// during processing is ended at once instead of replaying as a late,
+/// empty Recording once this one finishes.
+async fn while_busy<F: Future>(
+    work: F,
+    actions: &mut UnboundedReceiver<Action>,
+    ended: &EndedSink,
+) -> F::Output {
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            biased;
+            output = &mut work => return output,
+            Some(action) = actions.recv() => {
+                if let Action::Start(id) = action {
+                    tracing::debug!(id, "Recording refused: still processing");
+                    ended(id);
+                }
+            }
+        }
+    }
+}
+
 async fn abort(capture: Box<dyn ActiveCapture>, providers: ProviderCoordinator) {
     let (capture, providers) = tokio::join!(capture.abort(), providers.abort());
     if let Err(error) = capture.and(providers) {
         tracing::warn!(diagnostic = error.diagnostic(), "Recording cleanup failed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::poll_fn;
+    use std::task::Poll;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn a_chord_pressed_while_busy_is_refused_not_replayed() {
+        let (tx, mut actions) = mpsc::unbounded_channel();
+        let refused = Arc::new(Mutex::new(Vec::new()));
+        let ended: EndedSink = {
+            let refused = Arc::clone(&refused);
+            Arc::new(move |id| refused.lock().unwrap().push(id))
+        };
+        for action in [Action::Start(2), Action::HandsFree(2), Action::Stop(2)] {
+            tx.send(action).unwrap();
+        }
+        // Busy for four polls: long enough to see every queued action.
+        let mut polls = 0;
+        let work = poll_fn(|cx| {
+            polls += 1;
+            if polls > 3 {
+                Poll::Ready("transcript")
+            } else {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        });
+        assert_eq!(while_busy(work, &mut actions, &ended).await, "transcript");
+        assert_eq!(*refused.lock().unwrap(), [2]);
+        assert!(actions.try_recv().is_err(), "nothing left to replay");
     }
 }
