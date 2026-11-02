@@ -35,6 +35,15 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 voisu-cloud = { path = "../../../crates/voisu-cloud" }
 voisu-core = { path = "../../../crates/voisu-core" }
 
+[target.'cfg(windows)'.dependencies]
+# Same version tao/wry use, so `WebviewWindow::hwnd()` returns this HWND.
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_UI_HiDpi",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt"] }

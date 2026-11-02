@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Voisu overlay</title>
+    <link rel="stylesheet" href="./overlay.css" />
+  </head>
+  <body>
+    <div class="capsule" id="capsule" role="status" aria-live="polite" aria-label="">
+      <canvas class="meter" id="meter" aria-hidden="true"></canvas>
+      <p class="message" id="message" hidden><span aria-hidden="true">⚠</span> <span id="message-text"></span></p>
+    </div>
+    <script type="module" src="./overlay.js"></script>
+  </body>
+</html>
