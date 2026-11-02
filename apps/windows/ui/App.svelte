@@ -63,7 +63,8 @@
         await refresh();
       }
     } catch (e) {
-      error = 'Something went wrong while saving. Your input is kept; try again.';
+      // The backend rejects with a user-facing sentence; anything else is unexpected.
+      error = typeof e === 'string' ? e : 'Something went wrong while saving. Your input is kept; try again.';
     } finally {
       busy = false;
     }

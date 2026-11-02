@@ -8,7 +8,7 @@ pub mod settings;
 pub mod setup;
 mod tray;
 
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, WindowEvent};
@@ -28,7 +28,10 @@ const AUTOSTART_ARG: &str = "--autostart";
 
 pub struct AppState {
     settings: Mutex<Settings>,
-    tray: Mutex<Option<tray::TrayHandles>>,
+    /// Set once at startup and never locked: menu setters called off the main
+    /// thread block until the main thread runs them, so holding a lock across
+    /// them could deadlock against a main-thread menu or command handler.
+    tray: OnceLock<tray::TrayHandles>,
 }
 
 fn keys_ready() -> bool {
@@ -65,7 +68,7 @@ pub(crate) fn apply_autostart(app: &AppHandle, enabled: bool) -> bool {
     }
     let actual = autostart_enabled(app);
     tracing::info!(enabled = actual, "start at login");
-    if let Some(tray) = app.state::<AppState>().tray.lock().unwrap().as_ref() {
+    if let Some(tray) = app.state::<AppState>().tray.get() {
         tray.set_autostart(actual);
     }
     let _ = app.emit(STATE_CHANGED, ());
@@ -126,19 +129,34 @@ async fn save_keys(
     );
 
     let saved = !evaluation.to_store.is_empty();
+    let mut written = 0;
+    let mut failed = None;
     for (provider, credential) in evaluation.to_store {
-        store.replace(provider, credential).map_err(|error| {
+        if let Err(error) = store.replace(provider, credential) {
             tracing::error!(
                 diagnostic = error.diagnostic(),
                 ?provider,
                 "key save failed"
             );
-            "Windows Credential Manager refused to save the key.".to_owned()
-        })?;
+            failed = Some(provider);
+            break;
+        }
+        written += 1;
     }
-    if saved {
-        tracing::info!("keys saved");
+    if written > 0 {
+        tracing::info!(written, "keys saved");
         on_keys_saved(&app);
+    }
+    if let Some(provider) = failed {
+        let also = if written > 0 {
+            " The other key was saved."
+        } else {
+            ""
+        };
+        return Err(format!(
+            "Windows Credential Manager refused to save the {} key.{also}",
+            setup::provider_name(provider)
+        ));
     }
     Ok(SaveOutcome {
         saved,
@@ -147,26 +165,23 @@ async fn save_keys(
     })
 }
 
-/// After a successful save: refresh the tray and, the first time only,
-/// switch Start at login on.
+/// After keys are written: refresh the tray and, once both keys are stored
+/// for the first time, switch Start at login on. The default counts as
+/// applied only when Windows confirms it, so a failed write retries on the
+/// next save.
 fn on_keys_saved(app: &AppHandle) {
     let state = app.state::<AppState>();
-    if let Some(tray) = state.tray.lock().unwrap().as_ref() {
-        tray.set_ready(keys_ready());
+    let ready = keys_ready();
+    if let Some(tray) = state.tray.get() {
+        tray.set_ready(ready);
     }
-    let first_setup = {
+    let pending = ready && !state.settings.lock().unwrap().autostart_default_applied;
+    if pending && apply_autostart(app, true) {
         let mut settings = state.settings.lock().unwrap();
-        let first = !settings.autostart_default_applied;
-        if first {
-            settings.autostart_default_applied = true;
-            if let Err(error) = settings.save(&paths::settings_file()) {
-                tracing::warn!(%error, "settings save failed");
-            }
+        settings.autostart_default_applied = true;
+        if let Err(error) = settings.save(&paths::settings_file()) {
+            tracing::warn!(%error, "settings save failed");
         }
-        first
-    };
-    if first_setup {
-        apply_autostart(app, true);
     }
     let _ = app.emit(STATE_CHANGED, ());
 }
@@ -196,7 +211,7 @@ fn open_key_page(app: AppHandle, provider: KeyPage) -> Result<(), String> {
 }
 
 pub fn run() {
-    let _log_guard = logging::init(&paths::log_dir());
+    let mut log_guard = logging::init(&paths::log_dir());
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "Voisu starting");
 
     let app = tauri::Builder::default()
@@ -214,7 +229,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {
             settings: Mutex::new(Settings::load(&paths::settings_file())),
-            tray: Mutex::new(None),
+            tray: OnceLock::new(),
         })
         .invoke_handler(tauri::generate_handler![
             get_state,
@@ -226,7 +241,7 @@ pub fn run() {
             let handle = app.handle();
             let ready = keys_ready();
             let tray = tray::build(handle, ready, autostart_enabled(handle))?;
-            *app.state::<AppState>().tray.lock().unwrap() = Some(tray);
+            let _ = app.state::<AppState>().tray.set(tray);
             let at_login = std::env::args().any(|arg| arg == AUTOSTART_ARG);
             tracing::info!(keys_ready = ready, at_login, "startup");
             if setup::should_open_window(at_login, ready) {
@@ -244,13 +259,17 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("Voisu failed to start");
 
-    app.run(|_app, event| {
+    app.run(move |_app, event| match event {
         // Only the tray's Quit (an explicit exit code) ends the process.
-        if let RunEvent::ExitRequested {
+        RunEvent::ExitRequested {
             code: None, api, ..
-        } = event
-        {
-            api.prevent_exit();
+        } => api.prevent_exit(),
+        // `run` exits the process without returning on Windows, so the log
+        // writer is flushed here rather than by `log_guard` going out of scope.
+        RunEvent::Exit => {
+            tracing::info!("Voisu exiting");
+            drop(log_guard.take());
         }
+        _ => {}
     });
 }

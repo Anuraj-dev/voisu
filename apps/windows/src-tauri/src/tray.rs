@@ -78,10 +78,8 @@ pub fn build(app: &AppHandle, keys_ready: bool, autostart: bool) -> tauri::Resul
                 let wanted = app
                     .state::<crate::AppState>()
                     .tray
-                    .lock()
-                    .ok()
-                    .and_then(|tray| tray.as_ref().map(|t| t.autostart.is_checked()))
-                    .and_then(Result::ok);
+                    .get()
+                    .and_then(|tray| tray.autostart.is_checked().ok());
                 if let Some(wanted) = wanted {
                     crate::apply_autostart(app, wanted);
                 }
