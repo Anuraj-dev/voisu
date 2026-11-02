@@ -51,6 +51,7 @@
     } else if (state === 'recording') {
       dictationError = '';
     } else if (state === 'idle') {
+      dictationError = '';
       refreshTranscript();
     }
   }
@@ -75,8 +76,10 @@
         if (disposed) fn();
         else unlisteners.push(fn);
       });
-    subscribe('state-changed', () => {
-      refresh();
+    subscribe('state-changed', async () => {
+      await refresh();
+      // Saving both keys resolves a "keys missing" refusal.
+      if (app.groqSaved && app.deepgramSaved) dictationError = '';
       refreshTranscript();
     });
     subscribe('recording-state', onRecordingState);
