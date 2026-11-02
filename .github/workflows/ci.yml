@@ -118,8 +118,16 @@ jobs:
       # --deny warnings escalates unmaintained/yanked notices to failures too.
       # Document any accepted advisory here with a trailing --ignore RUSTSEC-YYYY-NNNN
       # (with a comment justifying the exception) rather than silencing the whole job.
+      # RUSTSEC-2026-0370/0371/0372: informational "unmaintained" notices, not
+      # vulnerabilities. zvariant, zvariant_derive and zbus_names were folded
+      # into zbus 6. They come in only through zbus 5 (voisu-app's portal and
+      # session code); drop these ignores when that code moves to zbus 6.
       - name: cargo audit
-        run: cargo audit --deny warnings
+        run: >-
+          cargo audit --deny warnings
+          --ignore RUSTSEC-2026-0370
+          --ignore RUSTSEC-2026-0371
+          --ignore RUSTSEC-2026-0372
       # tools/transcript-quality keeps its own Cargo.lock (excluded from the
       # root workspace), so its dependency set needs its own audit pass.
       - name: cargo audit (tools/transcript-quality lockfile)
