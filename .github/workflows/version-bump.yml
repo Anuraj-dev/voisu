@@ -6,7 +6,7 @@ name: Version bump
 # stays a deliberate manual `git push origin v<version>` (see
 # packaging/RELEASING.md) — this workflow never tags and never publishes.
 #
-# The version lives in FIVE synchronized places and they move together here:
+# The version lives in SIX synchronized places and they move together here:
 #   1. crates/voisu-app/Cargo.toml   version = "X.Y.Z"
 #   2. crates/voisu-core/Cargo.toml and crates/voisu-cloud/Cargo.toml
 #                                    version = "X.Y.Z" (lockstep)
@@ -14,6 +14,9 @@ name: Version bump
 #   4. Cargo.lock                    (regenerated via `cargo update`)
 #   5. tools/transcript-quality/Cargo.lock  (voisu-core path-dep entry synced
 #      in place, then proven with `cargo metadata --locked`)
+#   6. apps/windows/src-tauri/Cargo.toml + its own Cargo.lock (the Windows
+#      app's version is what the updater's latest.json compares against; the
+#      lock's voisu-windows/voisu-core/voisu-cloud entries are synced in place)
 # plus a prepended packaging/voisu.spec %changelog entry. The release pipeline's
 # validate stage fails closed if the tag name and the tree version disagree, and
 # packaging/rpm-lib.sh:voisu_derive_version() fails if cargo metadata and the
@@ -192,7 +195,7 @@ jobs:
             echo "range_base=${base}"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Rewrite all five version locations and prepend the changelog
+      - name: Rewrite all six version locations and prepend the changelog
         id: apply
         if: steps.detect.outputs.bump_type != ''
         env:
@@ -283,11 +286,21 @@ jobs:
             tools/transcript-quality/Cargo.lock
           cargo metadata --manifest-path tools/transcript-quality/Cargo.toml --locked > /dev/null
 
+          # 6: the Windows Tauri app is its own workspace with its own lock,
+          # path-depending on voisu-core and voisu-cloud. Same in-place edit,
+          # same --locked proof (resolves every target, so Windows-only deps
+          # are covered too).
+          sed -i -E 's/^version = "[0-9]+\.[0-9]+\.[0-9]+"/version = "'"$NEW_VERSION"'"/' \
+            apps/windows/src-tauri/Cargo.toml
+          sed -i -E '/^name = "voisu-(windows|core|cloud)"$/{n;s/^version = "[0-9]+\.[0-9]+\.[0-9]+"$/version = "'"$NEW_VERSION"'"/;}' \
+            apps/windows/src-tauri/Cargo.lock
+          cargo metadata --manifest-path apps/windows/src-tauri/Cargo.toml --locked > /dev/null
+
       - name: Diff whitelist — only the version files may have changed
         if: steps.detect.outputs.bump_type != ''
         run: |
           set -euo pipefail
-          allowed=$'crates/voisu-app/Cargo.toml\ncrates/voisu-core/Cargo.toml\ncrates/voisu-cloud/Cargo.toml\nCargo.lock\npackaging/voisu.spec\ntools/transcript-quality/Cargo.lock'
+          allowed=$'crates/voisu-app/Cargo.toml\ncrates/voisu-core/Cargo.toml\ncrates/voisu-cloud/Cargo.toml\nCargo.lock\npackaging/voisu.spec\ntools/transcript-quality/Cargo.lock\napps/windows/src-tauri/Cargo.toml\napps/windows/src-tauri/Cargo.lock'
           bad=0
           while IFS= read -r f; do
             [ -n "$f" ] || continue
@@ -328,7 +341,8 @@ jobs:
           git config user.email 'github-actions[bot]@users.noreply.github.com'
           git add crates/voisu-app/Cargo.toml crates/voisu-core/Cargo.toml \
                   crates/voisu-cloud/Cargo.toml Cargo.lock packaging/voisu.spec \
-                  tools/transcript-quality/Cargo.lock
+                  tools/transcript-quality/Cargo.lock \
+                  apps/windows/src-tauri/Cargo.toml apps/windows/src-tauri/Cargo.lock
           git commit -m "chore(release): bump version to ${NEW_VERSION}"
           # No tag — tags stay manual and deliberate. A plain push to main; the
           # bot's push does not retrigger this workflow.

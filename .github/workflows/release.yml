@@ -4,6 +4,9 @@ name: Release
 #
 #   validate -> build -> smoke (fedora/ubuntu/arch) -> publish
 #
+# The Windows installer builds in parallel (build-windows) and is attached to the
+# Release after it exists (publish-windows); it never gates the Linux jobs.
+#
 # Publishing (apt repo, AUR, GitHub Release) is BLOCKED on the smoke gate: the
 # artifacts are installed through each distro's REAL package-manager path before
 # any live channel is touched. COPR needs nothing here -- its webhook self-
@@ -348,3 +351,114 @@ jobs:
           chown -R builder:builder "$GITHUB_WORKSPACE"
           tb=$(ls "$GITHUB_WORKSPACE"/dist/release/voisu-*-x86_64.tar.gz)
           su - builder -c "export HOME=/home/builder && git config --global --add safe.directory '$GITHUB_WORKSPACE' && '$GITHUB_WORKSPACE/packaging/ci/aur-publish.sh' '$VERSION' '$GITHUB_WORKSPACE' '$tb'"
+
+  # --- Windows: signed NSIS installer + updater manifest ----------------------
+  # Independent of the Linux pipeline: it builds in parallel and only attaches
+  # assets to the Release that publish-release created, so a Windows failure
+  # never blocks or alters a Linux publish. Respin by re-running these two
+  # jobs (uploads use --clobber).
+  build-windows:
+    name: Build Windows installer (signed for the updater)
+    needs: validate
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+        working-directory: apps/windows
+    steps:
+      - uses: actions/checkout@v4
+      # Fail closed before the long build: no key, the placeholder public key
+      # (VOISU_UPDATER_PUBKEY_UNSET), or an app version that disagrees with the
+      # tag would ship an installer whose updates can't verify or never fire.
+      - name: Refuse an unconfigured updater or a version mismatch
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            echo "::error::secret TAURI_SIGNING_PRIVATE_KEY is not set; see packaging/RELEASING.md (Windows)" >&2
+            exit 1
+          fi
+          pubkey=$(node -p "require('./src-tauri/tauri.conf.json').plugins.updater.pubkey")
+          if [ -z "$pubkey" ] || [ "$pubkey" = "VOISU_UPDATER_PUBKEY_UNSET" ]; then
+            echo "::error::plugins.updater.pubkey in apps/windows/src-tauri/tauri.conf.json is still the placeholder" >&2
+            exit 1
+          fi
+          app=$(grep -m1 -E '^version = ' src-tauri/Cargo.toml | cut -d'"' -f2)
+          if [ "$app" != "$VERSION" ]; then
+            echo "::error::apps/windows/src-tauri/Cargo.toml is $app but the tag is v$VERSION" >&2
+            exit 1
+          fi
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/windows/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install UI dependencies
+        run: npm ci
+      # createUpdaterArtifacts stays off in tauri.conf.json so PR builds need
+      # no key; only this job turns it on, producing <setup>.exe.sig.
+      - name: Build the signed NSIS installer
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npx tauri build --bundles nsis --config '{"bundle":{"createUpdaterArtifacts":true}}' -- --locked
+      - name: Collect the installer and its signature
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          setup=(src-tauri/target/release/bundle/nsis/*-setup.exe)
+          if [ "${#setup[@]}" -ne 1 ]; then
+            echo "expected one installer, found ${#setup[@]}" >&2
+            exit 1
+          fi
+          test -s "${setup[0]}.sig"
+          mkdir -p out
+          cp "${setup[0]}" out/Voisu-Setup-x64.exe
+          cp "${setup[0]}.sig" out/Voisu-Setup-x64.exe.sig
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: apps/windows/out/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-windows:
+    name: Attach Windows installer + latest.json to the Release
+    needs: [validate, build-windows, publish-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-release
+          path: dist/windows
+      - name: Write latest.json and upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd dist/windows
+          # Stable name for the landing page's releases/latest/download link;
+          # the versioned copy is what latest.json points at, so an updater
+          # never fetches bytes from a newer release than its manifest.
+          versioned="Voisu-${VERSION}-Setup-x64.exe"
+          cp Voisu-Setup-x64.exe "$versioned"
+          jq -n \
+            --arg version "$VERSION" \
+            --arg notes "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}" \
+            --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg signature "$(cat Voisu-Setup-x64.exe.sig)" \
+            --arg url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${versioned}" \
+            '{version: $version, notes: $notes, pub_date: $date,
+              platforms: {"windows-x86_64": {signature: $signature, url: $url}}}' \
+            > latest.json
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            Voisu-Setup-x64.exe "$versioned" latest.json
