@@ -119,6 +119,10 @@ fn controlled_key_status(mode: &str) -> ProviderKeyStatus {
     }
 }
 
+/// Where curl discards the probe body. On Windows `/dev/null` is an ordinary
+/// path that curl fails to create.
+const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
+
 fn authenticated_status(
     credential: Credential,
     request: ProviderHttpRequest,
@@ -141,7 +145,7 @@ fn authenticated_status(
             "--silent",
             "--show-error",
             "--output",
-            "/dev/null",
+            NULL_DEVICE,
             "--write-out",
             "%{http_code}\t%header{retry-after}",
             "--max-time",
