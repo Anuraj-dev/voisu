@@ -18,6 +18,8 @@ name = "voisu_windows"
 tauri-build = { version = "2.7", features = [] }
 
 [dependencies]
+# WASAPI shared-mode capture on Windows (ALSA off Windows, for local checks).
+cpal = "0.18"
 dirs = "6"
 # windows-native stores in Credential Manager. Off Windows the crate falls
 # back to its mock store; non-Windows builds exist only for local checks.
@@ -28,7 +30,7 @@ tauri = { version = "2.12", features = ["tray-icon"] }
 tauri-plugin-autostart = "2.7"
 tauri-plugin-opener = "2.7"
 tauri-plugin-single-instance = "2.5"
-tokio = { version = "1", features = ["macros"] }
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
@@ -37,10 +39,19 @@ voisu-core = { path = "../../../crates/voisu-core" }
 
 [target.'cfg(windows)'.dependencies]
 # Same version tao/wry use, so `WebviewWindow::hwnd()` returns this HWND.
+# The overlay, the keyboard hook, session/power notifications and the mic
+# privacy check all use it directly.
 windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Power",
+  "Win32_System_Registry",
+  "Win32_System_RemoteDesktop",
+  "Win32_System_SystemInformation",
+  "Win32_System_Threading",
   "Win32_UI_HiDpi",
+  "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_WindowsAndMessaging",
 ] }
 

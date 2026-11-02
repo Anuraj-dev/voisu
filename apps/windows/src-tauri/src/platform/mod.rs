@@ -1,4 +1,8 @@
-//! Windows implementations of voisu-core's platform seams. W1 ships the
-//! secret store; hotkey, capture and delivery arrive in W2/W3.
+//! Windows implementations of voisu-core's platform seams: the secret
+//! store, microphone capture and the Ctrl+Win keyboard hook. Delivery
+//! arrives in W3.
 
+pub mod capture;
+#[cfg(windows)]
+pub mod hotkey;
 pub mod secrets;
