@@ -12,6 +12,7 @@
 use std::collections::BTreeMap;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1440,10 +1441,7 @@ impl DiagnosticStore {
         // during the append below can leave a torn final line; skipping it keeps
         // every record that was completely written, where a single-value file
         // would have to discard the whole ring.
-        let mut file = match OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(self.history_file())
+        let mut file = match existing_entry(OpenOptions::new().read(true)).open(self.history_file())
         {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1466,21 +1464,12 @@ impl DiagnosticStore {
 
     fn open_append_file(&self) -> io::Result<(File, bool)> {
         let path = self.history_file();
-        match OpenOptions::new()
-            .read(true)
-            .append(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC)
-            .open(&path)
-        {
+        let mut create = OpenOptions::new();
+        create.read(true).append(true).create_new(true);
+        match close_on_exec(owner_only(&mut create)).open(&path) {
             Ok(file) => Ok((file, true)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                let file = OpenOptions::new()
-                    .read(true)
-                    .append(true)
-                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-                    .open(path)?;
+                let file = existing_entry(OpenOptions::new().read(true).append(true)).open(path)?;
                 if !file.metadata()?.is_file() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -1567,12 +1556,7 @@ impl DiagnosticStore {
                     std::process::id(),
                     self.temp_counter.fetch_add(1, Ordering::Relaxed)
                 ));
-                match OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(&temp)
-                {
+                match owner_only(OpenOptions::new().write(true).create_new(true)).open(&temp) {
                     Ok(file) => break 'created (temp, file),
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                     Err(error) => return Err(error),
@@ -1796,11 +1780,7 @@ impl DiagnosticStore {
             expires_at_unix_ms
         );
         let path = self.audio_dir().join(&file_name);
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)?;
+        let mut file = owner_only(OpenOptions::new().write(true).create_new(true)).open(&path)?;
         let result = file
             .write_all(pcm_s16le_mono_16khz)
             .and_then(|()| file.sync_all());
@@ -1860,20 +1840,79 @@ fn create_private_dir(path: &Path) -> io::Result<()> {
                     "diagnostics path is not a private directory",
                 ));
             }
-            // SAFETY: geteuid has no preconditions and does not mutate memory.
-            if metadata.uid() != unsafe { libc::geteuid() } {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "diagnostics directory is not owned by the current user",
-                ));
-            }
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            restrict_existing_dir(path, &metadata)
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            DirBuilder::new().mode(0o700).create(path)
-        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => create_owner_only_dir(path),
         Err(error) => Err(error),
     }
+}
+
+#[cfg(unix)]
+fn restrict_existing_dir(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+    // SAFETY: geteuid has no preconditions and does not mutate memory.
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "diagnostics directory is not owned by the current user",
+        ));
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+// TODO(windows): verify the directory owner SID and restrict its DACL to the
+// current user. Until then the store relies on the per-user profile ACL.
+#[cfg(not(unix))]
+fn restrict_existing_dir(_path: &Path, _metadata: &fs::Metadata) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_owner_only_dir(path: &Path) -> io::Result<()> {
+    DirBuilder::new().mode(0o700).create(path)
+}
+
+// TODO(windows): create with an owner-only DACL.
+#[cfg(not(unix))]
+fn create_owner_only_dir(path: &Path) -> io::Result<()> {
+    DirBuilder::new().create(path)
+}
+
+/// Owner-only (0600) permissions for a newly created diagnostics file.
+#[cfg(unix)]
+fn owner_only(options: &mut OpenOptions) -> &mut OpenOptions {
+    options.mode(0o600)
+}
+
+// TODO(windows): apply an owner-only DACL to newly created files.
+#[cfg(not(unix))]
+fn owner_only(options: &mut OpenOptions) -> &mut OpenOptions {
+    options
+}
+
+#[cfg(unix)]
+fn close_on_exec(options: &mut OpenOptions) -> &mut OpenOptions {
+    options.custom_flags(libc::O_CLOEXEC)
+}
+
+// Windows handles are not inherited unless explicitly marked inheritable.
+#[cfg(not(unix))]
+fn close_on_exec(options: &mut OpenOptions) -> &mut OpenOptions {
+    options
+}
+
+/// Opens an existing history entry without following a final symlink and
+/// without blocking on a FIFO planted in its place; the caller then rejects
+/// anything that is not a regular file.
+#[cfg(unix)]
+fn existing_entry(options: &mut OpenOptions) -> &mut OpenOptions {
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+}
+
+// TODO(windows): refuse a reparse point (FILE_FLAG_OPEN_REPARSE_POINT) the way
+// O_NOFOLLOW refuses a symlink. The regular-file check after open still runs.
+#[cfg(not(unix))]
+fn existing_entry(options: &mut OpenOptions) -> &mut OpenOptions {
+    options
 }
 
 /// The outcome of replaying a fixed captured fixture through the provider and
@@ -1929,15 +1968,17 @@ pub async fn replay_capture(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
 
     fn store_with_policy(dir: &Path, policy: RetentionPolicy) -> DiagnosticStore {
         DiagnosticStore::open(dir.join("diagnostics"), policy).unwrap()
     }
 
+    #[cfg(unix)]
     #[test]
     fn history_fifo_is_rejected_without_a_blocking_read() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
         let dir = tempfile::tempdir().unwrap();
         let store = store_with_policy(dir.path(), RetentionPolicy::default());
         let path = store.history_file();
