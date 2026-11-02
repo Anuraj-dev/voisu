@@ -1874,3 +1874,118 @@ fn non_selected_reconciliation_models_omit_reasoning_effort() {
         );
     }
 }
+
+/// A fake platform host for the `CloudHost` contract: a slow synchronous
+/// credential load that records where it ran, and an Intent Reconstruction
+/// preparation that resolves only through the shared `CancelRegistry`.
+struct ContractHost {
+    cleanup: CleanupSupervisor,
+    load_delay: Duration,
+    loaded_on: Arc<Mutex<Option<std::thread::ThreadId>>>,
+}
+
+impl ContractHost {
+    fn new(load_delay: Duration) -> Self {
+        Self {
+            cleanup: CleanupSupervisor::new(),
+            load_delay,
+            loaded_on: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+impl CloudHost for ContractHost {
+    fn cleanup(&self) -> &CleanupSupervisor {
+        &self.cleanup
+    }
+
+    fn load_credential(&self, _provider: Provider) -> Result<Credential, BoundaryError> {
+        *self.loaded_on.lock().unwrap() = Some(std::thread::current().id());
+        // Deliberately blocking, like a Credential Manager or Secret Service
+        // call. The pipeline must keep the async thread free meanwhile.
+        std::thread::sleep(self.load_delay);
+        Credential::new("contract-test-key".to_owned())
+    }
+
+    fn prepare_intent_credential(
+        &self,
+        cancel: Arc<CancelRegistry>,
+    ) -> BoundaryFuture<'static, Credential> {
+        Box::pin(async move {
+            while !cancel.is_cancelled() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Err(BoundaryError::new(
+                BoundaryKind::Validation,
+                "credential preparation cancelled",
+            ))
+        })
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn reconciliation_loads_the_credential_off_the_async_thread() {
+    let host = ContractHost::new(Duration::from_millis(150));
+    let loaded_on = Arc::clone(&host.loaded_on);
+    let mut model = GroqReconciliationModel::new(host);
+    // Cancelled up front so the request stops after the credential load and
+    // never reaches curl.
+    let cancel = CancelRegistry::new();
+    cancel.cancel();
+
+    let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ticker = {
+        let ticks = Arc::clone(&ticks);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                ticks.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+    };
+
+    let result = model
+        .request(ReconciliationKind::Reconcile, Vec::new(), None, cancel)
+        .await;
+    ticker.abort();
+
+    let error = result.expect_err("a cancelled request must not succeed");
+    assert_eq!(error.kind(), BoundaryKind::Validation);
+    assert_ne!(
+        loaded_on.lock().unwrap().expect("credential was loaded"),
+        std::thread::current().id(),
+        "load_credential ran on the async thread"
+    );
+    assert!(
+        ticks.load(Ordering::SeqCst) >= 5,
+        "the single async thread stalled during the blocking load"
+    );
+}
+
+#[tokio::test]
+async fn cancel_resolves_intent_credential_preparation() {
+    let mut model = GroqReconciliationModel::new(ContractHost::new(Duration::ZERO));
+    let cancel = CancelRegistry::new();
+    let request = IntentReconstructionRequest {
+        sources: Vec::new(),
+        dictionary_terms: Vec::new(),
+    };
+    let canceller = {
+        let cancel = Arc::clone(&cancel);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            cancel.cancel();
+        })
+    };
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        model.reconstruct_intent(request, cancel),
+    )
+    .await
+    .expect("cancel must resolve the preparation promptly");
+    canceller.await.unwrap();
+
+    let error = result.expect_err("a cancelled preparation must not succeed");
+    assert_eq!(error.kind(), BoundaryKind::Validation);
+}
