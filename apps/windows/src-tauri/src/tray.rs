@@ -1,8 +1,12 @@
 //! The notification-area icon and its menu: a status line, Settings…,
-//! Preview overlay, Test paste, Start at login, Quit.
+//! Preview overlay, Test paste, Start at login, Quit. A downloaded update adds
+//! a dot to the icon and an "Update to vX" item under the status line.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
-use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, Wry};
 
 /// Fixed so the icon keeps one identity across launches. Tauri 2 exposes no
@@ -15,6 +19,9 @@ const MENU_PREVIEW_OVERLAY: &str = "preview-overlay";
 const MENU_TEST_PASTE: &str = "test-paste";
 const MENU_AUTOSTART: &str = "autostart";
 const MENU_QUIT: &str = "quit";
+const MENU_UPDATE: &str = "update";
+/// Under the status line, above the first separator.
+const UPDATE_POSITION: usize = 1;
 
 pub fn status_text(keys_ready: bool) -> &'static str {
     if keys_ready {
@@ -28,6 +35,11 @@ pub fn status_text(keys_ready: bool) -> &'static str {
 pub struct TrayHandles {
     status: MenuItem<Wry>,
     autostart: CheckMenuItem<Wry>,
+    menu: Menu<Wry>,
+    /// Kept out of the menu until an update is ready.
+    update: MenuItem<Wry>,
+    update_shown: AtomicBool,
+    icon: TrayIcon<Wry>,
 }
 
 impl TrayHandles {
@@ -49,6 +61,73 @@ impl TrayHandles {
             tracing::warn!(%error, "tray autostart update failed");
         }
     }
+
+    /// Marks a downloaded update: the icon dot, the tooltip and the menu item.
+    pub fn show_update(&self, version: &str) {
+        if let Err(error) = self.update.set_text(update_text(version)) {
+            tracing::warn!(%error, "tray update item failed");
+        }
+        if !self.update_shown.swap(true, Ordering::SeqCst)
+            && let Err(error) = self.menu.insert(&self.update, UPDATE_POSITION)
+        {
+            tracing::warn!(%error, "tray update item failed");
+            self.update_shown.store(false, Ordering::SeqCst);
+        }
+        let tooltip = format!("Voisu: {} ready", update_text(version).to_lowercase());
+        if let Err(error) = self.icon.set_tooltip(Some(tooltip)) {
+            tracing::warn!(%error, "tray tooltip update failed");
+        }
+        let app = self.icon.app_handle();
+        if let Some(icon) = app.default_window_icon() {
+            let dotted = with_dot(icon.rgba(), icon.width(), icon.height());
+            let image = Image::new_owned(dotted, icon.width(), icon.height());
+            if let Err(error) = self.icon.set_icon(Some(image)) {
+                tracing::warn!(%error, "tray icon update failed");
+            }
+        }
+    }
+}
+
+fn update_text(version: &str) -> String {
+    format!("Update to v{}", version.trim_start_matches('v'))
+}
+
+/// Amber, as on the landing page and the capsule.
+const DOT: [u8; 3] = [0xf0, 0xb4, 0x29];
+/// Dark ring that keeps the dot visible on light and dark taskbars.
+const RING: [u8; 3] = [0x0d, 0x0f, 0x12];
+
+/// Paints an update dot into the top-right corner of an RGBA icon.
+fn with_dot(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let mut out = rgba.to_vec();
+    let size = width.min(height) as f32;
+    let radius = size * 0.2;
+    let ring = (size * 0.06).max(1.0);
+    let outer = radius + ring;
+    let (cx, cy) = (width as f32 - outer, outer);
+    for y in 0..height {
+        for x in 0..width {
+            let distance = ((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt();
+            // One pixel of anti-aliasing at each edge.
+            let in_outer = (outer - distance + 0.5).clamp(0.0, 1.0);
+            if in_outer == 0.0 {
+                continue;
+            }
+            let in_dot = (radius - distance + 0.5).clamp(0.0, 1.0);
+            let i = ((y * width + x) * 4) as usize;
+            // Straight-alpha "over": a soft edge over a transparent pixel
+            // keeps the dot's colour instead of fading towards black.
+            let below = out[i + 3] as f32 / 255.0 * (1.0 - in_outer);
+            let alpha = in_outer + below;
+            for c in 0..3 {
+                let colour = RING[c] as f32 * (1.0 - in_dot) + DOT[c] as f32 * in_dot;
+                let under = out[i + c] as f32;
+                out[i + c] = ((colour * in_outer + under * below) / alpha).round() as u8;
+            }
+            out[i + 3] = (alpha * 255.0).round() as u8;
+        }
+    }
+    out
 }
 
 pub fn build(app: &AppHandle, keys_ready: bool, autostart: bool) -> tauri::Result<TrayHandles> {
@@ -77,6 +156,7 @@ pub fn build(app: &AppHandle, keys_ready: bool, autostart: bool) -> tauri::Resul
         None::<&str>,
     )?;
     let quit = MenuItem::with_id(app, MENU_QUIT, "Quit Voisu", true, None::<&str>)?;
+    let update = MenuItem::with_id(app, MENU_UPDATE, "Update", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
         &[
@@ -111,7 +191,12 @@ pub fn build(app: &AppHandle, keys_ready: bool, autostart: bool) -> tauri::Resul
                     crate::apply_autostart(app, wanted);
                 }
             }
-            MENU_QUIT => app.exit(0),
+            MENU_UPDATE => crate::updater::install(app, true),
+            MENU_QUIT => {
+                // A downloaded update installs on the way out, without relaunching.
+                crate::updater::install(app, false);
+                app.exit(0);
+            }
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -127,8 +212,15 @@ pub fn build(app: &AppHandle, keys_ready: bool, autostart: bool) -> tauri::Resul
     if let Some(icon) = app.default_window_icon() {
         builder = builder.icon(icon.clone());
     }
-    builder.build(app)?;
-    Ok(TrayHandles { status, autostart })
+    let icon = builder.build(app)?;
+    Ok(TrayHandles {
+        status,
+        autostart,
+        menu,
+        update,
+        update_shown: AtomicBool::new(false),
+        icon,
+    })
 }
 
 #[cfg(test)]
@@ -139,5 +231,36 @@ mod tests {
     fn status_line_tells_ready_from_setup_needed() {
         assert!(status_text(false).contains("setup needed"));
         assert!(status_text(true).contains("ready"));
+    }
+
+    #[test]
+    fn update_item_names_the_version_once() {
+        assert_eq!(update_text("0.66.0"), "Update to v0.66.0");
+        assert_eq!(update_text("v0.66.0"), "Update to v0.66.0");
+    }
+
+    #[test]
+    fn the_dot_sits_top_right_and_leaves_the_rest_alone() {
+        let (w, h) = (32u32, 32u32);
+        let clear = vec![0u8; (w * h * 4) as usize];
+        let dotted = with_dot(&clear, w, h);
+        assert_eq!(dotted.len(), clear.len());
+        let pixel = |x: u32, y: u32| {
+            let i = ((y * w + x) * 4) as usize;
+            [dotted[i], dotted[i + 1], dotted[i + 2], dotted[i + 3]]
+        };
+        // The dot's centre is opaque amber.
+        let outer = 32.0 * 0.2 + 32.0 * 0.06;
+        let (cx, cy) = ((32.0 - outer) as u32, outer as u32);
+        assert_eq!(pixel(cx, cy), [DOT[0], DOT[1], DOT[2], 255]);
+        // The opposite corner is untouched.
+        assert_eq!(pixel(0, h - 1), [0, 0, 0, 0]);
+        assert_eq!(pixel(w / 4, h / 2), [0, 0, 0, 0]);
+        // Soft edges over transparency keep the ring's colour, not black.
+        for px in dotted.chunks(4).filter(|px| px[3] > 0) {
+            for c in 0..3 {
+                assert!(px[c] >= RING[c].min(DOT[c]), "edge darkened: {px:?}");
+            }
+        }
     }
 }

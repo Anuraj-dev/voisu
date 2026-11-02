@@ -33,8 +33,9 @@ until the smoke gate is green.
 You no longer bump the version by hand. `.github/workflows/version-bump.yml` runs on
 every push to `main`: it reads the Conventional Commits merged since the last bump and,
 if any are release-worthy, bumps the version (`feat:` → minor, `fix:`/`perf:` → patch,
-a `!`/`BREAKING CHANGE:` → major) across all four synchronized places — both crate
-`Cargo.toml`s, `packaging/voisu.spec` `Version:` + `%changelog`, and `Cargo.lock` — then
+a `!`/`BREAKING CHANGE:` → major) across every synchronized place — the crate
+`Cargo.toml`s, `packaging/voisu.spec` `Version:` + `%changelog`, `Cargo.lock`, and the
+Windows app's `apps/windows/src-tauri/Cargo.toml` + its own `Cargo.lock` — then
 commits `chore(release): bump version to X.Y.Z` back to `main`. **Docs-only merges
 (only `docs:`/`chore:`/`test:`/`ci:`/`style:`/`refactor:`) do not bump.** The tree is
 therefore always tag-ready; cutting a release is just the tag push above. Any manual
@@ -68,8 +69,17 @@ push tag vX.Y.Z
   publish (only after all smoke legs pass, in parallel except AUR):
      ├─ publish-apt      make-apt-repo.sh (real key, loopback) → push gh-pages
      ├─ publish-release  gh release create vX.Y.Z + attach deb, tarball, SHA256SUMS
-     └─ publish-aur      (after publish-release) bump + push AUR voisu & voisu-bin
+     ├─ publish-aur      (after publish-release) bump + push AUR voisu & voisu-bin
+     └─ publish-windows  (after publish-release) attach Voisu-Setup-x64.exe,
+                         Voisu-<ver>-Setup-x64.exe and the signed latest.json
+
+  build-windows ─ windows-latest, in parallel from validate: refuses a missing
+                  TAURI_SIGNING_PRIVATE_KEY, the placeholder updater pubkey, or an
+                  app version ≠ tag; builds the NSIS installer + its .sig.
 ```
+
+The Windows jobs never block or change the Linux ones: a red `build-windows` leaves
+the Linux release fully published, minus the Windows assets.
 
 COPR is not in this workflow: its Custom-source webhook self-triggers on the same
 tag via `copr-trigger.yml`, self-pins to the highest `v*` tag, and rebuilds from
@@ -136,6 +146,8 @@ installs them directly from `$srcdir` with no versioned subdir.
 | `GPG_PASSPHRASE` | publish-apt, apt-refresh | passphrase for loopback pinentry (written to a temp file, never argv/log) | provisioned in ticket 09 |
 | `COPR_WEBHOOK_URL` | copr-trigger.yml (not this workflow) | COPR Custom-source rebuild webhook | provisioned in ticket 12 |
 | `AUR_SSH_PRIVATE_KEY` | publish-aur | SSH deploy key registered on the AUR account for the `voisu` and `voisu-bin` repos | **MUST be created by Raja** (see below) |
+| `TAURI_SIGNING_PRIVATE_KEY` | build-windows | minisign key that signs the Windows installer for the in-app updater | **MUST be created by Raja** (see below) |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | build-windows | that key's password | **MUST be created by Raja** |
 
 `GITHUB_TOKEN` (built-in) covers the gh-pages push and `gh release create`; the
 publish jobs request `contents: write` for it.
@@ -154,6 +166,25 @@ The workflow pins AUR's host key by its published ed25519 fingerprint
 (`SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4`) and fails closed on a
 mismatch. If AUR ever rotates its host key, update that constant in
 `.github/workflows/release.yml` (`publish-aur` → "Configure the AUR SSH deploy key").
+
+### Creating the Windows updater key
+
+The installed Windows app only accepts an update whose signature verifies against the
+public key compiled into it, so **losing the private key strands every install on its
+current version** (they would need a manual reinstall). Keep an offline backup.
+
+```sh
+cd apps/windows && npm ci
+npx tauri signer generate -w ~/.tauri/voisu-updater.key   # prompts for a password
+gh secret set TAURI_SIGNING_PRIVATE_KEY < ~/.tauri/voisu-updater.key
+gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD           # paste the same password
+cat ~/.tauri/voisu-updater.key.pub                          # the PUBLIC key
+```
+
+Then replace `VOISU_UPDATER_PUBKEY_UNSET` in `apps/windows/src-tauri/tauri.conf.json`
+(`plugins.updater.pubkey`) with the contents of `voisu-updater.key.pub` and merge that
+to main before tagging. Until both are done, `build-windows` fails closed and builds
+from that tree never check for updates.
 
 ## One-time prerequisites (HITL)
 
@@ -193,6 +224,8 @@ Recovery from an expired repo is simply to re-run the refresh (Actions →
 | `publish-aur` fails: "AUR … is at pkgver … newer than …; will not downgrade" | re-running an OLDER release's publish after a newer one already landed on AUR | expected guard — do nothing; the newer AUR package stands |
 | gh-pages checkout fails | gh-pages branch missing | complete the HITL gh-pages setup |
 | `publish-aur` host-key mismatch | AUR rotated its SSH host key | update the pinned fingerprint in `release.yml` |
+| `build-windows` fails at "Refuse an unconfigured updater" | updater key secret or public key missing, or the Windows app version ≠ tag | see "Creating the Windows updater key"; the version moves with version-bump |
+| `build-windows` / `publish-windows` failed after Linux published | Windows-only problem | fix, then re-run just those jobs — uploads use `--clobber` |
 
 ### Respinning a release
 
