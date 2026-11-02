@@ -149,9 +149,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Check portable crates (all targets, --locked)
-        run: cargo check -p voisu-core -p voisu-cloud --all-targets --locked
+      # Clippy, not check: cfg(windows) branches are linted nowhere else.
+      - name: Clippy portable crates (all targets, warnings are errors)
+        run: cargo clippy -p voisu-core -p voisu-cloud --all-targets --locked -- -D warnings
       - name: Test portable crates (--locked)
         run: cargo test -p voisu-core -p voisu-cloud --locked
 

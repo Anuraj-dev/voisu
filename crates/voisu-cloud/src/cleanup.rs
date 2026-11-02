@@ -125,8 +125,9 @@ pub trait CloudHost: Send + Sync + 'static {
     /// The supervisor that adopts dropped streams' cleanup.
     fn cleanup(&self) -> &CleanupSupervisor;
 
-    /// Loads `provider`'s credential. Synchronous and possibly slow: callers
-    /// run it inside their own blocking task or at stream start.
+    /// Loads `provider`'s credential. Synchronous and possibly slow. Callers
+    /// invoke it from a blocking task or directly on a runtime worker at stream
+    /// start, so it must never block on a tokio runtime (`block_on`).
     fn load_credential(&self, provider: Provider) -> Result<Credential, BoundaryError>;
 
     /// Prepares the Groq credential for one Intent Reconstruction attempt. It
