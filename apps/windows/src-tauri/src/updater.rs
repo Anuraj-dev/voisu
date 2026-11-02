@@ -1,0 +1,159 @@
+//! Self-update from GitHub Releases (W5).
+//!
+//! Checks the release's `latest.json` at start and every 6 h, downloads a
+//! newer installer in the background (the plugin verifies its signature),
+//! then marks the tray: a dot on the icon and an "Update to vX" item.
+//! Clicking it installs and relaunches; Quit installs without relaunching.
+
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
+
+use tauri::{AppHandle, Manager};
+use tauri_plugin_updater::{Update, UpdaterExt};
+
+/// What `plugins.updater.pubkey` holds until a signing key exists. Builds
+/// that still carry it never check, and the release job refuses them.
+pub const PUBKEY_UNSET: &str = "VOISU_UPDATER_PUBKEY_UNSET";
+
+const CHECK_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
+/// How often the loop wakes to see whether a check is due. Due-ness uses
+/// wall-clock time, so a laptop that slept through the 6 h still checks on
+/// the next wake.
+const TICK: Duration = Duration::from_secs(15 * 60);
+
+/// A downloaded, signature-verified installer waiting for the user.
+struct Ready {
+    update: Update,
+    bytes: Vec<u8>,
+}
+
+#[derive(Default)]
+pub struct UpdaterState {
+    ready: Mutex<Option<Ready>>,
+}
+
+/// Whether this build carries a real updater public key.
+fn configured(app: &AppHandle) -> bool {
+    let pubkey = app
+        .config()
+        .plugins
+        .0
+        .get("updater")
+        .and_then(|updater| updater.get("pubkey"))
+        .and_then(|pubkey| pubkey.as_str())
+        .unwrap_or_default();
+    !pubkey.is_empty() && pubkey != PUBKEY_UNSET
+}
+
+pub fn start(app: &AppHandle) {
+    if !configured(app) {
+        tracing::info!("updates off: this build has no updater public key");
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut last = None;
+        loop {
+            let now = SystemTime::now();
+            if is_due(last, now) {
+                last = Some(now);
+                check(&app).await;
+            }
+            tokio::time::sleep(TICK).await;
+        }
+    });
+}
+
+fn is_due(last: Option<SystemTime>, now: SystemTime) -> bool {
+    match last {
+        None => true,
+        // A clock set backwards counts as due rather than stalling checks.
+        Some(last) => now
+            .duration_since(last)
+            .map_or(true, |elapsed| elapsed >= CHECK_EVERY),
+    }
+}
+
+async fn check(app: &AppHandle) {
+    let handle = app.clone();
+    let updater = app
+        .updater_builder()
+        // Replaces the plugin's hook, so it repeats its cleanup and then
+        // flushes the log: the install ends the process with `exit(0)`.
+        .on_before_exit(move || {
+            handle.cleanup_before_exit();
+            crate::flush_logs();
+        })
+        .build();
+    let found = match updater {
+        Ok(updater) => updater.check().await,
+        Err(error) => Err(error),
+    };
+    let update = match found {
+        Ok(Some(update)) => update,
+        Ok(None) => {
+            tracing::info!("up to date");
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(%error, "update check failed");
+            return;
+        }
+    };
+    let version = update.version.clone();
+    if pending_version(app).as_deref() == Some(version.as_str()) {
+        return;
+    }
+    tracing::info!(%version, "update found; downloading");
+    match update.download(|_, _| {}, || {}).await {
+        Ok(bytes) => {
+            *app.state::<UpdaterState>().ready.lock().unwrap() = Some(Ready { update, bytes });
+            tracing::info!(%version, "update ready");
+            if let Some(tray) = app.state::<crate::AppState>().tray.get() {
+                tray.show_update(&version);
+            }
+        }
+        Err(error) => tracing::warn!(%error, %version, "update download failed"),
+    }
+}
+
+fn pending_version(app: &AppHandle) -> Option<String> {
+    let state = app.state::<UpdaterState>();
+    let ready = state.ready.lock().unwrap();
+    ready.as_ref().map(|ready| ready.update.version.clone())
+}
+
+/// Runs the downloaded installer, which ends this process on Windows. Does
+/// nothing when no update is pending; an installer that fails to start
+/// keeps the update pending so the menu item can retry it.
+pub fn install(app: &AppHandle, relaunch: bool) {
+    let state = app.state::<UpdaterState>();
+    let Some(ready) = state.ready.lock().unwrap().take() else {
+        return;
+    };
+    tracing::info!(version = %ready.update.version, relaunch, "installing update");
+    let update = ready.update.clone().restart_after_install(relaunch);
+    if let Err(error) = update.install(&ready.bytes) {
+        tracing::warn!(%error, "update install failed");
+        *state.ready.lock().unwrap() = Some(ready);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checks_at_start_then_every_six_hours() {
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        assert!(is_due(None, start));
+        assert!(!is_due(Some(start), start + CHECK_EVERY - TICK));
+        assert!(is_due(Some(start), start + CHECK_EVERY));
+    }
+
+    #[test]
+    fn a_clock_set_backwards_checks_again() {
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        assert!(is_due(Some(start), start - Duration::from_secs(60)));
+    }
+}

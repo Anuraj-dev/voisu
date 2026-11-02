@@ -19,6 +19,7 @@ pub mod setup;
 mod tray;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod trigger;
+mod updater;
 
 use std::sync::{Mutex, OnceLock};
 
@@ -26,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, WindowEvent};
 use tauri_plugin_autostart::ManagerExt as _;
 use tauri_plugin_opener::OpenerExt as _;
+use tracing_appender::non_blocking::WorkerGuard;
 use voisu_cloud::ProviderHttpClient;
 use voisu_core::{Provider, SecretStore};
 
@@ -37,6 +39,14 @@ const SETTINGS_WINDOW: &str = "settings";
 const STATE_CHANGED: &str = "state-changed";
 /// Passed by the HKCU Run entry so a login launch stays in the tray.
 const AUTOSTART_ARG: &str = "--autostart";
+
+/// Held for the process lifetime; taken to flush the log before an exit
+/// that skips `RunEvent::Exit` (the updater's `exit(0)`).
+static LOG_GUARD: Mutex<Option<WorkerGuard>> = Mutex::new(None);
+
+pub(crate) fn flush_logs() {
+    drop(LOG_GUARD.lock().unwrap().take());
+}
 
 pub struct AppState {
     settings: Mutex<Settings>,
@@ -263,7 +273,7 @@ fn start_dictation(app: &AppHandle) {
 }
 
 pub fn run() {
-    let mut log_guard = logging::init(&paths::log_dir());
+    *LOG_GUARD.lock().unwrap() = logging::init(&paths::log_dir());
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "Voisu starting");
 
     let app = tauri::Builder::default()
@@ -279,6 +289,8 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(updater::UpdaterState::default())
         .manage(AppState {
             settings: Mutex::new(Settings::load(&paths::settings_file())),
             tray: OnceLock::new(),
@@ -302,6 +314,7 @@ pub fn run() {
                 show_settings(handle);
             }
             start_dictation(handle);
+            updater::start(handle);
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -314,16 +327,16 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("Voisu failed to start");
 
-    app.run(move |_app, event| match event {
+    app.run(|_app, event| match event {
         // Only the tray's Quit (an explicit exit code) ends the process.
         RunEvent::ExitRequested {
             code: None, api, ..
         } => api.prevent_exit(),
         // `run` exits the process without returning on Windows, so the log
-        // writer is flushed here rather than by `log_guard` going out of scope.
+        // writer is flushed here.
         RunEvent::Exit => {
             tracing::info!("Voisu exiting");
-            drop(log_guard.take());
+            flush_logs();
         }
         _ => {}
     });

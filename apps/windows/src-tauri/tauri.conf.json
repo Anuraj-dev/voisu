@@ -45,5 +45,16 @@
         "installMode": "currentUser"
       }
     }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "VOISU_UPDATER_PUBKEY_UNSET",
+      "endpoints": [
+        "https://github.com/Anuraj-dev/voisu/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }
