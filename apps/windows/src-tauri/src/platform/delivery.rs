@@ -14,9 +14,11 @@
 //!    owner window, plus the formats that keep it out of clipboard history,
 //!    cloud clipboard and clipboard monitors.
 //! 4. Release held modifiers, then send the paste chord.
-//! 5. The target's `WM_RENDERFORMAT` is the receipt that it pasted. Restore
-//!    once reads go quiet, but only while Voisu still owns the clipboard and
-//!    nothing else has written to it since (`GetClipboardSequenceNumber`).
+//! 5. The target's `WM_RENDERFORMAT` is the receipt that it pasted; reads by
+//!    any other app do not count. Restore shortly after the receipt, but only
+//!    while Voisu still owns the clipboard and nothing else has written to it
+//!    since (`GetClipboardSequenceNumber`). With no receipt, leave the
+//!    Transcript on the clipboard so a late paste still gets it.
 //!
 //! The receipt design (delayed render as proof of read, a quiet period before
 //! restoring, the history/cloud exclusion formats) follows Handy's Windows
@@ -29,14 +31,13 @@ use tauri::{AppHandle, Emitter};
 
 use crate::overlay::{RECORDING_STATE, RecordingState, RecordingStatePayload};
 
-/// Restore this long after the target's last clipboard read.
+/// Restore this long after the target's read, so it can finish with the
+/// clipboard first.
 pub const QUIET_AFTER_READ: Duration = Duration::from_millis(200);
-/// No read this long after the chord means the paste did not land. Long
-/// enough for a cold Word or Electron paste; a read after this would see the
-/// restored clipboard instead.
+/// No read this long after the chord means the paste is unconfirmed. Long
+/// enough for a cold Word or Electron paste. The Transcript then stays on the
+/// clipboard, so a later read still gets it.
 pub const NO_READ_TIMEOUT: Duration = Duration::from_millis(1500);
-/// Hard stop for targets that keep re-reading the clipboard.
-pub const RESTORE_TIMEOUT: Duration = Duration::from_secs(8);
 /// Gap between chord phases. RDP drops a modifier pressed and released in the
 /// same instant and types a literal "v".
 pub const CHORD_HOLD: Duration = Duration::from_millis(40);
@@ -49,8 +50,11 @@ pub const TEST_PASTE_DELAY: Duration = Duration::from_secs(3);
 pub enum DeliveryOutcome {
     /// The target read the Transcript from the clipboard after the chord.
     Pasted,
-    /// The chord went out but the target never read the clipboard.
+    /// The chord went out but the target never read the clipboard. The
+    /// Transcript stays on the clipboard.
     NotConfirmed,
+    /// Another app replaced the clipboard before the target read it.
+    ClipboardTaken,
     /// The target runs elevated; Windows would silently drop the keystrokes.
     ElevatedTarget,
     /// No focused window was captured, or it has closed since.
@@ -66,7 +70,8 @@ impl DeliveryOutcome {
     pub fn notice(self) -> Option<&'static str> {
         match self {
             Self::Pasted => None,
-            Self::NotConfirmed => Some("The app didn't take the paste"),
+            Self::NotConfirmed => Some("Transcript is on your clipboard — press Ctrl+V"),
+            Self::ClipboardTaken => Some("Another app replaced the clipboard; nothing pasted"),
             Self::ElevatedTarget => Some("Can't type into an admin window"),
             Self::TargetGone => Some("The window you were typing in closed"),
             Self::OwnWindow => Some("Click into another app first"),
@@ -113,8 +118,9 @@ impl DeliveryTarget {
     }
 }
 
-/// Pastes `text` into `target` and restores the clipboard. Blocks for up to
-/// `RESTORE_TIMEOUT` and pumps its own messages: call it off the main thread.
+/// Pastes `text` into `target` and restores the clipboard. Blocks for about
+/// `NO_READ_TIMEOUT` at most and pumps its own messages: call it off the main
+/// thread.
 /// Concurrent calls run one after another.
 pub fn deliver(target: &DeliveryTarget, text: &str) -> Result<DeliveryOutcome, DeliveryError> {
     native::deliver(target.hwnd, text)
@@ -264,14 +270,19 @@ pub fn clipboard_text(text: &str) -> Vec<u16> {
     wide
 }
 
-/// Formats whose data is a plain `HGLOBAL` and can be copied byte for byte.
-/// GDI-handle formats (bitmap, palette, metafiles), owner-display and the
-/// private/GDI-object ranges hold handles, not bytes. A bitmap still survives
-/// through its `CF_DIB`/`CF_DIBV5` forms, which Windows synthesises.
+/// `CF_ENHMETAFILE`: a GDI handle, saved through its serialised bits.
+pub const CF_ENHMETAFILE: u32 = 14;
+
+/// Formats Voisu can save and put back: plain `HGLOBAL` data copied byte for
+/// byte, plus `CF_ENHMETAFILE`. The other GDI-handle formats (bitmap,
+/// palette, old metafile), owner-display and the private/GDI-object ranges
+/// hold handles, not bytes. A bitmap still survives through its
+/// `CF_DIB`/`CF_DIBV5` forms, and the old metafile is synthesised from the
+/// enhanced one.
 pub fn snapshot_format(format: u32) -> bool {
     !matches!(
         format,
-        2 | 3 | 9 | 14 | 0x80 | 0x82 | 0x83 | 0x8E | 0x200..=0x3FF
+        2 | 3 | 9 | 0x80 | 0x82 | 0x83 | 0x8E | 0x200..=0x3FF
     )
 }
 
@@ -283,12 +294,14 @@ pub fn may_restore(still_owner: bool, sequence_now: u32, sequence_ours: u32) -> 
 
 // ---- Read timing ----
 
+/// A delayed render fires once per publish, so the target's first read is
+/// the only one Voisu can see.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Watch {
     pub since_chord: Duration,
-    /// When the target last read the clipboard, measured from the chord.
-    /// Reads before the chord (clipboard managers) never count.
-    pub last_read: Option<Duration>,
+    /// When the target read the clipboard, measured from the chord. Reads
+    /// before the chord, and reads by other apps, never count.
+    pub read: Option<Duration>,
     /// Another app took the clipboard.
     pub ownership_lost: bool,
 }
@@ -296,9 +309,10 @@ pub struct Watch {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
     Wait,
-    Restore {
-        pasted: bool,
-    },
+    /// The target pasted: put the user's clipboard back.
+    Restore,
+    /// No read yet: leave the Transcript on the clipboard for a late paste.
+    Keep,
     /// Leave the clipboard alone: it is no longer Voisu's.
     Abandon {
         pasted: bool,
@@ -306,19 +320,42 @@ pub enum Verdict {
 }
 
 pub fn evaluate(watch: Watch) -> Verdict {
-    let pasted = watch.last_read.is_some();
     if watch.ownership_lost {
-        return Verdict::Abandon { pasted };
+        return Verdict::Abandon {
+            pasted: watch.read.is_some(),
+        };
     }
-    if watch.since_chord >= RESTORE_TIMEOUT {
-        return Verdict::Restore { pasted };
-    }
-    match watch.last_read {
+    match watch.read {
         Some(read) if watch.since_chord.saturating_sub(read) >= QUIET_AFTER_READ => {
-            Verdict::Restore { pasted: true }
+            Verdict::Restore
         }
-        None if watch.since_chord >= NO_READ_TIMEOUT => Verdict::Restore { pasted: false },
+        None if watch.since_chord >= NO_READ_TIMEOUT => Verdict::Keep,
         _ => Verdict::Wait,
+    }
+}
+
+/// Who had the clipboard open when the text was rendered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reader {
+    /// Opened with no window (`OpenClipboard(NULL)`): cannot be told apart.
+    Anonymous,
+    Window {
+        /// Its top-level window is the target (covers child windows and the
+        /// console host, whose window reports the shell's process id).
+        root_is_target: bool,
+        pid: u32,
+    },
+}
+
+/// Whether a render counts as the target's paste. An anonymous opener gets
+/// the benefit of the doubt; a clipboard monitor or another app does not.
+pub fn read_by_target(reader: Reader, target_pid: u32) -> bool {
+    match reader {
+        Reader::Anonymous => true,
+        Reader::Window {
+            root_is_target,
+            pid,
+        } => root_is_target || pid == target_pid,
     }
 }
 
@@ -435,14 +472,17 @@ mod native {
         CloseHandle, ERROR_ACCESS_DENIED, GlobalFree, HANDLE, HGLOBAL, HINSTANCE, HWND, LPARAM,
         LRESULT, WPARAM,
     };
+    use windows::Win32::Graphics::Gdi::{
+        DeleteEnhMetaFile, GetEnhMetaFileBits, HENHMETAFILE, SetEnhMetaFileBits,
+    };
     use windows::Win32::Security::{
         GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TOKEN_MANDATORY_LABEL,
         TOKEN_QUERY, TokenIntegrityLevel,
     };
     use windows::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData, GetClipboardOwner,
-        GetClipboardSequenceNumber, IsClipboardFormatAvailable, OpenClipboard,
-        RegisterClipboardFormatW, SetClipboardData,
+        GetClipboardSequenceNumber, GetOpenClipboardWindow, IsClipboardFormatAvailable,
+        OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
     };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::System::Memory::{
@@ -458,8 +498,8 @@ mod native {
         VIRTUAL_KEY,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClassNameW,
-        GetForegroundWindow, GetWindowThreadProcessId, HWND_MESSAGE, IsWindow, MSG,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GA_ROOT, GetAncestor,
+        GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId, HWND_MESSAGE, IsWindow, MSG,
         MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW, QS_ALLINPUT, RegisterClassW,
         SetForegroundWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_DESTROYCLIPBOARD,
         WM_RENDERALLFORMATS, WM_RENDERFORMAT, WNDCLASSW,
@@ -467,9 +507,10 @@ mod native {
     use windows::core::{HRESULT, PCWSTR, PWSTR, w};
 
     use super::{
-        CHORD_HOLD, DeliveryError, DeliveryOutcome, Integrity, Key, MODIFIERS, PasteChord, Probe,
-        SNAPSHOT_BUDGET, Verdict, Watch, chord_phases, clipboard_text, evaluate, may_restore,
-        paste_chord, preflight, release_held, snapshot_format,
+        CF_ENHMETAFILE, CHORD_HOLD, DeliveryError, DeliveryOutcome, Integrity, Key, MODIFIERS,
+        PasteChord, Probe, Reader, SNAPSHOT_BUDGET, VK_MASK, Verdict, Watch, chord_phases,
+        clipboard_text, evaluate, may_restore, paste_chord, preflight, read_by_target,
+        release_held, snapshot_format,
     };
 
     const CF_UNICODETEXT: u32 = 13;
@@ -489,7 +530,10 @@ mod native {
     /// can re-enter the window procedure.
     struct Published {
         text: Vec<u16>,
-        reads: Vec<Instant>,
+        target: HWND,
+        target_pid: u32,
+        /// The target's read, the receipt that it pasted.
+        read: Option<Instant>,
         sequence: u32,
         lost: bool,
     }
@@ -523,9 +567,9 @@ mod native {
             return Ok(DeliveryOutcome::FocusLost);
         }
         let owner = owner_window()?;
-        let result = paste(owner, target, text, chord);
-        // Destroying the owner renders any still-delayed text, so state goes
-        // only after it.
+        let result = paste(owner, target, probe.pid, text, chord);
+        // Destroying the owner renders any still-delayed text (an unconfirmed
+        // paste leaves it there on purpose), so state goes only after it.
         unsafe {
             let _ = DestroyWindow(owner);
         }
@@ -536,6 +580,7 @@ mod native {
     fn paste(
         owner: HWND,
         target: HWND,
+        target_pid: u32,
         text: &str,
         chord: PasteChord,
     ) -> Result<DeliveryOutcome, DeliveryError> {
@@ -546,7 +591,9 @@ mod native {
         PUBLISHED.with(|cell| {
             *cell.borrow_mut() = Some(Published {
                 text: clipboard_text(text),
-                reads: Vec::new(),
+                target,
+                target_pid,
+                read: None,
                 sequence: 0,
                 lost: false,
             });
@@ -570,19 +617,17 @@ mod native {
         let chord_at = Instant::now();
         let verdict = loop {
             pump();
-            let (last_read, lost) = with_published(|state| {
-                let last = state
-                    .reads
-                    .iter()
-                    .rev()
-                    .find(|read| **read >= chord_at)
+            let (read, lost) = with_published(|state| {
+                let read = state
+                    .read
+                    .filter(|read| *read >= chord_at)
                     .map(|read| read.duration_since(chord_at));
-                (last, state.lost)
+                (read, state.lost)
             })
             .unwrap_or((None, true));
             match evaluate(Watch {
                 since_chord: chord_at.elapsed(),
-                last_read,
+                read,
                 ownership_lost: lost,
             }) {
                 Verdict::Wait => unsafe {
@@ -591,18 +636,16 @@ mod native {
                 verdict => break verdict,
             }
         };
-        let pasted = match verdict {
-            Verdict::Restore { pasted } => {
+        Ok(match verdict {
+            Verdict::Restore => {
                 restore_guarded(owner, &saved);
-                pasted
+                DeliveryOutcome::Pasted
             }
-            Verdict::Abandon { pasted } => pasted,
+            // Restoring now would hand a late paste the old clipboard.
+            Verdict::Keep => DeliveryOutcome::NotConfirmed,
+            Verdict::Abandon { pasted: true } => DeliveryOutcome::Pasted,
+            Verdict::Abandon { pasted: false } => DeliveryOutcome::ClipboardTaken,
             Verdict::Wait => unreachable!(),
-        };
-        Ok(if pasted {
-            DeliveryOutcome::Pasted
-        } else {
-            DeliveryOutcome::NotConfirmed
         })
     }
 
@@ -719,6 +762,9 @@ mod native {
         if unsafe { GetForegroundWindow() } == target {
             return true;
         }
+        // Windows lets the process that sent the last input take the
+        // foreground; an unassigned key counts and types nothing.
+        let _ = send(&[Key::down(VK_MASK), Key::up(VK_MASK)]);
         unsafe {
             let _ = SetForegroundWindow(target);
         }
@@ -777,11 +823,13 @@ mod native {
             .collect();
         send(&release_held(&held))?;
         let [down, tap, up] = chord_phases(chord);
-        send(&down)?;
-        sleep(CHORD_HOLD);
-        let tapped = send(&tap);
-        sleep(CHORD_HOLD);
-        // Modifiers go up even if the tap failed, so none stays stuck.
+        let tapped = send(&down).and_then(|()| {
+            sleep(CHORD_HOLD);
+            let tapped = send(&tap);
+            sleep(CHORD_HOLD);
+            tapped
+        });
+        // Modifiers go up whatever failed above, so none stays stuck.
         let released = send(&up);
         tapped.and(released)
     }
@@ -855,27 +903,87 @@ mod native {
             let Ok(handle) = (unsafe { GetClipboardData(format) }) else {
                 continue;
             };
-            let memory = HGLOBAL(handle.0);
-            let size = unsafe { GlobalSize(memory) };
-            if size == 0 {
-                continue;
+            let room = SNAPSHOT_BUDGET - total;
+            let bytes = if format == CF_ENHMETAFILE {
+                metafile_bits(HENHMETAFILE(handle.0), room)
+            } else {
+                global_bits(HGLOBAL(handle.0), room)
+            };
+            match bytes {
+                Ok(bytes) => {
+                    total += bytes.len();
+                    saved.push((format, bytes));
+                }
+                Err(Some(size)) => {
+                    tracing::warn!(format, size, "clipboard format too large to restore");
+                }
+                Err(None) => {}
             }
-            if total + size > SNAPSHOT_BUDGET {
-                tracing::warn!(format, size, "clipboard format too large to restore");
-                continue;
-            }
-            let source = unsafe { GlobalLock(memory) };
-            if source.is_null() {
-                continue;
-            }
-            let bytes = unsafe { std::slice::from_raw_parts(source.cast::<u8>(), size) }.to_vec();
-            unsafe {
-                let _ = GlobalUnlock(memory);
-            }
-            total += size;
-            saved.push((format, bytes));
         }
         saved
+    }
+
+    /// `Err(Some(size))`: over `room`. `Err(None)`: empty or unreadable.
+    fn global_bits(memory: HGLOBAL, room: usize) -> Result<Vec<u8>, Option<usize>> {
+        let size = unsafe { GlobalSize(memory) };
+        if size == 0 {
+            return Err(None);
+        }
+        if size > room {
+            return Err(Some(size));
+        }
+        let source = unsafe { GlobalLock(memory) };
+        if source.is_null() {
+            return Err(None);
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(source.cast::<u8>(), size) }.to_vec();
+        unsafe {
+            let _ = GlobalUnlock(memory);
+        }
+        Ok(bytes)
+    }
+
+    fn metafile_bits(metafile: HENHMETAFILE, room: usize) -> Result<Vec<u8>, Option<usize>> {
+        let size = unsafe { GetEnhMetaFileBits(metafile, None) } as usize;
+        if size == 0 {
+            return Err(None);
+        }
+        if size > room {
+            return Err(Some(size));
+        }
+        let mut bytes = vec![0u8; size];
+        if unsafe { GetEnhMetaFileBits(metafile, Some(&mut bytes)) } as usize != size {
+            return Err(None);
+        }
+        Ok(bytes)
+    }
+
+    /// Puts one saved format back. The clipboard is open and owned.
+    fn put_back(format: u32, bytes: &[u8]) -> bool {
+        if format != CF_ENHMETAFILE {
+            return set(format, bytes);
+        }
+        let metafile = unsafe { SetEnhMetaFileBits(bytes) };
+        if metafile.0.is_null() {
+            return false;
+        }
+        if unsafe { SetClipboardData(format, Some(HANDLE(metafile.0))) }.is_ok() {
+            true
+        } else {
+            unsafe {
+                let _ = DeleteEnhMetaFile(Some(metafile));
+            }
+            false
+        }
+    }
+
+    /// Keeps what is on the clipboard out of monitors, Win+V history and
+    /// cloud clipboard, skipping any marker it already carries.
+    fn mark_private(present: &[u32]) -> bool {
+        PRIVACY_FORMATS.iter().all(|name| {
+            let format = unsafe { RegisterClipboardFormatW(*name) };
+            format != 0 && (present.contains(&format) || set(format, &0u32.to_ne_bytes()))
+        })
     }
 
     /// Owns the clipboard with the text as a delayed render, so the target's
@@ -898,13 +1006,10 @@ mod native {
         if unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT) }.is_err() {
             return Err(DeliveryError::Clipboard("could not offer the text"));
         }
-        for name in PRIVACY_FORMATS {
-            let format = unsafe { RegisterClipboardFormatW(name) };
-            if format == 0 || !set(format, &0u32.to_ne_bytes()) {
-                return Err(DeliveryError::Clipboard(
-                    "could not hide the text from history",
-                ));
-            }
+        if !mark_private(&[]) {
+            return Err(DeliveryError::Clipboard(
+                "could not hide the text from history",
+            ));
         }
         Ok(())
     }
@@ -929,9 +1034,15 @@ mod native {
         if allowed {
             if unsafe { EmptyClipboard() }.is_ok() {
                 for (format, bytes) in saved {
-                    if !set(*format, bytes) {
+                    if !put_back(*format, bytes) {
                         tracing::warn!(format, "clipboard format not restored");
                     }
+                }
+                // The user's data is already in history once; restoring it
+                // must not add a second entry.
+                let present: Vec<u32> = saved.iter().map(|(format, _)| *format).collect();
+                if !mark_private(&present) {
+                    tracing::warn!("restored clipboard may reappear in history");
                 }
             }
         } else {
@@ -985,19 +1096,40 @@ mod native {
         }
     }
 
-    /// Writes the text in answer to a render request. `read` marks a real
-    /// request from an app, as opposed to the owner window closing.
-    fn render(read: bool) {
-        let Some(text) = with_published(|state| state.text.clone()) else {
+    /// Who has the clipboard open during `WM_RENDERFORMAT`.
+    fn reader(target: HWND) -> Reader {
+        let Ok(opener) = (unsafe { GetOpenClipboardWindow() }) else {
+            return Reader::Anonymous;
+        };
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(opener, Some(&mut pid as *mut u32)) };
+        Reader::Window {
+            root_is_target: unsafe { GetAncestor(opener, GA_ROOT) } == target,
+            pid,
+        }
+    }
+
+    /// Writes the text in answer to a render request. `reader` is the app
+    /// that asked, or `None` when the owner window is closing.
+    fn render(reader: Option<Reader>) {
+        let Some((text, target_pid)) =
+            with_published(|state| (state.text.clone(), state.target_pid))
+        else {
             return;
         };
         let bytes: Vec<u8> = text.iter().flat_map(|unit| unit.to_ne_bytes()).collect();
         set(CF_UNICODETEXT, &bytes);
         let sequence = unsafe { GetClipboardSequenceNumber() };
+        let by_target = reader.is_some_and(|reader| read_by_target(reader, target_pid));
+        if reader.is_some() && !by_target {
+            // Its read used up the delayed render, so the target's paste
+            // will go unseen and end as NotConfirmed.
+            tracing::info!(?reader, "another app read the transcript first");
+        }
         with_published(|state| {
             state.sequence = sequence;
-            if read {
-                state.reads.push(Instant::now());
+            if by_target && state.read.is_none() {
+                state.read = Some(Instant::now());
             }
         });
     }
@@ -1011,14 +1143,16 @@ mod native {
         match message {
             WM_RENDERFORMAT => {
                 if wparam.0 as u32 == CF_UNICODETEXT {
-                    render(true);
+                    if let Some(target) = with_published(|state| state.target) {
+                        render(Some(reader(target)));
+                    }
                 }
                 LRESULT(0)
             }
             WM_RENDERALLFORMATS => {
                 if unsafe { OpenClipboard(Some(hwnd)) }.is_ok() {
                     if owns_clipboard(hwnd) {
-                        render(false);
+                        render(None);
                     }
                     close();
                 }
@@ -1167,14 +1301,12 @@ mod tests {
 
     #[test]
     fn handle_formats_are_not_snapshotted() {
-        for format in [
-            2, 3, 9, 14, 0x80, 0x82, 0x83, 0x8E, 0x200, 0x2FF, 0x300, 0x3FF,
-        ] {
+        for format in [2, 3, 9, 0x80, 0x82, 0x83, 0x8E, 0x200, 0x2FF, 0x300, 0x3FF] {
             assert!(!snapshot_format(format), "{format:#x}");
         }
-        // CF_TEXT, CF_DIB, CF_UNICODETEXT, CF_HDROP, CF_LOCALE, CF_DIBV5, a
-        // registered format such as "HTML Format".
-        for format in [1, 8, 13, 15, 16, 17, 0xC0A1] {
+        // CF_TEXT, CF_DIB, CF_UNICODETEXT, CF_ENHMETAFILE, CF_HDROP,
+        // CF_LOCALE, CF_DIBV5, a registered format such as "HTML Format".
+        for format in [1, 8, 13, CF_ENHMETAFILE, 15, 16, 17, 0xC0A1] {
             assert!(snapshot_format(format), "{format:#x}");
         }
     }
@@ -1186,44 +1318,31 @@ mod tests {
         assert!(!may_restore(false, 7, 7));
     }
 
-    fn watch(since_chord: u64, last_read: Option<u64>) -> Watch {
+    fn watch(since_chord: u64, read: Option<u64>) -> Watch {
         Watch {
             since_chord: ms(since_chord),
-            last_read: last_read.map(ms),
+            read: read.map(ms),
             ownership_lost: false,
         }
     }
 
     #[test]
-    fn waits_for_the_read_then_a_quiet_period() {
+    fn restores_a_quiet_period_after_the_read() {
         assert_eq!(evaluate(watch(50, None)), Verdict::Wait);
         assert_eq!(evaluate(watch(150, Some(100))), Verdict::Wait);
-        assert_eq!(
-            evaluate(watch(300, Some(100))),
-            Verdict::Restore { pasted: true }
-        );
+        assert_eq!(evaluate(watch(300, Some(100))), Verdict::Restore);
     }
 
     #[test]
-    fn a_later_read_restarts_the_quiet_period() {
-        assert_eq!(evaluate(watch(350, Some(250))), Verdict::Wait);
+    fn a_read_just_before_the_timeout_still_restores() {
+        assert_eq!(evaluate(watch(1600, Some(1450))), Verdict::Wait);
+        assert_eq!(evaluate(watch(1650, Some(1450))), Verdict::Restore);
     }
 
     #[test]
-    fn no_read_gives_up_and_restores() {
+    fn no_read_keeps_the_transcript_on_the_clipboard() {
         assert_eq!(evaluate(watch(1499, None)), Verdict::Wait);
-        assert_eq!(
-            evaluate(watch(1500, None)),
-            Verdict::Restore { pasted: false }
-        );
-    }
-
-    #[test]
-    fn endless_reads_still_restore_at_the_timeout() {
-        assert_eq!(
-            evaluate(watch(8000, Some(7990))),
-            Verdict::Restore { pasted: true }
-        );
+        assert_eq!(evaluate(watch(1500, None)), Verdict::Keep);
     }
 
     #[test]
@@ -1231,8 +1350,37 @@ mod tests {
         let mut lost = watch(100, Some(50));
         lost.ownership_lost = true;
         assert_eq!(evaluate(lost), Verdict::Abandon { pasted: true });
-        lost.last_read = None;
+        lost.read = None;
         assert_eq!(evaluate(lost), Verdict::Abandon { pasted: false });
+    }
+
+    #[test]
+    fn only_the_target_reading_counts_as_a_paste() {
+        let target_pid = 40;
+        assert!(read_by_target(Reader::Anonymous, target_pid));
+        assert!(read_by_target(
+            Reader::Window {
+                root_is_target: false,
+                pid: 40
+            },
+            target_pid
+        ));
+        // Console host: different pid, but its window is the target.
+        assert!(read_by_target(
+            Reader::Window {
+                root_is_target: true,
+                pid: 7
+            },
+            target_pid
+        ));
+        // A clipboard monitor or any other app.
+        assert!(!read_by_target(
+            Reader::Window {
+                root_is_target: false,
+                pid: 99
+            },
+            target_pid
+        ));
     }
 
     fn probe() -> Probe {
@@ -1310,6 +1458,7 @@ mod tests {
         assert_eq!(DeliveryOutcome::Pasted.notice(), None);
         for outcome in [
             DeliveryOutcome::NotConfirmed,
+            DeliveryOutcome::ClipboardTaken,
             DeliveryOutcome::ElevatedTarget,
             DeliveryOutcome::TargetGone,
             DeliveryOutcome::OwnWindow,
