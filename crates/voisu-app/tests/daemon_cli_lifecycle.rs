@@ -5587,6 +5587,50 @@ fn overlay_status_carries_the_delivered_event_while_lifecycle_responses_do_not()
 }
 
 #[test]
+fn overlay_status_confirms_delivery_while_the_recording_is_still_processing() {
+    // The paste lands before diagnostics and the reaper drain finish. The
+    // Overlay must be able to confirm it then, and Completed must not retain
+    // a second event that would flash and announce the confirmation again.
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[("VOISU_TEST_COMPLETION_STALL_MS", "1500")],
+    );
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stop_dir = runtime.path().to_path_buf();
+    let stopping = std::thread::spawn(move || voisu(&stop_dir, "stop"));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let early = loop {
+        let observed = ipc_request(runtime.path(), OVERLAY_STATUS);
+        if observed["state"] == "processing" && observed.get("overlay_event").is_some() {
+            break observed;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no early Overlay event while Processing: {observed}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let event = &early["overlay_event"];
+    assert_eq!(event["outcome"], "delivered", "{early}");
+    assert_eq!(event["message"], "Delivered", "{early}");
+    assert_eq!(
+        event["correlation_id"], early["evidence"]["correlation_id"],
+        "the early event names the Recording it confirms: {early}"
+    );
+
+    let stopped = stopping.join().unwrap();
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+    let idle = ipc_request(runtime.path(), OVERLAY_STATUS);
+    assert_eq!(idle["state"], "idle", "{idle}");
+    assert_eq!(
+        idle["overlay_event"], *event,
+        "Completed must keep the early event, not retain a second one"
+    );
+}
+
+#[test]
 fn overlay_status_reports_a_startup_failure_without_touching_lifecycle_responses() {
     let runtime = TempDir::new().unwrap();
     let _daemon = Daemon::start_with_env(
@@ -6000,6 +6044,14 @@ fn unavailable_direct_delivery_reports_that_the_transcript_is_on_the_clipboard()
         "{history}"
     );
     assert_eq!(record["delivery_count"], 1, "{history}");
+    // The Overlay shows a calm Copied state, not a check mark or a failure.
+    let observed = ipc_request(runtime.path(), OVERLAY_STATUS);
+    assert_eq!(observed["overlay_event"]["outcome"], "copied", "{observed}");
+    assert_eq!(
+        observed["overlay_event"]["message"],
+        "Direct Delivery unavailable; Transcript is on the clipboard",
+        "{observed}"
+    );
 }
 
 #[test]

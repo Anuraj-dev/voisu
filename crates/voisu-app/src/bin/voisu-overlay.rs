@@ -27,7 +27,7 @@ use voisu_app::overlay::{
     connect_within, edge_falloff_alpha, fetch_status, limit_notification_body, limit_warning_class,
     limit_warning_from_response, notification_rung_choice, phase_glyph, poll_tick,
     read_until_eof_within, recording_bar_height, recording_bar_rgb, recording_identity,
-    recording_remaining, resting_floor, sweep_brightness, write_within,
+    recording_remaining, resting_floor, status_poll_period, sweep_brightness, write_within,
 };
 use voisu_core::{Command, Request, Response, socket_path};
 
@@ -246,6 +246,7 @@ const fn overlay_phase_label(phase: OverlayPhase) -> &'static str {
         OverlayPhase::Loading => "loading",
         OverlayPhase::Unavailable => "unavailable",
         OverlayPhase::NoSpeech => "no_speech",
+        OverlayPhase::Copied => "copied",
     }
 }
 
@@ -388,6 +389,7 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
          .capsule.loading .state-label, .capsule.loading .meter { color: #8FB4FF; }
          .capsule.unavailable .state-label, .capsule.unavailable .meter { color: #FFB454; }
          .capsule.nospeech .state-label, .capsule.nospeech .meter { color: #FFB454; }
+         .capsule.copied .state-label { color: #FFB454; }
          .capsule.limitwarn { border: 1px solid rgba(255, 138, 138, 0.9); box-shadow: 0 0 8px rgba(255, 138, 138, 0.35); }",
     );
     capsule.add_css_class("capsule");
@@ -475,7 +477,9 @@ fn install_surface_feedback(
     let level_worker = Rc::new(RefCell::new(None::<LevelWorker>));
     let animation = MeterAnimation::default();
     let trigger_latch = Rc::new(RefCell::new(TriggerRepeatLatch::default()));
-    gtk::glib::timeout_add_local(STATUS_POLL_PERIOD, move || {
+    let cadence = Rc::new(Cell::new(STATUS_POLL_PERIOD));
+    let tick_cadence = Rc::clone(&cadence);
+    poll_at_cadence(cadence, move || {
         if switched.get() {
             // A genuine surface-creation failure handed feedback to the
             // notification backend; stop driving the retired window.
@@ -489,6 +493,7 @@ fn install_surface_feedback(
         let Some(observation) = status_worker.take_latest() else {
             return gtk::glib::ControlFlow::Continue;
         };
+        tick_cadence.set(status_poll_period(observation.response.as_ref()));
         let now = Instant::now();
         // Status I/O runs on StatusWorker. The GTK tick only takes the newest
         // finished round trip, so a stalled daemon cannot freeze the loop.
@@ -644,6 +649,36 @@ fn install_surface_feedback(
     });
 }
 
+/// Runs `tick` on the GTK main loop at the period last stored in `cadence`.
+/// A glib timeout's interval is fixed once added, so when the tick asks for a
+/// different cadence (fast while Processing, slow otherwise) the current
+/// source is retired and an identical one is re-added at the new period.
+fn poll_at_cadence(
+    cadence: Rc<Cell<Duration>>,
+    tick: impl FnMut() -> gtk::glib::ControlFlow + 'static,
+) {
+    let tick: Rc<RefCell<dyn FnMut() -> gtk::glib::ControlFlow>> = Rc::new(RefCell::new(tick));
+    schedule_at_cadence(cadence, tick);
+}
+
+fn schedule_at_cadence(
+    cadence: Rc<Cell<Duration>>,
+    tick: Rc<RefCell<dyn FnMut() -> gtk::glib::ControlFlow>>,
+) {
+    let period = cadence.get();
+    gtk::glib::timeout_add_local(period, move || {
+        let flow = (tick.borrow_mut())();
+        if matches!(flow, gtk::glib::ControlFlow::Break) {
+            return gtk::glib::ControlFlow::Break;
+        }
+        if cadence.get() != period {
+            schedule_at_cadence(Rc::clone(&cadence), Rc::clone(&tick));
+            return gtk::glib::ControlFlow::Break;
+        }
+        gtk::glib::ControlFlow::Continue
+    });
+}
+
 /// Drive the desktop-notification rung from a plain (non-GTK) poll loop.
 /// `org.freedesktop.Notifications` needs no GTK display, so this backend never
 /// initializes GTK — the caller reaches it directly for X11/Unknown sessions
@@ -654,8 +689,9 @@ fn run_notification_feedback(selection: FeedbackSelection) -> i32 {
     let mut tick = NotificationTickState::default();
     loop {
         let observation = read_status();
+        let period = status_poll_period(observation.as_ref());
         notification_tick(&mut controller, &mut tick, &notifier, observation);
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(period);
     }
 }
 
@@ -676,9 +712,12 @@ fn install_notification_feedback(application: &gtk::Application) {
     let status_worker = StatusWorker::spawn();
     let controller = Rc::new(RefCell::new(PresentationController::default()));
     let tick = Rc::new(RefCell::new(NotificationTickState::default()));
-    gtk::glib::timeout_add_local(STATUS_POLL_PERIOD, move || {
+    let cadence = Rc::new(Cell::new(STATUS_POLL_PERIOD));
+    let tick_cadence = Rc::clone(&cadence);
+    poll_at_cadence(cadence, move || {
         let _hold = &hold;
         if let Some(observation) = status_worker.take_latest() {
+            tick_cadence.set(status_poll_period(observation.response.as_ref()));
             notification_tick(
                 &mut controller.borrow_mut(),
                 &mut tick.borrow_mut(),
@@ -1007,6 +1046,7 @@ fn render_surface(
         "loading",
         "unavailable",
         "nospeech",
+        "copied",
         LIMIT_WARNING_CLASS,
     ] {
         capsule.remove_css_class(class);
@@ -1019,6 +1059,7 @@ fn render_surface(
         OverlayPhase::Loading => "loading",
         OverlayPhase::Unavailable => "unavailable",
         OverlayPhase::NoSpeech => "nospeech",
+        OverlayPhase::Copied => "copied",
         OverlayPhase::Hidden => "",
     };
     if !class.is_empty() {

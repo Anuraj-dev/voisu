@@ -387,6 +387,17 @@ enum ActorMessage {
         correlation_id: String,
         reply: oneshot::Sender<bool>,
     },
+    /// The Processing Recording's Delivery landed. The actor retains its
+    /// Overlay event now, while diagnostics and the provider reaper drain are
+    /// still running, so the Overlay can confirm the paste at once. The
+    /// `Completed` that follows recognizes the event by correlation ID and
+    /// does not retain a second one.
+    DeliveryLanded {
+        id: u64,
+        correlation_id: String,
+        method: DeliveryMethod,
+        truncated: bool,
+    },
     Completed(Box<Completion>),
     Recovered(u64),
     ReplayCompleted(Box<ReplayCompletion>),
@@ -1462,6 +1473,7 @@ async fn actor_loop(
                                 daemon_instance,
                                 overlay_outcome(&failure.error),
                                 failure.error.public_message().to_owned(),
+                                None,
                             );
                             let _ = reply.send(response);
                             if recovering {
@@ -1557,9 +1569,35 @@ async fn actor_loop(
                 );
                 let _ = reply.send(authorized);
             }
+            ActorMessage::DeliveryLanded {
+                id,
+                correlation_id,
+                method,
+                truncated,
+            } => {
+                // Same check as AuthorizeDelivery: only the Recording still
+                // Processing may publish, so a late message from a superseded
+                // Recording cannot overwrite a newer outcome.
+                if matches!(
+                    &state,
+                    ActorState::Processing(evidence)
+                        if evidence.recording_id == id && evidence.correlation_id == correlation_id
+                ) {
+                    let (outcome, message) = delivered_overlay_event(Some(method), truncated);
+                    retain_overlay_event(
+                        &mut next_overlay_event_id,
+                        &mut last_overlay_event,
+                        daemon_instance,
+                        outcome,
+                        message,
+                        Some(correlation_id),
+                    );
+                }
+            }
             ActorMessage::Completed(completed) => {
                 let truncated = completed.evidence.truncated_by.is_some();
                 let delivery_method = completed.evidence.delivery_method;
+                let correlation_id = completed.evidence.correlation_id.clone();
                 validator = Some(completed.validator);
                 delivery = Some(completed.delivery);
                 if matches!(&state, ActorState::Processing(evidence) if evidence.recording_id == completed.id)
@@ -1600,18 +1638,24 @@ async fn actor_loop(
                                 },
                                 Some(completed.evidence),
                             );
-                            retain_overlay_event(
-                                &mut next_overlay_event_id,
-                                &mut last_overlay_event,
-                                daemon_instance,
-                                OverlayOutcome::Delivered,
-                                if truncated {
-                                    "Delivered, but the Recording was truncated; check the end"
-                                        .to_owned()
-                                } else {
-                                    "Delivered".to_owned()
-                                },
-                            );
+                            // DeliveryLanded normally retained this
+                            // Recording's event already; a second id would
+                            // flash and announce the confirmation twice.
+                            let announced = last_overlay_event.as_ref().is_some_and(|event| {
+                                event.correlation_id.as_deref() == Some(correlation_id.as_str())
+                            });
+                            if !announced {
+                                let (outcome, message) =
+                                    delivered_overlay_event(delivery_method, truncated);
+                                retain_overlay_event(
+                                    &mut next_overlay_event_id,
+                                    &mut last_overlay_event,
+                                    daemon_instance,
+                                    outcome,
+                                    message,
+                                    Some(correlation_id),
+                                );
+                            }
                             response
                         }
                         Err(error) => {
@@ -1637,6 +1681,7 @@ async fn actor_loop(
                                 daemon_instance,
                                 overlay_outcome(&error),
                                 error.public_message().to_owned(),
+                                Some(correlation_id),
                             );
                             response
                         }
@@ -1993,14 +2038,63 @@ fn retain_overlay_event(
     instance: u64,
     outcome: OverlayOutcome,
     message: String,
+    correlation_id: Option<String>,
 ) {
     *last = Some(OverlayEvent {
         id: *next_id,
         instance,
         outcome,
         message,
+        correlation_id,
     });
     *next_id += 1;
+}
+
+/// The Overlay event for a Recording whose Delivery succeeded: a check mark
+/// when the Transcript was pasted, a calm Copied state when it only reached the
+/// clipboard and the user still has to paste.
+fn delivered_overlay_event(
+    method: Option<DeliveryMethod>,
+    truncated: bool,
+) -> (OverlayOutcome, String) {
+    let (outcome, message) = match (method, truncated) {
+        (Some(DeliveryMethod::ClipboardFallback), true) => (
+            OverlayOutcome::Copied,
+            "Direct Delivery unavailable; Transcript is on the clipboard, \
+             but the Recording was truncated; check the end",
+        ),
+        (Some(DeliveryMethod::ClipboardFallback), false) => (
+            OverlayOutcome::Copied,
+            "Direct Delivery unavailable; Transcript is on the clipboard",
+        ),
+        (_, true) => (
+            OverlayOutcome::Delivered,
+            "Delivered, but the Recording was truncated; check the end",
+        ),
+        _ => (OverlayOutcome::Delivered, "Delivered"),
+    };
+    (outcome, message.to_owned())
+}
+
+/// Tells the actor this Recording's Delivery landed so the Overlay can confirm
+/// it before the slow tail of processing. Sent only once nothing after it can
+/// fail the Recording. A closed actor means the daemon is shutting down, and
+/// `Completed` still retains the event if this was lost.
+async fn announce_delivery(
+    actor: &mpsc::Sender<ActorMessage>,
+    id: u64,
+    correlation_id: &str,
+    method: DeliveryMethod,
+    truncated: bool,
+) {
+    let _ = actor
+        .send(ActorMessage::DeliveryLanded {
+            id,
+            correlation_id: correlation_id.to_owned(),
+            method,
+            truncated,
+        })
+        .await;
 }
 
 /// A value unique to this daemon process launch, used to scope observer event
@@ -2533,6 +2627,7 @@ async fn process_recording(
                         correlation_id: correlation_id.clone(),
                     };
                     let outcome = authorized.deliver(Transcript(text.clone())).await?;
+                    let method = outcome.method;
                     local_routing::apply_local_delivery_evidence(
                         &mut evidence,
                         outcome,
@@ -2543,6 +2638,14 @@ async fn process_recording(
                     local_routing::finish_delivery(&rec_id, &text, recovery).map_err(|error| {
                         BoundaryError::new(BoundaryKind::Delivery, error.message())
                     })?;
+                    announce_delivery(
+                        &actor,
+                        id,
+                        &correlation_id,
+                        method,
+                        evidence.truncated_by.is_some(),
+                    )
+                    .await;
                     final_transcript = Some(text);
                     return Ok(());
                 }
@@ -2754,6 +2857,14 @@ async fn process_recording(
         evidence.stop_to_finalized_ms = Some(timings.stop_to_finalized_ms);
         evidence.stop_to_delivered_ms = Some(timings.stop_to_delivered_ms);
         evidence.stages.push(LifecycleStage::DeliveryCompleted);
+        announce_delivery(
+            &actor,
+            id,
+            &correlation_id,
+            delivery_outcome.method,
+            evidence.truncated_by.is_some(),
+        )
+        .await;
         Ok(())
     }
     .await;
@@ -3041,6 +3152,12 @@ async fn supervise_recording(
     // completion before acknowledging: Completed alone permits the Idle
     // transition, so a new Recording cannot overlap this Recording's blocking
     // cleanup even when one bounded drain pass expires.
+    let completion_stall = env_millis("VOISU_TEST_COMPLETION_STALL_MS");
+    if controlled && !completion_stall.is_zero() {
+        // Test hook: a slow tail after Delivery (diagnostics, reaper drain),
+        // during which the Overlay must already show the outcome.
+        tokio::time::sleep(completion_stall).await;
+    }
     reaper.drain_credential_lane().await;
     reaper.drain_to_completion(RECOVERY_ABORT_DEADLINE).await;
     let _ = actor

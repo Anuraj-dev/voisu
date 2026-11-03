@@ -614,6 +614,10 @@ pub struct LevelFrame {
 #[serde(rename_all = "snake_case")]
 pub enum OverlayOutcome {
     Delivered,
+    /// Direct Delivery was unavailable, so the Transcript is only on the
+    /// clipboard: a calm notice that the user still has to paste, not a
+    /// failure.
+    Copied,
     QualityFailure,
     CaptureFailure,
     EmptyRecording,
@@ -642,6 +646,12 @@ pub struct OverlayEvent {
     pub instance: u64,
     pub outcome: OverlayOutcome,
     pub message: String,
+    /// The correlation ID of the Recording this outcome belongs to. It lets an
+    /// observer show a Delivery the moment it lands, while the daemon still
+    /// reports Processing, without mistaking a previous Recording's retained
+    /// event for it. Absent from a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
 }
 
 impl Response {
