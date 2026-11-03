@@ -10,7 +10,7 @@ instead of dropping it.
 | | Windows | Linux |
 | --- | --- | --- |
 | Systems | Windows 10 / 11, x64 | Fedora, Arch, Debian/Ubuntu (KDE Plasma, GNOME, Hyprland, X11 desktops) |
-| Trigger Key | Hold `Ctrl`+`Win` to talk; double-tap for hands-free; `Esc` cancels | Press your Trigger Key to start, press again to stop |
+| Trigger Key | Hold `Ctrl`+`Win` (or your own key) to talk; double-tap for hands-free; `Esc` cancels | Press your Trigger Key to start, press again to stop |
 | Transcription | Cloud (Deepgram + Groq) | Cloud (Deepgram + Groq), or Local on your own GPU or CPU |
 | Runs as | Tray app with a settings window | systemd **user** services and the `voisu` CLI |
 | Install | Per-user installer, self-updating | COPR, AUR, signed apt repository |
@@ -34,7 +34,10 @@ choose *More info → Run anyway*.
 On first launch the settings window opens. Paste your Groq and Deepgram keys
 and choose *Validate & save*. Then hold `Ctrl`+`Win`, speak, and let go.
 
-- **Settings window** (tray → *Settings…*): provider keys, *Paste
+- **Trigger Key:** `Ctrl`+`Win` by default. Pick a preset in settings
+  (`Ctrl`+`` ` ``, Right `Ctrl`, Caps Lock, `Ctrl`+`Shift`+`Space`) or choose
+  *Custom…* and press your own shortcut.
+- **Settings window** (tray → *Settings…*): provider keys, Trigger Key, *Paste
   automatically* (off = clipboard only), overlay size, boost words, start at
   login, and the last Transcript with a Copy button.
 - **Tray menu:** *Preview overlay*, *Test paste (in 3 s)*, *Start at login*,
