@@ -2092,7 +2092,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voisu-app"
-version = "0.68.0"
+version = "0.69.0"
 dependencies = [
  "futures-util",
  "gtk4",
@@ -2116,7 +2116,7 @@ dependencies = [
 
 [[package]]
 name = "voisu-cloud"
-version = "0.68.0"
+version = "0.69.0"
 dependencies = [
  "bytes",
  "flacenc",
@@ -2136,7 +2136,7 @@ dependencies = [
 
 [[package]]
 name = "voisu-core"
-version = "0.68.0"
+version = "0.69.0"
 dependencies = [
  "libc",
  "regex",
