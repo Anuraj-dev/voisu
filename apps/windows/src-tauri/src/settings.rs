@@ -8,8 +8,7 @@ use std::path::Path;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 
-/// The only Trigger Key the hook supports today.
-pub const DEFAULT_HOTKEY: &str = "Ctrl+Win";
+use crate::trigger_key::TriggerChord;
 
 /// How large the recording Overlay draws. Medium is the DESIGN.md capsule.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,9 +38,10 @@ pub struct Settings {
     /// Later the user's own choice (stored by Windows in HKCU Run) wins, so a
     /// re-save never re-enables what they turned off.
     pub autostart_default_applied: bool,
-    /// The Trigger Key chord. Stored so a later release can offer a choice;
-    /// the hook only recognises Ctrl+Win.
-    pub hotkey: String,
+    /// The Trigger Key, in its written form (`Ctrl+Win`). A value that does
+    /// not parse or is no longer allowed falls back to Ctrl+Win.
+    #[serde(deserialize_with = "lenient_trigger_key")]
+    pub hotkey: TriggerChord,
     /// Paste the Transcript into the focused app. Off, it only goes to the
     /// clipboard and Last transcript.
     #[serde(deserialize_with = "lenient_on")]
@@ -78,6 +78,20 @@ fn lenient_terms<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Strin
     Ok(terms.unwrap_or_default())
 }
 
+/// [`lenient`] for the Trigger Key, logged so a hand edit that fell back is
+/// visible in the local log.
+fn lenient_trigger_key<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<TriggerChord, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(
+        serde_json::from_value(value.clone()).unwrap_or_else(|error| {
+            tracing::warn!(%value, %error, "Trigger Key setting not usable; using Ctrl+Win");
+            TriggerChord::default()
+        }),
+    )
+}
+
 /// [`lenient`] for a toggle whose default is on.
 fn lenient_on<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
     let value = serde_json::Value::deserialize(deserializer)?;
@@ -88,7 +102,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             autostart_default_applied: false,
-            hotkey: DEFAULT_HOTKEY.to_owned(),
+            hotkey: TriggerChord::default(),
             auto_paste: true,
             overlay_size: OverlaySize::Medium,
             boost_words: Vec::new(),
@@ -176,7 +190,34 @@ mod tests {
         fs::write(&path, br#"{"autostart_default_applied": true}"#).unwrap();
         let settings = Settings::load(&path);
         assert!(settings.autostart_default_applied);
-        assert_eq!(settings.hotkey, DEFAULT_HOTKEY);
+        assert_eq!(settings.hotkey, TriggerChord::CTRL_WIN);
+    }
+
+    #[test]
+    fn a_chosen_trigger_key_round_trips_in_its_written_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let settings = Settings {
+            hotkey: "Ctrl+`".parse().unwrap(),
+            ..Settings::default()
+        };
+        settings.save(&path).unwrap();
+        let json = fs::read_to_string(&path).unwrap();
+        assert!(json.contains(r#""hotkey": "Ctrl+`""#), "{json}");
+        assert_eq!(Settings::load(&path), settings);
+    }
+
+    #[test]
+    fn an_unusable_trigger_key_falls_back_to_ctrl_win_alone() {
+        for value in [r#""Ctrl+Hyper""#, r#""Win""#, r#""Ctrl+C""#, "7", "null"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("settings.json");
+            let json = format!(r#"{{"auto_paste": false, "hotkey": {value}}}"#);
+            fs::write(&path, json).unwrap();
+            let settings = Settings::load(&path);
+            assert_eq!(settings.hotkey, TriggerChord::CTRL_WIN, "{value}");
+            assert!(!settings.auto_paste, "{value} wiped another setting");
+        }
     }
 
     #[test]

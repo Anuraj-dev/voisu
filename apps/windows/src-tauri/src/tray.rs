@@ -2,6 +2,7 @@
 //! Preview overlay, Test paste, Start at login, Quit. A downloaded update adds
 //! a dot to the icon and an "Update to vX" item under the status line.
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tauri::image::Image;
@@ -23,17 +24,20 @@ const MENU_UPDATE: &str = "update";
 /// Under the status line, above the first separator.
 const UPDATE_POSITION: usize = 1;
 
-pub fn status_text(keys_ready: bool) -> &'static str {
+pub fn status_text(keys_ready: bool, trigger: &str) -> String {
     if keys_ready {
-        "Voisu: ready (hold Ctrl+Win to dictate)"
+        format!("Voisu: ready (hold {trigger} to dictate)")
     } else {
-        "Voisu: setup needed (add your API keys)"
+        "Voisu: setup needed (add your API keys)".to_owned()
     }
 }
 
 /// Menu items the app updates after launch.
 pub struct TrayHandles {
     status: MenuItem<Wry>,
+    /// The Trigger Key's label for the ready line. Never held across a menu
+    /// call.
+    trigger: Mutex<String>,
     autostart: CheckMenuItem<Wry>,
     menu: Menu<Wry>,
     /// Kept out of the menu until an update is ready.
@@ -44,9 +48,16 @@ pub struct TrayHandles {
 
 impl TrayHandles {
     pub fn set_ready(&self, keys_ready: bool) {
-        if let Err(error) = self.status.set_text(status_text(keys_ready)) {
+        let trigger = self.trigger.lock().unwrap().clone();
+        if let Err(error) = self.status.set_text(status_text(keys_ready, &trigger)) {
             tracing::warn!(%error, "tray status update failed");
         }
+    }
+
+    /// Names a newly chosen Trigger Key in the ready line.
+    pub fn set_trigger(&self, label: String, keys_ready: bool) {
+        *self.trigger.lock().unwrap() = label;
+        self.set_ready(keys_ready);
     }
 
     /// Shows a transient engine state such as "recording".
@@ -130,8 +141,19 @@ fn with_dot(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
     out
 }
 
-pub fn build(app: &AppHandle, keys_ready: bool, autostart: bool) -> tauri::Result<TrayHandles> {
-    let status = MenuItem::with_id(app, "status", status_text(keys_ready), false, None::<&str>)?;
+pub fn build(
+    app: &AppHandle,
+    keys_ready: bool,
+    autostart: bool,
+    trigger: String,
+) -> tauri::Result<TrayHandles> {
+    let status = MenuItem::with_id(
+        app,
+        "status",
+        status_text(keys_ready, &trigger),
+        false,
+        None::<&str>,
+    )?;
     let settings = MenuItem::with_id(app, MENU_SETTINGS, "Settings…", true, None::<&str>)?;
     let preview = MenuItem::with_id(
         app,
@@ -215,6 +237,7 @@ pub fn build(app: &AppHandle, keys_ready: bool, autostart: bool) -> tauri::Resul
     let icon = builder.build(app)?;
     Ok(TrayHandles {
         status,
+        trigger: Mutex::new(trigger),
         autostart,
         menu,
         update,
@@ -229,8 +252,16 @@ mod tests {
 
     #[test]
     fn status_line_tells_ready_from_setup_needed() {
-        assert!(status_text(false).contains("setup needed"));
-        assert!(status_text(true).contains("ready"));
+        assert!(status_text(false, "Ctrl+Win").contains("setup needed"));
+        assert!(status_text(true, "Ctrl+Win").contains("ready"));
+    }
+
+    #[test]
+    fn ready_line_names_the_chosen_trigger_key() {
+        assert_eq!(
+            status_text(true, "Ctrl+`"),
+            "Voisu: ready (hold Ctrl+` to dictate)"
+        );
     }
 
     #[test]

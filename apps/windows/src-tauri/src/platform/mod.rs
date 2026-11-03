@@ -1,5 +1,5 @@
 //! Windows implementations of voisu-core's platform seams: the secret
-//! store, microphone capture, the Ctrl+Win keyboard hook and delivery into
+//! store, microphone capture, the Trigger Key keyboard hook and delivery into
 //! the focused app.
 
 pub mod capture;

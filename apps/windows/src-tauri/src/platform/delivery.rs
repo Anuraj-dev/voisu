@@ -970,7 +970,9 @@ mod native {
                     wScan: unsafe { MapVirtualKeyW(u32::from(key.vk), MAPVK_VK_TO_VSC) } as u16,
                     dwFlags: flags,
                     time: 0,
-                    dwExtraInfo: 0,
+                    // Tagged so the Trigger Key hook never takes a pasted
+                    // key for the user's own.
+                    dwExtraInfo: crate::chord::MASK_TAG,
                 },
             },
         }
