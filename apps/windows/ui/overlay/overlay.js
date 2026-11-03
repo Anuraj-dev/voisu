@@ -24,6 +24,10 @@ const ERROR_HOLD_MS = 3500;
 // state is told by shape and position, not colour alone.
 const HANDS_FREE_RGB = '101, 214, 160';
 const HANDS_FREE_SLOTS = 3;
+// Width of the medium overlay window, capsule plus glow room (overlay.rs
+// CAPSULE_WIDTH + 2 * GLOW_PAD). The native side sizes the window for the
+// chosen Overlay size; the page scales everything by the ratio.
+const BASE_WIDTH = 296;
 
 const LABELS = {
   recording: 'Recording',
@@ -45,16 +49,27 @@ let frame = 0;
 let lastFrame = 0;
 let sweepStart = 0;
 let errorTimer = 0;
+let scale = 1;
 
+function fitScale() {
+  const next = window.innerWidth / BASE_WIDTH;
+  scale = Number.isFinite(next) && next > 0 ? next : 1;
+  document.documentElement.style.setProperty('--s', String(scale));
+}
+
+// Scaled CSS sizes are fractional, so the backing store follows the exact
+// layout box (not the integer clientWidth) to stay one texel per device pixel.
 function fitCanvas() {
   const dpr = window.devicePixelRatio || 1;
-  const width = Math.round(canvas.clientWidth * dpr);
-  const height = Math.round(canvas.clientHeight * dpr);
+  const box = canvas.getBoundingClientRect();
+  const width = Math.round(box.width * dpr);
+  const height = Math.round(box.height * dpr);
   if (canvas.width !== width || canvas.height !== height) {
     canvas.width = width;
     canvas.height = height;
   }
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.setTransform(width / box.width || dpr, 0, 0, height / box.height || dpr, 0, 0);
+  return box;
 }
 
 // Half-sine falloff: 0.45 at the ends, 1.0 at the centre.
@@ -78,18 +93,17 @@ function sweepBrightness(i, now) {
 }
 
 function draw(now) {
-  fitCanvas();
-  const width = canvas.clientWidth;
-  const height = canvas.clientHeight;
+  const { width, height } = fitCanvas();
   ctx.clearRect(0, 0, width, height);
 
-  const barWidth = (width - GAP * (BARS - 1)) / BARS;
+  const gap = GAP * scale;
+  const barWidth = (width - gap * (BARS - 1)) / BARS;
   const drawable = height - 2;
   const floor = Math.max(0.1 * drawable, 1.5);
   const first = state === 'handsFree' ? HANDS_FREE_SLOTS : 0;
 
   if (state === 'handsFree') {
-    const r = 3.5;
+    const r = 3.5 * scale;
     ctx.fillStyle = `rgb(${HANDS_FREE_RGB})`;
     ctx.beginPath();
     ctx.arc(r + 1, height / 2, r, 0, 2 * Math.PI);
@@ -104,7 +118,7 @@ function draw(now) {
     } else {
       barHeight = floor + barLevel(i) * (drawable - floor);
     }
-    const x = i * (barWidth + GAP);
+    const x = i * (barWidth + gap);
     const y = (height - barHeight) / 2;
     ctx.fillStyle = `rgba(${BAR_RGB}, ${alpha})`;
     ctx.beginPath();
@@ -184,6 +198,14 @@ function onLevel(level) {
   history.unshift(smoothed);
   requestDraw();
 }
+
+fitScale();
+// The native side resizes the window when the capsule is shown at another
+// Overlay size, or moves it to a monitor with another DPI.
+window.addEventListener('resize', () => {
+  fitScale();
+  if (state === 'recording' || state === 'handsFree' || state === 'processing') requestDraw();
+});
 
 listen('recording-state', ({ payload }) => setState(payload.state, payload.message));
 listen('audio-level', ({ payload }) => onLevel(payload.level));

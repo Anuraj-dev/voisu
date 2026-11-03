@@ -16,13 +16,16 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Listener, Manager, WebviewUrl, WebviewWindowBuilder};
 
+use crate::settings::OverlaySize;
+
 pub const OVERLAY_WINDOW: &str = "overlay";
 /// W2 → W4 contract: emitted on every Recording lifecycle change.
 pub const RECORDING_STATE: &str = "recording-state";
 /// W2 → W4 contract: at most 30 Hz, only while recording or hands-free.
 pub const AUDIO_LEVEL: &str = "audio-level";
 
-/// DESIGN.md capsule, in logical pixels.
+/// DESIGN.md capsule at the medium size, in logical pixels. The page scales
+/// itself from the window width it is given (overlay.js `BASE_WIDTH`).
 const CAPSULE_WIDTH: f64 = 280.0;
 const CAPSULE_HEIGHT: f64 = 64.0;
 /// Transparent room around the capsule for the error state's 8 px glow.
@@ -130,14 +133,16 @@ pub struct Rect {
 }
 
 /// Where the overlay window goes on a monitor: centred horizontally, with the
-/// capsule's bottom edge `BOTTOM_MARGIN` above the work area. `scale` is the
-/// monitor's effective DPI / 96.
-pub fn placement(work: Rect, scale: f64) -> Rect {
-    let px = |logical: f64| (logical * scale).round() as i32;
-    let width = px(CAPSULE_WIDTH + 2.0 * GLOW_PAD);
-    let height = px(CAPSULE_HEIGHT + 2.0 * GLOW_PAD);
+/// capsule's bottom edge `BOTTOM_MARGIN` above the work area. `dpi_scale` is
+/// the monitor's effective DPI / 96. The capsule and its glow room grow with
+/// `size`; the margin does not.
+pub fn placement(work: Rect, dpi_scale: f64, size: OverlaySize) -> Rect {
+    let px = |logical: f64| (logical * dpi_scale).round() as i32;
+    let s = size.scale();
+    let width = px((CAPSULE_WIDTH + 2.0 * GLOW_PAD) * s);
+    let height = px((CAPSULE_HEIGHT + 2.0 * GLOW_PAD) * s);
     let left = work.left + (work.right - work.left - width) / 2;
-    let bottom = work.bottom - px(BOTTOM_MARGIN - GLOW_PAD);
+    let bottom = work.bottom - px(BOTTOM_MARGIN - GLOW_PAD * s);
     Rect {
         left,
         top: bottom - height,
@@ -158,6 +163,24 @@ pub fn preview_level(seconds: f64) -> f32 {
         1.0
     };
     (syllable * phrase * pause).clamp(0.0, 1.0) as f32
+}
+
+/// The size the next show places the capsule at. Read on the main thread at
+/// each hidden → visible edge, so a change applies from the next Recording.
+static SIZE: Mutex<OverlaySize> = Mutex::new(OverlaySize::Medium);
+
+pub fn set_size(size: OverlaySize) {
+    *SIZE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = size;
+}
+
+/// Only the Windows placement reads it.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn size() -> OverlaySize {
+    *SIZE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// The app's one [`Presenter`]. It is only touched on the main thread, so
@@ -348,6 +371,21 @@ fn play_preview(app: &AppHandle, token: u64) -> bool {
     state(RecordingState::Idle)
 }
 
+/// Shows the capsule at the size just chosen: re-places a preview already
+/// on screen, or starts one. A real Recording on screen keeps its size until
+/// it ends.
+pub fn preview_size(app: &AppHandle) {
+    if !preview_gate().running {
+        return preview(app);
+    }
+    on_main_thread(app, |app| {
+        let previewing = preview_gate().running && presenter(app).is_visible();
+        if previewing {
+            apply(app, Step::Show { place: true });
+        }
+    });
+}
+
 /// Tray diagnostic: plays recording (~3 s of fake levels) → processing (~1 s)
 /// → idle through the same events W2 emits. It does nothing while the capsule
 /// is already up (a real Recording) or another preview runs, and stops at
@@ -384,7 +422,7 @@ mod native {
         WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
     };
 
-    use super::{Rect, placement};
+    use super::{Rect, placement, size};
 
     pub fn show(window: &WebviewWindow, place: bool) {
         let Ok(hwnd) = window.hwnd() else { return };
@@ -493,6 +531,7 @@ mod native {
                     bottom: work.bottom,
                 },
                 f64::from(dpi_x) / 96.0,
+                size(),
             ))
         }
     }
@@ -596,7 +635,7 @@ mod tests {
             bottom: 1040,
         };
         assert_eq!(
-            placement(work, 1.0),
+            placement(work, 1.0, OverlaySize::Medium),
             Rect {
                 left: 812,
                 top: 944,
@@ -611,10 +650,35 @@ mod tests {
             right: 0,
             bottom: 1392,
         };
-        let r = placement(left_monitor, 1.5);
+        let r = placement(left_monitor, 1.5, OverlaySize::Medium);
         assert_eq!((r.right - r.left, r.bottom - r.top), (444, 120));
         assert_eq!(r.left - left_monitor.left, left_monitor.right - r.right);
         assert_eq!(left_monitor.bottom - r.bottom, 24);
+    }
+
+    #[test]
+    fn sizes_scale_the_window_but_keep_the_capsule_margin() {
+        let work = Rect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        for (size, (w, h)) in [
+            (OverlaySize::Small, (237, 64)),
+            (OverlaySize::Large, (370, 100)),
+        ] {
+            let r = placement(work, 1.0, size);
+            assert_eq!((r.right - r.left, r.bottom - r.top), (w, h), "{size:?}");
+            let (left_gap, right_gap) = (r.left - work.left, work.right - r.right);
+            assert!((left_gap - right_gap).abs() <= 1, "{size:?} stays centred");
+            // The glow room scales too, so the capsule edge stays 24 px up.
+            let glow = (GLOW_PAD * size.scale()).round() as i32;
+            assert_eq!(work.bottom - (r.bottom - glow), 24, "{size:?}");
+        }
+        // 125% DPI and large: physical pixels, still bottom-centred.
+        let r = placement(work, 1.25, OverlaySize::Large);
+        assert_eq!((r.right - r.left, r.bottom - r.top), (463, 125));
     }
 
     #[test]

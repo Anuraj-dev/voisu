@@ -151,6 +151,14 @@ pub fn deliver(
     }
 }
 
+/// Puts `text` on the clipboard and sends no keystroke, for auto-paste off:
+/// the user pastes it themselves, so nothing is restored afterwards. It is
+/// kept out of clipboard history and monitors exactly like a paste.
+/// Call it off the main thread; it waits behind any delivery in progress.
+pub fn copy(text: &str) -> Result<(), DeliveryError> {
+    native::copy(text)
+}
+
 // ---- Paste chord ----
 
 const VK_SHIFT: u16 = 0x10;
@@ -522,6 +530,10 @@ mod native {
     ) -> Result<DeliveryOutcome, DeliveryError> {
         Err(DeliveryError::Unsupported)
     }
+
+    pub fn copy(_text: &str) -> Result<(), DeliveryError> {
+        Err(DeliveryError::Unsupported)
+    }
 }
 
 #[cfg(windows)]
@@ -651,6 +663,46 @@ mod native {
         }
         PUBLISHED.with(|cell| cell.borrow_mut().take());
         result
+    }
+
+    pub fn copy(text: &str) -> Result<(), DeliveryError> {
+        // Queued like `deliver`, so a paste waiting out its grace period
+        // ends it early instead of holding this copy back.
+        QUEUED.fetch_add(1, Ordering::SeqCst);
+        let _serial = ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        QUEUED.fetch_sub(1, Ordering::SeqCst);
+        let owner = owner_window()?;
+        let result = open(owner).and_then(|()| {
+            let result = copy_open(text);
+            close();
+            result
+        });
+        // Nothing is delayed, so the text stays on the clipboard after its
+        // owner goes.
+        unsafe {
+            let _ = DestroyWindow(owner);
+        }
+        result
+    }
+
+    fn copy_open(text: &str) -> Result<(), DeliveryError> {
+        unsafe { EmptyClipboard() }
+            .map_err(|_| DeliveryError::Clipboard("could not clear the clipboard"))?;
+        let bytes: Vec<u8> = clipboard_text(text)
+            .iter()
+            .flat_map(|unit| unit.to_ne_bytes())
+            .collect();
+        if !set(CF_UNICODETEXT, &bytes) {
+            return Err(DeliveryError::Clipboard("could not copy the text"));
+        }
+        if !mark_private(&[]) {
+            return Err(DeliveryError::Clipboard(
+                "could not hide the text from history",
+            ));
+        }
+        Ok(())
     }
 
     fn paste(
