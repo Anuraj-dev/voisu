@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Updating &amp; uninstalling — Voisu docs</title>
+<meta name="description" content="Keep Voisu up to date on Windows and Linux, or remove it and its keys cleanly.">
+<link rel="canonical" href="https://anuraj-dev.github.io/voisu/docs/updating.html">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#17191d">
+<meta name="theme-color" media="(prefers-color-scheme: light)" content="#e8eae5">
+<link rel="icon" type="image/png" sizes="32x32" href="../assets/favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="../assets/favicon-16.png">
+<link rel="apple-touch-icon" href="../assets/apple-touch-icon.png">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Voisu">
+<meta property="og:title" content="Updating &amp; uninstalling — Voisu docs">
+<meta property="og:description" content="Keep Voisu up to date on Windows and Linux, or remove it and its keys cleanly.">
+<meta property="og:url" content="https://anuraj-dev.github.io/voisu/docs/updating.html">
+<meta property="og:image" content="https://anuraj-dev.github.io/voisu/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Voisu: Hold a key, speak. Your words land where you're typing.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,100..900&amp;family=Martian+Mono:wdth,wght@75..112.5,100..800&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<script>document.documentElement.classList.add("js")</script>
+<script src="../assets/site.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../" aria-label="Voisu home">
+      <img class="mark" src="../assets/logo.svg" alt="" width="32" height="32">
+      <span>voisu</span>
+    </a>
+    <nav aria-label="Main">
+      <ul class="site-nav">
+        <li><a href="../#install">Install</a></li>
+        <li><a href="./" aria-current="page">Docs</a></li>
+        <li><a class="gh" href="https://github.com/Anuraj-dev/voisu"><svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg><span>GitHub</span></a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap docs">
+  <nav class="docs-nav" aria-label="Docs">
+    <h2>Start here</h2>
+    <ul>
+        <li><a href="./">Overview</a></li>
+        <li><a href="getting-started.html">Getting started</a></li>
+        <li><a href="agents.html">Install with an agent</a></li>
+    </ul>
+    <h2>Guides</h2>
+    <ul>
+        <li><a href="using.html">Dictating</a></li>
+        <li><a href="providers.html">Providers &amp; API keys</a></li>
+        <li><a href="updating.html" aria-current="page">Updating &amp; uninstalling</a></li>
+    </ul>
+    <h2>Reference</h2>
+    <ul>
+        <li><a href="settings.html">Settings &amp; commands</a></li>
+        <li><a href="privacy.html">Privacy</a></li>
+    </ul>
+    <h2>Help</h2>
+    <ul>
+        <li><a href="troubleshooting.html">Troubleshooting</a></li>
+    </ul>
+  </nav>
+
+  <main id="main" class="doc">
+<h1>Updating &amp; uninstalling</h1>
+<p class="lead">Windows updates itself. On Linux, Voisu updates with the rest of your system through the package manager you installed it from.</p>
+
+<h2 id="windows">Updating on Windows</h2>
+<p>Voisu checks GitHub for a new release when it starts and every 6 hours after that. When it finds one, it downloads the installer in the background and checks its signature. Then the tray icon gets a dot and the menu shows <strong>Update to v…</strong>.</p>
+<ul>
+  <li>Choose <strong>Update to v…</strong> to install now. Voisu relaunches on the new version.</li>
+  <li>Or carry on and choose <strong>Quit Voisu</strong> later. The update installs as Voisu quits.</li>
+</ul>
+<p>You can always download the latest installer yourself and run it over the top: <a href="https://github.com/Anuraj-dev/voisu/releases/latest/download/Voisu-Setup-x64.exe">Voisu-Setup-x64.exe</a>. Your keys and settings are kept.</p>
+
+<h2 id="linux">Updating on Linux</h2>
+<h3 id="update-fedora">Fedora</h3>
+<div class="code"><pre><span class="p">$ </span>sudo dnf upgrade voisu voisu-overlay</pre></div>
+<h3 id="update-debian">Debian / Ubuntu</h3>
+<div class="code"><pre><span class="p">$ </span>sudo apt-get update &amp;&amp; sudo apt-get install --only-upgrade voisu</pre></div>
+<h3 id="update-arch">Arch</h3>
+<div class="code"><pre><span class="p">$ </span>yay -Syu</pre></div>
+<p>Then restart the daemon so the new version is the one running:</p>
+<div class="code"><pre><span class="p">$ </span>systemctl --user restart voisu.service</pre></div>
+<p>Release notes for every version are on <a href="https://github.com/Anuraj-dev/voisu/releases">GitHub releases</a>.</p>
+
+<h2 id="uninstall">Uninstalling</h2>
+
+<h3 id="uninstall-windows">Windows</h3>
+<ol class="steps">
+  <li><p>Choose <strong>Quit Voisu</strong> from the tray.</p></li>
+  <li><p>Open <em>Settings → Apps → Installed apps</em>, find <strong>Voisu</strong>, and choose <strong>Uninstall</strong>.</p></li>
+  <li><p>To remove your API keys too, open <em>Credential Manager</em> from the Start menu, choose <em>Windows Credentials</em>, and remove <code>groq-api-key.Voisu</code> and <code>deepgram-api-key.Voisu</code>.</p></li>
+  <li><p>To remove settings and logs, delete <code>%APPDATA%\Voisu</code> and <code>%LOCALAPPDATA%\Voisu</code> if they're still there.</p></li>
+</ol>
+
+<h3 id="uninstall-linux">Linux</h3>
+<p>Stop and remove Voisu's user services first:</p>
+<div class="code"><pre><span class="p">$ </span>voisu service uninstall</pre></div>
+<p>Then remove the package:</p>
+<div class="code"><pre><span class="c"># Fedora</span>
+<span class="p">$ </span>sudo dnf remove voisu voisu-overlay
+<span class="p">$ </span>sudo dnf copr remove anuraj-dev/voisu
+
+<span class="c"># Debian / Ubuntu</span>
+<span class="p">$ </span>sudo apt-get remove voisu
+<span class="p">$ </span>sudo rm /etc/apt/sources.list.d/voisu.list /etc/apt/keyrings/voisu-archive-keyring.asc
+
+<span class="c"># Arch</span>
+<span class="p">$ </span>yay -R voisu-bin</pre></div>
+<p>If you installed a local model, remove it before uninstalling with <code>voisu local remove</code>.</p>
+<p>Your API keys stay in your desktop keyring until you delete them: open KWallet Manager on KDE Plasma, or <em>Passwords and Keys</em> on GNOME, and remove Voisu's entries. To remove settings, history and anything else Voisu kept:</p>
+<div class="code"><pre><span class="p">$ </span>rm -rf ~/.config/voisu ~/.local/state/voisu ~/.local/share/voisu</pre></div>
+
+    <nav class="pager" aria-label="Docs pages">
+      <a class="prev" href="providers.html"><small>Previous</small>Providers &amp; API keys</a><a class="next" href="settings.html"><small>Next</small>Settings &amp; commands</a>
+    </nav>
+  </main>
+</div>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="foot-grid">
+      <div class="foot-brand">
+        <a class="brand" href="../"><img class="mark" src="../assets/logo.svg" alt="" width="32" height="32"><span>voisu</span></a>
+        <p>Voice dictation for Linux and Windows. MIT licensed. © 2026 Anuraj Jit Saikia.</p>
+      </div>
+      <div>
+        <h2>Docs</h2>
+        <ul>
+          <li><a href="getting-started.html">Getting started</a></li>
+          <li><a href="agents.html">Install with an agent</a></li>
+          <li><a href="using.html">Dictating</a></li>
+          <li><a href="settings.html">Settings &amp; commands</a></li>
+          <li><a href="troubleshooting.html">Troubleshooting</a></li>
+          <li><a href="privacy.html">Privacy</a></li>
+        </ul>
+      </div>
+      <div>
+        <h2>Project</h2>
+        <ul>
+          <li><a href="https://github.com/Anuraj-dev/voisu">Source on GitHub</a></li>
+          <li><a href="https://github.com/Anuraj-dev/voisu/releases">Releases</a></li>
+          <li><a href="https://github.com/Anuraj-dev/voisu/issues">Report a problem</a></li>
+          <li><a href="https://github.com/Anuraj-dev/voisu/blob/main/LICENSE">MIT License</a></li>
+        </ul>
+      </div>
+    </div>
+    <p class="foot-key">apt signing key · 4149 EE38 68B3 6B60 0759 2966 D08B CFDC 3412 5B28</p>
+  </div>
+</footer>
+</body>
+</html>

@@ -1,316 +1,247 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Voisu — dictation for Linux and Windows</title>
-<meta name="description" content="Voisu is dictation for Linux and Windows: press a key, speak, and your words land in the app you're using. Install on Fedora, Arch, or Debian/Ubuntu with one command, or download the Windows installer.">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="dark light">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230d0f12'/%3E%3Cg fill='none' stroke='%23f0b429' stroke-width='2.4' stroke-linecap='round'%3E%3Cline x1='8' y1='16' x2='8' y2='16.2'/%3E%3Cline x1='12' y1='12' x2='12' y2='20'/%3E%3Cline x1='16' y1='7' x2='16' y2='25'/%3E%3Cline x1='20' y1='11' x2='20' y2='21'/%3E%3Cline x1='24' y1='14' x2='24' y2='18'/%3E%3C/g%3E%3C/svg%3E">
-
-<style>
-  /* Voisu landing page — self-contained: no external requests, system fonts, dark/light aware. */
-  :root {
-    --mono: ui-monospace, "JetBrains Mono", "SF Mono", "Cascadia Code",
-            "Fira Code", Menlo, Consolas, "Liberation Mono", monospace;
-    --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
-            Arial, sans-serif;
-
-    --bg:        #0d0f12;
-    --bg-soft:   #14171c;
-    --panel:     #16191f;
-    --panel-2:   #1b1f26;
-    --line:      #262b33;
-    --line-soft: #1f242b;
-    --ink:       #e9e7e1;
-    --ink-dim:   #a7adb6;
-    --ink-faint: #767d87;
-    --amber:     #f0b429;
-    --amber-dim: #c99320;
-    --prompt:    #e0a458;
-    --sel:       rgba(240,180,41,0.22);
-  }
-  @media (prefers-color-scheme: light) {
-    :root {
-      --bg:        #f7f4ee;
-      --bg-soft:   #efeae1;
-      --panel:     #fffdf8;
-      --panel-2:   #f2ede3;
-      --line:      #ddd6c8;
-      --line-soft: #e6e0d4;
-      --ink:       #1b1d21;
-      --ink-dim:   #55595f;
-      --ink-faint: #82868d;
-      --amber:     #8a5500;
-      --amber-dim: #6f4600;
-      --prompt:    #9a5b00;
-      --sel:       rgba(138,85,0,0.16);
-    }
-  }
-  :root[data-theme="dark"]  { color-scheme: dark; }
-  :root[data-theme="light"] { color-scheme: light; }
-
-  * { box-sizing: border-box; }
-  html { -webkit-text-size-adjust: 100%; }
-  body {
-    margin: 0;
-    background: var(--bg);
-    color: var(--ink);
-    font-family: var(--sans);
-    font-size: 16px;
-    line-height: 1.6;
-    -webkit-font-smoothing: antialiased;
-    text-rendering: optimizeLegibility;
-    background-image:
-      radial-gradient(110% 70% at 50% -12%, rgba(240,180,41,0.07), transparent 62%);
-    background-attachment: fixed;
-  }
-  ::selection { background: var(--sel); }
-  a { color: inherit; }
-
-  .wrap { max-width: 680px; margin: 0 auto; padding: 0 22px; }
-
-  /* ---- hero ---- */
-  .hero { padding: 76px 0 30px; }
-  .wordmark {
-    font-family: var(--mono); font-weight: 700; font-size: 1.05rem;
-    letter-spacing: .02em; display: inline-flex; align-items: center; gap: 9px;
-    text-decoration: none; color: var(--ink);
-  }
-  .wordmark .dot {
-    width: 9px; height: 9px; border-radius: 50%; background: var(--amber);
-    box-shadow: 0 0 0 0 var(--amber); animation: pulse 2.6s ease-out infinite;
-  }
-  @keyframes pulse {
-    0%   { box-shadow: 0 0 0 0 rgba(240,180,41,0.5); }
-    70%  { box-shadow: 0 0 0 7px rgba(240,180,41,0); }
-    100% { box-shadow: 0 0 0 0 rgba(240,180,41,0); }
-  }
-  @media (prefers-reduced-motion: reduce) { .wordmark .dot { animation: none; } }
-
-  h1 {
-    font-family: var(--mono); font-weight: 700;
-    font-size: clamp(1.7rem, 5.4vw, 2.5rem);
-    line-height: 1.16; letter-spacing: -0.018em;
-    margin: 30px 0 0; max-width: 18ch;
-  }
-  h1 .amber { color: var(--amber); }
-  .promise {
-    font-family: var(--mono); font-size: .9rem; letter-spacing: .04em;
-    color: var(--ink-faint); margin: 16px 0 0;
-  }
-  .promise b { color: var(--amber); font-weight: 700; }
-
-  /* ---- install ---- */
-  .install { padding: 48px 0 8px; }
-  .seg-radio {
-    position: absolute; opacity: 0; width: 1px; height: 1px;
-    pointer-events: none; margin: 0;
-  }
-  .seg {
-    display: flex; gap: 4px; padding: 4px;
-    border: 1px solid var(--line); border-radius: 11px;
-    background: var(--panel); margin-bottom: 18px;
-  }
-  .seg label {
-    flex: 1; text-align: center; cursor: pointer;
-    font-family: var(--mono); font-size: .84rem; font-weight: 600;
-    color: var(--ink-dim); padding: 9px 6px; border-radius: 8px;
-    border: 1px solid transparent; user-select: none;
-    transition: color .12s, background .12s;
-  }
-  .seg label:hover { color: var(--ink); }
-  #t-fedora:checked ~ .seg label[for="t-fedora"],
-  #t-arch:checked   ~ .seg label[for="t-arch"],
-  #t-debian:checked ~ .seg label[for="t-debian"],
-  #t-windows:checked ~ .seg label[for="t-windows"] {
-    color: var(--bg); background: var(--amber);
-    border-color: var(--amber);
-  }
-  #t-fedora:focus-visible ~ .seg label[for="t-fedora"],
-  #t-arch:focus-visible   ~ .seg label[for="t-arch"],
-  #t-debian:focus-visible ~ .seg label[for="t-debian"],
-  #t-windows:focus-visible ~ .seg label[for="t-windows"] {
-    outline: 2px solid var(--amber); outline-offset: 2px;
-  }
-
-  /* Panels: all visible if CSS fails; otherwise only the checked one shows. */
-  #t-fedora:checked ~ .panels .panel[data-d="fedora"],
-  #t-arch:checked   ~ .panels .panel[data-d="arch"],
-  #t-debian:checked ~ .panels .panel[data-d="debian"],
-  #t-windows:checked ~ .panels .panel[data-d="windows"] { display: block; }
-  @media (max-width: 460px) {
-    .seg label { font-size: .76rem; padding: 9px 3px; }
-    .dl small { display: none; }
-  }
-
-  /* ---- Windows download ---- */
-  .dl {
-    display: inline-flex; align-items: center; gap: 10px;
-    font-family: var(--mono); font-size: .92rem; font-weight: 700;
-    color: var(--bg); background: var(--amber); border: 1px solid var(--amber);
-    border-radius: 10px; padding: 12px 20px; margin: 0 0 12px;
-    text-decoration: none; transition: filter .12s;
-  }
-  .dl:hover { filter: brightness(1.08); }
-  .dl:focus-visible { outline: 2px solid var(--amber); outline-offset: 3px; }
-  .dl small { font-weight: 500; opacity: .75; font-size: .76rem; }
-  .css-tabs .panel { display: none; }
-
-  .meta {
-    font-family: var(--mono); font-size: .78rem; color: var(--ink-faint);
-    margin: 0 0 12px;
-  }
-
-  /* ---- code blocks ---- */
-  .code {
-    position: relative;
-    border: 1px solid var(--line); border-radius: 10px;
-    background: var(--bg-soft); margin: 0 0 12px;
-  }
-  .code pre {
-    margin: 0; padding: 14px 52px 14px 16px; overflow-x: auto;
-    font-family: var(--mono); font-size: .84rem; line-height: 1.8;
-    color: var(--ink); tab-size: 2;
-  }
-  .code pre .c { color: var(--ink-faint); }
-  .code pre .p { color: var(--prompt); user-select: none; }
-  .code .copy {
-    position: absolute; top: 8px; right: 8px;
-    font-family: var(--mono); font-size: .72rem; color: var(--ink-dim);
-    background: var(--panel-2); border: 1px solid var(--line);
-    border-radius: 6px; padding: 4px 9px; cursor: pointer; line-height: 1;
-  }
-  .code .copy:hover { color: var(--ink); border-color: var(--ink-faint); }
-  .code .copy.ok { color: var(--amber); border-color: var(--amber); }
-
-  .alt {
-    font-family: var(--mono); font-size: .8rem; color: var(--ink-faint);
-    margin: 0 0 4px;
-  }
-  .alt code { color: var(--ink-dim); }
-
-  details {
-    border: 1px solid var(--line-soft); border-radius: 9px;
-    background: var(--panel); padding: 0 14px; margin: 4px 0 0;
-  }
-  details > summary {
-    cursor: pointer; list-style: none; padding: 11px 2px;
-    font-family: var(--mono); font-size: .8rem; color: var(--ink-dim);
-  }
-  details > summary::-webkit-details-marker { display: none; }
-  details > summary::before { content: "› "; color: var(--amber); }
-  details[open] > summary::before { content: "⌄ "; }
-  details[open] > summary { color: var(--ink); }
-  details .code { margin: 4px 0 14px; }
-
-  .fp {
-    font-family: var(--mono); font-size: .76rem; color: var(--ink-faint);
-    line-height: 1.7; margin: 14px 0 0; word-break: break-word;
-  }
-  .fp b { color: var(--ink-dim); font-weight: 600; letter-spacing: .02em; }
-
-  /* ---- after install ---- */
-  .after {
-    margin: 28px 0 0; padding: 20px 0 0;
-    border-top: 1px solid var(--line-soft);
-  }
-  .after-title {
-    font-family: var(--mono); font-size: .88rem; font-weight: 600;
-    color: var(--ink); margin: 0 0 6px;
-  }
-  .after-note {
-    max-width: 62ch; font-family: var(--sans); font-size: .9rem;
-    line-height: 1.55; color: var(--ink-dim); margin: 0 0 12px;
-  }
-
-  /* ---- footer ---- */
-  footer {
-    border-top: 1px solid var(--line); margin-top: 56px;
-    padding: 26px 0 46px; color: var(--ink-faint);
-    font-family: var(--mono); font-size: .78rem;
-  }
-  footer .f-row {
-    display: flex; flex-wrap: wrap; gap: 6px 20px; align-items: center;
-  }
-  footer a { color: var(--ink-dim); text-decoration: none; }
-  footer a:hover { color: var(--ink); }
-  footer .fp-foot { flex-basis: 100%; margin-top: 10px; word-break: break-word; }
-</style>
+<title>Voisu — voice dictation for Linux and Windows</title>
+<meta name="description" content="Voisu is voice dictation for Linux and Windows. Press your key, speak, and your words land in the app you're typing in. Install on Fedora, Arch or Debian/Ubuntu, or download the Windows installer.">
+<link rel="canonical" href="https://anuraj-dev.github.io/voisu/">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#17191d">
+<meta name="theme-color" media="(prefers-color-scheme: light)" content="#e8eae5">
+<link rel="icon" type="image/png" sizes="32x32" href="assets/favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="assets/favicon-16.png">
+<link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Voisu">
+<meta property="og:title" content="Voisu — voice dictation for Linux and Windows">
+<meta property="og:description" content="Press your key, speak, and your words land where you're typing.">
+<meta property="og:url" content="https://anuraj-dev.github.io/voisu/">
+<meta property="og:image" content="https://anuraj-dev.github.io/voisu/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Voisu: Hold a key, speak. Your words land where you're typing.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,100..900&amp;family=Martian+Mono:wdth,wght@75..112.5,100..800&amp;display=swap">
+<link rel="stylesheet" href="assets/site.css">
+<script>document.documentElement.classList.add("js")</script>
+<script src="assets/site.js" defer></script>
+<script src="assets/hero.js" defer></script>
 </head>
 <body>
+<a class="skip" href="#main">Skip to content</a>
 
-<main class="wrap">
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="./" aria-label="Voisu home">
+      <img class="mark" src="assets/logo.svg" alt="" width="32" height="32">
+      <span>voisu</span>
+    </a>
+    <nav aria-label="Main">
+      <ul class="site-nav">
+        <li><a href="#install">Install</a></li>
+        <li><a href="docs/">Docs</a></li>
+        <li><a class="gh" href="https://github.com/Anuraj-dev/voisu"><svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg><span>GitHub</span></a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
 
-  <section class="hero">
-    <a class="wordmark" href="https://github.com/Anuraj-Dev/voisu"><span class="dot"></span>voisu</a>
-    <h1>Press a key, speak, and your words land in the <span class="amber">app you're using</span>.</h1>
-    <p class="promise"><b>Press. Speak. Inserted.</b> — dictation for Linux and Windows.</p>
+<main id="main">
+
+  <section class="hero" aria-labelledby="hero-title">
+    <div class="wrap">
+      <div>
+        <h1 id="hero-title">Hold a key, speak. <span class="land">Your words land where you're typing.</span></h1>
+        <p class="lede">Voisu is voice dictation for Linux and Windows. It turns speech into clean text and puts it in the app you were already using: a reply, a doc, a terminal. On Windows you hold <kbd>Ctrl</kbd>&nbsp;<kbd>Win</kbd> while you talk. On Linux you press your Trigger Key to start and again to stop.</p>
+        <div class="cta-row">
+          <a class="btn primary" data-cta="windows" href="#install-windows">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M0 2.2 6.5 1.3v6.2H0zm7.3-1L16 0v7.5H7.3zM0 8.3h6.5v6.3L0 13.7zm7.3 0H16V16l-8.7-1.2z"/></svg>
+            Download for Windows
+          </a>
+          <a class="btn" data-cta="linux" href="#install">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" d="m3 4.5 3.5 3.5L3 11.5M8.5 12H13"/></svg>
+            Install on Linux
+          </a>
+        </div>
+        <p class="cta-note">Free and open source (MIT). Uses your own Deepgram and Groq API keys.</p>
+      </div>
+
+      <figure class="hero-demo">
+        <div class="stage-wrap">
+        <div class="stage" data-hero role="img" aria-label="Demo: someone holds Ctrl and Win, the Voisu capsule shows their voice as moving level bars, then the spoken sentence appears as typed text in the open window.">
+          <div class="win">
+            <div class="win-bar">
+              <span class="win-title">Re: Thursday — Mail</span>
+              <span class="win-ctl"><i></i><i></i><i></i></span>
+            </div>
+            <div class="win-body">
+              <p class="ctx">Hi Sam,</p>
+              <span class="typed">Thursday works for me. I'll bring the draft and we can go through the numbers together.</span><span class="caret"></span>
+            </div>
+          </div>
+          <div class="capsule"><canvas width="264" height="40"></canvas></div>
+        </div>
+        <button class="stage-pause" type="button" aria-label="Pause the demo" aria-pressed="false" hidden><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="3.5" y="2.5" width="3" height="11" rx="1" fill="currentColor"/><rect x="9.5" y="2.5" width="3" height="11" rx="1" fill="currentColor"/></svg></button>
+        </div>
+        <figcaption class="stage-foot" aria-hidden="true">
+          <span class="keys"><kbd>Ctrl</kbd><kbd>Win</kbd></span>
+          <ul class="rail">
+            <li data-s="rec">Recording</li>
+            <li data-s="proc">Processing</li>
+            <li data-s="ok">Delivered</li>
+          </ul>
+        </figcaption>
+      </figure>
+    </div>
   </section>
 
-  <section class="install css-tabs">
-    <input class="seg-radio" type="radio" name="distro" id="t-fedora" checked>
-    <input class="seg-radio" type="radio" name="distro" id="t-arch">
-    <input class="seg-radio" type="radio" name="distro" id="t-debian">
-    <input class="seg-radio" type="radio" name="distro" id="t-windows">
-
-    <div class="seg" role="tablist" aria-label="Choose your system">
-      <label for="t-fedora">Fedora</label>
-      <label for="t-arch">Arch</label>
-      <label for="t-debian">Debian / Ubuntu</label>
-      <label for="t-windows">Windows</label>
+  <section class="section" id="how" aria-labelledby="how-title">
+    <div class="wrap">
+      <div class="section-head">
+        <div>
+          <h2 id="how-title">Three beats, no window to switch to.</h2>
+        </div>
+        <p>Voisu sits in the background: the tray on Windows, a user service on Linux. A small capsule floats over your screen while it listens, and gets out of the way when your text arrives.</p>
+      </div>
+      <ol class="beats">
+        <li>
+          <span class="num">Recording</span>
+          <h3>Press and talk</h3>
+          <p>Hold <kbd>Ctrl</kbd>&nbsp;<kbd>Win</kbd> on Windows, or press your Trigger Key on Linux. The capsule shows your voice as it comes in.</p>
+        </li>
+        <li>
+          <span class="num">Processing</span>
+          <h3>Let go</h3>
+          <p>Release the keys, or press the Trigger Key again. Voisu turns the Recording into a clean Transcript with punctuation.</p>
+        </li>
+        <li>
+          <span class="num">Delivered</span>
+          <h3>Keep typing</h3>
+          <p>The Transcript lands in the window you were typing in when you started. If it can't land there, Voisu keeps it for you instead of dropping it.</p>
+        </li>
+      </ol>
     </div>
+  </section>
 
-    <div class="panels">
-      <!-- Fedora -->
-      <div class="panel" data-d="fedora">
-        <div class="code">
-          <button class="copy" type="button">copy</button>
-<pre><span class="p">$ </span>sudo dnf copr enable anuraj-dev/voisu
+  <section class="section alt" id="why" aria-labelledby="why-title">
+    <div class="wrap">
+      <div class="section-head">
+        <div>
+          <h2 id="why-title">Built to get the words right and put them in the right place.</h2>
+        </div>
+        <p>Dictation is only useful if you can trust it with a half-written email. Voisu is careful about what it hears, where it types, and what it keeps.</p>
+      </div>
+
+      <div class="why">
+        <article class="card wide">
+          <h3>Two providers, one Transcript</h3>
+          <p>Deepgram streams while you talk. When you stop, Groq transcribes the whole Recording. Voisu reconciles the two into one Transcript, so a dropped stream or a misheard word in one doesn't cost you the sentence.</p>
+          <div class="flow" aria-hidden="true">
+            <span class="who">Deepgram</span><span class="lane dg"><span></span></span>
+            <span class="who">Groq</span><span class="lane gq"><span></span></span>
+            <span class="who">Voisu</span><span class="lane out"><span></span></span>
+            <span class="axis"><span>you speak</span><span class="stop">stop</span></span>
+          </div>
+        </article>
+
+        <article class="card">
+          <h3>Lands where you were</h3>
+          <p>On Windows, text goes to the window that had focus when you started, even if you clicked away, and your clipboard is put back afterwards. Terminals get their own paste chord.</p>
+        </article>
+
+        <article class="card">
+          <h3>Nothing vanishes</h3>
+          <p>If a paste can't land, Voisu tells you why and keeps the Transcript: on your clipboard, or one click away under <em>Last transcript</em> on Windows.</p>
+        </article>
+
+        <article class="card">
+          <h3>Your keys, your keyring</h3>
+          <p>API keys live in your desktop keyring or Windows Credential Manager. Logs and history stay on your machine.</p>
+        </article>
+
+        <article class="card">
+          <h3>No root, no raw input</h3>
+          <p>On Linux, Voisu uses your desktop's portals for the shortcut and typing. It never needs <code>uinput</code> or access to input devices.</p>
+        </article>
+
+        <article class="card half">
+          <h3>Hands-free when you need it</h3>
+          <p>On Windows, double-tap <kbd>Ctrl</kbd>&nbsp;<kbd>Win</kbd> to keep recording without holding the keys; press the chord again to stop. <kbd>Esc</kbd> cancels.</p>
+        </article>
+
+        <article class="card half">
+          <h3>Say the punctuation</h3>
+          <p>On Linux, speak marks the way you'd read them: “dash dash”, “slash”, “quote … unquote”, “new paragraph”, or “first … second …” for a numbered list.</p>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="install" aria-labelledby="install-title">
+    <div class="wrap install">
+      <div class="section-head">
+        <h2 id="install-title">Pick your system.</h2>
+        <p>Every channel installs the same Voisu. After installing, <code>voisu setup</code> (Linux) or the settings window (Windows) asks for your API keys and you're ready.</p>
+      </div>
+
+      <div class="tabs" data-tabs>
+        <div class="tablist" role="tablist" aria-label="Choose your system">
+          <button type="button" role="tab" id="tab-fedora" aria-controls="install-fedora" data-os="fedora" aria-selected="true"><span class="os">Fedora</span><span class="via">COPR</span></button>
+          <button type="button" role="tab" id="tab-arch" aria-controls="install-arch" data-os="arch" aria-selected="false" tabindex="-1"><span class="os">Arch</span><span class="via">AUR</span></button>
+          <button type="button" role="tab" id="tab-debian" aria-controls="install-debian" data-os="debian" aria-selected="false" tabindex="-1"><span class="os">Debian / Ubuntu</span><span class="via">apt</span></button>
+          <button type="button" role="tab" id="tab-windows" aria-controls="install-windows" data-os="windows" aria-selected="false" tabindex="-1"><span class="os">Windows</span><span class="via">Installer</span></button>
+        </div>
+
+        <div class="tabpanel" role="tabpanel" id="install-fedora" aria-labelledby="tab-fedora" tabindex="0">
+          <h3 class="panel-title">Fedora</h3>
+          <p class="meta">KDE Plasma or GNOME on Wayland · RPM from COPR, with an optional overlay package</p>
+          <div class="procedure">
+          <div class="step">
+          <p class="step-label"><span class="n">1</span>Install</p>
+          <div class="code"><pre><span class="p">$ </span>sudo dnf copr enable anuraj-dev/voisu
 <span class="p">$ </span>sudo dnf install voisu
 <span class="c"># optional on-screen overlay:</span>
-<span class="p">$ </span>sudo dnf install voisu-overlay</pre>
-        </div>
-        <div class="after">
-          <p class="after-title">Finish setup</p>
-          <p class="after-note">On Fedora KDE or GNOME, enable the user daemon, then add your API keys.</p>
-          <div class="code">
-            <button class="copy" type="button">copy</button>
-<pre><span class="p">$ </span>systemctl --user daemon-reload
+<span class="p">$ </span>sudo dnf install voisu-overlay</pre></div>
+          </div>
+          <div class="step">
+          <p class="step-label"><span class="n">2</span>Finish setup</p>
+          <p class="small">Enable the user daemon, then add your API keys. The first time you dictate, your desktop asks you to confirm the shortcut; that choice sticks.</p>
+          <div class="code"><pre><span class="p">$ </span>systemctl --user daemon-reload
 <span class="p">$ </span>systemctl --user enable --now voisu.service
-<span class="p">$ </span>voisu setup</pre>
+<span class="p">$ </span>voisu setup</pre></div>
+          <p class="small">Optional overlay (install <code>voisu-overlay</code> first):</p>
+          <div class="code"><pre><span class="p">$ </span>systemctl --user enable --now voisu-overlay.service</pre></div>
           </div>
-          <p class="after-note">Optional GTK overlay (install <code>voisu-overlay</code> first):</p>
-          <div class="code">
-            <button class="copy" type="button">copy</button>
-<pre><span class="p">$ </span>systemctl --user enable --now voisu-overlay.service</pre>
           </div>
         </div>
-      </div>
 
-      <!-- Arch -->
-      <div class="panel" data-d="arch">
-        <div class="code">
-          <button class="copy" type="button">copy</button>
-<pre><span class="p">$ </span>yay -S voisu-bin</pre>
-        </div>
-        <p class="alt">Build from source instead: <code>yay -S voisu</code></p>
-        <div class="after">
-          <p class="after-title">Finish setup</p>
-          <p class="after-note">On Hyprland, setup saves your API keys, writes the trigger binding, and starts Voisu services.</p>
-          <div class="code">
-            <button class="copy" type="button">copy</button>
-<pre><span class="p">$ </span>voisu setup</pre>
+        <div class="tabpanel" role="tabpanel" id="install-arch" aria-labelledby="tab-arch" tabindex="0">
+          <h3 class="panel-title">Arch</h3>
+          <p class="meta">Arch Linux · AUR, prebuilt or from source</p>
+          <div class="procedure">
+          <div class="step">
+          <p class="step-label"><span class="n">1</span>Install</p>
+          <div class="code"><pre><span class="p">$ </span>yay -S voisu-bin</pre></div>
+          <p class="small">Build from source instead with <code>yay -S voisu</code>. The two packages conflict, so pick one.</p>
+          </div>
+          <div class="step">
+          <p class="step-label"><span class="n">2</span>Finish setup</p>
+          <p class="small">On Hyprland, setup saves your API keys, writes the trigger binding and starts Voisu's services.</p>
+          <div class="code"><pre><span class="p">$ </span>voisu setup</pre></div>
+          </div>
           </div>
         </div>
-      </div>
 
-      <!-- Debian / Ubuntu -->
-      <div class="panel" data-d="debian">
-        <p class="meta">Ubuntu 26.04 LTS · GNOME Wayland · amd64</p>
-        <div class="code">
-          <button class="copy" type="button">copy</button>
-<pre><span class="c"># 1. Add Voisu's signing key.</span>
+        <div class="tabpanel" role="tabpanel" id="install-debian" aria-labelledby="tab-debian" tabindex="0">
+          <h3 class="panel-title">Debian / Ubuntu</h3>
+          <p class="meta">Ubuntu 26.04 LTS · GNOME Wayland · amd64 · the signed apt repository on this site</p>
+          <div class="procedure stacked">
+          <div class="step">
+          <p class="step-label"><span class="n">1</span>Install</p>
+          <div class="code"><pre><span class="c"># 1. Add Voisu's signing key.</span>
 <span class="p">$ </span>sudo install -d -m 0755 /etc/apt/keyrings
 <span class="p">$ </span>curl -fsSL https://anuraj-dev.github.io/voisu/voisu-archive-keyring.asc \
     | sudo tee /etc/apt/keyrings/voisu-archive-keyring.asc &gt;/dev/null
@@ -320,76 +251,116 @@
     | sudo tee /etc/apt/sources.list.d/voisu.list
 
 <span class="c"># 3. Install.</span>
-<span class="p">$ </span>sudo apt-get update &amp;&amp; sudo apt-get install -y voisu</pre>
-        </div>
-        <p class="fp"><b>Signing key fingerprint</b><br>4149 EE38 68B3 6B60 0759 2966 D08B CFDC 3412 5B28 — should match what you fetched.</p>
-        <details>
-          <summary>Verify the key first</summary>
-          <div class="code">
-            <button class="copy" type="button">copy</button>
-<pre><span class="c"># Fetch the key to a temp file and check its fingerprint before trusting it.</span>
+<span class="p">$ </span>sudo apt-get update &amp;&amp; sudo apt-get install -y voisu</pre></div>
+          <p class="fp"><b>Signing key fingerprint</b><br>4149 EE38 68B3 6B60 0759 2966 D08B CFDC 3412 5B28</p>
+          <details class="more">
+            <summary>Verify the key first</summary>
+            <div class="code"><pre><span class="c"># Fetch the key to a temp file and check its fingerprint before trusting it.</span>
 <span class="p">$ </span>EXPECT=4149EE3868B36B6007592966D08BCFDC34125B28
 <span class="p">$ </span>curl -fsSL https://anuraj-dev.github.io/voisu/voisu-archive-keyring.asc -o /tmp/voisu.asc
 <span class="p">$ </span>gpg --show-keys --with-colons /tmp/voisu.asc \
     | awk -F: '$1=="fpr"{print $10; exit}'
-<span class="c"># The printed fingerprint must equal $EXPECT before you add the key above.</span></pre>
+<span class="c"># The printed fingerprint must equal $EXPECT before you add the key above.</span></pre></div>
+          </details>
           </div>
-        </details>
-        <div class="after">
-          <p class="after-title">Finish setup</p>
-          <p class="after-note">Setup asks for API keys, enables the daemon and native GNOME capsule, and uses Ctrl+Space by default. If asked, log out and back in or reboot.</p>
-          <div class="code">
-            <button class="copy" type="button">copy</button>
-<pre><span class="p">$ </span>voisu setup</pre>
+          <div class="step">
+          <p class="step-label"><span class="n">2</span>Finish setup</p>
+          <p class="small">Setup asks for your API keys, enables the daemon and the native GNOME capsule, and uses <kbd>Ctrl</kbd>&nbsp;<kbd>Space</kbd> by default. If it asks, log out and back in, or reboot.</p>
+          <div class="code"><pre><span class="p">$ </span>voisu setup</pre></div>
+          </div>
+          </div>
+        </div>
+
+        <div class="tabpanel" role="tabpanel" id="install-windows" aria-labelledby="tab-windows" tabindex="0">
+          <h3 class="panel-title">Windows</h3>
+          <p class="meta">Windows 10 / 11 · x64 · installs for your user, no admin needed</p>
+          <div class="procedure">
+          <div class="step">
+          <p class="step-label"><span class="n">1</span>Install</p>
+          <div class="dl-card">
+            <a class="btn primary" href="https://github.com/Anuraj-dev/voisu/releases/latest/download/Voisu-Setup-x64.exe">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" d="M8 2v8.5M4.5 7 8 10.5 11.5 7M3 13.5h10"/></svg>
+              <span>Download for Windows <small>Voisu-Setup-x64.exe</small></span>
+            </a>
+          </div>
+          <div class="callout">
+            <p>The installer isn't code-signed yet, so SmartScreen may warn on first run: choose <strong>More info</strong> → <strong>Run anyway</strong>.</p>
+          </div>
+          </div>
+          <div class="step">
+          <p class="step-label"><span class="n">2</span>Finish setup</p>
+          <p class="small">Voisu opens its settings on first launch: paste your Groq and Deepgram API keys. Then hold <kbd>Ctrl</kbd>&nbsp;<kbd>Win</kbd>, speak, and release. Voisu lives in the tray and updates itself when a new version is out.</p>
+          </div>
           </div>
         </div>
       </div>
 
-      <!-- Windows -->
-      <div class="panel" data-d="windows">
-        <p class="meta">Windows 10 / 11 · x64 · installs for your user, no admin needed</p>
-        <a class="dl" href="https://github.com/Anuraj-dev/voisu/releases/latest/download/Voisu-Setup-x64.exe">Download for Windows <small>Voisu-Setup-x64.exe</small></a>
-        <p class="after-note">The installer isn't code-signed yet, so SmartScreen may warn on first run: choose <b>More info</b> → <b>Run anyway</b>.</p>
-        <div class="after">
-          <p class="after-title">Finish setup</p>
-          <p class="after-note">Voisu opens its settings on first launch: paste your Groq and Deepgram API keys. Then hold <code>Ctrl+Win</code>, speak, and release. Voisu lives in the tray and updates itself when a new version is out.</p>
+      <div class="agent-install">
+        <div>
+          <h3>Install with your agent</h3>
+          <p class="small">Paste this into Claude Code, Codex or another agent that can run terminal commands. It installs Voisu for your system; you type your API keys into Voisu's own setup. <a href="docs/agents.html">How it works</a></p>
         </div>
+        <div class="code prompt"><pre>Install Voisu on this computer: read https://anuraj-dev.github.io/voisu/agent-install.md and follow it step by step. Never ask me for API keys in this chat; I'll type them into Voisu's own setup.</pre></div>
       </div>
+
+      <p class="install-notes small">Every <a href="https://github.com/Anuraj-dev/voisu/releases">GitHub release</a> also carries the <code>.deb</code>, a tarball and <code>SHA256SUMS</code>. New here? <a href="docs/getting-started.html">Getting started</a> walks through the first Recording on each system.</p>
+    </div>
+  </section>
+
+  <section class="section alt" id="keys" aria-labelledby="keys-title">
+    <div class="wrap byok">
+      <div>
+        <h2 id="keys-title">No account. You talk to the providers directly.</h2>
+        <p class="byok-body">Voisu has no sign-up and no server of its own in the middle. Your audio goes only to the speech providers you configure, using your own API keys, and you pay them for what you use.</p>
+        <p><a href="docs/providers.html">Set up your providers →</a></p>
+      </div>
+      <ul class="provider-list">
+        <li>
+          <span class="sw sw-rec"></span>
+          <strong>Deepgram</strong>
+          <span>Streams a live transcript while you're still talking.</span>
+        </li>
+        <li>
+          <span class="sw sw-proc"></span>
+          <strong>Groq</strong>
+          <span>Transcribes the full Recording when you stop.</span>
+        </li>
+      </ul>
     </div>
   </section>
 
 </main>
 
-<footer>
-  <div class="wrap f-row">
-    <a href="https://github.com/Anuraj-Dev/voisu">github.com/Anuraj-Dev/voisu</a>
-    <a href="https://github.com/Anuraj-Dev/voisu/blob/main/LICENSE">MIT</a>
-    <span>© 2026 Anuraj Jit Saikia</span>
-    <span class="fp-foot">key · 4149 EE38 68B3 6B60 0759 2966 D08B CFDC 3412 5B28</span>
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="foot-grid">
+      <div class="foot-brand">
+        <a class="brand" href="./"><img class="mark" src="assets/logo.svg" alt="" width="32" height="32"><span>voisu</span></a>
+        <p>Voice dictation for Linux and Windows. MIT licensed. © 2026 Anuraj Jit Saikia.</p>
+      </div>
+      <div>
+        <h2>Docs</h2>
+        <ul>
+          <li><a href="docs/getting-started.html">Getting started</a></li>
+          <li><a href="docs/agents.html">Install with your agent</a></li>
+          <li><a href="docs/using.html">Using Voisu</a></li>
+          <li><a href="docs/providers.html">Providers &amp; API keys</a></li>
+          <li><a href="docs/troubleshooting.html">Troubleshooting</a></li>
+          <li><a href="docs/privacy.html">Privacy</a></li>
+        </ul>
+      </div>
+      <div>
+        <h2>Project</h2>
+        <ul>
+          <li><a href="https://github.com/Anuraj-dev/voisu">Source on GitHub</a></li>
+          <li><a href="https://github.com/Anuraj-dev/voisu/releases">Releases</a></li>
+          <li><a href="https://github.com/Anuraj-dev/voisu/issues">Report a problem</a></li>
+          <li><a href="https://github.com/Anuraj-dev/voisu/blob/main/LICENSE">MIT License</a></li>
+        </ul>
+      </div>
+    </div>
+    <p class="foot-key">apt signing key · 4149 EE38 68B3 6B60 0759 2966 D08B CFDC 3412 5B28</p>
   </div>
 </footer>
-
-<script>
-  // Progressive enhancement only: commands are visible & selectable without JS.
-  document.querySelectorAll('.code .copy').forEach(function (btn) {
-    btn.addEventListener('click', function () {
-      var pre = btn.parentElement.querySelector('pre');
-      var text = pre.innerText.replace(/^\$ /gm, '');
-      var done = function () {
-        var old = btn.textContent;
-        btn.textContent = 'copied'; btn.classList.add('ok');
-        setTimeout(function () { btn.textContent = old; btn.classList.remove('ok'); }, 1400);
-      };
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text).then(done, function () {});
-      } else {
-        var r = document.createRange(); r.selectNode(pre);
-        var s = getSelection(); s.removeAllRanges(); s.addRange(r);
-        try { document.execCommand('copy'); done(); } catch (e) {}
-        s.removeAllRanges();
-      }
-    });
-  });
-</script>
 </body>
 </html>

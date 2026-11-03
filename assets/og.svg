@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">
+  <!-- Share card. Rebuild og.png with: sh assets/build-icons.sh -->
+  <defs>
+    <radialGradient id="glow" cx="78%" cy="22%" r="45%">
+      <stop offset="0" stop-color="#65D6A0" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#65D6A0" stop-opacity="0"/>
+    </radialGradient>
+    <clipPath id="mark"><rect x="96" y="96" width="112" height="112" rx="20"/></clipPath>
+  </defs>
+  <rect width="1200" height="630" fill="#0E0F12"/>
+  <rect width="1200" height="630" fill="url(#glow)"/>
+  <image href="logo.svg" x="96" y="96" width="112" height="112" clip-path="url(#mark)"/>
+  <text x="232" y="172" font-family="Schibsted Grotesk, Adwaita Sans, Liberation Sans, sans-serif" font-size="56" font-weight="700" fill="#F4F5F7" letter-spacing="-1">voisu</text>
+  <text x="96" y="318" font-family="Schibsted Grotesk, Adwaita Sans, Liberation Sans, sans-serif" font-size="64" font-weight="700" fill="#F4F5F7" letter-spacing="-1.5">Hold a key, speak.</text>
+  <text x="96" y="394" font-family="Schibsted Grotesk, Adwaita Sans, Liberation Sans, sans-serif" font-size="64" font-weight="700" fill="#65D6A0" letter-spacing="-1.5">Your words land where</text>
+  <text x="96" y="470" font-family="Schibsted Grotesk, Adwaita Sans, Liberation Sans, sans-serif" font-size="64" font-weight="700" fill="#65D6A0" letter-spacing="-1.5">you're typing.</text>
+  <text x="96" y="552" font-family="Adwaita Mono, JetBrains Mono, Liberation Mono, monospace" font-size="24" fill="#B5BAC5">Voice dictation for Linux and Windows</text>
+  <g transform="translate(544 88)">
+    <rect width="560" height="128" rx="64" fill="#17191D" fill-opacity="0.96" stroke="#65D6A0" stroke-width="5"/>
+      <rect x="18.0" y="58.0" width="8.0" height="12.0" rx="4.0" fill="#8FB4FF" fill-opacity="0.47"/>
+      <rect x="30.0" y="56.6" width="8.0" height="14.8" rx="4.0" fill="#8FB4FF" fill-opacity="0.51"/>
+      <rect x="42.0" y="57.3" width="8.0" height="13.4" rx="4.0" fill="#8FB4FF" fill-opacity="0.55"/>
+      <rect x="54.0" y="55.2" width="8.0" height="17.6" rx="4.0" fill="#8FB4FF" fill-opacity="0.59"/>
+      <rect x="66.0" y="56.6" width="8.0" height="14.8" rx="4.0" fill="#8FB4FF" fill-opacity="0.62"/>
+      <rect x="78.0" y="53.1" width="8.0" height="21.8" rx="4.0" fill="#8FB4FF" fill-opacity="0.66"/>
+      <rect x="90.0" y="55.9" width="8.0" height="16.2" rx="4.0" fill="#8FB4FF" fill-opacity="0.70"/>
+      <rect x="102.0" y="51.0" width="8.0" height="26.1" rx="4.0" fill="#8FB4FF" fill-opacity="0.73"/>
+      <rect x="114.0" y="53.8" width="8.0" height="20.4" rx="4.0" fill="#8FB4FF" fill-opacity="0.76"/>
+      <rect x="126.0" y="49.6" width="8.0" height="28.9" rx="4.0" fill="#8FB4FF" fill-opacity="0.80"/>
+      <rect x="138.0" y="52.4" width="8.0" height="23.2" rx="4.0" fill="#8FB4FF" fill-opacity="0.82"/>
+      <rect x="150.0" y="45.4" width="8.0" height="37.3" rx="4.0" fill="#8FB4FF" fill-opacity="0.85"/>
+      <rect x="162.0" y="49.6" width="8.0" height="28.9" rx="4.0" fill="#8FB4FF" fill-opacity="0.88"/>
+      <rect x="174.0" y="43.3" width="8.0" height="41.5" rx="4.0" fill="#8FB4FF" fill-opacity="0.90"/>
+      <rect x="186.0" y="47.8" width="8.0" height="32.4" rx="4.0" fill="#8FB4FF" fill-opacity="0.92"/>
+      <rect x="198.0" y="38.3" width="8.0" height="51.3" rx="4.0" fill="#8FB4FF" fill-opacity="0.94"/>
+      <rect x="210.0" y="42.5" width="8.0" height="42.9" rx="4.0" fill="#8FB4FF" fill-opacity="0.96"/>
+      <rect x="222.0" y="34.8" width="8.0" height="58.3" rx="4.0" fill="#8FB4FF" fill-opacity="0.97"/>
+      <rect x="234.0" y="39.0" width="8.0" height="49.9" rx="4.0" fill="#8FB4FF" fill-opacity="0.98"/>
+      <rect x="246.0" y="29.2" width="8.0" height="69.6" rx="4.0" fill="#8FB4FF" fill-opacity="0.99"/>
+      <rect x="258.0" y="32.0" width="8.0" height="64.0" rx="4.0" fill="#8FB4FF" fill-opacity="1.00"/>
+      <rect x="270.0" y="26.8" width="8.0" height="74.5" rx="4.0" fill="#8FB4FF" fill-opacity="1.00"/>
+      <rect x="282.0" y="26.8" width="8.0" height="74.5" rx="4.0" fill="#8FB4FF" fill-opacity="1.00"/>
+      <rect x="294.0" y="32.0" width="8.0" height="64.0" rx="4.0" fill="#8FB4FF" fill-opacity="1.00"/>
+      <rect x="306.0" y="29.2" width="8.0" height="69.6" rx="4.0" fill="#8FB4FF" fill-opacity="0.99"/>
+      <rect x="318.0" y="39.0" width="8.0" height="49.9" rx="4.0" fill="#8FB4FF" fill-opacity="0.98"/>
+      <rect x="330.0" y="34.8" width="8.0" height="58.3" rx="4.0" fill="#8FB4FF" fill-opacity="0.97"/>
+      <rect x="342.0" y="42.5" width="8.0" height="42.9" rx="4.0" fill="#8FB4FF" fill-opacity="0.96"/>
+      <rect x="354.0" y="38.3" width="8.0" height="51.3" rx="4.0" fill="#8FB4FF" fill-opacity="0.94"/>
+      <rect x="366.0" y="47.8" width="8.0" height="32.4" rx="4.0" fill="#8FB4FF" fill-opacity="0.92"/>
+      <rect x="378.0" y="43.3" width="8.0" height="41.5" rx="4.0" fill="#8FB4FF" fill-opacity="0.90"/>
+      <rect x="390.0" y="49.6" width="8.0" height="28.9" rx="4.0" fill="#8FB4FF" fill-opacity="0.88"/>
+      <rect x="402.0" y="45.4" width="8.0" height="37.3" rx="4.0" fill="#8FB4FF" fill-opacity="0.85"/>
+      <rect x="414.0" y="52.4" width="8.0" height="23.2" rx="4.0" fill="#8FB4FF" fill-opacity="0.82"/>
+      <rect x="426.0" y="49.6" width="8.0" height="28.9" rx="4.0" fill="#8FB4FF" fill-opacity="0.80"/>
+      <rect x="438.0" y="53.8" width="8.0" height="20.4" rx="4.0" fill="#8FB4FF" fill-opacity="0.76"/>
+      <rect x="450.0" y="51.0" width="8.0" height="26.1" rx="4.0" fill="#8FB4FF" fill-opacity="0.73"/>
+      <rect x="462.0" y="55.9" width="8.0" height="16.2" rx="4.0" fill="#8FB4FF" fill-opacity="0.70"/>
+      <rect x="474.0" y="53.1" width="8.0" height="21.8" rx="4.0" fill="#8FB4FF" fill-opacity="0.66"/>
+      <rect x="486.0" y="56.6" width="8.0" height="14.8" rx="4.0" fill="#8FB4FF" fill-opacity="0.62"/>
+      <rect x="498.0" y="55.2" width="8.0" height="17.6" rx="4.0" fill="#8FB4FF" fill-opacity="0.59"/>
+      <rect x="510.0" y="57.3" width="8.0" height="13.4" rx="4.0" fill="#8FB4FF" fill-opacity="0.55"/>
+      <rect x="522.0" y="56.6" width="8.0" height="14.8" rx="4.0" fill="#8FB4FF" fill-opacity="0.51"/>
+      <rect x="534.0" y="58.0" width="8.0" height="12.0" rx="4.0" fill="#8FB4FF" fill-opacity="0.47"/>
+  </g>
+</svg>

@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Install with an agent — Voisu docs</title>
+<meta name="description" content="Paste one prompt into Claude Code, Codex or another terminal agent and it installs Voisu for you. Your API keys stay out of the chat.">
+<link rel="canonical" href="https://anuraj-dev.github.io/voisu/docs/agents.html">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#17191d">
+<meta name="theme-color" media="(prefers-color-scheme: light)" content="#e8eae5">
+<link rel="icon" type="image/png" sizes="32x32" href="../assets/favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="../assets/favicon-16.png">
+<link rel="apple-touch-icon" href="../assets/apple-touch-icon.png">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Voisu">
+<meta property="og:title" content="Install with an agent — Voisu docs">
+<meta property="og:description" content="Paste one prompt into Claude Code, Codex or another terminal agent and it installs Voisu for you. Your API keys stay out of the chat.">
+<meta property="og:url" content="https://anuraj-dev.github.io/voisu/docs/agents.html">
+<meta property="og:image" content="https://anuraj-dev.github.io/voisu/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Voisu: Hold a key, speak. Your words land where you're typing.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,100..900&amp;family=Martian+Mono:wdth,wght@75..112.5,100..800&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<script>document.documentElement.classList.add("js")</script>
+<script src="../assets/site.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../" aria-label="Voisu home">
+      <img class="mark" src="../assets/logo.svg" alt="" width="32" height="32">
+      <span>voisu</span>
+    </a>
+    <nav aria-label="Main">
+      <ul class="site-nav">
+        <li><a href="../#install">Install</a></li>
+        <li><a href="./" aria-current="page">Docs</a></li>
+        <li><a class="gh" href="https://github.com/Anuraj-dev/voisu"><svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg><span>GitHub</span></a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap docs">
+  <nav class="docs-nav" aria-label="Docs">
+    <h2>Start here</h2>
+    <ul>
+        <li><a href="./">Overview</a></li>
+        <li><a href="getting-started.html">Getting started</a></li>
+        <li><a href="agents.html" aria-current="page">Install with an agent</a></li>
+    </ul>
+    <h2>Guides</h2>
+    <ul>
+        <li><a href="using.html">Dictating</a></li>
+        <li><a href="providers.html">Providers &amp; API keys</a></li>
+        <li><a href="updating.html">Updating &amp; uninstalling</a></li>
+    </ul>
+    <h2>Reference</h2>
+    <ul>
+        <li><a href="settings.html">Settings &amp; commands</a></li>
+        <li><a href="privacy.html">Privacy</a></li>
+    </ul>
+    <h2>Help</h2>
+    <ul>
+        <li><a href="troubleshooting.html">Troubleshooting</a></li>
+    </ul>
+  </nav>
+
+  <main id="main" class="doc">
+<h1>Install with an agent</h1>
+<p class="lead">Paste one prompt into Claude Code, Codex or any agent that can run terminal commands. The agent installs Voisu, starts it and checks it. You type your API keys and approve the desktop's prompts yourself.</p>
+
+<nav class="toc" aria-label="On this page">
+  <a href="#prompt">The prompt</a>
+  <a href="#by-system">A prompt for your system</a>
+  <a href="#split">What the agent does, what you do</a>
+  <a href="#guide">The guide the agent follows</a>
+</nav>
+
+<div class="callout warn">
+  <p><strong>Your API keys never go in the chat.</strong> The agent won't ask for them. When it's time, you type them into Voisu's own setup: <code>voisu setup</code> in a terminal of your own on Linux, or the settings window on Windows. If you paste a key into an agent chat by mistake, revoke it in the provider's console and create a new one.</p>
+</div>
+
+<h2 id="prompt">The prompt</h2>
+<p>This one works on any supported system. The agent detects your OS and distribution first.</p>
+<p class="prompt-label">Paste into Claude Code, Codex, Cursor or another terminal agent</p>
+<div class="code prompt"><pre>Install Voisu on this computer: read https://anuraj-dev.github.io/voisu/agent-install.md and follow it step by step. Never ask me for API keys in this chat; I'll type them into Voisu's own setup.</pre></div>
+<p>Before you start, create an API key at <a href="https://console.groq.com/keys">Groq</a> and one at <a href="https://console.deepgram.com">Deepgram</a>. <a href="providers.html">Providers &amp; API keys</a> explains why Voisu uses both.</p>
+
+<h2 id="by-system">A prompt for your system</h2>
+<p>If you'd rather skip detection, use the prompt for your system. Each one points the agent at that system's section of the same guide.</p>
+
+<div class="tabs" data-tabs>
+  <div class="tablist" role="tablist" aria-label="Choose your system">
+    <button type="button" role="tab" id="tab-fedora" aria-controls="prompt-fedora" data-os="fedora" aria-selected="true">Fedora</button>
+    <button type="button" role="tab" id="tab-arch" aria-controls="prompt-arch" data-os="arch" aria-selected="false" tabindex="-1">Arch</button>
+    <button type="button" role="tab" id="tab-debian" aria-controls="prompt-debian" data-os="debian" aria-selected="false" tabindex="-1">Debian / Ubuntu</button>
+    <button type="button" role="tab" id="tab-windows" aria-controls="prompt-windows" data-os="windows" aria-selected="false" tabindex="-1">Windows</button>
+  </div>
+
+  <div class="tabpanel" role="tabpanel" id="prompt-fedora" aria-labelledby="tab-fedora" tabindex="0">
+    <h3 class="panel-title">Fedora</h3>
+    <p class="meta">Fedora · KDE Plasma or GNOME on Wayland · COPR</p>
+    <div class="code prompt"><pre>Install Voisu on this Fedora computer: read https://anuraj-dev.github.io/voisu/agent-install.md and follow the Fedora section step by step. Show me each sudo command before you run it. Never ask me for API keys in this chat; when the guide says so, I'll run voisu setup in my own terminal.</pre></div>
+    <p>Expect to approve: <code>sudo</code> for the package install, then your desktop's shortcut dialog when the daemon first starts.</p>
+  </div>
+
+  <div class="tabpanel" role="tabpanel" id="prompt-arch" aria-labelledby="tab-arch" tabindex="0">
+    <h3 class="panel-title">Arch</h3>
+    <p class="meta">Arch Linux · AUR</p>
+    <div class="code prompt"><pre>Install Voisu on this Arch computer: read https://anuraj-dev.github.io/voisu/agent-install.md and follow the Arch section step by step. Ask me before installing anything that isn't in the guide. Never ask me for API keys in this chat; when the guide says so, I'll run voisu setup in my own terminal.</pre></div>
+    <p>Expect to approve: the AUR install, then <code>voisu setup</code>. On Hyprland, setup also binds your Trigger Key.</p>
+  </div>
+
+  <div class="tabpanel" role="tabpanel" id="prompt-debian" aria-labelledby="tab-debian" tabindex="0">
+    <h3 class="panel-title">Debian / Ubuntu</h3>
+    <p class="meta">Ubuntu 26.04 LTS · GNOME Wayland · amd64</p>
+    <div class="code prompt"><pre>Install Voisu on this Debian/Ubuntu computer: read https://anuraj-dev.github.io/voisu/agent-install.md and follow the Debian / Ubuntu section step by step. Check the signing key fingerprint before adding the repository, and show me each sudo command before you run it. Never ask me for API keys in this chat; when the guide says so, I'll run voisu setup in my own terminal.</pre></div>
+    <p>Expect to approve: <code>sudo</code> for the repository and package, then <code>voisu setup</code>. Setup may ask you to log out and back in.</p>
+  </div>
+
+  <div class="tabpanel" role="tabpanel" id="prompt-windows" aria-labelledby="tab-windows" tabindex="0">
+    <h3 class="panel-title">Windows</h3>
+    <p class="meta">Windows 10 / 11 · x64 · PowerShell</p>
+    <div class="code prompt"><pre>Install Voisu on this Windows computer: read https://anuraj-dev.github.io/voisu/agent-install.md and follow the Windows section step by step using PowerShell. Never ask me for API keys in this chat; I'll type them into Voisu's settings window.</pre></div>
+    <p>Expect to approve: SmartScreen's <strong>More info</strong> → <strong>Run anyway</strong> (the installer isn't code-signed yet), then the installer itself. No admin rights are needed.</p>
+  </div>
+</div>
+
+<h2 id="split">What the agent does, what you do</h2>
+<div class="table-scroll">
+<table>
+  <thead><tr><th>Step</th><th>Agent</th><th>You</th></tr></thead>
+  <tbody>
+    <tr><td data-label="Step">Detect</td><td data-label="Agent">Reads your OS, distribution and desktop session.</td><td data-label="You">Nothing.</td></tr>
+    <tr><td data-label="Step">Install</td><td data-label="Agent">Runs the package commands, or downloads the Windows installer and starts it.</td><td data-label="You">Approve <code>sudo</code>, or click through SmartScreen and the installer.</td></tr>
+    <tr><td data-label="Step">Start</td><td data-label="Agent">Enables Voisu's user service on Linux.</td><td data-label="You">Pick your Trigger Key if your desktop shows a shortcut dialog.</td></tr>
+    <tr><td data-label="Step">Keys</td><td data-label="Agent">Tells you when it's time. Never sees them.</td><td data-label="You">Run <code>voisu setup</code> in your own terminal, or use the Windows settings window.</td></tr>
+    <tr><td data-label="Step">Check</td><td data-label="Agent">Runs <code>voisu doctor</code> and checks both keys with their providers.</td><td data-label="You">Make one Recording and confirm the words landed.</td></tr>
+  </tbody>
+</table>
+</div>
+<p>Run <code>voisu setup</code> in a separate terminal window, not through the agent. It's an interactive wizard that masks your keys as you type, which needs a real terminal.</p>
+
+<h2 id="guide">The guide the agent follows</h2>
+<p>Every prompt points to one plain-text file: <a href="../agent-install.md">agent-install.md</a>. It lists the exact commands for each system, the checks that prove the install worked, and the points where the agent must stop and hand over to you. Read it before you paste the prompt. An agent will run what that file says.</p>
+<p>For tools that index sites for language models, <a href="../llms.txt">llms.txt</a> lists these docs and the guide.</p>
+<p>If the agent gets stuck, it should stop and show you the error. <a href="troubleshooting.html">Troubleshooting</a> and <code>voisu doctor --verbose</code> cover the usual causes.</p>
+
+    <nav class="pager" aria-label="Docs pages">
+      <a class="prev" href="getting-started.html"><small>Previous</small>Getting started</a><a class="next" href="using.html"><small>Next</small>Dictating</a>
+    </nav>
+  </main>
+</div>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="foot-grid">
+      <div class="foot-brand">
+        <a class="brand" href="../"><img class="mark" src="../assets/logo.svg" alt="" width="32" height="32"><span>voisu</span></a>
+        <p>Voice dictation for Linux and Windows. MIT licensed. © 2026 Anuraj Jit Saikia.</p>
+      </div>
+      <div>
+        <h2>Docs</h2>
+        <ul>
+          <li><a href="getting-started.html">Getting started</a></li>
+          <li><a href="agents.html">Install with an agent</a></li>
+          <li><a href="using.html">Dictating</a></li>
+          <li><a href="settings.html">Settings &amp; commands</a></li>
+          <li><a href="troubleshooting.html">Troubleshooting</a></li>
+          <li><a href="privacy.html">Privacy</a></li>
+        </ul>
+      </div>
+      <div>
+        <h2>Project</h2>
+        <ul>
+          <li><a href="https://github.com/Anuraj-dev/voisu">Source on GitHub</a></li>
+          <li><a href="https://github.com/Anuraj-dev/voisu/releases">Releases</a></li>
+          <li><a href="https://github.com/Anuraj-dev/voisu/issues">Report a problem</a></li>
+          <li><a href="https://github.com/Anuraj-dev/voisu/blob/main/LICENSE">MIT License</a></li>
+        </ul>
+      </div>
+    </div>
+    <p class="foot-key">apt signing key · 4149 EE38 68B3 6B60 0759 2966 D08B CFDC 3412 5B28</p>
+  </div>
+</footer>
+</body>
+</html>

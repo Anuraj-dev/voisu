@@ -1,0 +1,25 @@
+# Voisu
+
+> Voisu is free, MIT-licensed voice dictation for Linux (Fedora, Arch, Debian/Ubuntu) and Windows 10/11. Press a key, speak, and the Transcript is pasted where you were typing. It uses your own Deepgram and Groq API keys and has no account, server or analytics of its own.
+
+Agents installing Voisu for a user: follow the agent install guide below. Never ask the user to paste API keys into the chat; they type them into Voisu's own setup (`voisu setup` on Linux, the settings window on Windows).
+
+## Agents
+
+- [Agent install guide](https://anuraj-dev.github.io/voisu/agent-install.md): exact commands per platform, the steps only the human can do, and verification checks
+
+## Docs
+
+- [Overview](https://anuraj-dev.github.io/voisu/docs/): what Voisu is, and the words the docs use (Recording, Transcript, Trigger Key, Delivery, Overlay)
+- [Getting started](https://anuraj-dev.github.io/voisu/docs/getting-started.html): install on Windows, Fedora, Arch or Debian/Ubuntu, add keys, make the first Recording
+- [Install with an agent](https://anuraj-dev.github.io/voisu/docs/agents.html): copyable prompts for Claude Code, Codex and other terminal agents
+- [Dictating](https://anuraj-dev.github.io/voisu/docs/using.html): gestures, the capsule's states, where text goes, recovering a Transcript
+- [Providers & API keys](https://anuraj-dev.github.io/voisu/docs/providers.html): what Deepgram and Groq do, getting and storing keys, local transcription on Linux
+- [Settings & commands](https://anuraj-dev.github.io/voisu/docs/settings.html): the Windows settings window and tray, every Linux `voisu` command, file locations
+- [Troubleshooting](https://anuraj-dev.github.io/voisu/docs/troubleshooting.html): Trigger Key, portals, keys, microphone, failed pastes, SmartScreen, bug reports
+
+## Optional
+
+- [Privacy](https://anuraj-dev.github.io/voisu/docs/privacy.html): what leaves the computer and what stays on it
+- [Updating & uninstalling](https://anuraj-dev.github.io/voisu/docs/updating.html): updates on each platform and clean removal
+- [Source on GitHub](https://github.com/Anuraj-dev/voisu)

@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <title>Voisu</title>
+  <rect width="512" height="512" fill="#17191D"/>
+  <rect x="96" y="112" width="320" height="150" rx="75" fill="none" stroke="#65D6A0" stroke-width="26"/>
+  <g fill="#8FB4FF">
+    <rect x="164" y="157" width="36" height="60" rx="18"/>
+    <rect x="238" y="141" width="36" height="92" rx="18"/>
+    <rect x="312" y="157" width="36" height="60" rx="18"/>
+  </g>
+  <text x="256" y="388" text-anchor="middle" fill="#F4F5F7" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="104" font-weight="600" letter-spacing="-2">voisu</text>
+</svg>
