@@ -47,6 +47,8 @@ const CLEANUP_DRAIN: Duration = Duration::from_secs(2);
 const LANGUAGE: &str = "en";
 
 const KEYS_MISSING: &str = "Add your Groq and Deepgram keys to start dictating.";
+/// Accessible label for `done` when auto-paste is off and nothing was pasted.
+const COPIED: &str = "Transcript copied to the clipboard";
 
 /// Tells the trigger that the engine finished or refused a Recording.
 pub type EndedSink = Arc<dyn Fn(u64) + Send + Sync>;
@@ -312,7 +314,7 @@ impl Engine {
         if !self.settings().auto_paste {
             let copied = tokio::task::spawn_blocking(move || delivery::copy(&text)).await;
             let message = match copied {
-                Ok(Ok(())) => None,
+                Ok(Ok(())) => return self.emit_state(Phase::Done, Some(COPIED.to_owned())),
                 Ok(Err(error)) => {
                     tracing::warn!(id, %error, "copy failed");
                     Some(error.to_string())
@@ -340,7 +342,7 @@ impl Engine {
     /// Success unless there is something to tell the user.
     fn delivered(&self, message: Option<String>) {
         match message {
-            None => self.emit_state(Phase::Idle, None),
+            None => self.emit_state(Phase::Done, None),
             Some(message) => self.emit_state(Phase::Error, Some(message)),
         }
     }
@@ -497,7 +499,7 @@ impl Engine {
             match state {
                 Phase::Recording | Phase::HandsFree => tray.set_status("Voisu: recording…"),
                 Phase::Processing => tray.set_status("Voisu: transcribing…"),
-                Phase::Idle | Phase::Error => tray.set_ready(crate::keys_ready()),
+                Phase::Idle | Phase::Done | Phase::Error => tray.set_ready(crate::keys_ready()),
             }
         }
         let _ = self

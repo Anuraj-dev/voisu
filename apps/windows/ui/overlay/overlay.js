@@ -1,7 +1,8 @@
 // The recording Overlay page. It only listens: `recording-state` and
 // `audio-level` come from the Recording engine (or the tray's "Preview
 // overlay"), and nothing is sent back. Drawing stops whenever the capsule is
-// idle or showing an error, so a hidden overlay costs no frames.
+// idle or showing the check mark or an error, so a hidden overlay costs no
+// frames.
 import { listen } from '@tauri-apps/api/event';
 
 // Geometry and motion from the Linux overlay (voisu-overlay.rs).
@@ -20,6 +21,8 @@ const FRAME_MS = 1000 / 30;
 // (overlay.rs ERROR_DISPLAY); the page holds it a little longer so it never
 // blanks before the window hides.
 const ERROR_HOLD_MS = 3500;
+// Same for the Delivered check mark (overlay.rs DONE_DISPLAY, 2 s).
+const DONE_HOLD_MS = 2500;
 // Hands-free shows a Recording-green dot in place of the leftmost bars, so the
 // state is told by shape and position, not colour alone.
 const HANDS_FREE_RGB = '101, 214, 160';
@@ -33,12 +36,14 @@ const LABELS = {
   recording: 'Recording',
   handsFree: 'Recording hands-free',
   processing: 'Processing',
+  done: 'Transcript Delivered',
 };
 
 const capsule = document.getElementById('capsule');
 const canvas = document.getElementById('meter');
 const message = document.getElementById('message');
 const messageText = document.getElementById('message-text');
+const check = document.getElementById('check');
 const ctx = canvas.getContext('2d');
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
 
@@ -48,7 +53,7 @@ let smoothed = 0;
 let frame = 0;
 let lastFrame = 0;
 let sweepStart = 0;
-let errorTimer = 0;
+let holdTimer = 0;
 let scale = 1;
 
 function fitScale() {
@@ -152,8 +157,9 @@ function stopDrawing() {
 }
 
 function setState(next, text) {
-  if (next === 'idle' && state === 'error') return;
-  clearTimeout(errorTimer);
+  // `done` and `error` hold until their own timer, even if `idle` follows.
+  if (next === 'idle' && (state === 'error' || state === 'done')) return;
+  clearTimeout(holdTimer);
   const wasMetering = state === 'recording' || state === 'handsFree';
   const metering = next === 'recording' || next === 'handsFree';
   if (metering && !wasMetering) {
@@ -171,14 +177,19 @@ function setState(next, text) {
     stopDrawing();
     messageText.textContent = text || 'Something went wrong';
     message.hidden = false;
+    check.hidden = true;
     capsule.setAttribute('aria-label', `Error: ${messageText.textContent}`);
-    errorTimer = setTimeout(() => {
-      state = 'cleared';
-      setState('idle');
-    }, ERROR_HOLD_MS);
+    holdTimer = setTimeout(clear, ERROR_HOLD_MS);
     return;
   }
   message.hidden = true;
+  check.hidden = next !== 'done';
+  if (next === 'done') {
+    stopDrawing();
+    capsule.setAttribute('aria-label', text || LABELS.done);
+    holdTimer = setTimeout(clear, DONE_HOLD_MS);
+    return;
+  }
   capsule.setAttribute('aria-label', LABELS[next] ?? '');
   if (next === 'idle') {
     // Leave nothing behind for the next show to flash before its first frame.
@@ -188,6 +199,11 @@ function setState(next, text) {
   } else {
     requestDraw();
   }
+}
+
+function clear() {
+  state = 'cleared';
+  setState('idle');
 }
 
 function onLevel(level) {

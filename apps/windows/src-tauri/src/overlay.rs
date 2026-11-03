@@ -34,6 +34,8 @@ const GLOW_PAD: f64 = 8.0;
 const BOTTOM_MARGIN: f64 = 24.0;
 /// Long enough to read a one-line error, then the capsule hides.
 const ERROR_DISPLAY: Duration = Duration::from_secs(3);
+/// The Delivered check mark, as long as the Linux overlay's terminal phases.
+const DONE_DISPLAY: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -42,10 +44,24 @@ pub enum RecordingState {
     Recording,
     HandsFree,
     Processing,
+    /// The transcript was delivered: a brief check mark, then hidden.
+    Done,
     Error,
 }
 
-/// `recording-state` payload. `message` is set only for `error`.
+impl RecordingState {
+    /// How long a terminal state stays up on its own before the capsule hides.
+    fn display_time(self) -> Option<Duration> {
+        match self {
+            Self::Done => Some(DONE_DISPLAY),
+            Self::Error => Some(ERROR_DISPLAY),
+            Self::Idle | Self::Recording | Self::HandsFree | Self::Processing => None,
+        }
+    }
+}
+
+/// `recording-state` payload. `message` is set for `error`, and for `done`
+/// when the transcript was only copied (the overlay's accessible label).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RecordingStatePayload {
     pub state: RecordingState,
@@ -72,38 +88,38 @@ pub enum Step {
 }
 
 /// Pure visibility logic: which states show the capsule, and which pending
-/// error-hide timer is still current.
+/// hide timer (after `done` or `error`) is still current.
 #[derive(Debug, Default)]
 pub struct Presenter {
     visible: bool,
     generation: u64,
-    error_showing: bool,
+    terminal_showing: bool,
 }
 
 impl Presenter {
-    /// Returns the window step and, for `error`, the generation a delayed
-    /// [`Presenter::on_hide_timer`] call must carry to still apply.
+    /// Returns the window step and, for `done` and `error`, the generation a
+    /// delayed [`Presenter::on_hide_timer`] call must carry to still apply.
     pub fn on_state(&mut self, state: RecordingState) -> (Step, Option<u64>) {
-        // The engine goes idle right after a failure; the error stays up until
-        // its own timer hides it so the message can be read.
-        if state == RecordingState::Idle && self.error_showing {
+        // An `idle` right after `done` or `error` (the preview ends that way)
+        // leaves the check mark or message up until its own timer hides it.
+        if state == RecordingState::Idle && self.terminal_showing {
             return (Step::Nothing, None);
         }
-        // Any other new state supersedes a pending error hide.
+        // Any other new state supersedes a pending hide.
         self.generation += 1;
-        self.error_showing = state == RecordingState::Error;
+        self.terminal_showing = state.display_time().is_some();
         if state == RecordingState::Idle {
             return (self.hide(), None);
         }
         let place = !self.visible;
         self.visible = true;
-        let timer = self.error_showing.then_some(self.generation);
+        let timer = self.terminal_showing.then_some(self.generation);
         (Step::Show { place }, timer)
     }
 
     pub fn on_hide_timer(&mut self, generation: u64) -> Step {
         if generation == self.generation {
-            self.error_showing = false;
+            self.terminal_showing = false;
             self.hide()
         } else {
             Step::Nothing
@@ -112,6 +128,12 @@ impl Presenter {
 
     pub fn is_visible(&self) -> bool {
         self.visible
+    }
+
+    /// Visible for a Recording in progress, not just a check mark or error
+    /// waiting out its timer.
+    pub fn is_live(&self) -> bool {
+        self.visible && !self.terminal_showing
     }
 
     fn hide(&mut self) -> Step {
@@ -237,10 +259,10 @@ fn on_main_thread(app: &AppHandle, work: impl FnOnce(&AppHandle) + Send + 'stati
 fn on_state(app: &AppHandle, state: RecordingState) {
     let (step, timer) = presenter(app).on_state(state);
     apply(app, step);
-    if let Some(generation) = timer {
+    if let (Some(generation), Some(delay)) = (timer, state.display_time()) {
         let app = app.clone();
         std::thread::spawn(move || {
-            std::thread::sleep(ERROR_DISPLAY);
+            std::thread::sleep(delay);
             on_main_thread(&app, move |app| {
                 let step = presenter(app).on_hide_timer(generation);
                 apply(app, step);
@@ -368,7 +390,7 @@ fn play_preview(app: &AppHandle, token: u64) -> bool {
         return false;
     }
     std::thread::sleep(Duration::from_secs(1));
-    state(RecordingState::Idle)
+    state(RecordingState::Done)
 }
 
 /// Shows the capsule at the size just chosen: re-places a preview already
@@ -387,11 +409,11 @@ pub fn preview_size(app: &AppHandle) {
 }
 
 /// Tray diagnostic: plays recording (~3 s of fake levels) → processing (~1 s)
-/// → idle through the same events W2 emits. It does nothing while the capsule
-/// is already up (a real Recording) or another preview runs, and stops at
-/// once when a real Recording starts.
+/// → done through the same events W2 emits. It does nothing while a real
+/// Recording is on screen or another preview runs, and stops at once when a
+/// real Recording starts.
 pub fn preview(app: &AppHandle) {
-    if presenter(app).is_visible() {
+    if presenter(app).is_live() {
         return;
     }
     let Some(token) = preview_gate().begin() else {
@@ -608,6 +630,35 @@ mod tests {
             presenter.on_state(RecordingState::Processing).0,
             Step::Show { place: false }
         );
+    }
+
+    #[test]
+    fn done_shows_then_hides_on_its_own_timer_and_ignores_a_following_idle() {
+        let mut presenter = Presenter::default();
+        presenter.on_state(RecordingState::Processing);
+        let (step, timer) = presenter.on_state(RecordingState::Done);
+        assert_eq!(step, Step::Show { place: false });
+        assert_eq!(presenter.on_state(RecordingState::Idle).0, Step::Nothing);
+        assert!(presenter.is_visible());
+        assert!(!presenter.is_live(), "a preview may replace the check mark");
+        assert_eq!(presenter.on_hide_timer(timer.unwrap()), Step::Hide);
+        assert_eq!(
+            RecordingState::Done.display_time(),
+            Some(Duration::from_secs(2))
+        );
+    }
+
+    #[test]
+    fn a_new_recording_supersedes_the_check_mark() {
+        let mut presenter = Presenter::default();
+        let (_, timer) = presenter.on_state(RecordingState::Done);
+        assert_eq!(
+            presenter.on_state(RecordingState::Recording).0,
+            Step::Show { place: false }
+        );
+        assert_eq!(presenter.on_hide_timer(timer.unwrap()), Step::Nothing);
+        assert!(presenter.is_live());
+        assert_eq!(presenter.on_state(RecordingState::Idle).0, Step::Hide);
     }
 
     #[test]

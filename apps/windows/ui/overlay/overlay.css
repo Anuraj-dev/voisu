@@ -6,6 +6,7 @@
 :root {
   --s: 1;
   --surface: rgba(23, 25, 29, 0.96);
+  --accent: #65d6a0;
   --failure: #ff8a8a;
   --text: #f4f5f7;
 }
@@ -67,8 +68,38 @@ body {
   overflow: hidden;
 }
 
-.message[hidden] {
+.message[hidden],
+.check[hidden] {
   display: none;
+}
+
+/* Delivered: the check mark alone, like the Linux Success phase. */
+.check {
+  color: var(--accent);
+  font-size: calc(14pt * var(--s));
+  font-weight: 600;
+  line-height: 1;
+}
+
+.capsule.done .meter {
+  display: none;
+}
+
+.capsule.done .check {
+  animation: check-in 160ms ease-out;
+}
+
+@keyframes check-in {
+  from {
+    opacity: 0;
+    transform: scale(0.8);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .capsule.done .check {
+    animation: none;
+  }
 }
 
 .capsule.error {

@@ -74,7 +74,7 @@
       dictationError = message ?? 'Dictation failed.';
     } else if (state === 'recording') {
       dictationError = '';
-    } else if (state === 'idle') {
+    } else if (state === 'idle' || state === 'done') {
       dictationError = '';
       refreshTranscript();
     }
