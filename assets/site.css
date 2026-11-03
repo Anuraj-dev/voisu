@@ -1,17 +1,26 @@
 /* Voisu site: one stylesheet for the landing page and the docs.
-   Palette comes from the Overlay tokens in DESIGN.md (Surface #17191D,
-   Recording #65D6A0, Processing #8FB4FF, Success #B8E986, Failure #FF8A8A).
-   Dark is the default; light follows prefers-color-scheme. */
+
+   Identity: an operator's manual for a small instrument. The page is a cool
+   grey panel; anything that *is* Voisu (the capsule, the hero stage, commands
+   you paste) sits on the logo's own ground, #17191D, in both themes. Colour is
+   reserved for state: Recording #65D6A0, Processing #8FB4FF, Delivered
+   #B8E986, Failure #FF8A8A — the Overlay tokens from DESIGN.md.
+
+   Type: Archivo (variable width) for everything you read, run wide and heavy
+   for headings like engraved panel labels; Martian Mono only where a machine
+   is speaking (commands, keys, fingerprints).
+
+   Light is the designed base; dark follows prefers-color-scheme. */
 
 :root {
-  color-scheme: dark light;
+  color-scheme: light dark;
 
-  --font: "Schibsted Grotesk", "Segoe UI Variable Text", "Segoe UI", "Adwaita Sans",
-    Cantarell, "Noto Sans", "Helvetica Neue", sans-serif;
-  --mono: ui-monospace, "JetBrains Mono", "Cascadia Mono", "Adwaita Mono", "SF Mono",
-    Menlo, Consolas, "Liberation Mono", monospace;
+  --font: "Archivo", "Segoe UI Variable Text", "Segoe UI", "Adwaita Sans", Cantarell,
+    "Noto Sans", "Helvetica Neue", sans-serif;
+  --mono: "Martian Mono", ui-monospace, "JetBrains Mono", "Cascadia Mono", "Adwaita Mono",
+    Menlo, Consolas, monospace;
 
-  /* Overlay tokens: the capsule looks the same in both themes. */
+  /* Overlay tokens: the capsule and the plates look the same in both themes. */
   --capsule: #17191d;
   --capsule-line: #2a2e35;
   --rec: #65d6a0;
@@ -19,64 +28,66 @@
   --ok: #b8e986;
   --fail: #ff8a8a;
 
-  --bg: #0e0f12;
-  --bg-2: #121418;
-  --surface: #17191d;
-  --surface-2: #1d2025;
-  --line: #2a2e35;
-  --line-2: #212429;
-  --ink: #f4f5f7;
-  --ink-2: #b5bac5;
-  --ink-3: #8a909b;
+  /* Plate: the logo ground. Hero stage, code, primary buttons. */
+  --plate: #17191d;
+  --plate-2: #1f2227;
+  --plate-line: #30343c;
+  --plate-ink: #eceee8;
+  --plate-ink-2: #a9aeb6;
 
-  /* Text-safe accent variants (dark: the tokens themselves). */
-  --rec-ink: #65d6a0;
-  --proc-ink: #8fb4ff;
-  --ok-ink: #b8e986;
-  --fail-ink: #ff8a8a;
+  --bg: #e8eae5;
+  --bg-2: #dfe2dc;
+  --surface: #f3f4f0;
+  --surface-2: #e2e5df;
+  --line: #b9beb5;
+  --line-2: #cfd3cb;
+  --ink: #17191d;
+  --ink-2: #41464e;
+  --ink-3: #585e67;
+
+  /* Text-safe state inks for the paper. */
+  --rec-ink: #0f6a45;
+  --proc-ink: #2a4bbf;
+  --ok-ink: #3f6a0c;
+  --fail-ink: #a82a2a;
 
   --accent: #65d6a0;
-  --accent-hover: #7fe0b2;
-  --on-accent: #0b1a12;
-  --link: #8fb4ff;
-  --focus: #8fb4ff;
-  --code-bg: #111317;
-  --code-ink: #e6e8ec;
-  --sel: rgba(101, 214, 160, 0.28);
-  --shadow: 0 1px 0 rgba(255, 255, 255, 0.04) inset, 0 24px 60px -24px rgba(0, 0, 0, 0.7);
+  --link: #2a4bbf;
+  --focus: #2a4bbf;
+  --code-bg: var(--plate);
+  --code-ink: var(--plate-ink);
+  --sel: rgba(101, 214, 160, 0.4);
 
-  --radius: 14px;
-  --radius-sm: 9px;
+  --radius: 6px;
+  --radius-sm: 4px;
   --gutter: clamp(16px, 4vw, 40px);
   --max: 1180px;
 }
 
-@media (prefers-color-scheme: light) {
+@media (prefers-color-scheme: dark) {
   :root {
-    --bg: #f5f4ef;
-    --bg-2: #eceae3;
-    --surface: #ffffff;
-    --surface-2: #f1efe9;
-    --line: #d6d3c9;
-    --line-2: #e4e1d8;
-    --ink: #15171b;
-    --ink-2: #474c55;
-    --ink-3: #5d626b;
+    --plate: #0f1113;
+    --plate-2: #181b1f;
+    --plate-line: #2a2e35;
 
-    --rec-ink: #13774b;
-    --proc-ink: #2c52b0;
-    --ok-ink: #44700f;
-    --fail-ink: #b02c2c;
+    --bg: #17191d;
+    --bg-2: #1b1e22;
+    --surface: #1f2226;
+    --surface-2: #262a2f;
+    --line: #3a3f47;
+    --line-2: #2b2f35;
+    --ink: #eceee8;
+    --ink-2: #b4b9bf;
+    --ink-3: #8f959d;
 
-    --accent: #3dbe85;
-    --accent-hover: #34ad78;
-    --on-accent: #08130d;
-    --link: #2c52b0;
-    --focus: #2c52b0;
-    --code-bg: #eeece5;
-    --code-ink: #1b1d22;
-    --sel: rgba(61, 190, 133, 0.3);
-    --shadow: 0 1px 0 rgba(255, 255, 255, 0.6) inset, 0 24px 50px -28px rgba(30, 30, 20, 0.35);
+    --rec-ink: #65d6a0;
+    --proc-ink: #8fb4ff;
+    --ok-ink: #b8e986;
+    --fail-ink: #ff8a8a;
+
+    --link: #8fb4ff;
+    --focus: #8fb4ff;
+    --sel: rgba(101, 214, 160, 0.3);
   }
 }
 
@@ -107,7 +118,7 @@ body {
   font-family: var(--font);
   font-size: 1.0625rem;
   line-height: 1.6;
-  font-feature-settings: "ss01", "cv11";
+  font-variation-settings: "wdth" 100;
   -webkit-font-smoothing: antialiased;
   overflow-x: hidden;
 }
@@ -139,12 +150,15 @@ a:hover {
   border-radius: 4px;
 }
 
+/* Headings run semi-expanded and heavy: panel lettering, not a magazine. */
 h1,
 h2,
 h3,
 h4 {
-  line-height: 1.12;
-  letter-spacing: -0.02em;
+  font-stretch: 112%;
+  font-weight: 800;
+  line-height: 1.08;
+  letter-spacing: -0.01em;
   margin: 0;
   text-wrap: balance;
 }
@@ -157,14 +171,15 @@ code,
 kbd,
 pre {
   font-family: var(--mono);
-  font-size: 0.9em;
+  font-size: 0.84em;
+  font-stretch: 87.5%;
 }
 
 :not(pre) > code {
   background: var(--surface-2);
   border: 1px solid var(--line-2);
-  border-radius: 6px;
-  padding: 0.08em 0.38em;
+  border-radius: 3px;
+  padding: 0.06em 0.34em;
   overflow-wrap: anywhere;
 }
 
@@ -174,7 +189,7 @@ kbd {
   padding: 0.12em 0.5em 0.18em;
   border: 1px solid var(--line);
   border-bottom-width: 3px;
-  border-radius: 7px;
+  border-radius: 4px;
   background: var(--surface);
   color: var(--ink);
   font-size: 0.82em;
@@ -202,9 +217,10 @@ kbd {
   top: -60px;
   z-index: 100;
   padding: 10px 14px;
-  background: var(--accent);
-  color: var(--on-accent);
-  border-radius: var(--radius-sm);
+  background: var(--plate);
+  color: var(--plate-ink);
+  border: 2px solid var(--rec);
+  border-radius: 999px;
   font-weight: 700;
   text-decoration: none;
 }
@@ -324,6 +340,7 @@ kbd {
   font: inherit;
   font-weight: 650;
   font-size: 1rem;
+  font-stretch: 106%;
   line-height: 1.2;
   text-decoration: none;
   cursor: pointer;
@@ -338,15 +355,16 @@ kbd {
   transform: translateY(1px);
 }
 
+/* The primary button is the logo capsule: dark ground, green outline. */
 .btn.primary {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: var(--on-accent);
+  background: var(--plate);
+  border: 2px solid var(--rec);
+  color: var(--plate-ink);
 }
 
 .btn.primary:hover {
-  background: var(--accent-hover);
-  border-color: var(--accent-hover);
+  background: var(--plate-2);
+  border-color: var(--rec);
 }
 
 .btn svg {
@@ -1099,7 +1117,7 @@ details.more > :last-child {
 .code {
   position: relative;
   margin: 0 0 12px;
-  border: 1px solid var(--line-2);
+  border: 1px solid var(--plate-line);
   border-radius: var(--radius-sm);
   background: var(--code-bg);
 }
@@ -1116,13 +1134,12 @@ details.more > :last-child {
 }
 
 .code .p {
-  color: var(--ink-3);
+  color: var(--rec);
   user-select: none;
 }
 
 .code .c {
-  color: var(--ink-3);
-  font-style: italic;
+  color: var(--plate-ink-2);
 }
 
 .copy {
@@ -1131,13 +1148,13 @@ details.more > :last-child {
   right: 8px;
   min-height: 30px;
   padding: 4px 10px;
-  border: 1px solid var(--line);
-  border-radius: 7px;
-  background: var(--surface);
-  color: var(--ink-2);
+  border: 1px solid var(--plate-line);
+  border-radius: 999px;
+  background: var(--plate-2);
+  color: var(--plate-ink-2);
   font: inherit;
   font-family: var(--mono);
-  font-size: 0.74rem;
+  font-size: 0.7rem;
   cursor: pointer;
   display: none;
 }
@@ -1147,11 +1164,11 @@ details.more > :last-child {
 }
 
 .copy:hover {
-  color: var(--ink);
+  color: var(--plate-ink);
 }
 
 .copy.ok {
-  color: var(--rec-ink);
+  color: var(--rec);
   border-color: color-mix(in srgb, var(--rec) 50%, transparent);
 }
 
