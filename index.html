@@ -182,57 +182,65 @@
 
   <section class="section" id="install" aria-labelledby="install-title">
     <div class="wrap install">
-      <div class="install-copy">
-        <p class="kicker">Install</p>
+      <div class="section-head">
         <h2 id="install-title">Pick your system.</h2>
         <p>Every channel installs the same Voisu. After installing, <code>voisu setup</code> (Linux) or the settings window (Windows) asks for your API keys and you're ready.</p>
-        <ul>
-          <li><strong>Fedora</strong> via COPR (RPM), with an optional overlay package.</li>
-          <li><strong>Arch</strong> via the AUR, prebuilt or from source.</li>
-          <li><strong>Debian / Ubuntu</strong> via the signed apt repository on this site.</li>
-          <li><strong>Windows 10 / 11</strong> via an installer that needs no admin rights.</li>
-          <li>Every <a href="https://github.com/Anuraj-dev/voisu/releases">GitHub release</a> also carries the <code>.deb</code>, a tarball and <code>SHA256SUMS</code>.</li>
-        </ul>
-        <p class="small install-next">New here? <a href="docs/getting-started.html">Getting started</a> walks through the first Recording on each system.</p>
       </div>
 
       <div class="tabs" data-tabs>
         <div class="tablist" role="tablist" aria-label="Choose your system">
-          <button type="button" role="tab" id="tab-fedora" aria-controls="install-fedora" data-os="fedora" aria-selected="true">Fedora</button>
-          <button type="button" role="tab" id="tab-arch" aria-controls="install-arch" data-os="arch" aria-selected="false" tabindex="-1">Arch</button>
-          <button type="button" role="tab" id="tab-debian" aria-controls="install-debian" data-os="debian" aria-selected="false" tabindex="-1">Debian / Ubuntu</button>
-          <button type="button" role="tab" id="tab-windows" aria-controls="install-windows" data-os="windows" aria-selected="false" tabindex="-1">Windows</button>
+          <button type="button" role="tab" id="tab-fedora" aria-controls="install-fedora" data-os="fedora" aria-selected="true"><span class="os">Fedora</span><span class="via">COPR</span></button>
+          <button type="button" role="tab" id="tab-arch" aria-controls="install-arch" data-os="arch" aria-selected="false" tabindex="-1"><span class="os">Arch</span><span class="via">AUR</span></button>
+          <button type="button" role="tab" id="tab-debian" aria-controls="install-debian" data-os="debian" aria-selected="false" tabindex="-1"><span class="os">Debian / Ubuntu</span><span class="via">apt</span></button>
+          <button type="button" role="tab" id="tab-windows" aria-controls="install-windows" data-os="windows" aria-selected="false" tabindex="-1"><span class="os">Windows</span><span class="via">Installer</span></button>
         </div>
 
         <div class="tabpanel" role="tabpanel" id="install-fedora" aria-labelledby="tab-fedora" tabindex="0">
           <h3 class="panel-title">Fedora</h3>
-          <p class="meta">Fedora · KDE Plasma or GNOME on Wayland · COPR</p>
+          <p class="meta">KDE Plasma or GNOME on Wayland · RPM from COPR, with an optional overlay package</p>
+          <div class="procedure">
+          <div class="step">
+          <p class="step-label"><span class="n">1</span>Install</p>
           <div class="code"><pre><span class="p">$ </span>sudo dnf copr enable anuraj-dev/voisu
 <span class="p">$ </span>sudo dnf install voisu
 <span class="c"># optional on-screen overlay:</span>
 <span class="p">$ </span>sudo dnf install voisu-overlay</pre></div>
-          <p class="step-label">Finish setup</p>
+          </div>
+          <div class="step">
+          <p class="step-label"><span class="n">2</span>Finish setup</p>
           <p class="small">Enable the user daemon, then add your API keys. The first time you dictate, your desktop asks you to confirm the shortcut; that choice sticks.</p>
           <div class="code"><pre><span class="p">$ </span>systemctl --user daemon-reload
 <span class="p">$ </span>systemctl --user enable --now voisu.service
 <span class="p">$ </span>voisu setup</pre></div>
           <p class="small">Optional overlay (install <code>voisu-overlay</code> first):</p>
           <div class="code"><pre><span class="p">$ </span>systemctl --user enable --now voisu-overlay.service</pre></div>
+          </div>
+          </div>
         </div>
 
         <div class="tabpanel" role="tabpanel" id="install-arch" aria-labelledby="tab-arch" tabindex="0">
           <h3 class="panel-title">Arch</h3>
-          <p class="meta">Arch Linux · AUR</p>
+          <p class="meta">Arch Linux · AUR, prebuilt or from source</p>
+          <div class="procedure">
+          <div class="step">
+          <p class="step-label"><span class="n">1</span>Install</p>
           <div class="code"><pre><span class="p">$ </span>yay -S voisu-bin</pre></div>
           <p class="small">Build from source instead with <code>yay -S voisu</code>. The two packages conflict, so pick one.</p>
-          <p class="step-label">Finish setup</p>
+          </div>
+          <div class="step">
+          <p class="step-label"><span class="n">2</span>Finish setup</p>
           <p class="small">On Hyprland, setup saves your API keys, writes the trigger binding and starts Voisu's services.</p>
           <div class="code"><pre><span class="p">$ </span>voisu setup</pre></div>
+          </div>
+          </div>
         </div>
 
         <div class="tabpanel" role="tabpanel" id="install-debian" aria-labelledby="tab-debian" tabindex="0">
           <h3 class="panel-title">Debian / Ubuntu</h3>
-          <p class="meta">Ubuntu 26.04 LTS · GNOME Wayland · amd64</p>
+          <p class="meta">Ubuntu 26.04 LTS · GNOME Wayland · amd64 · the signed apt repository on this site</p>
+          <div class="procedure stacked">
+          <div class="step">
+          <p class="step-label"><span class="n">1</span>Install</p>
           <div class="code"><pre><span class="c"># 1. Add Voisu's signing key.</span>
 <span class="p">$ </span>sudo install -d -m 0755 /etc/apt/keyrings
 <span class="p">$ </span>curl -fsSL https://anuraj-dev.github.io/voisu/voisu-archive-keyring.asc \
@@ -254,14 +262,21 @@
     | awk -F: '$1=="fpr"{print $10; exit}'
 <span class="c"># The printed fingerprint must equal $EXPECT before you add the key above.</span></pre></div>
           </details>
-          <p class="step-label">Finish setup</p>
+          </div>
+          <div class="step">
+          <p class="step-label"><span class="n">2</span>Finish setup</p>
           <p class="small">Setup asks for your API keys, enables the daemon and the native GNOME capsule, and uses <kbd>Ctrl</kbd>&nbsp;<kbd>Space</kbd> by default. If it asks, log out and back in, or reboot.</p>
           <div class="code"><pre><span class="p">$ </span>voisu setup</pre></div>
+          </div>
+          </div>
         </div>
 
         <div class="tabpanel" role="tabpanel" id="install-windows" aria-labelledby="tab-windows" tabindex="0">
           <h3 class="panel-title">Windows</h3>
           <p class="meta">Windows 10 / 11 · x64 · installs for your user, no admin needed</p>
+          <div class="procedure">
+          <div class="step">
+          <p class="step-label"><span class="n">1</span>Install</p>
           <div class="dl-card">
             <a class="btn primary" href="https://github.com/Anuraj-dev/voisu/releases/latest/download/Voisu-Setup-x64.exe">
               <svg viewBox="0 0 16 16" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" d="M8 2v8.5M4.5 7 8 10.5 11.5 7M3 13.5h10"/></svg>
@@ -271,10 +286,24 @@
           <div class="callout">
             <p>The installer isn't code-signed yet, so SmartScreen may warn on first run: choose <strong>More info</strong> → <strong>Run anyway</strong>.</p>
           </div>
-          <p class="step-label">Finish setup</p>
+          </div>
+          <div class="step">
+          <p class="step-label"><span class="n">2</span>Finish setup</p>
           <p class="small">Voisu opens its settings on first launch: paste your Groq and Deepgram API keys. Then hold <kbd>Ctrl</kbd>&nbsp;<kbd>Win</kbd>, speak, and release. Voisu lives in the tray and updates itself when a new version is out.</p>
+          </div>
+          </div>
         </div>
       </div>
+
+      <div class="agent-install">
+        <div>
+          <h3>Install with your agent</h3>
+          <p class="small">Paste this into Claude Code, Codex or another agent that can run terminal commands. It installs Voisu for your system; you type your API keys into Voisu's own setup. <a href="docs/agents.html">How it works</a></p>
+        </div>
+        <div class="code prompt"><pre>Install Voisu on this computer: read https://anuraj-dev.github.io/voisu/agent-install.md and follow it step by step. Never ask me for API keys in this chat; I'll type them into Voisu's own setup.</pre></div>
+      </div>
+
+      <p class="install-notes small">Every <a href="https://github.com/Anuraj-dev/voisu/releases">GitHub release</a> also carries the <code>.deb</code>, a tarball and <code>SHA256SUMS</code>. New here? <a href="docs/getting-started.html">Getting started</a> walks through the first Recording on each system.</p>
     </div>
   </section>
 
@@ -313,6 +342,7 @@
         <h2>Docs</h2>
         <ul>
           <li><a href="docs/getting-started.html">Getting started</a></li>
+          <li><a href="docs/agents.html">Install with your agent</a></li>
           <li><a href="docs/using.html">Using Voisu</a></li>
           <li><a href="docs/providers.html">Providers &amp; API keys</a></li>
           <li><a href="docs/troubleshooting.html">Troubleshooting</a></li>

@@ -741,12 +741,6 @@ kbd {
   margin-bottom: clamp(32px, 5vw, 56px);
 }
 
-.kicker {
-  margin: 0 0 14px;
-  font-size: 0.78rem;
-  color: var(--ink-3);
-}
-
 .section h2 {
   font-size: clamp(1.8rem, 3.4vw, 2.7rem);
   font-weight: 850;
@@ -933,42 +927,11 @@ kbd {
   transform: translateX(-50%);
 }
 
-/* Install */
-.install {
-  display: grid;
-  grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
-  gap: clamp(28px, 5vw, 64px);
-  align-items: start;
-}
-
-.install-copy h2 {
-  margin-bottom: 16px;
-}
-
-.install-copy p {
-  color: var(--ink-2);
-}
-
-.install-copy ul {
-  margin: 20px 0 0;
-  padding: 0;
-  list-style: none;
-  color: var(--ink-2);
-  font-size: 0.95rem;
-}
-
-.install-copy li {
-  padding: 10px 0;
-  border-top: 1px solid var(--line-2);
-}
-
-.install-copy li strong {
-  color: var(--ink);
-}
-
+/* Install: one selector, then a numbered procedure. The tabs carry the
+   channel, so nothing beside them repeats the list. */
 .tabs {
   border: 1px solid var(--line);
-  border-radius: 18px;
+  border-radius: var(--radius);
   background: var(--surface);
   overflow: hidden;
 }
@@ -978,46 +941,59 @@ kbd {
 }
 
 .js .tablist {
-  display: flex;
-  gap: 2px;
-  padding: 6px;
-  border-bottom: 1px solid var(--line-2);
-  background: var(--surface-2);
-  overflow-x: auto;
-  scrollbar-width: none;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 1px;
+  border-bottom: 1px solid var(--line);
+  background: var(--line);
 }
 
 .tablist button {
-  flex: 1 0 auto;
-  min-height: 40px;
-  padding: 8px 14px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  min-height: 48px;
+  padding: 14px 18px 12px;
   border: 0;
-  border-radius: 10px;
-  background: transparent;
+  border-radius: 0;
+  background: var(--bg-2);
   color: var(--ink-2);
   font: inherit;
-  font-size: 0.92rem;
-  font-weight: 600;
-  white-space: nowrap;
+  text-align: left;
   cursor: pointer;
+  transition: background-color 0.15s, box-shadow 0.15s;
+}
+
+.tablist .os {
+  font-size: 0.98rem;
+  font-weight: 750;
+  font-stretch: 110%;
+  line-height: 1.2;
+}
+
+.tablist .via {
+  font-size: 0.78rem;
+  color: var(--ink-3);
 }
 
 .tablist button:hover {
+  background: var(--surface-2);
   color: var(--ink);
 }
 
 .tablist button[aria-selected="true"] {
   background: var(--surface);
   color: var(--ink);
-  box-shadow: 0 0 0 1px var(--line), 0 2px 6px -2px rgba(0, 0, 0, 0.3);
+  box-shadow: inset 0 3px 0 var(--ink);
 }
 
 .tabpanel {
-  padding: 22px clamp(16px, 3vw, 26px) 26px;
+  padding: 24px clamp(16px, 3vw, 30px) 30px;
 }
 
 .tabpanel + .tabpanel {
-  border-top: 1px solid var(--line-2);
+  border-top: 1px solid var(--line);
 }
 
 .js .tabpanel + .tabpanel {
@@ -1042,16 +1018,79 @@ kbd {
 }
 
 .meta {
-  margin: 0 0 14px;
-  font-family: var(--mono);
-  font-size: 0.78rem;
+  margin: 0 0 22px;
+  font-size: 0.88rem;
   color: var(--ink-3);
 }
 
+.procedure {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 28px clamp(24px, 4vw, 48px);
+}
+
+.procedure.stacked {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.step {
+  min-width: 0;
+}
+
+.step > :last-child {
+  margin-bottom: 0;
+}
+
 .step-label {
-  margin: 22px 0 8px;
-  font-weight: 700;
-  font-size: 0.95rem;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 12px;
+  font-weight: 750;
+  font-stretch: 110%;
+  font-size: 1rem;
+}
+
+.step-label .n {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--ink);
+  color: var(--bg);
+  font-size: 0.74rem;
+  font-weight: 800;
+  font-stretch: 100%;
+}
+
+.agent-install {
+  display: grid;
+  grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
+  gap: 12px clamp(24px, 4vw, 48px);
+  align-items: start;
+  margin-top: 36px;
+}
+
+.agent-install h3 {
+  margin-bottom: 8px;
+  font-size: 1.15rem;
+}
+
+.agent-install .small {
+  margin: 0;
+}
+
+.agent-install .code {
+  margin: 0;
+}
+
+.install-notes {
+  margin: 28px 0 0;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+  color: var(--ink-3);
 }
 
 .small {
@@ -1163,9 +1202,18 @@ details.more > :last-child {
   border-color: color-mix(in srgb, var(--rec) 50%, transparent);
 }
 
+/* Copy sits in its own strip above the commands, so a long command that
+   scrolls sideways never slides under it. */
+.js .code pre {
+  padding-top: 42px;
+  padding-right: 16px;
+}
+
 /* A prompt you paste into a coding agent: prose, so it wraps and reads in the
    text face. Copy still takes the text verbatim (site.js). */
-.code.prompt pre {
+.code.prompt pre,
+.js .code.prompt pre {
+  padding-top: 14px;
   padding-right: 92px;
   font-family: var(--font);
   font-size: 0.95rem;
@@ -1181,10 +1229,6 @@ details.more > :last-child {
   font-weight: 700;
   font-stretch: 112%;
   color: var(--ink-2);
-}
-
-.install-next {
-  margin-top: 20px;
 }
 
 /* Keys strip */
@@ -1698,7 +1742,8 @@ ol.steps > li::before {
 
 @media (max-width: 960px) {
   .hero .wrap,
-  .install,
+  .procedure,
+  .agent-install,
   .byok,
   .section-head {
     grid-template-columns: minmax(0, 1fr);
@@ -1766,19 +1811,21 @@ ol.steps > li::before {
 }
 
 @media (max-width: 640px) {
+  .js .code.prompt pre {
+    padding-top: 42px;
+    padding-right: 16px;
+  }
+
   body {
     font-size: 1rem;
   }
 
   .js .tablist {
-    display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  /* Copy sits in its own strip so it never covers a command. */
-  .js .code pre {
-    padding-top: 44px;
-    padding-right: 16px;
+  .tablist button {
+    padding: 10px 14px 9px;
   }
 
   .beats {
