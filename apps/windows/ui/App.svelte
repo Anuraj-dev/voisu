@@ -13,6 +13,15 @@
     { id: 'medium', name: 'Medium' },
     { id: 'large', name: 'Large' },
   ];
+  // Written forms, as the backend stores them.
+  const DEFAULT_TRIGGER = 'Ctrl+Win';
+  const TRIGGER_PRESETS = [
+    { key: 'Ctrl+Win', name: 'Ctrl+Win' },
+    { key: 'Ctrl+`', name: 'Ctrl+`' },
+    { key: 'Right Ctrl', name: 'Right Ctrl' },
+    { key: 'CapsLock', name: 'Caps Lock' },
+    { key: 'Ctrl+Shift+Space', name: 'Ctrl+Shift+Space' },
+  ];
 
   let app = $state({
     groqSaved: false,
@@ -23,6 +32,7 @@
     autoPaste: true,
     overlaySize: 'medium',
     boostWords: [],
+    trigger: { key: DEFAULT_TRIGGER, label: DEFAULT_TRIGGER, warnings: [], isDefault: true },
   });
   let values = $state({ groq: '', deepgram: '' });
   let shown = $state({ groq: false, deepgram: false });
@@ -40,11 +50,18 @@
   let wordsDraft = $state('');
   let wordsBusy = $state(false);
   let wordsStatus = $state('');
+  // Shortcut recorder: the hook swallows ordinary keys while it runs, so the
+  // keys pressed arrive as `trigger-capture` events, not DOM key events.
+  let recording = $state(false);
+  let preview = $state('');
+  let triggerBusy = $state(false);
+  let triggerError = $state('');
 
   const saved = $derived({ groq: app.groqSaved, deepgram: app.deepgramSaved });
   const blank = $derived(!values.groq.trim() && !values.deepgram.trim());
   const canSubmit = $derived(!busy && !(blank && saved.groq && saved.deepgram));
   const wordsDirty = $derived(wordsDraft !== app.boostWords.join('\n'));
+  const presetChosen = $derived(TRIGGER_PRESETS.some((p) => p.key === app.trigger.key));
 
   async function refresh() {
     try {
@@ -107,11 +124,61 @@
       refreshTranscript();
     });
     subscribe('recording-state', onRecordingState);
+    subscribe('trigger-capture', onTriggerCapture);
+    // Leaving the window ends a recording, so keys typed elsewhere are not
+    // swallowed.
+    window.addEventListener('blur', stopRecording);
     return () => {
       disposed = true;
       unlisteners.forEach((fn) => fn());
+      window.removeEventListener('blur', stopRecording);
+      stopRecording();
     };
   });
+
+  async function chooseTrigger(key) {
+    if (triggerBusy) return;
+    triggerBusy = true;
+    triggerError = '';
+    try {
+      app.trigger = await invoke('set_trigger_key', { key });
+    } catch (e) {
+      triggerError = typeof e === 'string' ? e : 'Could not change the Trigger Key.';
+    } finally {
+      triggerBusy = false;
+    }
+  }
+
+  function startRecording() {
+    if (recording || triggerBusy) return;
+    triggerError = '';
+    preview = '';
+    recording = true;
+    invoke('start_trigger_capture').catch((e) => {
+      recording = false;
+      triggerError = typeof e === 'string' ? e : 'Could not start recording a shortcut.';
+    });
+  }
+
+  function stopRecording() {
+    if (!recording) return;
+    recording = false;
+    invoke('stop_trigger_capture').catch(() => {});
+  }
+
+  function onTriggerCapture(event) {
+    if (!recording) return;
+    const update = event.payload;
+    if (update.kind === 'preview') {
+      preview = update.label;
+      triggerError = '';
+      return;
+    }
+    // The hook has already left recording mode for every other kind.
+    recording = false;
+    if (update.kind === 'done') chooseTrigger(update.key);
+    else if (update.kind === 'invalid') triggerError = update.message;
+  }
 
   async function submit(event) {
     event.preventDefault();
@@ -265,6 +332,56 @@
     {#if error}<p class="error" role="alert"><span aria-hidden="true">✕</span> {error}</p>{/if}
   </form>
 
+  <section class="card trigger" aria-labelledby="trigger-title">
+    <div class="transcript-head">
+      <h2 id="trigger-title">Trigger key</h2>
+      <kbd class="chord" class:live={recording} aria-live="polite">
+        {recording ? preview || 'Press your shortcut…' : app.trigger.label}
+      </kbd>
+    </div>
+    <div class="presets" role="group" aria-label="Trigger key">
+      {#each TRIGGER_PRESETS as preset (preset.key)}
+        <button
+          type="button"
+          class="chip"
+          class:on={!recording && app.trigger.key === preset.key}
+          aria-pressed={!recording && app.trigger.key === preset.key}
+          disabled={recording || triggerBusy}
+          onclick={() => chooseTrigger(preset.key)}
+        >
+          {preset.name}
+        </button>
+      {/each}
+      {#if recording}
+        <button type="button" class="chip on" onclick={stopRecording}>Cancel</button>
+      {:else}
+        <button
+          type="button"
+          class="chip"
+          class:on={!presetChosen}
+          aria-pressed={!presetChosen}
+          disabled={triggerBusy}
+          onclick={startRecording}
+        >
+          Custom…
+        </button>
+      {/if}
+    </div>
+    {#if recording}
+      <p class="hint" role="status">Hold the keys together, then let go. Esc cancels.</p>
+    {:else}
+      {#each app.trigger.warnings as warning (warning)}
+        <p class="hint warn"><span aria-hidden="true">!</span> {warning}</p>
+      {/each}
+    {/if}
+    {#if triggerError}<p class="error" role="alert"><span aria-hidden="true">✕</span> {triggerError}</p>{/if}
+    {#if !app.trigger.isDefault && !recording}
+      <button type="button" class="link reset" disabled={triggerBusy} onclick={() => chooseTrigger(DEFAULT_TRIGGER)}>
+        Reset to Ctrl+Win
+      </button>
+    {/if}
+  </section>
+
   <div class="card">
     <label class="switch-row" for="autostart">
       <span>Start at login</span>
@@ -347,7 +464,7 @@
     {#if transcript}
       <p class="transcript-text">{transcript}</p>
     {:else}
-      <p class="note">Hold Ctrl+Win and speak. Release to transcribe; double-tap for hands-free, Esc to cancel.</p>
+      <p class="note">Hold {app.trigger.label} and speak. Release to transcribe; double-tap for hands-free, Esc to cancel.</p>
     {/if}
     {#if dictationError}<p class="error" role="alert"><span aria-hidden="true">✕</span> {dictationError}</p>{/if}
   </section>
@@ -564,7 +681,54 @@
     color: var(--text-2);
     font-weight: 400;
   }
-  .card:not(.transcript):not(.words) {
+  .trigger {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .chord {
+    font: inherit;
+    font-weight: 600;
+    padding: 2px 10px;
+    border-radius: 8px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-bottom-width: 2px;
+  }
+  .chord.live {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .presets {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .chip {
+    background: var(--overlay-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 32px;
+    padding: 3px 12px;
+    cursor: pointer;
+  }
+  .chip.on {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--surface);
+  }
+  .chip:disabled:not(.on) {
+    color: var(--text-2);
+    cursor: not-allowed;
+  }
+  .warn span {
+    font-weight: 700;
+    color: var(--processing);
+  }
+  .reset {
+    align-self: flex-start;
+  }
+  .card:not(.transcript):not(.words):not(.trigger) {
     display: flex;
     flex-direction: column;
     gap: 12px;

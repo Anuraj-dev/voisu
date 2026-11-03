@@ -19,6 +19,7 @@ pub mod setup;
 mod tray;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod trigger;
+pub mod trigger_key;
 mod updater;
 pub mod vocabulary;
 
@@ -31,12 +32,18 @@ use tauri_plugin_opener::OpenerExt as _;
 use voisu_cloud::ProviderHttpClient;
 use voisu_core::{Provider, SecretStore};
 
+#[cfg(windows)]
+use platform::hotkey::{is_dead_key, key_label};
 use platform::secrets::CredentialManagerStore;
 use settings::{OverlaySize, Settings};
 use setup::{KeyInputs, KeyResult};
+use trigger_key::TriggerChord;
 
 const SETTINGS_WINDOW: &str = "settings";
 const STATE_CHANGED: &str = "state-changed";
+/// Shortcut-recorder updates for the settings window.
+#[cfg_attr(not(windows), allow(dead_code))]
+const TRIGGER_CAPTURE: &str = "trigger-capture";
 /// Passed by the HKCU Run entry so a login launch stays in the tray.
 const AUTOSTART_ARG: &str = "--autostart";
 
@@ -100,6 +107,52 @@ struct UiState {
     auto_paste: bool,
     overlay_size: OverlaySize,
     boost_words: Vec<String>,
+    trigger: UiTrigger,
+}
+
+/// The Trigger Key as the settings window shows it.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UiTrigger {
+    /// The written form, as stored and as `set_trigger_key` takes it.
+    key: String,
+    /// The key named as the active keyboard layout names it.
+    label: String,
+    warnings: Vec<String>,
+    is_default: bool,
+}
+
+impl UiTrigger {
+    fn of(chord: TriggerChord) -> Self {
+        let mut warnings: Vec<String> = chord.warning().map(String::from).into_iter().collect();
+        if chord.key().is_some_and(is_dead_key) {
+            warnings.push(
+                "On your keyboard layout this key starts an accent, so pressing it outside the shortcut may not type straight away."
+                    .to_owned(),
+            );
+        }
+        Self {
+            key: chord.to_string(),
+            label: trigger_label(chord),
+            warnings,
+            is_default: chord == TriggerChord::default(),
+        }
+    }
+}
+
+fn trigger_label(chord: TriggerChord) -> String {
+    chord.label(chord.key().and_then(key_label).as_deref())
+}
+
+/// Off Windows there is no active layout to ask: the US names stand.
+#[cfg(not(windows))]
+fn key_label(_vk: u8) -> Option<String> {
+    None
+}
+
+#[cfg(not(windows))]
+fn is_dead_key(_vk: u8) -> bool {
+    false
 }
 
 #[tauri::command]
@@ -115,7 +168,107 @@ fn get_state(app: AppHandle) -> UiState {
         auto_paste: settings.auto_paste,
         overlay_size: settings.overlay_size,
         boost_words: settings.boost_words,
+        trigger: UiTrigger::of(settings.hotkey),
     }
+}
+
+/// Validates, saves and applies a new Trigger Key without a restart. An
+/// error is the message to show.
+#[tauri::command]
+fn set_trigger_key(app: AppHandle, key: String) -> Result<UiTrigger, String> {
+    let chord = TriggerChord::try_from(key).map_err(|error| error.to_string())?;
+    // Applied before saving, so a key that can't take effect is never stored.
+    #[cfg(windows)]
+    if !platform::hotkey::set_chord(chord) {
+        return Err(HOOK_DOWN.into());
+    }
+    update_settings(&app, |settings| settings.hotkey = chord);
+    let trigger = UiTrigger::of(chord);
+    if let Some(tray) = app.state::<AppState>().tray.get() {
+        tray.set_trigger(trigger.label.clone(), keys_ready());
+    }
+    let _ = app.emit(STATE_CHANGED, ());
+    Ok(trigger)
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+const HOOK_DOWN: &str =
+    "Voisu's keyboard hook isn't running, so the Trigger Key can't change. Restart Voisu.";
+
+/// Starts recording a shortcut; updates arrive as `trigger-capture` events.
+#[tauri::command]
+fn start_trigger_capture() -> Result<(), String> {
+    #[cfg(windows)]
+    if !platform::hotkey::capture(true) {
+        return Err(HOOK_DOWN.into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn stop_trigger_capture() {
+    #[cfg(windows)]
+    let _ = platform::hotkey::capture(false);
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum CaptureEvent {
+    Preview {
+        label: String,
+    },
+    /// A usable chord: the window saves it with `set_trigger_key`.
+    Done {
+        key: String,
+        label: String,
+    },
+    Invalid {
+        message: String,
+    },
+    Cancelled,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl CaptureEvent {
+    fn of(capture: chord::Capture) -> Self {
+        use chord::Capture;
+        match capture {
+            Capture::Preview(chord) => Self::Preview {
+                label: trigger_label(chord),
+            },
+            Capture::Done(chord) => match chord.check() {
+                Ok(()) => Self::Done {
+                    key: chord.to_string(),
+                    label: trigger_label(chord),
+                },
+                Err(rejection) => Self::Invalid {
+                    message: rejection.to_string(),
+                },
+            },
+            Capture::Invalid(rejection) => Self::Invalid {
+                message: rejection.to_string(),
+            },
+            Capture::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+/// Relays recorder updates from the hook thread to the settings window.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn forward_captures(
+    app: &AppHandle,
+) -> std::io::Result<std::sync::mpsc::SyncSender<chord::Capture>> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(64);
+    let app = app.clone();
+    std::thread::Builder::new()
+        .name("voisu-capture".into())
+        .spawn(move || {
+            for capture in rx {
+                let _ = app.emit(TRIGGER_CAPTURE, CaptureEvent::of(capture));
+            }
+        })?;
+    Ok(tx)
 }
 
 /// Applies `change`, saves, and returns the settings as now held. A failed
@@ -272,16 +425,7 @@ fn open_key_page(app: AppHandle, provider: KeyPage) -> Result<(), String> {
 /// Recording back to the gesture thread, which is created after it, so the
 /// sink reads the trigger from a cell filled once both exist.
 fn start_dictation(app: &AppHandle) {
-    let hotkey = app
-        .state::<AppState>()
-        .settings
-        .lock()
-        .unwrap()
-        .hotkey
-        .clone();
-    if hotkey != settings::DEFAULT_HOTKEY {
-        tracing::warn!(%hotkey, "only Ctrl+Win is supported; using it");
-    }
+    let chord = app.state::<AppState>().settings.lock().unwrap().hotkey;
     let trigger_cell: std::sync::Arc<OnceLock<trigger::Trigger>> = Default::default();
     let sink_cell = std::sync::Arc::clone(&trigger_cell);
     let engine = engine::start(
@@ -301,11 +445,13 @@ fn start_dictation(app: &AppHandle) {
     };
     let _ = trigger_cell.set(trigger.clone());
     #[cfg(windows)]
-    if let Err(error) = platform::hotkey::install(trigger) {
+    if let Err(error) = forward_captures(app)
+        .and_then(|captures| platform::hotkey::install(trigger, chord, captures))
+    {
         tracing::error!(%error, "keyboard hook failed to start");
     }
     #[cfg(not(windows))]
-    drop(trigger);
+    drop((trigger, chord));
 }
 
 pub fn run() {
@@ -338,13 +484,22 @@ pub fn run() {
             set_auto_paste,
             set_overlay_size,
             set_boost_words,
+            set_trigger_key,
+            start_trigger_capture,
+            stop_trigger_capture,
             open_key_page,
             engine::last_transcript
         ])
         .setup(|app| {
             let handle = app.handle();
             let ready = keys_ready();
-            let tray = tray::build(handle, ready, autostart_enabled(handle))?;
+            let chord = app.state::<AppState>().settings.lock().unwrap().hotkey;
+            let tray = tray::build(
+                handle,
+                ready,
+                autostart_enabled(handle),
+                trigger_label(chord),
+            )?;
             let _ = app.state::<AppState>().tray.set(tray);
             overlay::set_size(
                 app.state::<AppState>()
@@ -381,4 +536,72 @@ pub fn run() {
         RunEvent::Exit => tracing::info!("Voisu exiting"),
         _ => {}
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chord::Capture;
+
+    #[test]
+    fn a_recorded_chord_is_checked_before_the_window_saves_it() {
+        let ctrl_c: TriggerChord = "Ctrl+C".parse().unwrap();
+        assert!(matches!(
+            CaptureEvent::of(Capture::Done(ctrl_c)),
+            CaptureEvent::Invalid { .. }
+        ));
+        let ctrl_tick: TriggerChord = "Ctrl+`".parse().unwrap();
+        assert_eq!(
+            CaptureEvent::of(Capture::Done(ctrl_tick)),
+            CaptureEvent::Done {
+                key: "Ctrl+`".into(),
+                label: "Ctrl+`".into()
+            }
+        );
+    }
+
+    #[test]
+    fn the_window_learns_the_trigger_key_its_warnings_and_whether_it_is_the_default() {
+        let default = UiTrigger::of(TriggerChord::default());
+        assert_eq!(default.key, "Ctrl+Win");
+        assert!(default.is_default && default.warnings.is_empty());
+        let tick = UiTrigger::of("Ctrl+`".parse().unwrap());
+        assert!(!tick.is_default);
+        assert!(tick.warnings[0].contains("VS Code"), "{:?}", tick.warnings);
+    }
+
+    #[test]
+    fn every_preset_the_window_offers_is_allowed_and_stored_as_written() {
+        // Read from the window itself, so the two can't drift apart.
+        const APP: &str = include_str!("../../ui/App.svelte");
+        let after = |marker: &str| APP.split_once(marker).expect(marker).1;
+        let default = after("const DEFAULT_TRIGGER = '")
+            .split_once('\'')
+            .unwrap()
+            .0;
+        assert_eq!(default, TriggerChord::default().to_string());
+        let list = after("const TRIGGER_PRESETS = [")
+            .split_once("];")
+            .unwrap()
+            .0;
+        let presets: Vec<&str> = list
+            .split("key: '")
+            .skip(1)
+            .map(|rest| rest.split_once('\'').unwrap().0)
+            .collect();
+        assert!(
+            presets.len() >= 5 && presets.contains(&default),
+            "{presets:?}"
+        );
+        for preset in presets {
+            let chord = TriggerChord::try_from(preset.to_owned()).expect(preset);
+            assert_eq!(UiTrigger::of(chord).key, preset);
+        }
+    }
+
+    #[test]
+    fn capture_events_reach_the_window_tagged_by_kind() {
+        let json = serde_json::to_string(&CaptureEvent::Cancelled).unwrap();
+        assert_eq!(json, r#"{"kind":"cancelled"}"#);
+    }
 }

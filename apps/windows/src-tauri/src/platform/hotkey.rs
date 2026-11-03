@@ -1,9 +1,10 @@
-//! The Ctrl+Win Trigger Key: a low-level keyboard hook on its own thread.
+//! The Trigger Key: a low-level keyboard hook on its own thread.
 //!
 //! The callback stays O(1) and never blocks, logs or allocates, because
 //! Windows silently removes a hook that exceeds `LowLevelHooksTimeout`. It
 //! classifies the key, feeds [`ChordTracker`] and `try_send`s any signal to
-//! the gesture thread. The Start-menu mask key is posted back to this
+//! the gesture thread. While the settings window records a new shortcut,
+//! the callback feeds a [`Recorder`] instead and `try_send`s its updates. The Start-menu mask key is posted back to this
 //! thread's message loop and injected after the callback returns, so the
 //! hook never re-enters itself.
 //!
@@ -14,7 +15,7 @@
 use std::cell::RefCell;
 use std::io;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc;
+use std::sync::mpsc::{self, SyncSender};
 use std::thread;
 
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
@@ -25,37 +26,51 @@ use windows::Win32::System::RemoteDesktop::{
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetLastInputInfo, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS,
-    KEYBDINPUT, KEYEVENTF_KEYUP, LASTINPUTINFO, SendInput, VIRTUAL_KEY,
+    GetAsyncKeyState, GetKeyNameTextW, GetKeyboardLayout, GetLastInputInfo, HKL, INPUT, INPUT_0,
+    INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP, LASTINPUTINFO,
+    MAPVK_VK_TO_CHAR, MAPVK_VSC_TO_VK_EX, MapVirtualKeyExW, SendInput, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, HC_ACTION,
-    HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, PBT_APMRESUMEAUTOMATIC, PostThreadMessageW,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetForegroundWindow,
+    GetMessageW, GetWindowThreadProcessId, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, KillTimer,
+    LLKHF_EXTENDED, LLKHF_INJECTED, MSG, PBT_APMRESUMEAUTOMATIC, PostThreadMessageW,
     RegisterClassW, SetTimer, SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL,
     WINDOW_EX_STYLE, WM_APP, WM_KEYDOWN, WM_POWERBROADCAST, WM_SYSKEYDOWN, WM_TIMER,
     WM_WTSSESSION_CHANGE, WNDCLASSW, WS_OVERLAPPED, WTS_SESSION_UNLOCK,
 };
 use windows::core::w;
 
-use crate::chord::{ChordTracker, Key, Side};
+use crate::chord::{
+    Capture, ChordTracker, Key, MASK_TAG, MASK_VK, ModMask, Modifier, Recorder, Side, VK_PACKET,
+};
 use crate::trigger::Trigger;
+use crate::trigger_key::{TriggerChord, scan_code};
 
+const VK_SHIFT: i32 = 0x10;
 const VK_CONTROL: i32 = 0x11;
+const VK_MENU: i32 = 0x12;
 const VK_ESCAPE: u32 = 0x1B;
 const VK_LWIN: u32 = 0x5B;
 const VK_RWIN: u32 = 0x5C;
+const VK_LSHIFT: u32 = 0xA0;
+const VK_RSHIFT: u32 = 0xA1;
 const VK_LCONTROL: u32 = 0xA2;
 const VK_RCONTROL: u32 = 0xA3;
-/// Unassigned virtual key injected while Win is held, so releasing Win does
-/// not open Start. The same key AutoHotkey and PowerToys use.
-const VK_MASK: u16 = 0xE8;
+const VK_PACKET_CODE: u32 = VK_PACKET as u32;
+const VK_LMENU: u32 = 0xA4;
+const VK_RMENU: u32 = 0xA5;
 /// AltGr arrives as a synthesized LCtrl whose scan code has this bit set.
 const ALTGR_SCAN_BIT: u32 = 0x200;
-/// Tags Voisu's own injected keys.
-const MASK_TAG: usize = 0x564F_4953; // "VOIS"
 
 /// Posted by the callback: inject the mask key now.
 const WM_INJECT_MASK: u32 = WM_APP + 1;
+/// Posted by [`set_chord`]: `wparam` is the packed [`TriggerChord`].
+const WM_SET_CHORD: u32 = WM_APP + 2;
+/// Posted by [`capture`]: `wparam` is 1 to start recording, 0 to stop.
+const WM_CAPTURE: u32 = WM_APP + 3;
+/// A recording nobody finishes ends on its own, so a forgotten settings
+/// window cannot keep swallowing keys.
+const CAPTURE_TIMEOUT_MS: u32 = 15_000;
 const HEALTH_TIMER: usize = 1;
 const HEALTH_INTERVAL_MS: u32 = 5_000;
 /// Input newer than the last callback by this much means the hook is gone.
@@ -63,9 +78,16 @@ const SILENT_HOOK_MS: u32 = 30_000;
 
 /// Tick of the most recent callback, read by the health check.
 static LAST_CALLBACK: AtomicU32 = AtomicU32::new(0);
+/// The hook thread, for [`set_chord`] and [`capture`]; 0 until installed.
+static HOOK_THREAD: AtomicU32 = AtomicU32::new(0);
 
 struct HookState {
     tracker: ChordTracker,
+    /// Set while the settings window records a new shortcut.
+    recorder: Option<Recorder>,
+    /// The thread timer ending the current recording, 0 when none.
+    capture_timer: usize,
+    captures: SyncSender<Capture>,
     trigger: Trigger,
     hook: Option<HHOOK>,
     thread_id: u32,
@@ -77,24 +99,57 @@ thread_local! {
     static STATE: RefCell<Option<HookState>> = const { RefCell::new(None) };
 }
 
-/// Starts the hook thread and returns once the hook is installed.
-pub fn install(trigger: Trigger) -> io::Result<()> {
+/// Starts the hook thread for `chord` and returns once the hook is
+/// installed. Recorder updates go to `captures`; a full queue drops them.
+pub fn install(
+    trigger: Trigger,
+    chord: TriggerChord,
+    captures: SyncSender<Capture>,
+) -> io::Result<()> {
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     thread::Builder::new()
         .name("voisu-hotkey".into())
-        .spawn(move || run(trigger, ready_tx))?;
+        .spawn(move || run(trigger, chord, captures, ready_tx))?;
     ready_rx
         .recv()
         .map_err(|_| io::Error::other("hotkey thread exited"))?
 }
 
-fn run(trigger: Trigger, ready: mpsc::SyncSender<io::Result<()>>) {
+/// Switches the hook to a new chord, effective from the next key event.
+/// False when the hook is not running, so nothing would change.
+#[must_use]
+pub fn set_chord(chord: TriggerChord) -> bool {
+    post(WM_SET_CHORD, usize::from(chord.pack()))
+}
+
+/// Starts or stops recording a new shortcut. While recording, the Trigger
+/// Key does nothing. False when the hook is not running.
+#[must_use]
+pub fn capture(on: bool) -> bool {
+    post(WM_CAPTURE, usize::from(on))
+}
+
+fn post(message: u32, wparam: usize) -> bool {
+    let thread = HOOK_THREAD.load(Ordering::Acquire);
+    // SAFETY: posts a plain message to the hook thread's queue.
+    thread != 0 && unsafe { PostThreadMessageW(thread, message, WPARAM(wparam), LPARAM(0)) }.is_ok()
+}
+
+fn run(
+    trigger: Trigger,
+    chord: TriggerChord,
+    captures: SyncSender<Capture>,
+    ready: SyncSender<io::Result<()>>,
+) {
     // SAFETY: plain Win32 calls on this thread; every pointer passed is to a
     // live local.
     unsafe {
         STATE.with(|cell| {
             *cell.borrow_mut() = Some(HookState {
-                tracker: ChordTracker::default(),
+                tracker: ChordTracker::new(chord),
+                recorder: None,
+                capture_timer: 0,
+                captures,
                 trigger,
                 hook: None,
                 thread_id: GetCurrentThreadId(),
@@ -115,18 +170,144 @@ fn run(trigger: Trigger, ready: mpsc::SyncSender<io::Result<()>>) {
             }
             Err(error) => tracing::warn!(%error, "hotkey watcher window failed"),
         }
-        tracing::info!("Ctrl+Win hook installed");
+        HOOK_THREAD.store(GetCurrentThreadId(), Ordering::Release);
+        tracing::info!(%chord, "Trigger Key hook installed");
         let _ = ready.send(Ok(()));
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            if msg.hwnd.is_invalid() && msg.message == WM_INJECT_MASK {
-                inject_mask();
+            if msg.hwnd.is_invalid() {
+                match msg.message {
+                    WM_INJECT_MASK => inject_mask(),
+                    WM_SET_CHORD => {
+                        let chord = TriggerChord::unpack(msg.wParam.0 as u16);
+                        with_state(|state| switch_chord(state, chord));
+                        tracing::info!(%chord, "Trigger Key changed");
+                    }
+                    WM_CAPTURE => set_capture(msg.wParam.0 != 0),
+                    WM_TIMER => end_capture_timer(msg.wParam.0),
+                    _ => {
+                        DispatchMessageW(&msg);
+                    }
+                }
                 continue;
             }
             DispatchMessageW(&msg);
         }
     }
+}
+
+fn with_state(f: impl FnOnce(&mut HookState)) {
+    STATE.with(|cell| {
+        if let Some(state) = cell.borrow_mut().as_mut() {
+            f(state);
+        }
+    });
+}
+
+/// Moves the tracker to `chord`, ending a held chord's Recording.
+fn switch_chord(state: &mut HookState, chord: TriggerChord) {
+    if let Some(signal) = state.tracker.set_chord(chord) {
+        state.trigger.signal(signal);
+    }
+}
+
+/// Starts or stops the recorder. Either way the tracker forgets what it
+/// held, since the recorder swallowed keys it never saw, but keeps
+/// swallowing a chord key it had swallowed.
+fn set_capture(on: bool) {
+    with_state(|state| {
+        if state.capture_timer != 0 {
+            // SAFETY: kills this thread's own timer.
+            let _ = unsafe { KillTimer(None, state.capture_timer) };
+            state.capture_timer = 0;
+        }
+        let chord = state.tracker.chord();
+        switch_chord(state, chord);
+        state.recorder = None;
+        if on {
+            state.recorder = Some(Recorder::default());
+            // SAFETY: a thread timer; WM_TIMER arrives on this queue.
+            state.capture_timer = unsafe { SetTimer(None, 0, CAPTURE_TIMEOUT_MS, None) };
+        }
+    });
+    tracing::info!(on, "Trigger Key recording");
+}
+
+fn end_capture_timer(timer: usize) {
+    with_state(|state| {
+        if timer == 0 || timer != state.capture_timer {
+            return;
+        }
+        // SAFETY: kills this thread's own timer.
+        let _ = unsafe { KillTimer(None, timer) };
+        state.capture_timer = 0;
+        if state.recorder.take().is_some() {
+            let chord = state.tracker.chord();
+            switch_chord(state, chord);
+            let _ = state.captures.try_send(Capture::Cancelled);
+        }
+    });
+}
+
+/// The foreground app's keyboard layout, the one the user types with:
+/// Windows keeps a layout per thread, and Voisu's own may differ.
+fn foreground_layout() -> HKL {
+    // SAFETY: plain lookups. Without a foreground window the thread is 0,
+    // which means the calling thread's layout.
+    unsafe { GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), None)) }
+}
+
+/// What the key at `vk`'s US position types on `layout`, unshifted, and
+/// whether it is a dead key there.
+fn layout_char(vk: u8, layout: HKL) -> Option<(char, bool)> {
+    let scan = scan_code(vk)?;
+    let extended = if scan & 0x100 != 0 { 0xE000 } else { 0 };
+    let scan = u32::from(scan & 0xFF) | extended;
+    // SAFETY: pure keyboard-layout lookups.
+    let mapped = unsafe {
+        let local = MapVirtualKeyExW(scan, MAPVK_VSC_TO_VK_EX, Some(layout));
+        if local == 0 {
+            return None;
+        }
+        MapVirtualKeyExW(local, MAPVK_VK_TO_CHAR, Some(layout))
+    };
+    let ch = char::from_u32(mapped & 0xFFFF).filter(|&c| c != '\0')?;
+    Some((ch, mapped & 0x8000_0000 != 0))
+}
+
+/// The foreground layout's name for the key at `vk`'s US position, such as
+/// "Ö" or "^" for the key a US layout calls `. The character it types wins
+/// over the key's name, which for a dead key is a word ("ZIRKUMFLEX").
+pub fn key_label(vk: u8) -> Option<String> {
+    let typed = layout_char(vk, foreground_layout())
+        .map(|(ch, _)| ch)
+        .filter(|ch| !ch.is_whitespace() && !ch.is_control());
+    if let Some(ch) = typed {
+        return Some(ch.to_uppercase().collect());
+    }
+    let scan = scan_code(vk)?;
+    let lparam = (i32::from(scan & 0xFF) << 16) | (i32::from(scan & 0x100 != 0) << 24);
+    let mut name = [0u16; 64];
+    // SAFETY: `name` is a live buffer whose length the call is given.
+    let len = unsafe { GetKeyNameTextW(lparam, &mut name) };
+    let name = String::from_utf16_lossy(&name[..usize::try_from(len).ok()?]);
+    let name = name.trim();
+    // Single characters come back as typed ("ö"); show them as on the key.
+    (!name.is_empty()).then(|| {
+        if name.chars().count() == 1 {
+            name.to_uppercase()
+        } else {
+            name.to_owned()
+        }
+    })
+}
+
+/// Whether the key at `vk`'s US position is a dead key on the foreground
+/// layout, so pressing it outside the chord starts an accent instead of
+/// typing.
+pub fn is_dead_key(vk: u8) -> bool {
+    layout_char(vk, foreground_layout()).is_some_and(|(_, dead)| dead)
 }
 
 /// Replaces the hook and forgets tracked keys, whose key-ups may have been
@@ -146,7 +327,10 @@ fn reinstall() -> io::Result<()> {
         let old = STATE.with(|cell| {
             let mut state = cell.borrow_mut();
             let state = state.as_mut()?;
-            state.tracker.reset();
+            // No carried key here: its key-up may be among those missed.
+            if let Some(signal) = state.tracker.reset() {
+                state.trigger.signal(signal);
+            }
             state.hook.replace(hook)
         });
         if let Some(old) = old {
@@ -159,8 +343,8 @@ fn reinstall() -> io::Result<()> {
 
 fn reinstall_logged(reason: &'static str) {
     match reinstall() {
-        Ok(()) => tracing::info!(reason, "Ctrl+Win hook reinstalled"),
-        Err(error) => tracing::error!(%error, reason, "Ctrl+Win hook reinstall failed"),
+        Ok(()) => tracing::info!(reason, "Trigger Key hook reinstalled"),
+        Err(error) => tracing::error!(%error, reason, "Trigger Key hook reinstall failed"),
     }
 }
 
@@ -237,7 +421,7 @@ fn inject_mask() {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
-                wVk: VIRTUAL_KEY(VK_MASK),
+                wVk: VIRTUAL_KEY(u16::from(MASK_VK)),
                 wScan: 0,
                 dwFlags: flags,
                 time: 0,
@@ -250,14 +434,27 @@ fn inject_mask() {
     unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
 }
 
-fn classify(vk: u32) -> Key {
-    match vk {
-        VK_LCONTROL => Key::Ctrl(Side::Left),
-        VK_RCONTROL => Key::Ctrl(Side::Right),
-        VK_LWIN => Key::Win(Side::Left),
-        VK_RWIN => Key::Win(Side::Right),
+fn classify(event: &KBDLLHOOKSTRUCT) -> Key {
+    match event.vkCode {
+        VK_LCONTROL => Key::Mod(Modifier::Ctrl, Side::Left),
+        VK_RCONTROL => Key::Mod(Modifier::Ctrl, Side::Right),
+        VK_LMENU => Key::Mod(Modifier::Alt, Side::Left),
+        VK_RMENU => Key::Mod(Modifier::Alt, Side::Right),
+        VK_LSHIFT => Key::Mod(Modifier::Shift, Side::Left),
+        VK_RSHIFT => Key::Mod(Modifier::Shift, Side::Right),
+        VK_LWIN => Key::Mod(Modifier::Win, Side::Left),
+        VK_RWIN => Key::Mod(Modifier::Win, Side::Right),
         VK_ESCAPE => Key::Escape,
-        _ => Key::Other,
+        // Unicode text: the scan code field holds a UTF-16 unit.
+        VK_PACKET_CODE => Key::Other(VK_PACKET, 0),
+        vk => {
+            let scan = match event.scanCode & 0xFF {
+                0 => 0,
+                code if event.flags.contains(LLKHF_EXTENDED) => code as u16 | 0x100,
+                code => code as u16,
+            };
+            Key::Other(vk as u8, scan)
+        }
     }
 }
 
@@ -266,22 +463,41 @@ fn held(vk: i32) -> bool {
     unsafe { GetAsyncKeyState(vk) < 0 }
 }
 
+/// The OS's view of the modifiers, read only on a modifier or chord-key
+/// press.
+fn os_modifiers() -> ModMask {
+    let mut mask = ModMask::default();
+    for (modifier, down) in [
+        (Modifier::Ctrl, held(VK_CONTROL)),
+        (Modifier::Alt, held(VK_MENU)),
+        (Modifier::Shift, held(VK_SHIFT)),
+        (Modifier::Win, held(VK_LWIN as i32) || held(VK_RWIN as i32)),
+    ] {
+        if down {
+            mask = mask.with(modifier);
+        }
+    }
+    mask
+}
+
+fn post_mask(state: &HookState) {
+    // SAFETY: posts to this thread's own queue; never blocks.
+    let _ = unsafe { PostThreadMessageW(state.thread_id, WM_INJECT_MASK, WPARAM(0), LPARAM(0)) };
+}
+
 /// Returns true to swallow the event.
 fn on_key(event: &KBDLLHOOKSTRUCT, message: u32) -> bool {
-    // Injected keys (Voisu's own mask key included) and AltGr's synthetic
-    // LCtrl never form or break the chord.
-    if event.flags.contains(LLKHF_INJECTED)
-        || (event.vkCode == VK_LCONTROL && event.scanCode & ALTGR_SCAN_BIT != 0)
-    {
+    // AltGr's synthetic LCtrl never forms or breaks the chord.
+    if event.vkCode == VK_LCONTROL && event.scanCode & ALTGR_SCAN_BIT != 0 {
         return false;
     }
     let down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
-    let key = classify(event.vkCode);
-    let other_down = match key {
-        Key::Ctrl(_) => held(VK_LWIN as i32) || held(VK_RWIN as i32),
-        Key::Win(_) => held(VK_CONTROL),
-        Key::Escape | Key::Other => false,
+    let injected = event.flags.contains(LLKHF_INJECTED);
+    let key = match classify(event) {
+        key if injected => key.injected(),
+        key => key,
     };
+    let tagged = event.dwExtraInfo == MASK_TAG;
     STATE.with(|cell| {
         // A failed borrow means re-entry; let the event through untouched.
         let Ok(mut state) = cell.try_borrow_mut() else {
@@ -290,17 +506,42 @@ fn on_key(event: &KBDLLHOOKSTRUCT, message: u32) -> bool {
         let Some(state) = state.as_mut() else {
             return false;
         };
-        let verdict = state
-            .tracker
-            .handle(key, down, other_down, state.trigger.armed());
+        if let Some(recorder) = state.recorder.as_mut() {
+            if injected && !Recorder::admits_injected(key, tagged) {
+                return false;
+            }
+            if state.tracker.carried(key, down) {
+                return true;
+            }
+            // Inside the hook the async state is from before this event.
+            let held_before = down && held(event.vkCode as i32);
+            let verdict = recorder.handle(key, down, held_before);
+            if verdict.inject_mask {
+                post_mask(state);
+            }
+            if let Some(update) = verdict.update {
+                if !matches!(update, Capture::Preview(_)) {
+                    // The timer is killed when it fires.
+                    state.recorder = None;
+                    let chord = state.tracker.chord();
+                    switch_chord(state, chord);
+                }
+                let _ = state.captures.try_send(update);
+            }
+            return !verdict.pass;
+        }
+        // Injected keys never form or break the chord, except an untagged
+        // chord key such as a remapper's F24.
+        if injected && !state.tracker.admits_injected(key, tagged) {
+            return false;
+        }
+        let armed = state.trigger.armed();
+        let verdict = state.tracker.handle(key, down, os_modifiers, armed);
         if let Some(signal) = verdict.signal {
             state.trigger.signal(signal);
         }
         if verdict.inject_mask {
-            // SAFETY: posts to this thread's own queue; never blocks.
-            let _ = unsafe {
-                PostThreadMessageW(state.thread_id, WM_INJECT_MASK, WPARAM(0), LPARAM(0))
-            };
+            post_mask(state);
         }
         !verdict.pass
     })
