@@ -1,7 +1,8 @@
 //! Portable cloud pipeline: the Groq and Deepgram transcript providers,
 //! Groq reconciliation and Intent Reconstruction, the provider auth probes,
-//! the Developer Prompt Rendering and Minimal Grammar HTTP clients, and the
-//! bounded subprocess runner they share.
+//! the Developer Prompt Rendering and Minimal Grammar HTTP clients, the
+//! network-free local formatting render, and the bounded subprocess runner
+//! they share.
 //!
 //! Platform concerns stay with the host: credential storage, capture, the
 //! credential-preparation lane, and Delivery live in voisu-app (Linux) and
@@ -22,6 +23,7 @@ use voisu_core::{
 use process::*;
 
 pub mod dpr_cloud;
+pub mod dpr_local;
 pub mod grammar_http;
 pub mod process;
 

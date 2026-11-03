@@ -11,16 +11,19 @@ use std::time::{Duration, Instant};
 use voisu_core::{
     CloudOutcome, CloudRequest, ComposeInput, ComposeSource, CompositionDecision, Credential,
     DeliveryAdapter, DeliveryFlags, DeliveryOutcome, DprDiagnostic, FormatEditSafety,
-    IntentObservation, LocalBaselineOptions, MAX_COMPOSE_FIELD_UTF8_BYTES, ProcessHint, Provider,
-    ProviderState, RenderingPolicy, RoutingDecision, SourceSelection, SourceTranscript,
-    SttProvider, SurfaceHint, TimingHint, Transcript, TranscriptSelection, apply_format_edits_with,
+    IntentObservation, LocalBaselineOptions, ProcessHint, ProviderState, RenderingPolicy,
+    RoutingDecision, SourceSelection, SurfaceHint, TimingHint, Transcript, apply_format_edits_with,
     compose_structured_candidate, leftover_admits_format_cloud, organize_local_baseline,
-    route_intent, sanitize_source_transcripts, text_sha256_fingerprint,
+    text_sha256_fingerprint,
 };
 
 use crate::dpr_cloud::{
     DprCloudAttempt, DprCloudClient, DprCloudErrorClass, DprCloudRequest, MAX_DPR_PROTECTED_TOKENS,
 };
+// Source selection and the local render are portable so Windows shares them;
+// re-exported to keep the existing `dpr_pipeline::*` paths.
+use voisu_cloud::dpr_local::route_and_organize_local;
+pub use voisu_cloud::dpr_local::{DprSourceContext, dpr_protected_tokens, dpr_source_context};
 
 /// Maximum elapsed time from utterance end to initiating Delivery.
 pub const DPR_DELIVERY_DEADLINE: Duration = Duration::from_millis(1_500);
@@ -141,380 +144,6 @@ pub struct DprTransformCompletion {
     pub diagnostic: DprDiagnostic,
 }
 
-/// Owned adapter from the daemon's Source Transcripts into the generic
-/// provider-a/provider-b compose contract. Selection is deliberately local:
-/// DPR must not spend a legacy free-form reconciliation call before its one
-/// permitted structured cloud attempt.
-pub struct DprSourceContext {
-    pub selected_source: String,
-    pub sources: Vec<ComposeSource>,
-    pub source_selection: SourceSelection,
-    pub provider_state: ProviderState,
-    pub transcript_selection: TranscriptSelection,
-}
-
-#[must_use]
-pub fn dpr_source_context(
-    sources: &[SourceTranscript],
-    dictionary_terms: &[String],
-) -> Option<DprSourceContext> {
-    // Quality-classify before selection so pure-outro Groq never wins over empty
-    // Deepgram and a trailing anchored outro never enters compose/Delivery.
-    let sanitized = sanitize_source_transcripts(sources.iter().cloned());
-    let available: Vec<&SourceTranscript> = sanitized
-        .iter()
-        .filter(|source| !source.text.is_empty())
-        .collect();
-    let selected = available
-        .iter()
-        .find(|source| source.provider == Provider::Groq)
-        .copied()
-        .or_else(|| available.first().copied())?;
-    let selected_provider = selected.provider;
-    let exact_agreement = available.len() > 1
-        && available
-            .iter()
-            .all(|source| source.text == available[0].text);
-    let punctuation_only_agreement = available.len() > 1
-        && !exact_agreement
-        && available.iter().all(|source| {
-            normalized_source_words(&source.text) == normalized_source_words(&available[0].text)
-        });
-    let other = available
-        .iter()
-        .find(|source| source.provider != selected_provider)
-        .copied();
-    let safe_complementary =
-        if available.len() == 2 && !exact_agreement && !punctuation_only_agreement {
-            other.and_then(|other| merge_insertion_only_sources(&selected.text, &other.text))
-        } else {
-            None
-        };
-    let protected_disagreement = safe_complementary.is_none()
-        && other.is_some_and(|other| {
-            protected_atoms_disagree(&selected.text, &other.text, dictionary_terms)
-        });
-    let provider_state = if available.len() <= 1 {
-        ProviderState::SingleProvider
-    } else if exact_agreement {
-        ProviderState::ExactAgreement
-    } else if punctuation_only_agreement {
-        ProviderState::PunctuationOnlyAgreement
-    } else if safe_complementary.is_some() {
-        ProviderState::SafeComplementary
-    } else if protected_disagreement {
-        ProviderState::ProtectedTokenDisagreement
-    } else {
-        ProviderState::SemanticDisagreement
-    };
-    let reason = if available.len() <= 1 {
-        "only_available"
-    } else if exact_agreement {
-        "exact_agreement"
-    } else if punctuation_only_agreement {
-        "punctuation_local_render"
-    } else if safe_complementary.is_some() {
-        "safe_complementary_merge"
-    } else {
-        "configured_primary_rank"
-    };
-
-    let mut compose_sources = Vec::with_capacity(available.len().min(2));
-    compose_sources.push(ComposeSource {
-        provider: SttProvider::ProviderA,
-        available: true,
-        text: selected.text.clone(),
-        primary: true,
-    });
-    if let Some(other) = other {
-        compose_sources.push(ComposeSource {
-            provider: SttProvider::ProviderB,
-            available: true,
-            text: other.text.clone(),
-            primary: false,
-        });
-    }
-
-    Some(DprSourceContext {
-        selected_source: safe_complementary.unwrap_or_else(|| selected.text.clone()),
-        sources: compose_sources,
-        source_selection: SourceSelection {
-            selected_provider: SttProvider::ProviderA,
-            reason: reason.to_owned(),
-        },
-        provider_state,
-        transcript_selection: if provider_state == ProviderState::SafeComplementary {
-            TranscriptSelection::Complementary
-        } else {
-            match selected_provider {
-                Provider::Groq if punctuation_only_agreement => {
-                    TranscriptSelection::NearIdenticalGroq
-                }
-                Provider::Groq => TranscriptSelection::SourceGroq,
-                Provider::Deepgram => TranscriptSelection::SourceDeepgram,
-            }
-        },
-    })
-}
-
-fn protected_atoms_disagree(left: &str, right: &str, dictionary_terms: &[String]) -> bool {
-    let left_protected: Vec<String> = dpr_protected_tokens(left, dictionary_terms)
-        .into_iter()
-        .filter(|token| !is_closed_negation(token))
-        .collect();
-    let right_protected: Vec<String> = dpr_protected_tokens(right, dictionary_terms)
-        .into_iter()
-        .filter(|token| !is_closed_negation(token))
-        .collect();
-    left_protected.iter().any(|token| !right.contains(token))
-        || right_protected.iter().any(|token| !left.contains(token))
-}
-
-fn is_closed_negation(token: &str) -> bool {
-    matches!(
-        token.to_ascii_lowercase().as_str(),
-        "no" | "not"
-            | "never"
-            | "cannot"
-            | "can't"
-            | "cant"
-            | "don't"
-            | "dont"
-            | "won't"
-            | "wont"
-            | "isn't"
-            | "isnt"
-            | "aren't"
-            | "arent"
-            | "ain't"
-            | "aint"
-    )
-}
-
-/// Conservatively merges two whitespace-token streams only when their shared
-/// anchors remain ordered and at most one provider contributes tokens in each
-/// gap. If both providers offer different text for the same gap, the evidence
-/// is disputed and no merge is produced. The token cap keeps the bounded
-/// look-ahead local even for an adversarially large Source Transcript.
-fn merge_insertion_only_sources(left: &str, right: &str) -> Option<String> {
-    const MAX_SAFE_COMPLEMENT_TOKENS: usize = 128;
-    let left_tokens: Vec<&str> = left.split_whitespace().collect();
-    let right_tokens: Vec<&str> = right.split_whitespace().collect();
-    if left_tokens.is_empty()
-        || right_tokens.is_empty()
-        || left_tokens.len() > MAX_SAFE_COMPLEMENT_TOKENS
-        || right_tokens.len() > MAX_SAFE_COMPLEMENT_TOKENS
-    {
-        return None;
-    }
-
-    let mut merged = Vec::with_capacity(left_tokens.len().saturating_add(right_tokens.len()));
-    let mut left_at = 0usize;
-    let mut right_at = 0usize;
-    let mut shared_anchors = 0usize;
-    let mut left_contributed = false;
-    let mut right_contributed = false;
-
-    while left_at < left_tokens.len() || right_at < right_tokens.len() {
-        let mut next_anchor = None;
-        let mut nearest_distance = usize::MAX;
-        for (left_index, left_token) in left_tokens.iter().enumerate().skip(left_at) {
-            for (right_index, right_token) in right_tokens.iter().enumerate().skip(right_at) {
-                if token_anchor_eq(left_token, right_token) {
-                    let distance =
-                        left_index.saturating_sub(left_at) + right_index.saturating_sub(right_at);
-                    if distance < nearest_distance {
-                        nearest_distance = distance;
-                        next_anchor = Some((left_index, right_index));
-                    }
-                }
-            }
-        }
-
-        let Some((left_anchor, right_anchor)) = next_anchor else {
-            let left_gap = &left_tokens[left_at..];
-            let right_gap = &right_tokens[right_at..];
-            if !left_gap.is_empty() && !right_gap.is_empty() {
-                return None;
-            }
-            if !left_gap
-                .iter()
-                .chain(right_gap)
-                .all(|token| safe_complement_token(token))
-            {
-                return None;
-            }
-            left_contributed |= !left_gap.is_empty();
-            right_contributed |= !right_gap.is_empty();
-            merged.extend_from_slice(left_gap);
-            merged.extend_from_slice(right_gap);
-            break;
-        };
-
-        let left_gap = &left_tokens[left_at..left_anchor];
-        let right_gap = &right_tokens[right_at..right_anchor];
-        if !left_gap.is_empty() && !right_gap.is_empty() {
-            return None;
-        }
-        if !left_gap
-            .iter()
-            .chain(right_gap)
-            .all(|token| safe_complement_token(token))
-        {
-            return None;
-        }
-        left_contributed |= !left_gap.is_empty();
-        right_contributed |= !right_gap.is_empty();
-        merged.extend_from_slice(left_gap);
-        merged.extend_from_slice(right_gap);
-        merged.push(left_tokens[left_anchor]);
-        shared_anchors += 1;
-        left_at = left_anchor + 1;
-        right_at = right_anchor + 1;
-    }
-
-    (shared_anchors >= 2 && left_contributed && right_contributed).then(|| merged.join(" "))
-}
-
-fn safe_complement_token(token: &str) -> bool {
-    token.bytes().any(|byte| byte.is_ascii_digit())
-        || token.contains("//")
-        || token.contains('/')
-        || token.contains('\\')
-        || token.starts_with('-')
-        || token.contains('_')
-        || token.contains("::")
-        || token.contains(['(', ')', '[', ']', '{', '}', '=', '@'])
-}
-
-fn token_anchor_eq(left: &str, right: &str) -> bool {
-    let normalize = |token: &str| {
-        token
-            .trim_matches(|character: char| !character.is_alphanumeric())
-            .to_ascii_lowercase()
-    };
-    let left = normalize(left);
-    !left.is_empty() && left == normalize(right)
-}
-
-fn normalized_source_words(text: &str) -> Vec<String> {
-    text.split(|character: char| !character.is_alphanumeric() && character != '\'')
-        .filter(|word| !word.is_empty())
-        .map(str::to_lowercase)
-        .collect()
-}
-
-/// Extract closed, host-verifiable protected atoms from the selected source.
-/// The model never decides this list. Ambiguous natural-language entities stay
-/// untouched by this conservative recognizer; exact dictionary terms and
-/// mechanically recognizable technical/semantic atoms fail closed.
-#[must_use]
-pub fn dpr_protected_tokens(selected_source: &str, dictionary_terms: &[String]) -> Vec<String> {
-    let mut protected = Vec::new();
-    for raw in selected_source.split_whitespace() {
-        let token = raw.trim_matches(|character: char| {
-            matches!(character, ',' | ';' | '!' | '?' | '"' | '\'' | '`')
-        });
-        let lower = token.to_ascii_lowercase();
-        let negation = matches!(
-            lower.as_str(),
-            "no" | "not"
-                | "never"
-                | "cannot"
-                | "can't"
-                | "cant"
-                | "don't"
-                | "dont"
-                | "won't"
-                | "wont"
-                | "isn't"
-                | "isnt"
-                | "aren't"
-                | "arent"
-                | "ain't"
-                | "aint"
-        );
-        let technical = token.bytes().any(|byte| byte.is_ascii_digit())
-            || token.contains("://")
-            || token.contains('/')
-            || token.contains('\\')
-            || token.starts_with('-')
-            || token.contains('_')
-            || token.contains("::")
-            || token.contains(['(', ')', '[', ']', '{', '}', '=', '@'])
-            || is_dot_technical_token(token);
-        if negation || technical {
-            push_protected(&mut protected, selected_source, token);
-        }
-    }
-
-    let lower = selected_source.to_ascii_lowercase();
-    let mut search_from = 0;
-    while let Some(open_relative) = lower[search_from..].find("quote ") {
-        let interior_start = search_from + open_relative + "quote ".len();
-        let Some(close_relative) = lower[interior_start..].find(" unquote") else {
-            break;
-        };
-        let interior_end = interior_start + close_relative;
-        push_protected(
-            &mut protected,
-            selected_source,
-            &selected_source[interior_start..interior_end],
-        );
-        search_from = interior_end + " unquote".len();
-    }
-
-    // Organized `"…"` spans (including interiors from `quote,` … `unquote`).
-    let mut quoted_from = 0;
-    while let Some(open_relative) = selected_source[quoted_from..].find('"') {
-        let interior_start = quoted_from + open_relative + 1;
-        let Some(close_relative) = selected_source[interior_start..].find('"') else {
-            break;
-        };
-        push_protected(
-            &mut protected,
-            selected_source,
-            &selected_source[interior_start..interior_start + close_relative],
-        );
-        quoted_from = interior_start + close_relative + 1;
-    }
-
-    // Dictionary entries are important spelling/name evidence, but cannot
-    // crowd closed technical or semantic atoms out of the bounded request.
-    for term in dictionary_terms {
-        push_protected(&mut protected, selected_source, term);
-    }
-
-    protected
-}
-
-/// `cargo.toml` / `.env` are technical. A sentence-final `hello.` is not.
-fn is_dot_technical_token(token: &str) -> bool {
-    let bytes = token.as_bytes();
-    if bytes.first() == Some(&b'.')
-        && bytes
-            .get(1)
-            .is_some_and(|byte| byte.is_ascii_alphanumeric())
-    {
-        return true;
-    }
-    bytes.windows(3).any(|window| {
-        window[1] == b'.' && window[0].is_ascii_alphanumeric() && window[2].is_ascii_alphanumeric()
-    })
-}
-
-fn push_protected(protected: &mut Vec<String>, source: &str, token: &str) {
-    if protected.len() >= MAX_DPR_PROTECTED_TOKENS
-        || token.is_empty()
-        || token.len() > MAX_COMPOSE_FIELD_UTF8_BYTES
-        || !source.contains(token)
-        || protected.iter().any(|existing| existing == token)
-    {
-        return;
-    }
-    protected.push(token.to_owned());
-}
-
 /// Build the safe Final Transcript and initiate Delivery exactly once.
 pub async fn dpr_transform_and_deliver(
     input: DprTransformInput<'_>,
@@ -525,7 +154,7 @@ pub async fn dpr_transform_and_deliver(
     } else {
         DPR_DELIVERY_DEADLINE
     };
-    let routing = route_intent(&IntentObservation {
+    let (routing, baseline) = route_and_organize_local(&IntentObservation {
         policy: input.policy,
         primary_text: input.selected_source.to_owned(),
         provider_state: input.provider_state,
@@ -535,14 +164,6 @@ pub async fn dpr_transform_and_deliver(
     });
     let route_selected_at = input.clock.elapsed();
     let mut diagnostic = DprDiagnostic::production(&routing, route_selected_at);
-    let baseline = organize_local_baseline(
-        input.selected_source,
-        &LocalBaselineOptions {
-            policy: input.policy,
-            route: routing.route,
-            timing: None,
-        },
-    );
     let organized_protected = dpr_protected_tokens(baseline.rendered(), &[]);
     let mut protected_tokens: Vec<&str> = input.protected_tokens.to_vec();
     for token in &organized_protected {
@@ -818,10 +439,13 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use voisu_core::{
-        BoundaryFuture, DprDiagnosticEventName, DprFeedbackKind, FormatEditCandidate,
-        StructuredCandidate, SttProvider, Transcript, parse_format_edit_candidate_json,
+        BoundaryFuture, DEFAULT_RENDERING_POLICY, DprDiagnosticEventName, DprFeedbackKind,
+        FormatEditCandidate, Provider, SourceTranscript, StructuredCandidate, SttProvider,
+        Transcript, TranscriptSelection, parse_format_edit_candidate_json,
         parse_structured_candidate_json, text_sha256_fingerprint,
     };
+
+    use voisu_cloud::dpr_local::render_dpr_local;
 
     use super::*;
 
@@ -3257,5 +2881,88 @@ mod tests {
             completion.cloud_error,
             Some(DprCloudErrorClass::CandidateSchema)
         );
+    }
+
+    /// Windows calls `render_dpr_local`; the daemon calls this pipeline with
+    /// no cloud formatter. Both must deliver the same text for one input.
+    #[tokio::test]
+    async fn local_render_matches_the_daemon_pipeline_without_a_cloud_formatter() {
+        let both = |groq: &str, deepgram: &str| {
+            vec![
+                SourceTranscript {
+                    provider: Provider::Groq,
+                    text: groq.to_owned(),
+                },
+                SourceTranscript {
+                    provider: Provider::Deepgram,
+                    text: deepgram.to_owned(),
+                },
+            ]
+        };
+        let cases = [
+            (
+                "first thought new line second thought",
+                both(
+                    "first thought new line second thought",
+                    "first thought new line second thought",
+                ),
+            ),
+            (
+                "hello new paragraph world",
+                both("hello new paragraph world", "hello new paragraph world"),
+            ),
+            (
+                "first open the file second run the tests",
+                vec![SourceTranscript {
+                    provider: Provider::Groq,
+                    text: "first open the file second run the tests".to_owned(),
+                }],
+            ),
+            (
+                "ship it on friday not monday",
+                both(
+                    "ship it on friday not monday",
+                    "ship it on monday not friday",
+                ),
+            ),
+            (
+                "run cargo test dash dash locked",
+                both("run cargo test dash dash locked", "run cargo test --locked"),
+            ),
+        ];
+        let dictionary = vec!["Voisu".to_owned()];
+        for (validated, sources) in cases {
+            let local =
+                render_dpr_local(validated, &sources, &dictionary, DEFAULT_RENDERING_POLICY)
+                    .expect("sources carry text");
+            let context = dpr_source_context(&sources, &dictionary).expect("sources carry text");
+            let protected = dpr_protected_tokens(validated, &dictionary);
+            let protected: Vec<&str> = protected.iter().map(String::as_str).collect();
+            let mut delivery = RecordingDelivery {
+                calls: Arc::new(AtomicUsize::new(0)),
+                rendered: Arc::new(Mutex::new(Vec::new())),
+                initiated_ms: None,
+            };
+            let completion = dpr_transform_and_deliver(
+                DprTransformInput {
+                    selected_source: validated,
+                    sources: &context.sources,
+                    source_selection: &context.source_selection,
+                    provider_state: context.provider_state,
+                    policy: DEFAULT_RENDERING_POLICY,
+                    english_eligible: true,
+                    surface_hint: None,
+                    process_hint: None,
+                    timing: None,
+                    protected_tokens: &protected,
+                    cloud: DprCloudCapability::Unavailable,
+                    clock: &FixedClock(Duration::ZERO),
+                    small_edit_contract: false,
+                },
+                &mut delivery,
+            )
+            .await;
+            assert_eq!(completion.rendered, local, "{validated}");
+        }
     }
 }

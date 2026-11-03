@@ -6,8 +6,9 @@
 //! `asr_mode` is re-read at Start/Replay admission under the shared config lock.
 //! Other keys may still be snapshotted at daemon start.
 //!
-//! Environment-configured options also live here: the rollout gates
-//! (`VOISU_ENABLE_DPR`, `VOISU_ENABLE_QWEN_FORMAT`) and the transcription
+//! Environment-configured options also live here: the local formatting
+//! rollback switch (`VOISU_ENABLE_DPR`, on when unset), the cloud formatter
+//! gate (`VOISU_ENABLE_QWEN_FORMAT`, off when unset) and the transcription
 //! language (`VOISU_TRANSCRIPTION_LANGUAGE`, read by
 //! [`transcription_language`] at each Recording boundary and shared by the
 //! Groq and Deepgram request builders). Intent Reconstruction follows
@@ -62,8 +63,9 @@ pub(crate) fn is_asr_mode_key(key: &str) -> bool {
     key == ASR_MODE_KEY || key == "\"asr_mode\"" || key == "'asr_mode'"
 }
 
-/// Explicit rollout gate for the DPR pipeline. Only `1` or `true` enables it;
-/// missing, empty, or malformed values keep Smart Writing in production.
+/// Rollback switch for the DPR pipeline (local formatting). Unset leaves it on
+/// ([`DEFAULT_DPR_ENABLED`]); `1` or `true` keep it on; `0`, `false`, or any
+/// other present value roll back to Smart Writing.
 pub const ENABLE_DPR_ENV: &str = "VOISU_ENABLE_DPR";
 
 /// Explicit rollout gate for the small-edit formatting job. Off by default so
@@ -187,8 +189,9 @@ pub const DEFAULT_WRITING_MODE: WritingMode = WritingMode::Smart;
 /// `resolve_rendering_policy`.
 pub const DEFAULT_RENDERING_POLICY: RenderingPolicy = voisu_core::DEFAULT_RENDERING_POLICY;
 
-/// Smart Writing remains the production path until an explicit rollout flag.
-pub const DEFAULT_DPR_ENABLED: bool = false;
+/// Local formatting (the DPR pipeline with no cloud formatter) is the shipped
+/// path; [`ENABLE_DPR_ENV`] set to `0` or `false` rolls back to Smart Writing.
+pub const DEFAULT_DPR_ENABLED: bool = true;
 
 /// Qwen small-edit formatting stays off until a test host sets
 /// [`ENABLE_QWEN_FORMAT_ENV`] to `1` or `true`. Independent of
@@ -266,11 +269,17 @@ pub fn rendering_policy() -> RenderingPolicy {
     resolve_rendering_policy(read_rendering_policy(&config_path()))
 }
 
-/// Whether the flagged Developer Prompt Rendering pipeline is active for this
-/// daemon process. This is deliberately not inferred from `rendering_policy`:
-/// policy can be configured while the rollout gate remains off.
+/// Whether the Developer Prompt Rendering pipeline is active for this daemon
+/// process. On unless [`ENABLE_DPR_ENV`] rolls it back. This is deliberately
+/// not inferred from `rendering_policy`: policy can be configured while the
+/// rollback switch is set.
 pub fn dpr_enabled() -> bool {
-    parse_optional_dpr_enablement(std::env::var(ENABLE_DPR_ENV).ok().as_deref())
+    resolve_dpr_enabled(std::env::var(ENABLE_DPR_ENV).ok().as_deref())
+}
+
+/// Unset is the packaged default (on); a present value must say `1`/`true`.
+fn resolve_dpr_enabled(value: Option<&str>) -> bool {
+    value.map_or(DEFAULT_DPR_ENABLED, parse_dpr_enablement)
 }
 
 /// Whether the small-edit formatting contract is active. Independent of
@@ -278,7 +287,7 @@ pub fn dpr_enabled() -> bool {
 /// this formatter remains off. Unset, `0`, `false`, or any value other than
 /// `1`/`true` is the instant rollback switch ([`ENABLE_QWEN_FORMAT_ENV`]).
 pub fn qwen_format_enabled() -> bool {
-    parse_optional_dpr_enablement(std::env::var(ENABLE_QWEN_FORMAT_ENV).ok().as_deref())
+    resolve_qwen_format_enabled(std::env::var(ENABLE_QWEN_FORMAT_ENV).ok().as_deref())
 }
 
 /// Whether Intent Reconstruction may run for this daemon process.
@@ -304,10 +313,10 @@ fn parse_dpr_enablement(value: &str) -> bool {
     matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true")
 }
 
-/// Shared missing-or-explicit-true parser for independent rollout env flags.
-/// `None` is the packaged default (off). Each flag is parsed on its own.
-fn parse_optional_dpr_enablement(value: Option<&str>) -> bool {
-    value.is_some_and(parse_dpr_enablement)
+/// Unset is the packaged default (off); only an explicit `1`/`true` turns the
+/// cloud formatter on.
+fn resolve_qwen_format_enabled(value: Option<&str>) -> bool {
+    value.map_or(DEFAULT_QWEN_FORMAT_ENABLED, parse_dpr_enablement)
 }
 
 /// The transcription language this process requests from every transcription
@@ -1459,15 +1468,21 @@ other_key = 5
     }
 
     #[test]
-    fn dpr_rollout_gate_defaults_off_and_requires_an_explicit_true_value() {
-        for value in ["", "0", "false", "yes", "adaptive", "garbage"] {
+    fn dpr_gate_defaults_on_and_zero_or_false_roll_it_back() {
+        const { assert!(DEFAULT_DPR_ENABLED) };
+        assert!(
+            resolve_dpr_enabled(None),
+            "unset must leave local formatting on"
+        );
+        // A present value must say on; a mangled one fails to the rollback.
+        for rollback in ["0", "false", " FALSE ", "", "yes", "garbage"] {
             assert!(
-                !parse_dpr_enablement(value),
-                "unexpected enablement: {value}"
+                !resolve_dpr_enabled(Some(rollback)),
+                "{rollback:?} must roll local formatting back"
             );
         }
-        for value in ["1", "true", " TRUE "] {
-            assert!(parse_dpr_enablement(value), "expected enablement: {value}");
+        for on in ["1", "true", " TRUE "] {
+            assert!(resolve_dpr_enabled(Some(on)), "{on:?} must keep it on");
         }
     }
 
@@ -1475,7 +1490,7 @@ other_key = 5
     fn qwen_format_gate_defaults_off_and_shares_the_explicit_true_parser() {
         const { assert!(!DEFAULT_QWEN_FORMAT_ENABLED) };
         assert_eq!(ENABLE_QWEN_FORMAT_ENV, "VOISU_ENABLE_QWEN_FORMAT");
-        assert!(!parse_optional_dpr_enablement(None));
+        assert!(!resolve_qwen_format_enabled(None));
         for value in ["", "0", "false", "yes", "qwen", "garbage"] {
             assert!(
                 !parse_dpr_enablement(value),
@@ -1494,16 +1509,14 @@ other_key = 5
         assert_eq!(ENABLE_QWEN_FORMAT_ENV, "VOISU_ENABLE_QWEN_FORMAT");
 
         let parse_gates = |dpr: Option<&str>, qwen: Option<&str>| {
-            (
-                parse_optional_dpr_enablement(dpr),
-                parse_optional_dpr_enablement(qwen),
-            )
+            (resolve_dpr_enabled(dpr), resolve_qwen_format_enabled(qwen))
         };
 
         assert_eq!(parse_gates(Some("1"), None), (true, false));
-        assert_eq!(parse_gates(None, Some("true")), (false, true));
+        assert_eq!(parse_gates(None, Some("true")), (true, true));
+        assert_eq!(parse_gates(Some("0"), Some("true")), (false, true));
         assert_eq!(parse_gates(Some("1"), Some("0")), (true, false));
-        assert_eq!(parse_gates(None, None), (false, false));
+        assert_eq!(parse_gates(None, None), (true, false));
         assert_eq!(parse_gates(Some("1"), Some("true")), (true, true));
     }
 

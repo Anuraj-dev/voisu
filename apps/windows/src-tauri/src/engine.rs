@@ -1,7 +1,8 @@
 //! The Recording → Transcript engine: the Linux Cloud mode pipeline on
 //! Windows. The default mic streams to Deepgram while recording; at stop
 //! Groq transcribes the whole Recording, and the two Source Transcripts are
-//! reconciled by the same voisu-core decision pipeline the Linux daemon runs.
+//! reconciled by the same voisu-core decision pipeline the Linux daemon runs,
+//! then formatted locally exactly as Linux does.
 //!
 //! The engine is one actor task. It reports every lifecycle change as a
 //! `recording-state` event and the mic level as `audio-level`, which the
@@ -16,14 +17,16 @@ use std::time::Duration;
 
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use voisu_cloud::dpr_local::render_dpr_local;
 use voisu_cloud::{
     CleanupSupervisor, CloudHost, DeepgramProvider, GroqProvider, MergeResultValidator,
 };
 use voisu_core::{
     ActiveCapture, AudioCapture, BoundaryError, BoundaryFuture, BoundaryKind, CancelRegistry,
-    CaptureLimit, Credential, PreparedTranscriptDecision, Provider, ProviderCoordinator,
-    ProviderStreams, SecretStore, TranscriptProvider, TranscriptValidator,
-    sanitize_source_transcripts,
+    CaptureLimit, Credential, DEFAULT_RENDERING_POLICY, EnglishEligibilityOutcome,
+    PreparedTranscriptDecision, Provider, ProviderCoordinator, ProviderStreams,
+    ResolvedRecordingLanguages, SecretStore, SourceTranscript, TranscriptProvider,
+    TranscriptValidator, sanitize_source_transcripts,
 };
 
 use crate::gesture::Action;
@@ -454,10 +457,11 @@ impl Engine {
         Ok(ProviderStreams { deepgram, groq })
     }
 
-    /// The Linux live decision path without the Linux-only formatting stages:
-    /// complete both providers, sanitize, validate, and reconstruct when the
-    /// validator asks for it. The boost words are both the user vocabulary
-    /// and the whole dictionary: Windows has no built-in terms.
+    /// The Linux live decision path with local formatting and no cloud
+    /// formatter: complete both providers, sanitize, validate, reconstruct
+    /// when the validator asks for it, then format locally (see
+    /// [`format_locally`]). The boost words are both the user vocabulary and
+    /// the whole dictionary: Windows has no built-in terms.
     async fn decide(
         &self,
         providers: ProviderCoordinator,
@@ -471,15 +475,15 @@ impl Engine {
         let mut validator = MergeResultValidator::intent_reconstruction(self.host.clone());
         validator.set_word_confidences(completed.word_confidences);
         validator.set_user_vocabulary(vocabulary.clone());
-        validator.set_dictionary_terms(vocabulary);
+        validator.set_dictionary_terms(vocabulary.clone());
         let sources = sanitize_source_transcripts(completed.sources);
-        let decision = match validator.prepare(sources).await? {
+        let decision = match validator.prepare(sources.clone()).await? {
             PreparedTranscriptDecision::Ready(decision) => decision,
             PreparedTranscriptDecision::Reconstruct(attempt) => {
                 validator.reconstruct(attempt).await?
             }
         };
-        Ok(decision.transcript.0)
+        Ok(format_locally(decision.transcript.0, &sources, &vocabulary))
     }
 
     fn fail(&self, id: u64, error: &BoundaryError) {
@@ -513,6 +517,28 @@ impl Engine {
             let _ = app.emit(AUDIO_LEVEL, AudioLevelPayload { level });
         })
     }
+}
+
+/// Local formatting, exactly as the Linux daemon delivers it with
+/// `VOISU_ENABLE_DPR` on and no cloud formatter: spoken "new line" and "new
+/// paragraph" become line breaks, and spoken marks, quotes, and first/second
+/// lists are organized, in the default rendering policy (Windows has no
+/// setting for it). Like Linux, only an English-eligible Recording is
+/// formatted; anything else, or no Source Transcript with text, keeps the
+/// validated Transcript as it is.
+fn format_locally(
+    validated: String,
+    sources: &[SourceTranscript],
+    vocabulary: &[String],
+) -> String {
+    let languages = ResolvedRecordingLanguages::new(vec![
+        (Provider::Groq, LANGUAGE.to_owned()),
+        (Provider::Deepgram, LANGUAGE.to_owned()),
+    ]);
+    if languages.english_eligibility() != EnglishEligibilityOutcome::Eligible {
+        return validated;
+    }
+    render_dpr_local(&validated, sources, vocabulary, DEFAULT_RENDERING_POLICY).unwrap_or(validated)
 }
 
 /// Runs `work` while refusing every trigger action, so a chord pressed
@@ -551,6 +577,30 @@ mod tests {
     use std::task::Poll;
 
     use super::*;
+
+    fn both_providers_heard(text: &str) -> Vec<SourceTranscript> {
+        [Provider::Groq, Provider::Deepgram]
+            .into_iter()
+            .map(|provider| SourceTranscript {
+                provider,
+                text: text.to_owned(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn spoken_new_line_and_new_paragraph_become_real_breaks() {
+        let spoken = "first thought new line second thought";
+        assert_eq!(
+            format_locally(spoken.to_owned(), &both_providers_heard(spoken), &[]),
+            "First thought.\nSecond thought"
+        );
+        let spoken = "hello new paragraph world";
+        assert_eq!(
+            format_locally(spoken.to_owned(), &both_providers_heard(spoken), &[]),
+            "Hello.\n\nWorld."
+        );
+    }
 
     #[tokio::test]
     async fn a_chord_pressed_while_busy_is_refused_not_replayed() {
