@@ -124,10 +124,10 @@ installs them directly from `$srcdir` with no versioned subdir.
   non-root `builder` with `TMPDIR=/var/tmp RUST_TEST_THREADS=4` (the tests spawn
   dbus-daemon/python/curl and a size-capped `/tmp` tmpfs would overflow). If this
   ever dominates release time, add an opt-in skip to `build-rpm.sh` and set it here.
-- **arch skips `check()` (`makepkg --nocheck`).** The PKGBUILD `check()` is the same
-  workspace test suite already gated on every push/PR by `ci.yml`; re-running 431
-  tests in the release gate buys nothing. This is the one leg that skips tests, via
-  a first-class makepkg switch.
+- **arch runs no tests.** The source PKGBUILD has no `check()`: the workspace test
+  suite is already gated on every push/PR by `ci.yml`, and running it again would
+  only slow every user's AUR build and this release gate. This is the one leg that
+  skips tests.
 - **lintian suppressions.** Three tags are suppressed, matching
   `packaging/deb/lintian-overrides`: `maintainer-script-calls-systemctl` (false
   positive — the scripts only print guidance), `no-manual-page` (built-in `--help`),

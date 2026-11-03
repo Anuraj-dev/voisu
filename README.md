@@ -62,9 +62,13 @@ works too.
 ### Arch (AUR)
 
 ```sh
-yay -S voisu-bin      # prebuilt
-yay -S voisu          # build from source (pick one; they conflict)
+yay -S voisu-bin
 ```
+
+`voisu-bin` installs the prebuilt release binaries, so nothing compiles on your
+machine. To build from source instead, install the `voisu` package
+(`yay -S voisu`); it compiles Voisu on your machine for every install and
+update. The two packages conflict, so pick one.
 
 ### Debian / Ubuntu (apt)
 
@@ -99,6 +103,28 @@ voisu setup   # guided wizard: Cloud or Local, then keys / Consented Install
 # optional on-screen Overlay (on Fedora, install voisu-overlay first):
 systemctl --user enable --now voisu-overlay.service
 ```
+
+### Updating
+
+On Linux, `voisu update` upgrades Voisu through the package manager that
+installed it, then restarts the Voisu user services that are running:
+
+| Installed from | `voisu update` runs |
+| --- | --- |
+| AUR `voisu-bin` | `yay -S --needed voisu-bin` (or `paru`); without an AUR helper it prints the manual `makepkg` steps |
+| AUR `voisu` (source) | Nothing by default: it explains that this package compiles on your machine. `voisu update --switch-to-bin` replaces it with `voisu-bin` |
+| Fedora COPR | `sudo dnf upgrade --refresh voisu` |
+| Debian / Ubuntu apt | `sudo apt-get update`, then `sudo apt-get install --only-upgrade voisu` |
+
+```sh
+voisu update --check     # installed version vs the latest GitHub Release; changes nothing
+voisu update --dry-run   # print the commands without running them
+voisu update
+```
+
+A binary no package owns (for example a `cargo` build) is not updated; install a
+package as described above. Only `voisu update --check` contacts the network
+itself (GitHub's release API).
 
 ### Trigger Key by desktop
 
@@ -213,6 +239,7 @@ local to your machine.
 | `voisu replay <path>` | Replay a captured fixture through the pipeline |
 | `voisu doctor [--verbose]` | Host readiness diagnostics |
 | `voisu service install` / `start` / `stop` / `restart` / `status` / `uninstall` | Manage the user services |
+| `voisu update [--check\|--dry-run] [--switch-to-bin]` | Update Voisu through its package manager (Linux; see [Updating](#updating)) |
 
 ## License
 

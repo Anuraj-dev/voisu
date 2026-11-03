@@ -33,6 +33,7 @@ commands:
   service <install|start|stop|restart|status|uninstall>
   local remove [--yes]
   local-dev register|select|status|replay
+  update [--check|--dry-run] [--switch-to-bin]
 
 options:
   -h, --help, help

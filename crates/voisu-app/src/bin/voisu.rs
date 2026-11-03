@@ -56,6 +56,7 @@ enum CliAction {
     Service(UserServiceAction),
     LocalDev(Vec<String>),
     LocalRemove { yes: bool },
+    Update(Vec<String>),
     Help,
     Version,
 }
@@ -89,6 +90,7 @@ fn main() -> ExitCode {
         },
         Ok(CliAction::LocalDev(args)) => ExitCode::from(voisu_app::local_dev_cli::run(&args)),
         Ok(CliAction::LocalRemove { yes }) => local_remove(yes),
+        Ok(CliAction::Update(args)) => ExitCode::from(voisu_app::update::run(&args)),
         Ok(CliAction::Help) => {
             println!("{}", usage());
             ExitCode::SUCCESS
@@ -1584,6 +1586,7 @@ fn parse_command() -> Result<CliAction, String> {
             }
         }
         [command, rest @ ..] if command == "local-dev" => Ok(CliAction::LocalDev(rest.to_vec())),
+        [command, rest @ ..] if command == "update" => Ok(CliAction::Update(rest.to_vec())),
         _ => Err(usage().to_owned()),
     }
 }
@@ -1671,6 +1674,7 @@ commands:
   service <install|start|stop|restart|status|uninstall>
   local remove [--yes]
   local-dev register|select|status|replay
+  update [--check|--dry-run] [--switch-to-bin]
 
 options:
   -h, --help, help

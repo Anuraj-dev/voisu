@@ -58,7 +58,7 @@ fn first_on_path(program: &str) -> Option<PathBuf> {
 
 /// Pure `PATH` resolution over an injected `PATH` value, so it is testable
 /// without mutating the process environment.
-pub(super) fn resolve_on_path(path: &std::ffi::OsStr, program: &str) -> Option<PathBuf> {
+pub(crate) fn resolve_on_path(path: &std::ffi::OsStr, program: &str) -> Option<PathBuf> {
     std::env::split_paths(path)
         .map(|dir| dir.join(program))
         .find(|candidate| {
