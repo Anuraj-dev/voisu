@@ -12,10 +12,8 @@ set -euo pipefail
 # user with passwordless sudo (pacman needs root to install build deps and the
 # finished package).
 #
-# --nocheck: the PKGBUILD check() runs the workspace test suite, which is
-# already gated on every push/PR by .github/workflows/ci.yml; re-running it here
-# would only lengthen the release gate. This is the one deliberate degradation
-# on the Arch path; see packaging/RELEASING.md.
+# The PKGBUILD has no check(): the workspace test suite is already gated on
+# every push/PR by .github/workflows/ci.yml; see packaging/RELEASING.md.
 #
 # TAG POINTER: the committed PKGBUILD's pkgver still reads the previous release
 # until the publish job bumps it, so the smoke rewrites pkgver to THIS tag before
@@ -44,8 +42,8 @@ cp "$repo_root"/packaging/aur/voisu/* "$build/"
 sed -i "s/^pkgver=.*/pkgver=${version}/; s/^pkgrel=.*/pkgrel=1/" "$build/PKGBUILD"
 chown -R builder:builder "$build"
 
-echo "== makepkg -si (source build + install; --nocheck, see header) =="
-su builder -c "cd '$build' && makepkg -si --noconfirm --nocheck --needed"
+echo "== makepkg -si (source build + install) =="
+su builder -c "cd '$build' && makepkg -si --noconfirm --needed"
 
 echo "== namcap (PKGBUILD + built package) =="
 pkg=$(su builder -c "cd '$build' && ls voisu-*-x86_64.pkg.tar.zst" | head -1)

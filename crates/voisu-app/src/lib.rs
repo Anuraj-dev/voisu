@@ -34,6 +34,7 @@ pub mod setup_profile;
 pub mod smart_writing;
 pub mod system;
 pub mod ubuntu_gnome;
+pub mod update;
 
 // The portable cloud pipeline lives in voisu-cloud; these re-exports keep the
 // existing `voisu_app::dpr_cloud` / `voisu_app::grammar_http` paths working.
