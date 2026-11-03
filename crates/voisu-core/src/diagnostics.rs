@@ -436,6 +436,50 @@ pub enum EnglishEligibilityOutcome {
     Ineligible,
 }
 
+/// Exact language declarations actually supplied to active transcription
+/// providers for one Recording. Eligibility never inspects transcript words.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedRecordingLanguages {
+    declarations: Vec<(Provider, String)>,
+}
+
+impl ResolvedRecordingLanguages {
+    #[must_use]
+    pub fn new(declarations: Vec<(Provider, String)>) -> Self {
+        Self { declarations }
+    }
+
+    #[must_use]
+    pub fn english_eligibility(&self) -> EnglishEligibilityOutcome {
+        if self.declarations.is_empty()
+            || self
+                .declarations
+                .iter()
+                .any(|(_, language)| !is_explicit_english(language))
+        {
+            EnglishEligibilityOutcome::Ineligible
+        } else {
+            EnglishEligibilityOutcome::Eligible
+        }
+    }
+
+    #[must_use]
+    pub fn declarations(&self) -> &[(Provider, String)] {
+        &self.declarations
+    }
+}
+
+fn is_explicit_english(language: &str) -> bool {
+    let normalized = language.trim().to_ascii_lowercase();
+    normalized == "en"
+        || normalized.strip_prefix("en-").is_some_and(|region| {
+            !region.is_empty()
+                && region
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+}
+
 /// Exactly one Smart Writing path outcome per Recording. Spec §10 closed set.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1968,6 +2012,30 @@ pub async fn replay_capture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn english_resolution_is_declaration_only_and_fail_closed() {
+        assert_eq!(
+            ResolvedRecordingLanguages::new(vec![
+                (Provider::Groq, "en".to_owned()),
+                (Provider::Deepgram, "en-US".to_owned()),
+            ])
+            .english_eligibility(),
+            EnglishEligibilityOutcome::Eligible
+        );
+        for declarations in [
+            Vec::new(),
+            vec![(Provider::Groq, String::new())],
+            vec![(Provider::Groq, "auto".to_owned())],
+            vec![(Provider::Groq, "fr".to_owned())],
+            vec![(Provider::Groq, "en-".to_owned())],
+        ] {
+            assert_eq!(
+                ResolvedRecordingLanguages::new(declarations).english_eligibility(),
+                EnglishEligibilityOutcome::Ineligible
+            );
+        }
+    }
 
     fn store_with_policy(dir: &Path, policy: RetentionPolicy) -> DiagnosticStore {
         DiagnosticStore::open(dir.join("diagnostics"), policy).unwrap()

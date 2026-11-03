@@ -9,11 +9,10 @@ use futures_util::FutureExt;
 use voisu_core::{
     BoundaryError, DeliveryAdapter, DeliveryOutcome, EnglishEligibilityOutcome,
     FORMATTER_CONTRACT_ID, FormatOptions, GrammarErrorCode, GrammarOutcome, GrammarSafetyOptions,
-    LOCAL_FORMATTER_WORK_DEADLINE, MAX_VALIDATED_TRANSCRIPT_UTF8_BYTES, Provider,
-    SmartWritingDiagnostic, SmartWritingEditEvidence, SmartWritingMode, SmartWritingOutcome,
-    SmartWritingReasonCode, Transcript, WritingMode as CoreWritingMode,
-    apply_grammar_candidate_json, format_validated_for_grammar, format_validated_with,
-    parse_formatting_commands,
+    LOCAL_FORMATTER_WORK_DEADLINE, MAX_VALIDATED_TRANSCRIPT_UTF8_BYTES, SmartWritingDiagnostic,
+    SmartWritingEditEvidence, SmartWritingMode, SmartWritingOutcome, SmartWritingReasonCode,
+    Transcript, WritingMode as CoreWritingMode, apply_grammar_candidate_json,
+    format_validated_for_grammar, format_validated_with, parse_formatting_commands,
 };
 
 use crate::config::WritingMode;
@@ -38,49 +37,8 @@ const _: () = assert!(
         == CANDIDATE_PIPELINE_DEADLINE.as_millis()
 );
 
-/// Exact language declarations actually supplied to active transcription
-/// providers for one Recording. Eligibility never inspects transcript words.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ResolvedRecordingLanguages {
-    declarations: Vec<(Provider, String)>,
-}
-
-impl ResolvedRecordingLanguages {
-    #[must_use]
-    pub fn new(declarations: Vec<(Provider, String)>) -> Self {
-        Self { declarations }
-    }
-
-    #[must_use]
-    pub fn english_eligibility(&self) -> EnglishEligibilityOutcome {
-        if self.declarations.is_empty()
-            || self
-                .declarations
-                .iter()
-                .any(|(_, language)| !is_explicit_english(language))
-        {
-            EnglishEligibilityOutcome::Ineligible
-        } else {
-            EnglishEligibilityOutcome::Eligible
-        }
-    }
-
-    #[must_use]
-    pub fn declarations(&self) -> &[(Provider, String)] {
-        &self.declarations
-    }
-}
-
-fn is_explicit_english(language: &str) -> bool {
-    let normalized = language.trim().to_ascii_lowercase();
-    normalized == "en"
-        || normalized.strip_prefix("en-").is_some_and(|region| {
-            !region.is_empty()
-                && region
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        })
-}
+/// The English-eligibility rule lives in voisu-core so Windows applies it too.
+pub use voisu_core::ResolvedRecordingLanguages;
 
 pub type GrammarBoundaryFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Vec<u8>, MinimalGrammarError>> + Send + 'a>>;
@@ -472,7 +430,7 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
     use tokio::time::{sleep, timeout};
-    use voisu_core::{BoundaryFuture, BoundaryKind};
+    use voisu_core::{BoundaryFuture, BoundaryKind, Provider};
 
     struct RecordingDelivery {
         calls: Arc<AtomicUsize>,
@@ -526,26 +484,6 @@ mod tests {
             (Provider::Groq, "en".to_owned()),
             (Provider::Deepgram, "en-US".to_owned()),
         ])
-    }
-
-    #[test]
-    fn english_resolution_is_declaration_only_and_fail_closed() {
-        assert_eq!(
-            english().english_eligibility(),
-            EnglishEligibilityOutcome::Eligible
-        );
-        for declarations in [
-            Vec::new(),
-            vec![(Provider::Groq, String::new())],
-            vec![(Provider::Groq, "auto".to_owned())],
-            vec![(Provider::Groq, "fr".to_owned())],
-            vec![(Provider::Groq, "en-".to_owned())],
-        ] {
-            assert_eq!(
-                ResolvedRecordingLanguages::new(declarations).english_eligibility(),
-                EnglishEligibilityOutcome::Ineligible
-            );
-        }
     }
 
     #[test]

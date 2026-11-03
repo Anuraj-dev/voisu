@@ -36,14 +36,14 @@ pub use diagnostics::{
     MAX_MODEL_ID_UTF8_BYTES, MAX_SMART_WRITING_DIAGNOSTIC_EDITS,
     MAX_SMART_WRITING_DIAGNOSTIC_TEXT_UTF8_BYTES, MAX_SMART_WRITING_EDIT_FIELD_UTF8_BYTES,
     MAX_SMART_WRITING_FREE_TEXT_UTF8_BYTES, MAX_STORED_TEXT, PruneOutcome, REDACTED, ReplayOutcome,
-    RetentionPolicy, SMART_WRITING_DIAGNOSTIC_VERSION, SmartWritingDiagnostic,
-    SmartWritingEditEvidence, SmartWritingMode, SmartWritingOutcome, SmartWritingReasonCode,
-    SourceCoverageRecord, SourceSelectionConfidence, SourceSelectionDiagnostic,
-    SourceTranscriptRecord, TELEMETRY_SCHEMA, TEXT_SHA256_FINGERPRINT_LEN,
-    clamp_stored_transcript_text, clamp_utf8_bytes, correlation_id, export_record,
-    is_secret_env_key, is_text_sha256_fingerprint, redacted_environment, replay_capture,
-    sanitize_url, scrub_embedded_urls, scrub_secret_values, text_sha256_fingerprint,
-    unix_millis_now,
+    ResolvedRecordingLanguages, RetentionPolicy, SMART_WRITING_DIAGNOSTIC_VERSION,
+    SmartWritingDiagnostic, SmartWritingEditEvidence, SmartWritingMode, SmartWritingOutcome,
+    SmartWritingReasonCode, SourceCoverageRecord, SourceSelectionConfidence,
+    SourceSelectionDiagnostic, SourceTranscriptRecord, TELEMETRY_SCHEMA,
+    TEXT_SHA256_FINGERPRINT_LEN, clamp_stored_transcript_text, clamp_utf8_bytes, correlation_id,
+    export_record, is_secret_env_key, is_text_sha256_fingerprint, redacted_environment,
+    replay_capture, sanitize_url, scrub_embedded_urls, scrub_secret_values,
+    text_sha256_fingerprint, unix_millis_now,
 };
 pub(crate) use timing::duration_millis;
 pub use timing::{StopAnchoredTimings, stop_anchored_timings};

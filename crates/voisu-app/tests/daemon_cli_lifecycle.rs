@@ -1465,9 +1465,10 @@ cat > "$dir/clipboard"
     assert!(recovered.status.success(), "{}", stderr(&recovered));
     request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     server.join().unwrap();
+    // Local formatting is on by default, so the recovered text is organized.
     assert_eq!(
         fs::read_to_string(commands.path().join("clipboard")).unwrap(),
-        "Recovered Transcript"
+        "Recovered Transcript."
     );
     let diagnostics = daemon.terminate_and_stderr();
     assert!(!diagnostics.contains("controlled-secret"));
@@ -12618,6 +12619,9 @@ fn smart_writing_real_wiring_reproves_grammar_http_and_credential_cache_miss() {
             ("VOISU_TEST_CLEAR_GROQ_API_KEY", "1"),
             ("VOISU_TEST_MINIMAL_GRAMMAR_ENDPOINT", &endpoint),
             ("VOISU_TEST_GROQ_TRANSCRIPT", "there is two issues"),
+            // Smart Writing owns formatting only once local formatting is
+            // rolled back; this proves that rollback path's wiring.
+            ("VOISU_ENABLE_DPR", "0"),
         ],
     );
 
