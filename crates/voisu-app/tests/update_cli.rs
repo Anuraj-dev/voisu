@@ -122,7 +122,10 @@ fn dry_run_prints_the_upgrade_and_restart_without_running_them() {
         "{out}"
     );
     assert!(
-        out.contains("would run: systemctl --user try-restart voisu.service"),
+        out.contains(
+            "would run: systemctl --user daemon-reload\n\
+             would run: systemctl --user try-restart voisu.service"
+        ),
         "{out}"
     );
     assert!(
@@ -137,7 +140,16 @@ fn dry_run_prints_the_upgrade_and_restart_without_running_them() {
 fn update_runs_the_helper_restarts_active_services_and_reports_the_version() {
     let host = FakeHost::new();
     host.pacman_owner("voisu-bin");
-    host.logging_tool("yay", 0);
+    // The fake helper "installs" a newer release over the installed binary.
+    host.tool(
+        "yay",
+        &format!(
+            "echo \"yay $*\" >> '{log}'\n\
+             printf '#!/bin/sh\\necho \"voisu 10.0.0\"\\n' > '{installed}'",
+            log = host.log.display(),
+            installed = host.installed.display()
+        ),
+    );
 
     let output = host.voisu(&["update"]);
 
@@ -145,11 +157,31 @@ fn update_runs_the_helper_restarts_active_services_and_reports_the_version() {
     let calls = host.calls();
     assert!(calls.contains("yay -S --needed voisu-bin\n"), "{calls}");
     assert!(
-        calls.contains("systemctl --user try-restart voisu.service\n"),
+        calls.contains(
+            "systemctl --user daemon-reload\n\
+             systemctl --user try-restart voisu.service\n"
+        ),
         "{calls}"
     );
     assert!(!calls.contains("try-restart voisu-overlay"), "{calls}");
-    assert!(stdout(&output).contains("voisu 9.9.9"), "{output:?}");
+    assert!(
+        stdout(&output).contains("Now installed: voisu 10.0.0"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn an_upgrade_that_installs_nothing_newer_says_so() {
+    let host = FakeHost::new();
+    host.pacman_owner("voisu-bin");
+    host.logging_tool("yay", 0);
+
+    let output = host.voisu(&["update"]);
+
+    assert!(output.status.success(), "{output:?}");
+    let out = stdout(&output);
+    assert!(out.contains("voisu is still 9.9.9"), "{out}");
+    assert!(!out.contains("Now installed"), "{out}");
 }
 
 #[test]

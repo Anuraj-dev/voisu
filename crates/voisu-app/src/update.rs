@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use voisu_cloud::process::{guard_external_child, run_restricted_with_deadline};
+use voisu_cloud::process::run_restricted_with_deadline;
 
 pub const UPDATE_USAGE: &str = "usage: voisu update [--check|--dry-run] [--switch-to-bin]";
 
@@ -22,8 +22,9 @@ pub const INSTALL_DOCS_URL: &str = "https://github.com/Anuraj-Dev/voisu#installa
 const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/Anuraj-Dev/voisu/releases/latest";
 
 /// Test and diagnostic seam: the binary whose owning package decides the
-/// plan, in place of the running executable. Only package names flow from
-/// it, so it cannot steer which command runs beyond the fixed plans below.
+/// plan, in place of the running executable. `voisu update` runs it with
+/// `--version` to read the installed version, so it is an exec seam; it can
+/// pick which fixed plan runs but never adds to that plan's argv.
 const BINARY_OVERRIDE_ENV: &str = "VOISU_UPDATE_BINARY";
 
 /// The user services restarted after an upgrade, when they are active.
@@ -78,6 +79,9 @@ pub enum OwnerManager {
 pub struct PackageOwner {
     pub manager: OwnerManager,
     pub package: String,
+    /// The Fedora `voisu-overlay` subpackage is installed. It pins
+    /// `voisu = %{version}-%{release}`, so dnf must upgrade both together.
+    pub overlay_installed: bool,
 }
 
 /// AUR helpers, in the order `voisu update` prefers them.
@@ -173,10 +177,18 @@ pub fn plan_update(
                 ),
             }
         }
-        (OwnerManager::Rpm, "voisu") => UpdatePlan::Upgrade {
-            notes: Vec::new(),
-            commands: vec![argv(&["sudo", "dnf", "upgrade", "--refresh", "voisu"])],
-        },
+        (OwnerManager::Rpm, "voisu") => {
+            // Name the subpackage only when installed: dnf5 rejects a named
+            // package that is not.
+            let mut dnf = argv(&["sudo", "dnf", "upgrade", "--refresh", "voisu"]);
+            if owner.overlay_installed {
+                dnf.push("voisu-overlay".to_owned());
+            }
+            UpdatePlan::Upgrade {
+                notes: Vec::new(),
+                commands: vec![dnf],
+            }
+        }
         (OwnerManager::Dpkg, "voisu") => UpdatePlan::Upgrade {
             notes: Vec::new(),
             commands: vec![
@@ -215,16 +227,21 @@ fn manual_aur_steps(package: &str) -> String {
     format!("  git clone https://aur.archlinux.org/{package}.git\n  cd {package}\n  makepkg -si")
 }
 
-/// Reads `pacman -Qqo`, `rpm -qf --qf '%{NAME}'`, or `dpkg -S` output into the
-/// owning package's name. `None` when the output names no package.
+/// Reads `pacman -Qqo`, `rpm -qf --qf '%{NAME}\n'`, or `dpkg -S` output into
+/// the owning package's name. `None` when the output names no package.
 pub fn parse_owner_output(manager: OwnerManager, stdout: &str) -> Option<String> {
-    let first = stdout.lines().next()?.trim();
     let name = match manager {
-        OwnerManager::Pacman | OwnerManager::Rpm => first,
+        OwnerManager::Pacman | OwnerManager::Rpm => stdout.lines().next()?.trim(),
         // `voisu: /usr/bin/voisu`, or `voisu:amd64: /usr/bin/voisu` for a
-        // multi-arch package.
+        // multi-arch package. A diverted file first prints
+        // `diversion by X from: ...`; several owners print `a, b: path`.
         OwnerManager::Dpkg => {
-            let (package, _) = first.split_once(": ")?;
+            let line = stdout
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.starts_with("diversion by "))?;
+            let (packages, _) = line.split_once(": ")?;
+            let package = packages.split(", ").next()?;
             package.split(':').next()?
         }
     };
@@ -278,6 +295,11 @@ pub fn run(args: &[String]) -> u8 {
         }
     };
     let owner = package_owner(&binary);
+    let owner = owner.map(|mut owner| {
+        owner.overlay_installed =
+            owner.manager == OwnerManager::Rpm && rpm_package_installed("voisu-overlay");
+        owner
+    });
     // Read from the owned binary rather than this process, so the version and
     // the owning package always describe the same file.
     let installed =
@@ -305,10 +327,13 @@ pub fn run(args: &[String]) -> u8 {
             println!("would run: {}", command.join(" "));
         }
         match active_services() {
-            Some(active) => println!(
-                "would run: systemctl --user try-restart {}",
-                active.join(" ")
-            ),
+            Some(active) => {
+                println!("would run: systemctl --user daemon-reload");
+                println!(
+                    "would run: systemctl --user try-restart {}",
+                    active.join(" ")
+                );
+            }
             None => println!("no active Voisu user services to restart"),
         }
         return 0;
@@ -328,6 +353,12 @@ pub fn run(args: &[String]) -> u8 {
         println!("restarted: {}", active.join(" "));
     }
     match installed_version(&binary) {
+        // A package manager exits 0 when it has nothing newer, or when it
+        // skips an upgrade it cannot resolve; say so instead of implying one.
+        Some(version) if version == installed => println!(
+            "voisu is still {version}: the package manager installed no newer version. \
+             Run `voisu update --check` to compare with the latest release."
+        ),
         Some(version) => println!("Now installed: voisu {version}"),
         None => println!("Update finished; run `voisu --version` to confirm the version."),
     }
@@ -380,7 +411,7 @@ fn package_owner(binary: &Path) -> Option<PackageOwner> {
     let path = binary.to_str()?;
     let queries: [(OwnerManager, &str, &[&str]); 3] = [
         (OwnerManager::Pacman, "pacman", &["-Qqo"]),
-        (OwnerManager::Rpm, "rpm", &["-qf", "--qf", "%{NAME}"]),
+        (OwnerManager::Rpm, "rpm", &["-qf", "--qf", "%{NAME}\n"]),
         (OwnerManager::Dpkg, "dpkg", &["-S"]),
     ];
     queries.into_iter().find_map(|(manager, program, args)| {
@@ -393,8 +424,17 @@ fn package_owner(binary: &Path) -> Option<PackageOwner> {
             return None;
         }
         let package = parse_owner_output(manager, &String::from_utf8_lossy(&outcome.stdout))?;
-        Some(PackageOwner { manager, package })
+        Some(PackageOwner {
+            manager,
+            package,
+            overlay_installed: false,
+        })
     })
+}
+
+fn rpm_package_installed(package: &str) -> bool {
+    run_restricted_with_deadline("rpm", &["-q", package], None, false, QUERY_DEADLINE, None)
+        .is_ok_and(|outcome| outcome.success)
 }
 
 fn detect_aur_helper() -> Option<AurHelper> {
@@ -423,11 +463,18 @@ fn active_services() -> Option<Vec<&'static str>> {
     (!active.is_empty()).then_some(active)
 }
 
+/// Reloads the user manager first: an upgrade that changed a unit file would
+/// otherwise restart the stale definition.
 fn restart_services(units: &[&str]) -> Result<(), String> {
+    systemctl_user(&["--user", "daemon-reload"])?;
     let mut arguments = vec!["--user", "try-restart"];
     arguments.extend_from_slice(units);
+    systemctl_user(&arguments)
+}
+
+fn systemctl_user(arguments: &[&str]) -> Result<(), String> {
     let outcome =
-        run_restricted_with_deadline("systemctl", &arguments, None, false, RESTART_DEADLINE, None)
+        run_restricted_with_deadline("systemctl", arguments, None, false, RESTART_DEADLINE, None)
             .map_err(|_| "systemctl --user did not complete".to_owned())?;
     if outcome.success {
         Ok(())
@@ -438,14 +485,18 @@ fn restart_services(units: &[&str]) -> Result<(), String> {
 
 /// Runs a package-manager command attached to the user's terminal, so `sudo`
 /// and the AUR helper can prompt. No deadline: the user drives it.
+///
+/// No parent-death SIGKILL guard: Ctrl-C reaches the whole foreground group,
+/// and yay/paru/dnf/apt must get to run their own SIGINT cleanup rather than
+/// be killed when `voisu` exits first.
 fn run_interactive(command: &[String]) -> bool {
     let Some((program, arguments)) = command.split_first() else {
         return false;
     };
-    let mut process = Command::new(program);
-    process.args(arguments);
-    guard_external_child(&mut process);
-    process.status().is_ok_and(|status| status.success())
+    match Command::new(program).args(arguments).status() {
+        Ok(status) => status.success(),
+        Err(_) => false,
+    }
 }
 
 fn installed_version(binary: &Path) -> Option<String> {
@@ -519,6 +570,7 @@ mod tests {
         PackageOwner {
             manager,
             package: package.to_owned(),
+            overlay_installed: false,
         }
     }
 
@@ -609,6 +661,15 @@ mod tests {
             );
             assert_eq!(commands(&fedora), ["sudo dnf upgrade --refresh voisu"]);
 
+            let with_overlay = PackageOwner {
+                overlay_installed: true,
+                ..owner(OwnerManager::Rpm, "voisu")
+            };
+            assert_eq!(
+                commands(&plan_update(Some(&with_overlay), None, switch_to_bin)),
+                ["sudo dnf upgrade --refresh voisu voisu-overlay"]
+            );
+
             let debian = plan_update(
                 Some(&owner(OwnerManager::Dpkg, "voisu")),
                 None,
@@ -653,6 +714,21 @@ mod tests {
         );
         assert_eq!(
             parse_owner_output(OwnerManager::Dpkg, "voisu:amd64: /usr/bin/voisu\n").as_deref(),
+            Some("voisu")
+        );
+        assert_eq!(
+            parse_owner_output(
+                OwnerManager::Dpkg,
+                "diversion by voisu-local from: /usr/bin/voisu\n\
+                 diversion by voisu-local to: /usr/bin/voisu.distrib\n\
+                 voisu: /usr/bin/voisu\n"
+            )
+            .as_deref(),
+            Some("voisu")
+        );
+        assert_eq!(
+            parse_owner_output(OwnerManager::Dpkg, "voisu, voisu-extra: /usr/bin/voisu\n")
+                .as_deref(),
             Some("voisu")
         );
         assert_eq!(parse_owner_output(OwnerManager::Pacman, ""), None);
