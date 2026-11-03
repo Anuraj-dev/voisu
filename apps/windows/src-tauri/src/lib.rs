@@ -177,9 +177,12 @@ fn get_state(app: AppHandle) -> UiState {
 #[tauri::command]
 fn set_trigger_key(app: AppHandle, key: String) -> Result<UiTrigger, String> {
     let chord = TriggerChord::try_from(key).map_err(|error| error.to_string())?;
-    update_settings(&app, |settings| settings.hotkey = chord);
+    // Applied before saving, so a key that can't take effect is never stored.
     #[cfg(windows)]
-    platform::hotkey::set_chord(chord);
+    if !platform::hotkey::set_chord(chord) {
+        return Err(HOOK_DOWN.into());
+    }
+    update_settings(&app, |settings| settings.hotkey = chord);
     let trigger = UiTrigger::of(chord);
     if let Some(tray) = app.state::<AppState>().tray.get() {
         tray.set_trigger(trigger.label.clone(), keys_ready());
@@ -188,17 +191,24 @@ fn set_trigger_key(app: AppHandle, key: String) -> Result<UiTrigger, String> {
     Ok(trigger)
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
+const HOOK_DOWN: &str =
+    "Voisu's keyboard hook isn't running, so the Trigger Key can't change. Restart Voisu.";
+
 /// Starts recording a shortcut; updates arrive as `trigger-capture` events.
 #[tauri::command]
-fn start_trigger_capture() {
+fn start_trigger_capture() -> Result<(), String> {
     #[cfg(windows)]
-    platform::hotkey::capture(true);
+    if !platform::hotkey::capture(true) {
+        return Err(HOOK_DOWN.into());
+    }
+    Ok(())
 }
 
 #[tauri::command]
 fn stop_trigger_capture() {
     #[cfg(windows)]
-    platform::hotkey::capture(false);
+    let _ = platform::hotkey::capture(false);
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -562,14 +572,28 @@ mod tests {
 
     #[test]
     fn every_preset_the_window_offers_is_allowed_and_stored_as_written() {
-        // Mirrors TRIGGER_PRESETS in ui/App.svelte.
-        for preset in [
-            "Ctrl+Win",
-            "Ctrl+`",
-            "Right Ctrl",
-            "CapsLock",
-            "Ctrl+Shift+Space",
-        ] {
+        // Read from the window itself, so the two can't drift apart.
+        const APP: &str = include_str!("../../ui/App.svelte");
+        let after = |marker: &str| APP.split_once(marker).expect(marker).1;
+        let default = after("const DEFAULT_TRIGGER = '")
+            .split_once('\'')
+            .unwrap()
+            .0;
+        assert_eq!(default, TriggerChord::default().to_string());
+        let list = after("const TRIGGER_PRESETS = [")
+            .split_once("];")
+            .unwrap()
+            .0;
+        let presets: Vec<&str> = list
+            .split("key: '")
+            .skip(1)
+            .map(|rest| rest.split_once('\'').unwrap().0)
+            .collect();
+        assert!(
+            presets.len() >= 5 && presets.contains(&default),
+            "{presets:?}"
+        );
+        for preset in presets {
             let chord = TriggerChord::try_from(preset.to_owned()).expect(preset);
             assert_eq!(UiTrigger::of(chord).key, preset);
         }

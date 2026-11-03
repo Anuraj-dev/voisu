@@ -26,21 +26,22 @@ use windows::Win32::System::RemoteDesktop::{
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetKeyNameTextW, GetLastInputInfo, INPUT, INPUT_0, INPUT_KEYBOARD,
-    KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP, LASTINPUTINFO, MAPVK_VK_TO_CHAR,
-    MAPVK_VSC_TO_VK_EX, MapVirtualKeyW, SendInput, VIRTUAL_KEY,
+    GetAsyncKeyState, GetKeyNameTextW, GetKeyboardLayout, GetLastInputInfo, HKL, INPUT, INPUT_0,
+    INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP, LASTINPUTINFO,
+    MAPVK_VK_TO_CHAR, MAPVK_VSC_TO_VK_EX, MapVirtualKeyExW, SendInput, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, HC_ACTION,
-    HHOOK, KBDLLHOOKSTRUCT, KillTimer, LLKHF_EXTENDED, LLKHF_INJECTED, MSG, PBT_APMRESUMEAUTOMATIC,
-    PostThreadMessageW, RegisterClassW, SetTimer, SetWindowsHookExW, UnhookWindowsHookEx,
-    WH_KEYBOARD_LL, WINDOW_EX_STYLE, WM_APP, WM_KEYDOWN, WM_POWERBROADCAST, WM_SYSKEYDOWN,
-    WM_TIMER, WM_WTSSESSION_CHANGE, WNDCLASSW, WS_OVERLAPPED, WTS_SESSION_UNLOCK,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetForegroundWindow,
+    GetMessageW, GetWindowThreadProcessId, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, KillTimer,
+    LLKHF_EXTENDED, LLKHF_INJECTED, MSG, PBT_APMRESUMEAUTOMATIC, PostThreadMessageW,
+    RegisterClassW, SetTimer, SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL,
+    WINDOW_EX_STYLE, WM_APP, WM_KEYDOWN, WM_POWERBROADCAST, WM_SYSKEYDOWN, WM_TIMER,
+    WM_WTSSESSION_CHANGE, WNDCLASSW, WS_OVERLAPPED, WTS_SESSION_UNLOCK,
 };
 use windows::core::w;
 
 use crate::chord::{
-    Capture, ChordTracker, Key, MASK_TAG, MASK_VK, ModMask, Modifier, Recorder, Side,
+    Capture, ChordTracker, Key, MASK_TAG, MASK_VK, ModMask, Modifier, Recorder, Side, VK_PACKET,
 };
 use crate::trigger::Trigger;
 use crate::trigger_key::{TriggerChord, scan_code};
@@ -55,6 +56,7 @@ const VK_LSHIFT: u32 = 0xA0;
 const VK_RSHIFT: u32 = 0xA1;
 const VK_LCONTROL: u32 = 0xA2;
 const VK_RCONTROL: u32 = 0xA3;
+const VK_PACKET_CODE: u32 = VK_PACKET as u32;
 const VK_LMENU: u32 = 0xA4;
 const VK_RMENU: u32 = 0xA5;
 /// AltGr arrives as a synthesized LCtrl whose scan code has this bit set.
@@ -114,22 +116,23 @@ pub fn install(
 }
 
 /// Switches the hook to a new chord, effective from the next key event.
-pub fn set_chord(chord: TriggerChord) {
-    post(WM_SET_CHORD, usize::from(chord.pack()));
+/// False when the hook is not running, so nothing would change.
+#[must_use]
+pub fn set_chord(chord: TriggerChord) -> bool {
+    post(WM_SET_CHORD, usize::from(chord.pack()))
 }
 
 /// Starts or stops recording a new shortcut. While recording, the Trigger
-/// Key does nothing.
-pub fn capture(on: bool) {
-    post(WM_CAPTURE, usize::from(on));
+/// Key does nothing. False when the hook is not running.
+#[must_use]
+pub fn capture(on: bool) -> bool {
+    post(WM_CAPTURE, usize::from(on))
 }
 
-fn post(message: u32, wparam: usize) {
+fn post(message: u32, wparam: usize) -> bool {
     let thread = HOOK_THREAD.load(Ordering::Acquire);
-    if thread != 0 {
-        // SAFETY: posts a plain message to the hook thread's queue.
-        let _ = unsafe { PostThreadMessageW(thread, message, WPARAM(wparam), LPARAM(0)) };
-    }
+    // SAFETY: posts a plain message to the hook thread's queue.
+    thread != 0 && unsafe { PostThreadMessageW(thread, message, WPARAM(wparam), LPARAM(0)) }.is_ok()
 }
 
 fn run(
@@ -178,7 +181,7 @@ fn run(
                     WM_INJECT_MASK => inject_mask(),
                     WM_SET_CHORD => {
                         let chord = TriggerChord::unpack(msg.wParam.0 as u16);
-                        with_state(|state| state.tracker.set_chord(chord));
+                        with_state(|state| switch_chord(state, chord));
                         tracing::info!(%chord, "Trigger Key changed");
                     }
                     WM_CAPTURE => set_capture(msg.wParam.0 != 0),
@@ -202,8 +205,16 @@ fn with_state(f: impl FnOnce(&mut HookState)) {
     });
 }
 
+/// Moves the tracker to `chord`, ending a held chord's Recording.
+fn switch_chord(state: &mut HookState, chord: TriggerChord) {
+    if let Some(signal) = state.tracker.set_chord(chord) {
+        state.trigger.signal(signal);
+    }
+}
+
 /// Starts or stops the recorder. Either way the tracker forgets what it
-/// held, since the recorder swallowed keys it never saw.
+/// held, since the recorder swallowed keys it never saw, but keeps
+/// swallowing a chord key it had swallowed.
 fn set_capture(on: bool) {
     with_state(|state| {
         if state.capture_timer != 0 {
@@ -211,7 +222,8 @@ fn set_capture(on: bool) {
             let _ = unsafe { KillTimer(None, state.capture_timer) };
             state.capture_timer = 0;
         }
-        state.tracker.reset();
+        let chord = state.tracker.chord();
+        switch_chord(state, chord);
         state.recorder = None;
         if on {
             state.recorder = Some(Recorder::default());
@@ -231,15 +243,49 @@ fn end_capture_timer(timer: usize) {
         let _ = unsafe { KillTimer(None, timer) };
         state.capture_timer = 0;
         if state.recorder.take().is_some() {
-            state.tracker.reset();
+            let chord = state.tracker.chord();
+            switch_chord(state, chord);
             let _ = state.captures.try_send(Capture::Cancelled);
         }
     });
 }
 
-/// The active layout's name for the key at `vk`'s US position, such as
-/// "Ö" or "^" for the key a US layout calls `.
+/// The foreground app's keyboard layout, the one the user types with:
+/// Windows keeps a layout per thread, and Voisu's own may differ.
+fn foreground_layout() -> HKL {
+    // SAFETY: plain lookups. Without a foreground window the thread is 0,
+    // which means the calling thread's layout.
+    unsafe { GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), None)) }
+}
+
+/// What the key at `vk`'s US position types on `layout`, unshifted, and
+/// whether it is a dead key there.
+fn layout_char(vk: u8, layout: HKL) -> Option<(char, bool)> {
+    let scan = scan_code(vk)?;
+    let extended = if scan & 0x100 != 0 { 0xE000 } else { 0 };
+    let scan = u32::from(scan & 0xFF) | extended;
+    // SAFETY: pure keyboard-layout lookups.
+    let mapped = unsafe {
+        let local = MapVirtualKeyExW(scan, MAPVK_VSC_TO_VK_EX, Some(layout));
+        if local == 0 {
+            return None;
+        }
+        MapVirtualKeyExW(local, MAPVK_VK_TO_CHAR, Some(layout))
+    };
+    let ch = char::from_u32(mapped & 0xFFFF).filter(|&c| c != '\0')?;
+    Some((ch, mapped & 0x8000_0000 != 0))
+}
+
+/// The foreground layout's name for the key at `vk`'s US position, such as
+/// "Ö" or "^" for the key a US layout calls `. The character it types wins
+/// over the key's name, which for a dead key is a word ("ZIRKUMFLEX").
 pub fn key_label(vk: u8) -> Option<String> {
+    let typed = layout_char(vk, foreground_layout())
+        .map(|(ch, _)| ch)
+        .filter(|ch| !ch.is_whitespace() && !ch.is_control());
+    if let Some(ch) = typed {
+        return Some(ch.to_uppercase().collect());
+    }
     let scan = scan_code(vk)?;
     let lparam = (i32::from(scan & 0xFF) << 16) | (i32::from(scan & 0x100 != 0) << 24);
     let mut name = [0u16; 64];
@@ -257,19 +303,11 @@ pub fn key_label(vk: u8) -> Option<String> {
     })
 }
 
-/// Whether the key at `vk`'s US position is a dead key on the active layout,
-/// so pressing it outside the chord starts an accent instead of typing.
+/// Whether the key at `vk`'s US position is a dead key on the foreground
+/// layout, so pressing it outside the chord starts an accent instead of
+/// typing.
 pub fn is_dead_key(vk: u8) -> bool {
-    let Some(scan) = scan_code(vk) else {
-        return false;
-    };
-    let extended = if scan & 0x100 != 0 { 0xE000 } else { 0 };
-    let scan = u32::from(scan & 0xFF) | extended;
-    // SAFETY: pure keyboard-layout lookups.
-    unsafe {
-        let local = MapVirtualKeyW(scan, MAPVK_VSC_TO_VK_EX);
-        local != 0 && MapVirtualKeyW(local, MAPVK_VK_TO_CHAR) & 0x8000_0000 != 0
-    }
+    layout_char(vk, foreground_layout()).is_some_and(|(_, dead)| dead)
 }
 
 /// Replaces the hook and forgets tracked keys, whose key-ups may have been
@@ -289,7 +327,10 @@ fn reinstall() -> io::Result<()> {
         let old = STATE.with(|cell| {
             let mut state = cell.borrow_mut();
             let state = state.as_mut()?;
-            state.tracker.reset();
+            // No carried key here: its key-up may be among those missed.
+            if let Some(signal) = state.tracker.reset() {
+                state.trigger.signal(signal);
+            }
             state.hook.replace(hook)
         });
         if let Some(old) = old {
@@ -404,6 +445,8 @@ fn classify(event: &KBDLLHOOKSTRUCT) -> Key {
         VK_LWIN => Key::Mod(Modifier::Win, Side::Left),
         VK_RWIN => Key::Mod(Modifier::Win, Side::Right),
         VK_ESCAPE => Key::Escape,
+        // Unicode text: the scan code field holds a UTF-16 unit.
+        VK_PACKET_CODE => Key::Other(VK_PACKET, 0),
         vk => {
             let scan = match event.scanCode & 0xFF {
                 0 => 0,
@@ -420,7 +463,8 @@ fn held(vk: i32) -> bool {
     unsafe { GetAsyncKeyState(vk) < 0 }
 }
 
-/// The OS's view of the modifiers, read only on a modifier press.
+/// The OS's view of the modifiers, read only on a modifier or chord-key
+/// press.
 fn os_modifiers() -> ModMask {
     let mut mask = ModMask::default();
     for (modifier, down) in [
@@ -448,8 +492,11 @@ fn on_key(event: &KBDLLHOOKSTRUCT, message: u32) -> bool {
         return false;
     }
     let down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
-    let key = classify(event);
     let injected = event.flags.contains(LLKHF_INJECTED);
+    let key = match classify(event) {
+        key if injected => key.injected(),
+        key => key,
+    };
     let tagged = event.dwExtraInfo == MASK_TAG;
     STATE.with(|cell| {
         // A failed borrow means re-entry; let the event through untouched.
@@ -463,7 +510,12 @@ fn on_key(event: &KBDLLHOOKSTRUCT, message: u32) -> bool {
             if injected && !Recorder::admits_injected(key, tagged) {
                 return false;
             }
-            let verdict = recorder.handle(key, down);
+            if state.tracker.carried(key, down) {
+                return true;
+            }
+            // Inside the hook the async state is from before this event.
+            let held_before = down && held(event.vkCode as i32);
+            let verdict = recorder.handle(key, down, held_before);
             if verdict.inject_mask {
                 post_mask(state);
             }
@@ -471,7 +523,8 @@ fn on_key(event: &KBDLLHOOKSTRUCT, message: u32) -> bool {
                 if !matches!(update, Capture::Preview(_)) {
                     // The timer is killed when it fires.
                     state.recorder = None;
-                    state.tracker.reset();
+                    let chord = state.tracker.chord();
+                    switch_chord(state, chord);
                 }
                 let _ = state.captures.try_send(update);
             }
@@ -482,11 +535,8 @@ fn on_key(event: &KBDLLHOOKSTRUCT, message: u32) -> bool {
         if injected && !state.tracker.admits_injected(key, tagged) {
             return false;
         }
-        let os = match key {
-            Key::Mod(..) if down => os_modifiers(),
-            _ => ModMask::default(),
-        };
-        let verdict = state.tracker.handle(key, down, os, state.trigger.armed());
+        let armed = state.trigger.armed();
+        let verdict = state.tracker.handle(key, down, os_modifiers, armed);
         if let Some(signal) = verdict.signal {
             state.trigger.signal(signal);
         }

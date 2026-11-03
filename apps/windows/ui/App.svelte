@@ -154,9 +154,9 @@
     triggerError = '';
     preview = '';
     recording = true;
-    invoke('start_trigger_capture').catch(() => {
+    invoke('start_trigger_capture').catch((e) => {
       recording = false;
-      triggerError = 'Could not start recording a shortcut.';
+      triggerError = typeof e === 'string' ? e : 'Could not start recording a shortcut.';
     });
   }
 

@@ -25,6 +25,9 @@ pub const MASK_VK: u8 = 0xE8;
 /// `dwExtraInfo` of every key Voisu injects ("VOIS"), so the hook can tell
 /// its own events from another app's.
 pub const MASK_TAG: usize = 0x564F_4953;
+/// `VK_PACKET`: text another app injects as Unicode, with the UTF-16 unit
+/// where the scan code goes. Never a chord key.
+pub const VK_PACKET: u8 = 0xE7;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Key {
@@ -33,6 +36,29 @@ pub enum Key {
     /// Any other key: its virtual key on the active layout, and its scan code
     /// with 0x100 marking an extended key (0 when an injected event has none).
     Other(u8, u16),
+}
+
+impl Key {
+    /// An injected event's scan code is whatever the injecting app chose, so
+    /// it never identifies a position: an injected key matches by virtual
+    /// key alone.
+    pub fn injected(self) -> Self {
+        match self {
+            Self::Other(vk, _) => Self::Other(vk, 0),
+            key => key,
+        }
+    }
+}
+
+/// Whether `vk`/`scan` is the key at `key_vk`/`key_scan`: by scan code, the
+/// physical position, unless either side has none. `VK_PACKET` is text, never
+/// a key.
+fn same_key(vk: u8, scan: u16, key_vk: u8, key_scan: u16) -> bool {
+    match () {
+        _ if vk == VK_PACKET => false,
+        _ if scan == 0 || key_scan == 0 => vk == key_vk,
+        _ => scan == key_scan,
+    }
 }
 
 /// The operating system's view of which modifiers are down, either side.
@@ -108,6 +134,9 @@ pub struct ChordTracker {
     /// An Esc down was swallowed; swallow its repeats and its key-up as well,
     /// so the focused app never sees half an Esc.
     escape_swallowed: bool,
+    /// A previous chord's key, held and swallowed when the chord changed:
+    /// swallow its repeats and key-up too, then forget it.
+    carried: Option<(u8, u16)>,
 }
 
 impl Default for ChordTracker {
@@ -162,32 +191,77 @@ impl ChordTracker {
             active: false,
             poisoned: false,
             escape_swallowed: false,
+            carried: None,
         }
     }
 
-    /// Clears all tracked state, for example after the hook is reinstalled and
-    /// key-ups may have been missed.
-    pub fn reset(&mut self) {
-        *self = Self::new(self.chord);
+    pub fn chord(&self) -> TriggerChord {
+        self.chord
     }
 
-    /// Switches to another chord, forgetting all tracked state.
-    pub fn set_chord(&mut self, chord: TriggerChord) {
+    /// Clears all tracked state, for example after the hook is reinstalled and
+    /// key-ups may have been missed. Returns Interrupted when the chord was
+    /// held, so the gesture thread never keeps a Recording nobody can end.
+    pub fn reset(&mut self) -> Option<ChordSignal> {
+        let signal = self.active.then_some(ChordSignal::Interrupted);
+        *self = Self::new(self.chord);
+        signal
+    }
+
+    /// Switches to another chord (the same one when recording starts or
+    /// ends), forgetting the tracked modifiers. Interrupts a held chord, and
+    /// keeps swallowing a key whose key-down was swallowed, so the focused
+    /// app never sees a stray key-up or repeat.
+    pub fn set_chord(&mut self, chord: TriggerChord) -> Option<ChordSignal> {
+        let signal = self.active.then_some(ChordSignal::Interrupted);
+        let carried = match self.chord.key() {
+            Some(vk) if self.key_swallowed => Some((vk, self.key_scan)),
+            _ => self.carried,
+        };
+        let escape_swallowed = self.escape_swallowed;
         *self = Self::new(chord);
+        self.carried = carried;
+        self.escape_swallowed = escape_swallowed;
+        signal
+    }
+
+    /// Swallows the rest of a carried key: its repeats and its key-up. The
+    /// recorder's branch calls this too.
+    pub fn carried(&mut self, key: Key, down: bool) -> bool {
+        match (key, self.carried) {
+            (Key::Other(vk, scan), Some((key_vk, key_scan)))
+                if same_key(vk, scan, key_vk, key_scan) =>
+            {
+                if !down {
+                    self.carried = None;
+                }
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Feeds one key transition.
     ///
     /// `os_held` is the operating system's current view of the modifiers. It
-    /// is read only on a fresh modifier press, so a key-up the hook missed
-    /// (secure desktop, lock screen) cannot leave a stale modifier that forms
-    /// or blocks a chord. `armed` is true while the gesture thread has a
+    /// is read only on a fresh modifier or chord-key press, so a key-up the
+    /// hook missed (secure desktop, lock screen) cannot leave a stale
+    /// modifier that forms or blocks a chord. `armed` is true while the gesture thread has a
     /// Recording or a pending tap in flight, which is when Esc means Cancel.
-    pub fn handle(&mut self, key: Key, down: bool, os_held: ModMask, armed: bool) -> Verdict {
+    pub fn handle(
+        &mut self,
+        key: Key,
+        down: bool,
+        os_held: impl FnOnce() -> ModMask,
+        armed: bool,
+    ) -> Verdict {
+        if self.carried(key, down) {
+            return Verdict::SWALLOW;
+        }
         match key {
             Key::Mod(modifier, side) => self.modifier(modifier, side, down, os_held),
             Key::Escape => self.escape(down, armed),
-            Key::Other(vk, scan) if self.is_chord_key(vk, scan) => self.chord_key(down),
+            Key::Other(vk, scan) if self.is_chord_key(vk, scan) => self.chord_key(down, os_held),
             Key::Other(..) => self.other(down),
         }
     }
@@ -204,10 +278,19 @@ impl ChordTracker {
     /// layout that moves the virtual key does not move the Trigger Key. An
     /// injected event without a scan code falls back to the virtual key.
     fn is_chord_key(&self, vk: u8, scan: u16) -> bool {
-        match self.chord.key() {
-            None => false,
-            Some(key) if scan == 0 || self.key_scan == 0 => vk == key,
-            Some(_) => scan == self.key_scan,
+        self.chord
+            .key()
+            .is_some_and(|key| same_key(vk, scan, key, self.key_scan))
+    }
+
+    /// Drops every tracked modifier but `except` that the OS says is up: its
+    /// key-up never reached the hook. Clear-only, since the OS also counts
+    /// injected modifiers the tracker deliberately ignores.
+    fn reconcile(&mut self, os: ModMask, except: Option<Modifier>) {
+        for modifier in Modifier::ALL {
+            if Some(modifier) != except && !os.has(modifier) {
+                self.held[modifier as usize] = SideSet::default();
+            }
         }
     }
 
@@ -256,7 +339,13 @@ impl ChordTracker {
         verdict
     }
 
-    fn modifier(&mut self, modifier: Modifier, side: Side, down: bool, os: ModMask) -> Verdict {
+    fn modifier(
+        &mut self,
+        modifier: Modifier,
+        side: Side,
+        down: bool,
+        os: impl FnOnce() -> ModMask,
+    ) -> Verdict {
         let index = modifier as usize;
         if !down {
             self.held[index].set(side, false);
@@ -269,13 +358,7 @@ impl ChordTracker {
         let fresh = !self.held[index].any();
         self.held[index].set(side, true);
         if fresh {
-            for other in Modifier::ALL {
-                if other != modifier && !os.has(other) {
-                    // The OS says it is up, but no key-up reached the hook:
-                    // drop the stale state.
-                    self.held[other as usize] = SideSet::default();
-                }
-            }
+            self.reconcile(os(), Some(modifier));
         }
         if !self.chord.uses(modifier) || (self.active && !self.holding()) {
             // A modifier outside the chord, or the wrong side of a one-sided
@@ -288,7 +371,7 @@ impl ChordTracker {
         Verdict::PASS
     }
 
-    fn chord_key(&mut self, down: bool) -> Verdict {
+    fn chord_key(&mut self, down: bool, os: impl FnOnce() -> ModMask) -> Verdict {
         if !down {
             self.key_held = false;
             let pass = !std::mem::take(&mut self.key_swallowed);
@@ -304,6 +387,11 @@ impl ChordTracker {
             } else {
                 Verdict::PASS
             };
+        }
+        self.reconcile(os(), None);
+        if !self.chord_mod_held() {
+            // Whatever poisoned the chord is over.
+            self.poisoned = false;
         }
         self.key_held = true;
         if !self.active && !self.poisoned && self.mods_satisfied() {
@@ -373,8 +461,10 @@ pub struct CaptureVerdict {
 
 /// The hook's capture mode. It records the keys held together and finishes
 /// once they are all released. Modifiers still pass through, with the mask
-/// key injected under Win and Alt, while ordinary keys are swallowed so
-/// recording Win+D does not show the desktop.
+/// key injected under Win and Alt, under a second modifier, and with every
+/// key swallowed under a modifier, so no release opens Start or switches the
+/// layout. Ordinary keys are swallowed so recording Win+D does not show the
+/// desktop.
 #[derive(Debug, Default)]
 pub struct Recorder {
     /// Modifier sides pressed since recording began.
@@ -392,13 +482,19 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    pub fn handle(&mut self, key: Key, down: bool) -> CaptureVerdict {
+    /// `held_before` is true when the key was already down before this event,
+    /// as the OS sees it. A key down since before recording began then passes
+    /// and is not recorded: its repeats and key-up finish in the app it
+    /// started in.
+    pub fn handle(&mut self, key: Key, down: bool, held_before: bool) -> CaptureVerdict {
         let mut verdict = CaptureVerdict {
             pass: true,
             inject_mask: false,
             update: None,
         };
+        let any_mod_held = self.held.iter().any(|s| s.any());
         match key {
+            Key::Other(VK_PACKET, _) => return verdict,
             Key::Escape => {
                 if down {
                     verdict.pass = false;
@@ -407,10 +503,18 @@ impl Recorder {
                 return verdict;
             }
             Key::Mod(modifier, side) => {
+                let others_held = Modifier::ALL
+                    .iter()
+                    .any(|&m| m != modifier && self.held[m as usize].any());
                 let held = &mut self.held[modifier as usize];
+                if down && !held.get(side) && held_before {
+                    return verdict;
+                }
                 if down && !held.get(side) {
-                    verdict.inject_mask =
-                        !held.any() && matches!(modifier, Modifier::Win | Modifier::Alt);
+                    // Mask Start and the menu bar, and the layout switch a
+                    // second modifier (Ctrl+Shift, Alt+Shift) arms.
+                    verdict.inject_mask = others_held
+                        || (!held.any() && matches!(modifier, Modifier::Win | Modifier::Alt));
                     held.set(side, true);
                     if !self.frozen {
                         self.seen[modifier as usize].set(side, true);
@@ -423,9 +527,16 @@ impl Recorder {
             }
             Key::Other(vk, scan) => {
                 let (word, bit) = (usize::from(vk / 64), 1u64 << (vk % 64));
+                let fresh = self.down[word] & bit == 0;
+                if down && fresh && held_before {
+                    return verdict;
+                }
                 if down {
                     verdict.pass = false;
-                    if self.down[word] & bit == 0 && !self.frozen {
+                    // A swallowed key under a modifier would otherwise leave
+                    // its release free to open Start or switch the layout.
+                    verdict.inject_mask = fresh && any_mod_held;
+                    if fresh && !self.frozen {
                         let position = match scan {
                             0 => key_name(vk).map(|_| vk),
                             _ => key_at(scan),
@@ -463,7 +574,7 @@ impl Recorder {
     /// While recording, an injected ordinary key may be recorded (a remapped
     /// F24), but never Voisu's own mask or an injected modifier.
     pub fn admits_injected(key: Key, tagged: bool) -> bool {
-        !tagged && matches!(key, Key::Other(..))
+        !tagged && matches!(key, Key::Other(vk, _) if vk != VK_PACKET)
     }
 
     fn anything_held(&self) -> bool {
@@ -530,7 +641,7 @@ mod tests {
             .iter()
             .map(|&(key, down)| {
                 let os = os(tracker);
-                tracker.handle(key, down, os, armed)
+                tracker.handle(key, down, || os, armed)
             })
             .collect()
     }
@@ -730,9 +841,9 @@ mod tests {
     fn missed_key_up_is_corrected_by_the_os_view() {
         let mut t = ChordTracker::default();
         // Ctrl went down, then its key-up was lost (e.g. the lock screen).
-        t.handle(LCTRL, true, ModMask::default(), false);
+        t.handle(LCTRL, true, ModMask::default, false);
         // Win now goes down; the OS reports Ctrl as up.
-        let v = t.handle(LWIN, true, ModMask::default(), false);
+        let v = t.handle(LWIN, true, ModMask::default, false);
         assert_eq!(v.signal, None);
         assert!(!v.inject_mask);
     }
@@ -741,11 +852,11 @@ mod tests {
     fn a_missed_extra_modifier_up_does_not_block_the_chord() {
         let mut t = ChordTracker::default();
         // Shift's key-up was lost; the OS now reports only Ctrl.
-        t.handle(LSHIFT, true, ModMask::default(), false);
-        t.handle(LCTRL, true, ModMask::default(), false);
+        t.handle(LSHIFT, true, ModMask::default, false);
+        t.handle(LCTRL, true, ModMask::default, false);
         let os = ModMask::default().with(Modifier::Ctrl);
         assert_eq!(
-            t.handle(LWIN, true, os, false).signal,
+            t.handle(LWIN, true, || os, false).signal,
             Some(ChordSignal::Pressed)
         );
     }
@@ -772,8 +883,8 @@ mod tests {
     #[test]
     fn escape_up_is_swallowed_even_after_disarming() {
         let mut t = ChordTracker::default();
-        let down = t.handle(Key::Escape, true, ModMask::default(), true);
-        let up = t.handle(Key::Escape, false, ModMask::default(), false);
+        let down = t.handle(Key::Escape, true, ModMask::default, true);
+        let up = t.handle(Key::Escape, false, ModMask::default, false);
         assert!(!down.pass && !up.pass);
     }
 
@@ -792,7 +903,11 @@ mod tests {
     fn reset_clears_held_state() {
         let mut t = ChordTracker::default();
         feed(&mut t, &[(LCTRL, true), (LWIN, true)], false);
-        t.reset();
+        assert_eq!(
+            t.reset(),
+            Some(ChordSignal::Interrupted),
+            "never a stuck Recording"
+        );
         let v = feed(&mut t, &[(LWIN, false), (LCTRL, false)], false);
         assert!(signals(&v).is_empty());
     }
@@ -855,12 +970,12 @@ mod tests {
 
     #[test]
     fn a_one_sided_chord_ignores_the_other_side() {
-        let mut t = ChordTracker::new(chord("Right Ctrl+Right Alt"));
-        let v = feed(&mut t, &[(LCTRL, true), (RALT, true)], false);
+        let mut t = ChordTracker::new(chord("Right Ctrl"));
+        let v = feed(&mut t, &[(LCTRL, true), (LCTRL, false)], false);
         assert!(signals(&v).is_empty());
 
-        let mut t = ChordTracker::new(chord("Right Ctrl+Right Alt"));
-        let v = feed(&mut t, &[(RCTRL, true), (RALT, true), (LALT, true)], false);
+        let mut t = ChordTracker::new(chord("Right Ctrl"));
+        let v = feed(&mut t, &[(RCTRL, true), (LCTRL, true)], false);
         assert_eq!(
             signals(&v),
             [ChordSignal::Pressed, ChordSignal::Interrupted]
@@ -1066,11 +1181,77 @@ mod tests {
         assert_eq!(signals(&v), [ChordSignal::Pressed]);
     }
 
+    #[test]
+    fn injected_unicode_text_never_triggers_or_records() {
+        // A password manager typing ":" as Unicode text: VK_PACKET, with the
+        // UTF-16 unit 0x3A where Caps Lock's scan code would be.
+        let colon = Key::Other(VK_PACKET, 0x3A);
+        let mut t = ChordTracker::new(chord("CapsLock"));
+        assert!(!t.admits_injected(colon, false));
+        assert!(!t.admits_injected(colon.injected(), false));
+        let v = feed(&mut t, &[(colon, true), (colon, false)], false);
+        assert!(signals(&v).is_empty() && v.iter().all(|v| v.pass));
+
+        assert!(!Recorder::admits_injected(colon, false));
+        let mut r = Recorder::default();
+        let v = r.handle(colon, true, false);
+        assert!(v.pass && v.update.is_none(), "never recorded");
+    }
+
+    #[test]
+    fn injected_keys_match_by_virtual_key_alone() {
+        // An app injecting D with F13's scan code is still D.
+        let t = ChordTracker::new(chord("F13"));
+        assert!(!t.admits_injected(Key::Other(b'D', 0x64).injected(), false));
+        assert!(t.admits_injected(Key::Other(0x7C, 0x64).injected(), false));
+    }
+
+    #[test]
+    fn a_stale_modifier_cannot_turn_a_bare_key_into_the_chord() {
+        // Ctrl went down, and its key-up went to the secure desktop (UAC).
+        let mut t = ChordTracker::new(chord("Ctrl+`"));
+        t.handle(LCTRL, true, ModMask::default, false);
+        let v = [
+            t.handle(D, true, ModMask::default, false),
+            t.handle(BACKTICK, true, ModMask::default, false),
+            t.handle(BACKTICK, false, ModMask::default, false),
+        ];
+        assert!(v.iter().all(|v| v.pass && v.signal.is_none()), "{v:?}");
+
+        // A stale Shift no longer blocks Caps Lock.
+        let mut t = ChordTracker::new(chord("CapsLock"));
+        t.handle(LSHIFT, true, ModMask::default, false);
+        let v = t.handle(CAPS, true, ModMask::default, false);
+        assert_eq!(v.signal, Some(ChordSignal::Pressed));
+    }
+
+    #[test]
+    fn changing_the_chord_while_it_is_held_interrupts_and_swallows_the_rest_of_its_key() {
+        let mut t = ChordTracker::new(chord("Ctrl+`"));
+        feed(&mut t, &[(LCTRL, true), (BACKTICK, true)], false);
+        assert_eq!(
+            t.set_chord(chord("Ctrl+Shift+Space")),
+            Some(ChordSignal::Interrupted)
+        );
+        let v = feed(
+            &mut t,
+            &[(BACKTICK, true), (BACKTICK, false), (BACKTICK, true)],
+            false,
+        );
+        assert!(
+            !v[0].pass && !v[1].pass,
+            "no backtick leaks after the switch"
+        );
+        assert!(v[2].pass, "a fresh press types again");
+        assert!(signals(&v).is_empty());
+        assert_eq!(t.set_chord(chord("Ctrl+Win")), None, "nothing was held");
+    }
+
     // The shortcut recorder.
 
     fn record(events: &[(Key, bool)]) -> Vec<CaptureVerdict> {
         let mut r = Recorder::default();
-        events.iter().map(|&(k, d)| r.handle(k, d)).collect()
+        events.iter().map(|&(k, d)| r.handle(k, d, false)).collect()
     }
 
     fn updates(verdicts: &[CaptureVerdict]) -> Vec<Capture> {
@@ -1103,6 +1284,7 @@ mod tests {
         ]);
         assert_eq!(updates(&v).last(), Some(&Capture::Done(chord("Win+D"))));
         assert!(v[0].inject_mask, "Start never opens while recording");
+        assert!(v[1].inject_mask && !v[2].inject_mask);
         assert!(!v[1].pass && !v[2].pass && !v[3].pass);
     }
 
@@ -1163,6 +1345,44 @@ mod tests {
         let v = record(&[(LCTRL, true), (Key::Escape, true)]);
         assert_eq!(updates(&v).last(), Some(&Capture::Cancelled));
         assert!(!v[1].pass);
+    }
+
+    #[test]
+    fn recording_ignores_a_key_held_since_before_it_began() {
+        let mut r = Recorder::default();
+        // The backtick was already down: this is its auto-repeat.
+        let repeat = r.handle(BACKTICK, true, true);
+        let up = r.handle(BACKTICK, false, false);
+        assert!(
+            repeat.pass && up.pass,
+            "it finishes in the app it started in"
+        );
+        assert!(repeat.update.is_none() && up.update.is_none());
+        let v = [
+            r.handle(LCTRL, true, false),
+            r.handle(D, true, false),
+            r.handle(D, false, false),
+            r.handle(LCTRL, false, false),
+        ];
+        assert_eq!(v[3].update, Some(Capture::Done(chord("Ctrl+D"))));
+    }
+
+    #[test]
+    fn recording_masks_every_key_swallowed_under_a_modifier() {
+        // Otherwise releasing Ctrl+Shift after Space switches the layout.
+        let v = record(&[
+            (LCTRL, true),
+            (LSHIFT, true),
+            (SPACE, true),
+            (SPACE, true),
+            (SPACE, false),
+            (LSHIFT, false),
+            (LCTRL, false),
+        ]);
+        assert!(!v[0].inject_mask);
+        assert!(v[1].inject_mask, "a second modifier masks the first");
+        assert!(v[2].inject_mask && !v[3].inject_mask);
+        assert!(!record(&[(SPACE, true)])[0].inject_mask);
     }
 
     #[test]

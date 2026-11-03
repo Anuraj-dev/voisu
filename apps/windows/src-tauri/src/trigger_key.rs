@@ -184,6 +184,11 @@ impl TriggerChord {
         if is_typing_key(key) && !self.uses(Modifier::Ctrl) && !self.uses(Modifier::Alt) {
             return Err(Rejection::TypingKey);
         }
+        if self.mods_are(&[Modifier::Shift]) {
+            // Shift+F10 opens the context menu, Shift+Caps Lock toggles caps,
+            // and apps read Shift+key as the key itself.
+            return Err(Rejection::ShiftOnly);
+        }
         if mods + 1 > 3 {
             return Err(Rejection::TooMany);
         }
@@ -259,6 +264,7 @@ pub enum Rejection {
     Unsupported,
     /// The recorder saw both sides of one modifier.
     BothSides,
+    ShiftOnly,
 }
 
 impl fmt::Display for Rejection {
@@ -277,6 +283,7 @@ impl fmt::Display for Rejection {
                 "Voisu can't use that key. Try modifiers, Caps Lock, an F-key, or Space."
             }
             Self::BothSides => "Use one side of each modifier, not both.",
+            Self::ShiftOnly => "Shift alone isn't enough. Add Ctrl or Alt, or use the key on its own.",
         })
     }
 }
@@ -354,6 +361,13 @@ impl FromStr for TriggerChord {
             }
             chord.key = Some(vk);
         }
+        if chord.key.is_some() || chord.modifier_count() > 1 {
+            // Only a lone modifier keeps its side; the hook matches every
+            // other chord's modifiers on either side.
+            for need in chord.mods.iter_mut().flatten() {
+                *need = Need::Either;
+            }
+        }
         Ok(chord)
     }
 }
@@ -430,12 +444,13 @@ const VK_SPACE: u8 = 0x20;
 const VK_PAUSE: u8 = 0x13;
 const VK_HOME: u8 = 0x24;
 const VK_END: u8 = 0x23;
+const VK_INSERT: u8 = 0x2D;
 const VK_BACKTICK: u8 = 0xC0;
 
 /// Ctrl+key edit shortcuts nearly every app uses.
 const CTRL_EDIT_KEYS: &[u8] = &[
     b'A', b'B', b'C', b'F', b'I', b'N', b'O', b'P', b'R', b'S', b'T', b'U', b'V', b'W', b'X', b'Y',
-    b'Z', VK_HOME, VK_END,
+    b'Z', VK_HOME, VK_END, VK_INSERT,
 ];
 
 /// Keys that type or move the caret: letters, digits, punctuation, Space and
@@ -444,7 +459,7 @@ fn is_typing_key(vk: u8) -> bool {
     vk.is_ascii_digit()
         || vk.is_ascii_uppercase()
         || (0xBA..=0xDE).contains(&vk)
-        || matches!(vk, VK_SPACE | 0x21..=0x24 | 0x2D)
+        || matches!(vk, VK_SPACE | 0x21..=0x24 | VK_INSERT)
 }
 
 /// The written name of a virtual key a chord may use.
@@ -563,8 +578,7 @@ mod tests {
         for text in [
             "Ctrl+Alt",
             "Ctrl+Shift+Win",
-            "Right Ctrl+Right Alt",
-            "Left Ctrl+Win",
+            "Right Ctrl",
             "Ctrl+Alt+Space",
             "Alt+Shift+F9",
             "Win+Z",
@@ -585,10 +599,7 @@ mod tests {
     fn short_and_long_spellings_parse() {
         assert_eq!(parse("RAlt+LCtrl"), parse("Left Ctrl+Right Alt"));
         assert_eq!(parse("Control+Windows"), TriggerChord::CTRL_WIN);
-        assert_eq!(
-            parse("RightAlt+RightCtrl").to_string(),
-            "Right Ctrl+Right Alt"
-        );
+        assert_eq!(parse("RightAlt").to_string(), "Right Alt");
         assert_eq!(parse("ctrl+alt+f12").to_string(), "Ctrl+Alt+F12");
         assert_eq!(parse("ctrl+alt+r").to_string(), "Ctrl+Alt+R");
         assert_eq!(parse("ctrl+alt+pageup").to_string(), "Ctrl+Alt+PageUp");
@@ -615,8 +626,8 @@ mod tests {
     fn pack_round_trips_every_shape() {
         for text in [
             "Ctrl+Win",
-            "Right Ctrl+Right Alt",
-            "Left Ctrl+Left Alt+Left Shift+Left Win",
+            "Right Ctrl",
+            "Left Alt",
             "Ctrl+Alt+Space",
             "Win+Z",
             "F24",
@@ -624,6 +635,12 @@ mod tests {
             let chord = parse(text);
             assert_eq!(TriggerChord::unpack(chord.pack()), chord, "{text}");
         }
+        let sided = TriggerChord::EMPTY
+            .with(Modifier::Ctrl, Need::Only(Side::Left))
+            .with(Modifier::Alt, Need::Only(Side::Right))
+            .with(Modifier::Shift, Need::Either)
+            .with(Modifier::Win, Need::Only(Side::Left));
+        assert_eq!(TriggerChord::unpack(sided.pack()), sided);
     }
 
     #[test]
@@ -684,6 +701,10 @@ mod tests {
             ("Ctrl+Home", Rejection::Reserved),
             ("F5", Rejection::Reserved),
             ("Ctrl+F11", Rejection::Reserved),
+            ("Ctrl+Insert", Rejection::Reserved),
+            ("Shift+F10", Rejection::ShiftOnly),
+            ("Shift+CapsLock", Rejection::ShiftOnly),
+            ("Shift+F13", Rejection::ShiftOnly),
             ("Ctrl", Rejection::LoneModifier),
             ("Right Shift", Rejection::LoneModifier),
             ("Left Ctrl", Rejection::LoneModifier),
@@ -699,6 +720,16 @@ mod tests {
             assert_eq!(parse(text).check(), Err(why), "{text}");
         }
         assert_eq!(TriggerChord::EMPTY.check(), Err(Rejection::Empty));
+    }
+
+    #[test]
+    fn chords_of_several_keys_match_either_side() {
+        // Only a lone modifier keeps its side, as the note says.
+        assert_eq!(parse("Right Ctrl+Right Alt"), parse("Ctrl+Alt"));
+        assert_eq!(parse("Left Ctrl+Win").to_string(), "Ctrl+Win");
+        assert_eq!(parse("Left Ctrl+Space"), parse("Ctrl+Space"));
+        assert_eq!(parse("RAlt+LCtrl").to_string(), "Ctrl+Alt");
+        assert_ne!(parse("Right Ctrl"), parse("Left Ctrl"));
     }
 
     #[test]
