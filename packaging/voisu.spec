@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.69.1
+Version:        0.69.2
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -167,6 +167,9 @@ install -D -m 0644 packaging/icons/voisu.svg %{buildroot}%{_datadir}/icons/hicol
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Tue Nov 03 2026 Voisu maintainers <voisu@example.invalid> - 0.69.2-1
+- fix(overlay): show the check mark the moment the paste lands (#300)
+
 * Tue Nov 03 2026 Voisu maintainers <voisu@example.invalid> - 0.69.1-1
 - fix(windows): offer only the preset Trigger Keys (#299)
 
