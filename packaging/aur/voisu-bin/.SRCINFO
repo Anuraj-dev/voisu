@@ -1,5 +1,5 @@
 pkgbase = voisu-bin
-	pkgdesc = Cloud-first Linux dictation for Wayland (prebuilt binaries)
+	pkgdesc = Voice dictation for Linux desktops (prebuilt binaries)
 	pkgver = 0.1.0
 	pkgrel = 1
 	url = https://github.com/Anuraj-Dev/voisu

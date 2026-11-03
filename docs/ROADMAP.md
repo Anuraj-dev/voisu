@@ -1,8 +1,9 @@
 # Voisu Roadmap
 
-Voisu is a cloud-first Linux desktop dictation daemon. Press the Trigger Key,
-speak, and a validated Transcript is delivered into the focused application.
-First supported target: Fedora KDE Plasma on Wayland.
+Voisu is voice dictation for Linux and Windows. Press the Trigger Key, speak,
+and a validated Transcript is delivered into the focused application. Primary
+Linux target: Fedora KDE Plasma on Wayland; Windows 10/11 runs a Cloud-only
+tray app.
 
 This document tracks what works today, what is coming next, and the known
 limitations you may hit. For install instructions see the

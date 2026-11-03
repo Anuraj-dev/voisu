@@ -1,7 +1,8 @@
 # Contributing to Voisu
 
-Voisu is a cloud-first Linux desktop dictation daemon, written in Rust. First
-supported target: Fedora KDE Plasma on Wayland.
+Voisu is voice dictation for Linux and Windows, written in Rust. The Linux
+daemon and CLI live in `crates/`; the Windows tray app (Tauri, Cloud-only) lives
+in `apps/windows/`. Primary Linux target: Fedora KDE Plasma on Wayland.
 
 ## Build
 

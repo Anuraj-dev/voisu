@@ -11,7 +11,7 @@ Version:        0.68.0
 # The fallback below is only reached if the spec is built raw without the scripts;
 # its leading 0. keeps such an accidental build below every real release.
 Release:        %{?voisu_release}%{!?voisu_release:0.0.gitunknown}%{?dist}
-Summary:        Cloud-first Linux dictation for Fedora Wayland
+Summary:        Voice dictation for Linux desktops (Cloud or Local)
 # Voisu is MIT; the statically linked ring crate adds ISC (new code),
 # Apache-2.0 and BSD-3-Clause (BoringSSL-derived code), plus MIT/Apache-2.0
 # (once_cell polyfill) and Apache-2.0 (fiat). Ring's full upstream license tree
@@ -57,10 +57,12 @@ Recommends:     libei%{?_isa}
 %{?systemd_requires}
 
 %description
-Voisu is a cloud-first Linux dictation application for Fedora KDE Plasma on
-Wayland. It keeps the daemon and CLI usable without GTK and uses desktop
-portals for the Trigger Key and direct Delivery, with clipboard preservation
-as the fallback.
+Voisu is voice dictation for Linux desktops, with Fedora KDE Plasma on Wayland
+as the primary target. Press the Trigger Key, speak, and the Transcript is
+delivered into the focused application. It transcribes with Cloud providers
+(Deepgram and Groq) or an optional Local model. The daemon and CLI stay usable
+without GTK and use desktop portals for the Trigger Key and direct Delivery,
+with clipboard preservation as the fallback.
 
 The package is built from a Cargo.lock-pinned source archive of one exact git
 commit. Pre-release builds carry that commit in their Release string; tagged
