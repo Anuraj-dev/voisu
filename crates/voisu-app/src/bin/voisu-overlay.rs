@@ -23,11 +23,11 @@ use voisu_app::overlay::{
     LIMIT_WARNING_CLASS, LevelPollAction, LevelPollLatch, LimitWarning, LimitWarningLatch,
     NoSpeechNotifyLatch, ObservedSignal, OverlayPhase, OverlayView, PresentationController,
     PresentationTracker, RecordingNotifyLatch, RungNotification, STATUS_POLL_PERIOD,
-    STATUS_ROUND_TRIP_DEADLINE, StatusWorker, TickAction, TickObservation, VISUAL_BAR_COUNT,
-    connect_within, edge_falloff_alpha, fetch_status, limit_notification_body, limit_warning_class,
-    limit_warning_from_response, notification_rung_choice, phase_glyph, poll_tick,
-    read_until_eof_within, recording_bar_height, recording_bar_rgb, recording_identity,
-    recording_remaining, resting_floor, status_poll_period, sweep_brightness, write_within,
+    STATUS_ROUND_TRIP_DEADLINE, StatusCadence, StatusWorker, TickAction, TickObservation,
+    VISUAL_BAR_COUNT, connect_within, edge_falloff_alpha, fetch_status, limit_notification_body,
+    limit_warning_class, limit_warning_from_response, notification_rung_choice, phase_glyph,
+    poll_tick, read_until_eof_within, recording_bar_height, recording_bar_rgb, recording_identity,
+    recording_remaining, resting_floor, sweep_brightness, write_within,
 };
 use voisu_core::{Command, Request, Response, socket_path};
 
@@ -493,7 +493,7 @@ fn install_surface_feedback(
         let Some(observation) = status_worker.take_latest() else {
             return gtk::glib::ControlFlow::Continue;
         };
-        tick_cadence.set(status_poll_period(observation.response.as_ref()));
+        tick_cadence.set(observation.period);
         let now = Instant::now();
         // Status I/O runs on StatusWorker. The GTK tick only takes the newest
         // finished round trip, so a stalled daemon cannot freeze the loop.
@@ -687,9 +687,10 @@ fn run_notification_feedback(selection: FeedbackSelection) -> i32 {
     let notifier = Notifier::start(selection);
     let mut controller = PresentationController::default();
     let mut tick = NotificationTickState::default();
+    let mut cadence = StatusCadence::default();
     loop {
         let observation = read_status();
-        let period = status_poll_period(observation.as_ref());
+        let period = cadence.next(observation.as_ref(), Instant::now());
         notification_tick(&mut controller, &mut tick, &notifier, observation);
         std::thread::sleep(period);
     }
@@ -717,7 +718,7 @@ fn install_notification_feedback(application: &gtk::Application) {
     poll_at_cadence(cadence, move || {
         let _hold = &hold;
         if let Some(observation) = status_worker.take_latest() {
-            tick_cadence.set(status_poll_period(observation.response.as_ref()));
+            tick_cadence.set(observation.period);
             notification_tick(
                 &mut controller.borrow_mut(),
                 &mut tick.borrow_mut(),

@@ -885,12 +885,31 @@ pub const STATUS_POLL_PERIOD: Duration = Duration::from_millis(200);
 /// between round trips.
 pub const PROCESSING_STATUS_POLL_PERIOD: Duration = Duration::from_millis(30);
 
-/// The status cadence after observing `response`: fast only while Processing,
-/// the only phase whose end the user is waiting on.
-pub fn status_poll_period(response: Option<&Response>) -> Duration {
-    match response.and_then(|response| response.state) {
-        Some(DaemonState::Processing) => PROCESSING_STATUS_POLL_PERIOD,
-        _ => STATUS_POLL_PERIOD,
+/// How long the fast cadence outlives the last Processing reply. It covers the
+/// check mark's whole hold plus a margin, so the capsule hides on time instead
+/// of waiting for the next 200 ms idle poll after the hold expires.
+const FAST_POLL_TAIL: Duration = Duration::from_millis(SUCCESS_DISPLAY.as_millis() as u64 + 100);
+
+/// The status cadence: fast while Processing (the phase whose end the user is
+/// waiting on) and through the check mark's hold that follows it, idle-slow
+/// otherwise.
+#[derive(Debug, Default)]
+pub struct StatusCadence {
+    fast_until: Option<Instant>,
+}
+
+impl StatusCadence {
+    /// The wait before the next round trip, after observing `response` at `now`.
+    pub fn next(&mut self, response: Option<&Response>, now: Instant) -> Duration {
+        if response.and_then(|response| response.state) == Some(DaemonState::Processing) {
+            self.fast_until = Some(now + FAST_POLL_TAIL);
+        }
+        if self.fast_until.is_some_and(|until| now < until) {
+            PROCESSING_STATUS_POLL_PERIOD
+        } else {
+            self.fast_until = None;
+            STATUS_POLL_PERIOD
+        }
     }
 }
 
@@ -1047,6 +1066,9 @@ pub fn read_until_eof_within(
 #[derive(Debug)]
 pub struct StatusObservation {
     pub response: Option<Response>,
+    /// The cadence the worker chose after this round trip; the GTK tick that
+    /// consumes observations follows it so it never lags the worker.
+    pub period: Duration,
 }
 
 /// The dedicated status-fetch worker. ALL OverlayStatus IPC runs on this
@@ -1076,10 +1098,11 @@ impl StatusWorker {
         let thread_stop = Arc::clone(&stop);
         let thread_latest = Arc::clone(&latest);
         thread::spawn(move || {
+            let mut cadence = StatusCadence::default();
             while !thread_stop.load(Ordering::Relaxed) {
                 let response = fetch();
-                let period = status_poll_period(response.as_ref());
-                *thread_latest.lock().unwrap() = Some(StatusObservation { response });
+                let period = cadence.next(response.as_ref(), Instant::now());
+                *thread_latest.lock().unwrap() = Some(StatusObservation { response, period });
                 thread::sleep(period);
             }
         });
@@ -1323,9 +1346,11 @@ mod tests {
         // rendered.
         *worker.latest.lock().unwrap() = Some(StatusObservation {
             response: Some(overlay_status(DaemonState::Idle, None)),
+            period: STATUS_POLL_PERIOD,
         });
         *worker.latest.lock().unwrap() = Some(StatusObservation {
             response: Some(overlay_status(DaemonState::Recording, None)),
+            period: STATUS_POLL_PERIOD,
         });
         let taken = worker.take_latest().unwrap();
         assert_eq!(taken.response.unwrap().state, Some(DaemonState::Recording));
@@ -1741,19 +1766,39 @@ mod tests {
     }
 
     #[test]
-    fn status_polls_fast_only_while_the_daemon_is_processing() {
-        assert_eq!(
-            status_poll_period(Some(&overlay_status(DaemonState::Processing, None))),
-            PROCESSING_STATUS_POLL_PERIOD,
-        );
+    fn status_polls_fast_while_processing_and_through_the_check_marks_hold() {
         assert!(PROCESSING_STATUS_POLL_PERIOD <= Duration::from_millis(30));
+        let t0 = Instant::now();
+        let mut idle = StatusCadence::default();
         for state in [DaemonState::Idle, DaemonState::Recording] {
             assert_eq!(
-                status_poll_period(Some(&overlay_status(state, None))),
+                idle.next(Some(&overlay_status(state, None)), t0),
                 STATUS_POLL_PERIOD,
             );
         }
-        assert_eq!(status_poll_period(None), STATUS_POLL_PERIOD);
+        assert_eq!(idle.next(None, t0), STATUS_POLL_PERIOD);
+
+        let mut cadence = StatusCadence::default();
+        assert_eq!(
+            cadence.next(Some(&overlay_status(DaemonState::Processing, None)), t0),
+            PROCESSING_STATUS_POLL_PERIOD,
+        );
+        // Idle replies right after Processing keep the fast cadence until the
+        // check mark's hold has passed, so the capsule hides on time.
+        let idle_reply = overlay_status(DaemonState::Idle, None);
+        assert_eq!(
+            cadence.next(Some(&idle_reply), t0 + SUCCESS_DISPLAY),
+            PROCESSING_STATUS_POLL_PERIOD,
+        );
+        assert_eq!(
+            cadence.next(Some(&idle_reply), t0 + FAST_POLL_TAIL),
+            STATUS_POLL_PERIOD,
+        );
+        assert_eq!(
+            cadence.next(Some(&idle_reply), t0 + SUCCESS_DISPLAY),
+            STATUS_POLL_PERIOD,
+            "once relaxed, the cadence stays slow until Processing returns",
+        );
     }
 
     #[test]
