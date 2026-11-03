@@ -296,14 +296,19 @@ impl Engine {
     }
 
     /// Pastes the Transcript into `target`. Delivery blocks and pumps its
-    /// own messages, so it runs on a blocking thread.
+    /// own messages, so it runs on a blocking thread, which may keep the
+    /// user's clipboard parked a little after the result arrives here.
     async fn deliver(&self, id: u64, target: DeliveryTarget, text: String) {
-        let delivered =
-            tokio::task::spawn_blocking(move || delivery::deliver(&target, &text)).await;
-        let message = match delivered {
+        let (settled, result) = tokio::sync::oneshot::channel();
+        tokio::task::spawn_blocking(move || {
+            delivery::deliver(&target, &text, |result| {
+                let _ = settled.send(result);
+            });
+        });
+        let message = match result.await {
             Ok(result) => delivery::notice(&result),
-            Err(join) => {
-                tracing::warn!(id, %join, "delivery task failed");
+            Err(_) => {
+                tracing::warn!(id, "delivery task ended without a result");
                 Some("Couldn't paste the Transcript".to_owned())
             }
         };
