@@ -3,10 +3,10 @@
 //! The callback stays O(1) and never blocks, logs or allocates, because
 //! Windows silently removes a hook that exceeds `LowLevelHooksTimeout`. It
 //! classifies the key, feeds [`ChordTracker`] and `try_send`s any signal to
-//! the gesture thread. While the settings window records a new shortcut,
-//! the callback feeds a [`Recorder`] instead and `try_send`s its updates. The Start-menu mask key is posted back to this
+//! the gesture thread. The Start-menu mask key is posted back to this
 //! thread's message loop and injected after the callback returns, so the
-//! hook never re-enters itself.
+//! hook never re-enters itself. A Trigger Key chosen in the settings window
+//! arrives the same way, as a message [`set_chord`] posts.
 //!
 //! The hook is reinstalled on session unlock, on resume from sleep, and by a
 //! health check when input arrived but the callback went quiet, which is how
@@ -32,17 +32,15 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetForegroundWindow,
-    GetMessageW, GetWindowThreadProcessId, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, KillTimer,
-    LLKHF_EXTENDED, LLKHF_INJECTED, MSG, PBT_APMRESUMEAUTOMATIC, PostThreadMessageW,
-    RegisterClassW, SetTimer, SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL,
-    WINDOW_EX_STYLE, WM_APP, WM_KEYDOWN, WM_POWERBROADCAST, WM_SYSKEYDOWN, WM_TIMER,
-    WM_WTSSESSION_CHANGE, WNDCLASSW, WS_OVERLAPPED, WTS_SESSION_UNLOCK,
+    GetMessageW, GetWindowThreadProcessId, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED,
+    LLKHF_INJECTED, MSG, PBT_APMRESUMEAUTOMATIC, PostThreadMessageW, RegisterClassW, SetTimer,
+    SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WINDOW_EX_STYLE, WM_APP, WM_KEYDOWN,
+    WM_POWERBROADCAST, WM_SYSKEYDOWN, WM_TIMER, WM_WTSSESSION_CHANGE, WNDCLASSW, WS_OVERLAPPED,
+    WTS_SESSION_UNLOCK,
 };
 use windows::core::w;
 
-use crate::chord::{
-    Capture, ChordTracker, Key, MASK_TAG, MASK_VK, ModMask, Modifier, Recorder, Side, VK_PACKET,
-};
+use crate::chord::{ChordTracker, Key, MASK_TAG, MASK_VK, ModMask, Modifier, Side, VK_PACKET};
 use crate::trigger::Trigger;
 use crate::trigger_key::{TriggerChord, scan_code};
 
@@ -66,11 +64,6 @@ const ALTGR_SCAN_BIT: u32 = 0x200;
 const WM_INJECT_MASK: u32 = WM_APP + 1;
 /// Posted by [`set_chord`]: `wparam` is the packed [`TriggerChord`].
 const WM_SET_CHORD: u32 = WM_APP + 2;
-/// Posted by [`capture`]: `wparam` is 1 to start recording, 0 to stop.
-const WM_CAPTURE: u32 = WM_APP + 3;
-/// A recording nobody finishes ends on its own, so a forgotten settings
-/// window cannot keep swallowing keys.
-const CAPTURE_TIMEOUT_MS: u32 = 15_000;
 const HEALTH_TIMER: usize = 1;
 const HEALTH_INTERVAL_MS: u32 = 5_000;
 /// Input newer than the last callback by this much means the hook is gone.
@@ -78,16 +71,11 @@ const SILENT_HOOK_MS: u32 = 30_000;
 
 /// Tick of the most recent callback, read by the health check.
 static LAST_CALLBACK: AtomicU32 = AtomicU32::new(0);
-/// The hook thread, for [`set_chord`] and [`capture`]; 0 until installed.
+/// The hook thread, for [`set_chord`]; 0 until installed.
 static HOOK_THREAD: AtomicU32 = AtomicU32::new(0);
 
 struct HookState {
     tracker: ChordTracker,
-    /// Set while the settings window records a new shortcut.
-    recorder: Option<Recorder>,
-    /// The thread timer ending the current recording, 0 when none.
-    capture_timer: usize,
-    captures: SyncSender<Capture>,
     trigger: Trigger,
     hook: Option<HHOOK>,
     thread_id: u32,
@@ -100,16 +88,12 @@ thread_local! {
 }
 
 /// Starts the hook thread for `chord` and returns once the hook is
-/// installed. Recorder updates go to `captures`; a full queue drops them.
-pub fn install(
-    trigger: Trigger,
-    chord: TriggerChord,
-    captures: SyncSender<Capture>,
-) -> io::Result<()> {
+/// installed.
+pub fn install(trigger: Trigger, chord: TriggerChord) -> io::Result<()> {
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     thread::Builder::new()
         .name("voisu-hotkey".into())
-        .spawn(move || run(trigger, chord, captures, ready_tx))?;
+        .spawn(move || run(trigger, chord, ready_tx))?;
     ready_rx
         .recv()
         .map_err(|_| io::Error::other("hotkey thread exited"))?
@@ -119,37 +103,19 @@ pub fn install(
 /// False when the hook is not running, so nothing would change.
 #[must_use]
 pub fn set_chord(chord: TriggerChord) -> bool {
-    post(WM_SET_CHORD, usize::from(chord.pack()))
-}
-
-/// Starts or stops recording a new shortcut. While recording, the Trigger
-/// Key does nothing. False when the hook is not running.
-#[must_use]
-pub fn capture(on: bool) -> bool {
-    post(WM_CAPTURE, usize::from(on))
-}
-
-fn post(message: u32, wparam: usize) -> bool {
     let thread = HOOK_THREAD.load(Ordering::Acquire);
+    let packed = WPARAM(usize::from(chord.pack()));
     // SAFETY: posts a plain message to the hook thread's queue.
-    thread != 0 && unsafe { PostThreadMessageW(thread, message, WPARAM(wparam), LPARAM(0)) }.is_ok()
+    thread != 0 && unsafe { PostThreadMessageW(thread, WM_SET_CHORD, packed, LPARAM(0)) }.is_ok()
 }
 
-fn run(
-    trigger: Trigger,
-    chord: TriggerChord,
-    captures: SyncSender<Capture>,
-    ready: SyncSender<io::Result<()>>,
-) {
+fn run(trigger: Trigger, chord: TriggerChord, ready: SyncSender<io::Result<()>>) {
     // SAFETY: plain Win32 calls on this thread; every pointer passed is to a
     // live local.
     unsafe {
         STATE.with(|cell| {
             *cell.borrow_mut() = Some(HookState {
                 tracker: ChordTracker::new(chord),
-                recorder: None,
-                capture_timer: 0,
-                captures,
                 trigger,
                 hook: None,
                 thread_id: GetCurrentThreadId(),
@@ -184,8 +150,6 @@ fn run(
                         with_state(|state| switch_chord(state, chord));
                         tracing::info!(%chord, "Trigger Key changed");
                     }
-                    WM_CAPTURE => set_capture(msg.wParam.0 != 0),
-                    WM_TIMER => end_capture_timer(msg.wParam.0),
                     _ => {
                         DispatchMessageW(&msg);
                     }
@@ -210,44 +174,6 @@ fn switch_chord(state: &mut HookState, chord: TriggerChord) {
     if let Some(signal) = state.tracker.set_chord(chord) {
         state.trigger.signal(signal);
     }
-}
-
-/// Starts or stops the recorder. Either way the tracker forgets what it
-/// held, since the recorder swallowed keys it never saw, but keeps
-/// swallowing a chord key it had swallowed.
-fn set_capture(on: bool) {
-    with_state(|state| {
-        if state.capture_timer != 0 {
-            // SAFETY: kills this thread's own timer.
-            let _ = unsafe { KillTimer(None, state.capture_timer) };
-            state.capture_timer = 0;
-        }
-        let chord = state.tracker.chord();
-        switch_chord(state, chord);
-        state.recorder = None;
-        if on {
-            state.recorder = Some(Recorder::default());
-            // SAFETY: a thread timer; WM_TIMER arrives on this queue.
-            state.capture_timer = unsafe { SetTimer(None, 0, CAPTURE_TIMEOUT_MS, None) };
-        }
-    });
-    tracing::info!(on, "Trigger Key recording");
-}
-
-fn end_capture_timer(timer: usize) {
-    with_state(|state| {
-        if timer == 0 || timer != state.capture_timer {
-            return;
-        }
-        // SAFETY: kills this thread's own timer.
-        let _ = unsafe { KillTimer(None, timer) };
-        state.capture_timer = 0;
-        if state.recorder.take().is_some() {
-            let chord = state.tracker.chord();
-            switch_chord(state, chord);
-            let _ = state.captures.try_send(Capture::Cancelled);
-        }
-    });
 }
 
 /// The foreground app's keyboard layout, the one the user types with:
@@ -506,30 +432,6 @@ fn on_key(event: &KBDLLHOOKSTRUCT, message: u32) -> bool {
         let Some(state) = state.as_mut() else {
             return false;
         };
-        if let Some(recorder) = state.recorder.as_mut() {
-            if injected && !Recorder::admits_injected(key, tagged) {
-                return false;
-            }
-            if state.tracker.carried(key, down) {
-                return true;
-            }
-            // Inside the hook the async state is from before this event.
-            let held_before = down && held(event.vkCode as i32);
-            let verdict = recorder.handle(key, down, held_before);
-            if verdict.inject_mask {
-                post_mask(state);
-            }
-            if let Some(update) = verdict.update {
-                if !matches!(update, Capture::Preview(_)) {
-                    // The timer is killed when it fires.
-                    state.recorder = None;
-                    let chord = state.tracker.chord();
-                    switch_chord(state, chord);
-                }
-                let _ = state.captures.try_send(update);
-            }
-            return !verdict.pass;
-        }
         // Injected keys never form or break the chord, except an untagged
         // chord key such as a remapper's F24.
         if injected && !state.tracker.admits_injected(key, tagged) {

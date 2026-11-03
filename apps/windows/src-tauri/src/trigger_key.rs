@@ -1,7 +1,8 @@
 //! The configured Trigger Key chord: which modifiers (and optionally one
-//! ordinary key) must be held together. Parsed from and written to the
-//! settings string, and packed into a `u16` so it can cross to the keyboard
-//! hook thread inside a posted message.
+//! ordinary key) must be held together. Only the [`PRESETS`] can be the
+//! Trigger Key. Parsed from and written to the settings string, and packed
+//! into a `u16` so it can cross to the keyboard hook thread inside a posted
+//! message.
 
 use std::fmt;
 use std::str::FromStr;
@@ -63,8 +64,8 @@ impl TriggerChord {
         mods: [Some(Need::Either), None, None, Some(Need::Either)],
         key: None,
     };
-    /// No keys at all: what the recorder starts from. Never a valid chord.
-    pub const EMPTY: Self = Self {
+    /// No keys at all: what parsing and unpacking start from.
+    const EMPTY: Self = Self {
         mods: [None; 4],
         key: None,
     };
@@ -89,16 +90,6 @@ impl TriggerChord {
     /// masks; a lone dedicated key (Caps Lock, F13) has nothing to mask.
     pub fn needs_mask(&self) -> bool {
         self.modifier_count() > 0
-    }
-
-    pub fn with(mut self, modifier: Modifier, need: Need) -> Self {
-        self.mods[modifier.index()] = Some(need);
-        self
-    }
-
-    pub fn with_key(mut self, vk: u8) -> Self {
-        self.key = Some(vk);
-        self
     }
 
     fn modifier_count(&self) -> usize {
@@ -137,103 +128,10 @@ impl TriggerChord {
         chord
     }
 
-    /// Exactly these modifiers, either side, and no others.
-    fn mods_are(&self, mods: &[Modifier]) -> bool {
-        Modifier::ALL
-            .iter()
-            .all(|m| self.uses(*m) == mods.contains(m))
-    }
-
-    /// Whether this chord may be the Trigger Key. Four shapes pass: two or
-    /// three modifiers (Ctrl+Win), one right-hand modifier (Right Ctrl), one
-    /// dedicated key (Caps Lock, F13), or modifiers plus one key
-    /// (Ctrl+Shift+Space). The rules run in order and the first match wins;
-    /// see `docs/research/2026-11-03-windows-custom-trigger-key.md`.
-    pub fn check(&self) -> Result<(), Rejection> {
-        let mods = self.modifier_count();
-        let Some(key) = self.key else {
-            return match mods {
-                0 => Err(Rejection::Empty),
-                1 if [Modifier::Ctrl, Modifier::Alt]
-                    .iter()
-                    .any(|&m| self.need(m) == Some(Need::Only(Side::Right))) =>
-                {
-                    Ok(())
-                }
-                1 => Err(Rejection::LoneModifier),
-                2 | 3 => Ok(()),
-                _ => Err(Rejection::TooMany),
-            };
-        };
-        let win = self.uses(Modifier::Win);
-        if key == VK_PAUSE || (key == VK_F1 + 22 && win && self.uses(Modifier::Shift)) {
-            // Pause sends no key-up; the Copilot key arrives as
-            // Left Shift+Left Win+F23.
-            return Err(Rejection::CantHold);
-        }
-        if win {
-            return Err(Rejection::WinKey);
-        }
-        let reserved = key == VK_F1 + 4
-            || key == VK_F1 + 10
-            || (self.mods_are(&[Modifier::Alt]) && (key == VK_F1 + 3 || key == VK_SPACE))
-            || (self.mods_are(&[Modifier::Ctrl]) && CTRL_EDIT_KEYS.contains(&key));
-        if reserved {
-            return Err(Rejection::Reserved);
-        }
-        if is_typing_key(key) && !self.uses(Modifier::Ctrl) && !self.uses(Modifier::Alt) {
-            return Err(Rejection::TypingKey);
-        }
-        if self.mods_are(&[Modifier::Shift]) {
-            // Shift+F10 opens the context menu, Shift+Caps Lock toggles caps,
-            // and apps read Shift+key as the key itself.
-            return Err(Rejection::ShiftOnly);
-        }
-        if mods + 1 > 3 {
-            return Err(Rejection::TooMany);
-        }
-        Ok(())
-    }
-
-    /// A risk worth telling the user about before they save an allowed
-    /// chord.
-    pub fn warning(&self) -> Option<&'static str> {
-        let lone_right_alt =
-            self.modifier_count() == 1 && self.need(Modifier::Alt) == Some(Need::Only(Side::Right));
-        let ctrl_alt = self.uses(Modifier::Ctrl) && self.uses(Modifier::Alt);
-        if lone_right_alt || ctrl_alt {
-            return Some(
-                "On keyboard layouts with an AltGr key, typing characters such as @ or € can trigger or interrupt this shortcut.",
-            );
-        }
-        if self.key.is_none()
-            && (self.mods_are(&[Modifier::Ctrl, Modifier::Shift])
-                || self.mods_are(&[Modifier::Alt, Modifier::Shift]))
-        {
-            return Some(
-                "If more than one keyboard layout is installed, Windows may use this shortcut to switch layouts.",
-            );
-        }
-        if self.key == Some(VK_SPACE) && self.mods_are(&[Modifier::Ctrl]) {
-            return Some(
-                "Ctrl+Space switches Chinese input methods and opens code completion in many editors.",
-            );
-        }
-        if self.key == Some(VK_SPACE) && self.mods_are(&[Modifier::Ctrl, Modifier::Shift]) {
-            return Some("Some apps, such as 1Password, also use Ctrl+Shift+Space.");
-        }
-        if self.key == Some(VK_BACKTICK) && self.mods_are(&[Modifier::Ctrl]) {
-            return Some(
-                "VS Code, Cursor and some terminals use Ctrl+` to toggle the terminal. Voisu will take it over while it's running.",
-            );
-        }
-        if self.modifier_count() == 0 && self.key.is_some_and(|k| (VK_F1..VK_F1 + 12).contains(&k))
-        {
-            return Some(
-                "Apps use F1–F12, and on many laptops they are media keys unless Fn is held.",
-            );
-        }
-        None
+    /// The preset this chord is, if any. Anything else cannot be the
+    /// Trigger Key.
+    pub fn preset(&self) -> Option<&'static Preset> {
+        PRESETS.iter().find(|preset| preset.chord == *self)
     }
 
     /// The name shown to the user: the written form, with the key named as the
@@ -250,43 +148,60 @@ impl TriggerChord {
     }
 }
 
-/// Why a chord cannot be the Trigger Key. Each message is shown to the user.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Rejection {
-    Empty,
-    CantHold,
-    WinKey,
-    Reserved,
-    LoneModifier,
-    TypingKey,
-    TooMany,
-    /// The recorder saw a key no chord can use (Enter, an arrow...).
-    Unsupported,
-    /// The recorder saw both sides of one modifier.
-    BothSides,
-    ShiftOnly,
+/// A Trigger Key the settings window offers.
+#[derive(Debug)]
+pub struct Preset {
+    pub chord: TriggerChord,
+    /// The name on its button.
+    pub name: &'static str,
+    /// A risk worth telling the user about while it is chosen.
+    pub warning: Option<&'static str>,
 }
 
-impl fmt::Display for Rejection {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Empty => "Press at least one key.",
-            Self::CantHold => "That key can't be held down, so it can't be the Trigger Key.",
-            Self::WinKey => {
-                "Windows owns Win+key shortcuts. Use Win only with other modifiers, such as Ctrl+Win."
-            }
-            Self::Reserved => "Windows or most apps already use that shortcut.",
-            Self::LoneModifier => "On its own, only Right Ctrl or Right Alt can be the Trigger Key.",
-            Self::TypingKey => "That key types text. Add Ctrl or Alt.",
-            Self::TooMany => "Use at most three keys.",
-            Self::Unsupported => {
-                "Voisu can't use that key. Try modifiers, Caps Lock, an F-key, or Space."
-            }
-            Self::BothSides => "Use one side of each modifier, not both.",
-            Self::ShiftOnly => "Shift alone isn't enough. Add Ctrl or Alt, or use the key on its own.",
-        })
-    }
-}
+/// The only Trigger Keys Voisu offers, the default first. Every one holds a
+/// modifier the hook masks or is a dedicated key; see
+/// `docs/research/2026-11-03-windows-custom-trigger-key.md`.
+pub const PRESETS: [Preset; 5] = [
+    Preset {
+        chord: TriggerChord::CTRL_WIN,
+        name: "Ctrl+Win",
+        warning: None,
+    },
+    Preset {
+        chord: TriggerChord {
+            mods: [Some(Need::Either), None, None, None],
+            key: Some(VK_BACKTICK),
+        },
+        name: "Ctrl+`",
+        warning: Some(
+            "VS Code, Cursor and some terminals use Ctrl+` to toggle the terminal. Voisu will take it over while it's running.",
+        ),
+    },
+    Preset {
+        chord: TriggerChord {
+            mods: [Some(Need::Only(Side::Right)), None, None, None],
+            key: None,
+        },
+        name: "Right Ctrl",
+        warning: None,
+    },
+    Preset {
+        chord: TriggerChord {
+            mods: [None; 4],
+            key: Some(VK_CAPSLOCK),
+        },
+        name: "Caps Lock",
+        warning: None,
+    },
+    Preset {
+        chord: TriggerChord {
+            mods: [Some(Need::Either), None, Some(Need::Either), None],
+            key: Some(VK_SPACE),
+        },
+        name: "Ctrl+Shift+Space",
+        warning: Some("Some apps, such as 1Password, also use Ctrl+Shift+Space."),
+    },
+];
 
 /// Why a settings string is not a chord at all.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -414,7 +329,7 @@ const KEYS: &[(u8, u16, &str)] = &[
     (VK_END, 0x14F, "End"),
     (VK_PAUSE, 0x45, "Pause"),
     (0x91, 0x46, "ScrollLock"),
-    (0x14, 0x3A, "CapsLock"),
+    (VK_CAPSLOCK, 0x3A, "CapsLock"),
     (0x5D, 0x15D, "Menu"),
     (VK_BACKTICK, 0x29, "`"),
     (0xBD, 0x0C, "-"),
@@ -444,23 +359,8 @@ const VK_SPACE: u8 = 0x20;
 const VK_PAUSE: u8 = 0x13;
 const VK_HOME: u8 = 0x24;
 const VK_END: u8 = 0x23;
-const VK_INSERT: u8 = 0x2D;
+const VK_CAPSLOCK: u8 = 0x14;
 const VK_BACKTICK: u8 = 0xC0;
-
-/// Ctrl+key edit shortcuts nearly every app uses.
-const CTRL_EDIT_KEYS: &[u8] = &[
-    b'A', b'B', b'C', b'F', b'I', b'N', b'O', b'P', b'R', b'S', b'T', b'U', b'V', b'W', b'X', b'Y',
-    b'Z', VK_HOME, VK_END, VK_INSERT,
-];
-
-/// Keys that type or move the caret: letters, digits, punctuation, Space and
-/// the navigation block. Everything else in [`KEYS`] is a dedicated key.
-fn is_typing_key(vk: u8) -> bool {
-    vk.is_ascii_digit()
-        || vk.is_ascii_uppercase()
-        || (0xBA..=0xDE).contains(&vk)
-        || matches!(vk, VK_SPACE | 0x21..=0x24 | VK_INSERT)
-}
 
 /// The written name of a virtual key a chord may use.
 pub fn key_name(vk: u8) -> Option<&'static str> {
@@ -492,12 +392,6 @@ pub fn scan_code(vk: u8) -> Option<u16> {
     Some(u16::from(scan))
 }
 
-/// The chord key at a physical position, by its US-layout virtual key. A
-/// bounded scan of 256 codes, used only by the recorder.
-pub fn key_at(scan: u16) -> Option<u8> {
-    (0..=u8::MAX).find(|&vk| key_name(vk).is_some() && scan_code(vk) == Some(scan))
-}
-
 fn key_code(token: &str) -> Option<u8> {
     let bytes = token.as_bytes();
     if let [byte] = bytes
@@ -517,8 +411,9 @@ fn key_code(token: &str) -> Option<u8> {
         .map(|k| k.0)
 }
 
-/// Settings store the written form; a value that does not parse or is not
-/// allowed fails here, and the settings loader falls back to Ctrl+Win.
+/// Settings store the written form; a value that does not parse or is not a
+/// preset fails here, and the settings loader falls back to Ctrl+Win. A
+/// custom chord saved by v0.68 or v0.69 is one of those.
 impl TryFrom<String> for TriggerChord {
     type Error = String;
 
@@ -526,8 +421,10 @@ impl TryFrom<String> for TriggerChord {
         let chord: Self = text
             .parse()
             .map_err(|error: ParseError| error.to_string())?;
-        chord.check().map_err(|rejection| rejection.to_string())?;
-        Ok(chord)
+        match chord.preset() {
+            Some(_) => Ok(chord),
+            None => Err(format!("{chord} is not one of Voisu's Trigger Keys")),
+        }
     }
 }
 
@@ -570,7 +467,7 @@ mod tests {
     fn the_default_is_ctrl_win_and_round_trips() {
         assert_eq!(TriggerChord::default().to_string(), "Ctrl+Win");
         assert_eq!(parse("Ctrl+Win"), TriggerChord::default());
-        assert_eq!(TriggerChord::default().check(), Ok(()));
+        assert_eq!(PRESETS[0].chord, TriggerChord::default());
     }
 
     #[test]
@@ -635,11 +532,15 @@ mod tests {
             let chord = parse(text);
             assert_eq!(TriggerChord::unpack(chord.pack()), chord, "{text}");
         }
-        let sided = TriggerChord::EMPTY
-            .with(Modifier::Ctrl, Need::Only(Side::Left))
-            .with(Modifier::Alt, Need::Only(Side::Right))
-            .with(Modifier::Shift, Need::Either)
-            .with(Modifier::Win, Need::Only(Side::Left));
+        let sided = TriggerChord {
+            mods: [
+                Some(Need::Only(Side::Left)),
+                Some(Need::Only(Side::Right)),
+                Some(Need::Either),
+                Some(Need::Only(Side::Left)),
+            ],
+            key: None,
+        };
         assert_eq!(TriggerChord::unpack(sided.pack()), sided);
     }
 
@@ -658,68 +559,46 @@ mod tests {
     }
 
     #[test]
-    fn the_four_allowed_shapes_pass() {
-        for text in [
-            // Two or three modifiers.
-            "Ctrl+Win",
-            "Alt+Win",
-            "Ctrl+Alt+Win",
-            "Ctrl+Shift",
-            // One right-hand modifier.
-            "Right Ctrl",
-            "Right Alt",
-            // One dedicated key.
-            "CapsLock",
-            "F13",
-            "F24",
-            "F9",
-            "Menu",
-            "ScrollLock",
-            // Modifiers plus one key.
-            "Ctrl+Shift+Space",
-            "Ctrl+Alt+Space",
-            "Alt+Shift+F12",
-            "Ctrl+Alt+R",
-        ] {
-            assert_eq!(parse(text).check(), Ok(()), "{text}");
+    fn every_preset_round_trips_in_its_written_form() {
+        let written: Vec<String> = PRESETS.iter().map(|p| p.chord.to_string()).collect();
+        assert_eq!(
+            written,
+            [
+                "Ctrl+Win",
+                "Ctrl+`",
+                "Right Ctrl",
+                "CapsLock",
+                "Ctrl+Shift+Space"
+            ]
+        );
+        for preset in &PRESETS {
+            let text = preset.chord.to_string();
+            assert_eq!(parse(&text), preset.chord, "{text}");
+            assert_eq!(TriggerChord::try_from(text.clone()), Ok(preset.chord));
+            assert_eq!(TriggerChord::unpack(preset.chord.pack()), preset.chord);
         }
     }
 
     #[test]
-    fn rejections_follow_the_research_note() {
-        for (text, why) in [
-            ("Pause", Rejection::CantHold),
-            ("Ctrl+Pause", Rejection::CantHold),
-            ("Shift+Win+F23", Rejection::CantHold),
-            ("Win+Z", Rejection::WinKey),
-            ("Ctrl+Win+5", Rejection::WinKey),
-            ("Win+L", Rejection::WinKey),
-            ("Alt+F4", Rejection::Reserved),
-            ("Alt+Space", Rejection::Reserved),
-            ("Ctrl+C", Rejection::Reserved),
-            ("Ctrl+V", Rejection::Reserved),
-            ("Ctrl+Home", Rejection::Reserved),
-            ("F5", Rejection::Reserved),
-            ("Ctrl+F11", Rejection::Reserved),
-            ("Ctrl+Insert", Rejection::Reserved),
-            ("Shift+F10", Rejection::ShiftOnly),
-            ("Shift+CapsLock", Rejection::ShiftOnly),
-            ("Shift+F13", Rejection::ShiftOnly),
-            ("Ctrl", Rejection::LoneModifier),
-            ("Right Shift", Rejection::LoneModifier),
-            ("Left Ctrl", Rejection::LoneModifier),
-            ("Left Alt", Rejection::LoneModifier),
-            ("Alt", Rejection::LoneModifier),
-            ("Win", Rejection::LoneModifier),
-            ("Space", Rejection::TypingKey),
-            ("Shift+A", Rejection::TypingKey),
-            ("Shift+/", Rejection::TypingKey),
-            ("Ctrl+Alt+Shift+Win", Rejection::TooMany),
-            ("Ctrl+Alt+Shift+Space", Rejection::TooMany),
+    fn only_a_preset_can_be_the_trigger_key() {
+        // Chords the v0.68 and v0.69 recorder could save, and ones it refused.
+        for text in [
+            "Ctrl+Alt",
+            "Alt+Win",
+            "Ctrl+Shift",
+            "Right Alt",
+            "Left Ctrl",
+            "F13",
+            "Alt+Shift+F12",
+            "Ctrl+Alt+Space",
+            "Ctrl+C",
+            "Win+Z",
+            "Ctrl",
         ] {
-            assert_eq!(parse(text).check(), Err(why), "{text}");
+            assert!(parse(text).preset().is_none(), "{text}");
+            assert!(TriggerChord::try_from(text.to_owned()).is_err(), "{text}");
         }
-        assert_eq!(TriggerChord::EMPTY.check(), Err(Rejection::Empty));
+        assert!(TriggerChord::try_from("nonsense".to_owned()).is_err());
     }
 
     #[test]
@@ -733,70 +612,49 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_backtick_is_allowed_and_round_trips() {
+    fn ctrl_backtick_is_a_preset_and_round_trips() {
         let chord = parse("Ctrl+`");
         assert_eq!(chord.to_string(), "Ctrl+`");
-        assert_eq!(chord.check(), Ok(()));
         assert_eq!(TriggerChord::unpack(chord.pack()), chord);
-        assert!(chord.warning().unwrap().contains("VS Code"));
+        assert!(chord.preset().unwrap().warning.unwrap().contains("VS Code"));
     }
 
     #[test]
     fn keys_are_physical_positions_on_a_us_layout() {
         // The key below Esc, whatever the active layout prints on it.
         assert_eq!(scan_code(0xC0), Some(0x29));
-        assert_eq!(key_at(0x29), Some(0xC0));
         assert_eq!(scan_code(b'Q'), Some(0x10));
         assert_eq!(scan_code(b'1'), Some(0x02));
         assert_eq!(scan_code(b'0'), Some(0x0B));
         assert_eq!(scan_code(0x7B), Some(0x58), "F12");
         assert_eq!(scan_code(0x87), Some(0x76), "F24");
         assert_eq!(scan_code(0x24), Some(0x147), "Home is an extended key");
-        // Numpad 7 shares Home's scan code without the extended bit.
-        assert_eq!(key_at(0x47), None);
-        // Every named key maps back to itself.
+        assert_eq!(scan_code(0x14), Some(0x3A), "Caps Lock");
+        assert_eq!(scan_code(0x20), Some(0x39), "Space");
+        // Every named key has a position the hook can match.
         for vk in 0..=u8::MAX {
             if key_name(vk).is_some() {
-                let scan = scan_code(vk).unwrap_or_else(|| panic!("{vk:#x} has no scan"));
-                assert_eq!(key_at(scan), Some(vk), "{vk:#x}");
+                assert!(scan_code(vk).is_some(), "{vk:#x} has no scan");
             }
         }
     }
 
     #[test]
-    fn risky_but_allowed_chords_carry_a_warning() {
-        for text in [
-            "Right Alt",
-            "Ctrl+Alt",
-            "Ctrl+Shift",
-            "Alt+Shift",
-            "Ctrl+Space",
-            "Ctrl+Shift+Space",
-            "F1",
-            "F12",
-        ] {
-            assert!(parse(text).warning().is_some(), "{text}");
-        }
-        for text in ["Ctrl+Win", "Right Ctrl", "CapsLock", "F13", "Alt+Win"] {
-            assert_eq!(parse(text).warning(), None, "{text}");
-        }
-    }
-
-    #[test]
-    fn settings_string_rejects_what_check_rejects() {
-        assert_eq!(
-            TriggerChord::try_from("Ctrl+Win".to_owned()),
-            Ok(TriggerChord::CTRL_WIN)
-        );
-        assert!(TriggerChord::try_from("Ctrl".to_owned()).is_err());
-        assert!(TriggerChord::try_from("nonsense".to_owned()).is_err());
+    fn presets_that_clash_with_common_apps_carry_a_warning() {
+        let warned: Vec<&str> = PRESETS
+            .iter()
+            .filter(|p| p.warning.is_some())
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(warned, ["Ctrl+`", "Ctrl+Shift+Space"]);
     }
 
     #[test]
     fn serde_uses_the_written_form() {
-        let json = serde_json::to_string(&parse("Ctrl+Alt+Space")).unwrap();
-        assert_eq!(json, r#""Ctrl+Alt+Space""#);
+        let json = serde_json::to_string(&parse("Ctrl+Shift+Space")).unwrap();
+        assert_eq!(json, r#""Ctrl+Shift+Space""#);
         let back: TriggerChord = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, parse("Ctrl+Alt+Space"));
+        assert_eq!(back, parse("Ctrl+Shift+Space"));
+        assert!(serde_json::from_str::<TriggerChord>(r#""Ctrl+Alt""#).is_err());
     }
 }
