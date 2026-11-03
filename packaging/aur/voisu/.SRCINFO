@@ -1,5 +1,5 @@
 pkgbase = voisu
-	pkgdesc = Cloud-first Linux dictation for Wayland (daemon, CLI, and optional Overlay)
+	pkgdesc = Voice dictation for Linux desktops (daemon, CLI, and optional Overlay)
 	pkgver = 0.1.0
 	pkgrel = 1
 	url = https://github.com/Anuraj-Dev/voisu

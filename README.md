@@ -1,22 +1,53 @@
 # Voisu
 
-Voisu is a cloud-first Linux desktop dictation application. Its first supported
-environment is Fedora KDE Plasma on Wayland. It runs as a set of systemd **user**
-services: press the Trigger Key, speak, and a validated Transcript is inserted
-into the focused application.
+Voice dictation for Linux and Windows, written in Rust. Hold or press a key,
+speak, and a clean Transcript lands in the app you were typing in: a reply, a
+doc, a terminal. If it can't land there, Voisu keeps it on the clipboard
+instead of dropping it.
 
-Current development host: Arch Linux (Omarchy) with Hyprland. The Fedora
-statement above is the product's first-support target, not the current host.
+**Project page, install guide and user docs: https://anuraj-dev.github.io/voisu/**
 
-Project page and full install docs: **https://anuraj-dev.github.io/voisu/**
+| | Windows | Linux |
+| --- | --- | --- |
+| Systems | Windows 10 / 11, x64 | Fedora, Arch, Debian/Ubuntu (KDE Plasma, GNOME, Hyprland, X11 desktops) |
+| Trigger Key | Hold `Ctrl`+`Win` (or your own key) to talk; double-tap for hands-free; `Esc` cancels | Press your Trigger Key to start, press again to stop |
+| Transcription | Cloud (Deepgram + Groq) | Cloud (Deepgram + Groq), or Local on your own GPU or CPU |
+| Runs as | Tray app with a settings window | systemd **user** services and the `voisu` CLI |
+| Install | Per-user installer, self-updating | COPR, AUR, signed apt repository |
 
-## Product promise
+In Cloud mode, Deepgram streams while you talk and Groq transcribes the whole
+Recording when you stop. Voisu reconciles the two into one Transcript. You use
+your own Groq and Deepgram API keys: Voisu has no account, server or analytics
+of its own, and keys live in your desktop keyring or Windows Credential
+Manager. Logs and history stay on your machine.
 
-Press the Trigger Key once, speak naturally, press it again, and receive one
-validated Transcript in the focused application. If direct insertion is not
-available, the Transcript remains available on the clipboard.
+Spoken punctuation and layout ("new paragraph", "dash dash", "quote …
+unquote", "first … second …" lists) are formatted locally on both platforms.
 
-## Installation
+## Windows
+
+Download **[Voisu-Setup-x64.exe](https://github.com/Anuraj-dev/voisu/releases/latest/download/Voisu-Setup-x64.exe)**
+and run it. It installs for your user account, with no admin rights needed.
+The installer isn't code-signed yet, so SmartScreen may warn on first run:
+choose *More info → Run anyway*.
+
+On first launch the settings window opens. Paste your Groq and Deepgram keys
+and choose *Validate & save*. Then hold `Ctrl`+`Win`, speak, and let go.
+
+- **Trigger Key:** `Ctrl`+`Win` by default. Pick a preset in settings
+  (`Ctrl`+`` ` ``, Right `Ctrl`, Caps Lock, `Ctrl`+`Shift`+`Space`) or choose
+  *Custom…* and press your own shortcut.
+- **Settings window** (tray → *Settings…*): provider keys, Trigger Key, *Paste
+  automatically* (off = clipboard only), overlay size, boost words, start at
+  login, and the last Transcript with a Copy button.
+- **Tray menu:** *Preview overlay*, *Test paste (in 3 s)*, *Start at login*,
+  *Update to v…*, *Quit Voisu*. Voisu updates itself from GitHub Releases.
+- **Delivery:** text is pasted into the window that had focus when you
+  started, even if you clicked away, and your clipboard is restored afterwards.
+  Terminals get their own paste chord.
+- Windows is Cloud-only for now; Local transcription is Linux-only.
+
+## Linux
 
 ### Fedora (COPR)
 
@@ -24,6 +55,9 @@ available, the Transcript remains available on the clipboard.
 sudo dnf copr enable anuraj-dev/voisu
 sudo dnf install voisu
 ```
+
+Fedora KDE Plasma on Wayland is the primary Linux target. GNOME on Wayland
+works too.
 
 ### Arch (AUR)
 
@@ -156,7 +190,7 @@ keeps Local selected with no model. Remove it with `voisu local remove`
   systemctl --user restart voisu.service
   ```
 
-## Command reference
+## Linux command reference
 
 `voisu` controls the daemon (`voisu-daemon`). All history and diagnostics stay
 local to your machine.
@@ -166,6 +200,7 @@ local to your machine.
 | `voisu start` / `stop` / `toggle` / `status` | Control and inspect the daemon |
 | `voisu shortcut` | Show the desktop-approved Trigger Key |
 | `voisu setup` | Guided wizard: Cloud or Local, Trigger Key, Delivery, provider keys or Consented Install |
+| `voisu mode [cloud\|local]` | Switch between the Cloud providers and an installed Local model |
 | `voisu local remove [--yes]` | Remove a Consented Install (`--yes` required when stdin is not a terminal) |
 | `voisu auth set` / `auth verify <groq\|deepgram>` | Store or verify a provider key (key on stdin) |
 | `voisu deepgram on` / `off` | Enable or disable Deepgram streaming |
@@ -189,5 +224,6 @@ Voisu is licensed under the [MIT License](LICENSE).
 - [Contributing](CONTRIBUTING.md)
 - [Domain language](CONTEXT.md)
 - [Architectural decisions](docs/adr/)
-- [Platform research](docs/research/linux-platform.md)
+- [Linux platform research](docs/research/linux-platform.md)
 - [Fedora packaging](docs/packaging-fedora.md)
+- Windows app source: [`apps/windows/`](apps/windows/)

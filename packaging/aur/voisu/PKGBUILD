@@ -2,7 +2,7 @@
 pkgname=voisu
 pkgver=0.1.0
 pkgrel=1
-pkgdesc="Cloud-first Linux dictation for Wayland (daemon, CLI, and optional Overlay)"
+pkgdesc="Voice dictation for Linux desktops (daemon, CLI, and optional Overlay)"
 arch=('x86_64')
 url="https://github.com/Anuraj-Dev/voisu"
 # Voisu itself is MIT. The voisu, voisu-daemon and voisu-overlay binaries

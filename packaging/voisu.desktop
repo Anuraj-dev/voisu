@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=Voisu
-Comment=Cloud-first dictation for Linux
+Comment=Voice dictation for Linux desktops
 Exec=/usr/bin/voisu
 Icon=voisu
 Terminal=false
