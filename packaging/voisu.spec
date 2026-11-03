@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.66.0
+Version:        0.67.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -165,6 +165,9 @@ install -D -m 0644 packaging/icons/voisu.svg %{buildroot}%{_datadir}/icons/hicol
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Tue Nov 03 2026 Voisu maintainers <voisu@example.invalid> - 0.67.0-1
+- feat(formatting): turn local formatting on by default on Linux and Windows (#294)
+
 * Tue Nov 03 2026 Voisu maintainers <voisu@example.invalid> - 0.66.0-1
 - feat(packaging): ship the Voisu logo as the Linux app icon (#292)
 - Linux overlay: level bars glide like the Windows waveform (#290)
