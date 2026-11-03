@@ -1,8 +1,12 @@
 /* The recording Overlay capsule. Values follow DESIGN.md and the Linux GTK
    overlay (crates/voisu-app/src/bin/voisu-overlay.rs). The window is 8 px
-   larger than the capsule on every side so the error glow is not clipped. */
+   larger than the capsule on every side so the error glow is not clipped.
+   Sizes are the medium capsule times --s, which overlay.js sets from the
+   window width the chosen Overlay size gave it. */
 :root {
+  --s: 1;
   --surface: rgba(23, 25, 29, 0.96);
+  --accent: #65d6a0;
   --failure: #ff8a8a;
   --text: #f4f5f7;
 }
@@ -31,10 +35,10 @@ body {
 }
 
 .capsule {
-  width: 280px;
-  height: 64px;
-  padding: 12px 8px;
-  border-radius: 32px;
+  width: calc(280px * var(--s));
+  height: calc(64px * var(--s));
+  padding: calc(12px * var(--s)) calc(8px * var(--s));
+  border-radius: calc(32px * var(--s));
   border: 1px solid transparent;
   background: var(--surface);
   display: grid;
@@ -42,18 +46,19 @@ body {
 }
 
 .meter {
-  /* The capsule's content box: 280x64 less the 12px/8px padding and 1px border. */
-  width: 262px;
-  height: 38px;
+  /* The capsule's content box: 280x64 less the 12px/8px padding (scaled) and
+     the 1px border (not scaled). */
+  width: calc(264px * var(--s) - 2px);
+  height: calc(40px * var(--s) - 2px);
   display: block;
 }
 
 .message {
   margin: 0;
-  padding: 0 16px;
+  padding: 0 calc(16px * var(--s));
   max-width: 100%;
   color: var(--failure);
-  font-size: 11pt;
+  font-size: calc(11pt * var(--s));
   font-weight: 600;
   line-height: 1.2;
   text-align: center;
@@ -63,13 +68,43 @@ body {
   overflow: hidden;
 }
 
-.message[hidden] {
+.message[hidden],
+.check[hidden] {
   display: none;
+}
+
+/* Delivered: the check mark alone, like the Linux Success phase. */
+.check {
+  color: var(--accent);
+  font-size: calc(14pt * var(--s));
+  font-weight: 600;
+  line-height: 1;
+}
+
+.capsule.done .meter {
+  display: none;
+}
+
+.capsule.done .check {
+  animation: check-in 160ms ease-out;
+}
+
+@keyframes check-in {
+  from {
+    opacity: 0;
+    transform: scale(0.8);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .capsule.done .check {
+    animation: none;
+  }
 }
 
 .capsule.error {
   border-color: rgba(255, 138, 138, 0.9);
-  box-shadow: 0 0 8px rgba(255, 138, 138, 0.35);
+  box-shadow: 0 0 calc(8px * var(--s)) rgba(255, 138, 138, 0.35);
 }
 
 .capsule.error .meter {

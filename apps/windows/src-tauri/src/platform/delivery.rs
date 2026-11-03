@@ -17,8 +17,12 @@
 //! 5. The target's `WM_RENDERFORMAT` is the receipt that it pasted; reads by
 //!    any other app do not count. Restore shortly after the receipt, but only
 //!    while Voisu still owns the clipboard and nothing else has written to it
-//!    since (`GetClipboardSequenceNumber`). With no receipt, leave the
-//!    Transcript on the clipboard so a late paste still gets it.
+//!    since (`GetClipboardSequenceNumber`). With no receipt the paste is
+//!    reported as delivered (the chord reached the window in front; apps
+//!    that read through a clipboard manager or another process never send a
+//!    receipt), and the Transcript stays on the clipboard for a bounded grace
+//!    period so a late paste still gets it, then the user's clipboard comes
+//!    back.
 //!
 //! The receipt design (delayed render as proof of read, a quiet period before
 //! restoring, the history/cloud exclusion formats) follows Handy's Windows
@@ -35,9 +39,16 @@ use crate::overlay::{RECORDING_STATE, RecordingState, RecordingStatePayload};
 /// clipboard first.
 pub const QUIET_AFTER_READ: Duration = Duration::from_millis(200);
 /// No read this long after the chord means the paste is unconfirmed. Long
-/// enough for a cold Word or Electron paste. The Transcript then stays on the
-/// clipboard, so a later read still gets it.
+/// enough for a cold Word or Electron paste. The outcome is reported then,
+/// so the Overlay never waits on the grace period below.
 pub const NO_READ_TIMEOUT: Duration = Duration::from_millis(1500);
+/// After an unconfirmed paste, the user's clipboard comes back this long
+/// after the chord. Restoring at `NO_READ_TIMEOUT` would hand a slow app's
+/// late read (or the user's own Ctrl+V, if nothing appeared) the old
+/// clipboard; never restoring loses what the user had copied. Five seconds
+/// covers both, and the next delivery ends it early so its snapshot sees
+/// the user's clipboard, not this Transcript.
+pub const NOT_CONFIRMED_GRACE: Duration = Duration::from_secs(5);
 /// Gap between chord phases. RDP drops a modifier pressed and released in the
 /// same instant and types a literal "v".
 pub const CHORD_HOLD: Duration = Duration::from_millis(40);
@@ -50,8 +61,10 @@ pub const TEST_PASTE_DELAY: Duration = Duration::from_secs(3);
 pub enum DeliveryOutcome {
     /// The target read the Transcript from the clipboard after the chord.
     Pasted,
-    /// The chord went out but the target never read the clipboard. The
-    /// Transcript stays on the clipboard.
+    /// The chord went out to the target but no receipt came back. Counted as
+    /// delivered: UWP apps, WebView2 and clipboard-manager setups paste
+    /// without a receipt Voisu can see, and the Transcript stays on the
+    /// clipboard (and in Last transcript) for a manual paste.
     NotConfirmed,
     /// Another app replaced the clipboard before the target read it.
     ClipboardTaken,
@@ -69,8 +82,7 @@ impl DeliveryOutcome {
     /// What to tell the user, if anything. `None` means the text landed.
     pub fn notice(self) -> Option<&'static str> {
         match self {
-            Self::Pasted => None,
-            Self::NotConfirmed => Some("Transcript is on your clipboard — press Ctrl+V"),
+            Self::Pasted | Self::NotConfirmed => None,
             Self::ClipboardTaken => Some("Another app replaced the clipboard; nothing pasted"),
             Self::ElevatedTarget => Some("Can't type into an admin window"),
             Self::TargetGone => Some("The window you were typing in closed"),
@@ -118,12 +130,33 @@ impl DeliveryTarget {
     }
 }
 
-/// Pastes `text` into `target` and restores the clipboard. Blocks for about
-/// `NO_READ_TIMEOUT` at most and pumps its own messages: call it off the main
-/// thread.
-/// Concurrent calls run one after another.
-pub fn deliver(target: &DeliveryTarget, text: &str) -> Result<DeliveryOutcome, DeliveryError> {
-    native::deliver(target.hwnd, text)
+/// Pastes `text` into `target` and restores the clipboard. `settled` gets
+/// the result as soon as it is known (`NO_READ_TIMEOUT` at most); the call
+/// itself can block up to `NOT_CONFIRMED_GRACE` longer before it restores.
+/// It pumps its own messages: call it off the main thread. Concurrent calls
+/// run one after another.
+pub fn deliver(
+    target: &DeliveryTarget,
+    text: &str,
+    settled: impl FnOnce(Result<DeliveryOutcome, DeliveryError>),
+) {
+    let mut settled = Some(settled);
+    let result = native::deliver(target.hwnd, text, &mut |early| {
+        if let Some(settled) = settled.take() {
+            settled(early);
+        }
+    });
+    if let Some(settled) = settled.take() {
+        settled(result);
+    }
+}
+
+/// Puts `text` on the clipboard and sends no keystroke, for auto-paste off:
+/// the user pastes it themselves, so nothing is restored afterwards. It is
+/// kept out of clipboard history and monitors exactly like a paste.
+/// Call it off the main thread; it waits behind any delivery in progress.
+pub fn copy(text: &str) -> Result<(), DeliveryError> {
+    native::copy(text)
 }
 
 // ---- Paste chord ----
@@ -311,7 +344,8 @@ pub enum Verdict {
     Wait,
     /// The target pasted: put the user's clipboard back.
     Restore,
-    /// No read yet: leave the Transcript on the clipboard for a late paste.
+    /// No read yet: report the paste, then watch `evaluate_grace` with the
+    /// Transcript still on the clipboard for a late paste.
     Keep,
     /// Leave the clipboard alone: it is no longer Voisu's.
     Abandon {
@@ -334,6 +368,26 @@ pub fn evaluate(watch: Watch) -> Verdict {
     }
 }
 
+/// After `Keep`: the user's clipboard comes back a quiet period after a late
+/// read, at `NOT_CONFIRMED_GRACE`, or as soon as another delivery is
+/// `queued` behind this one. Never `Keep`.
+pub fn evaluate_grace(watch: Watch, queued: bool) -> Verdict {
+    if watch.ownership_lost {
+        return Verdict::Abandon {
+            pasted: watch.read.is_some(),
+        };
+    }
+    match watch.read {
+        Some(read) if watch.since_chord.saturating_sub(read) >= QUIET_AFTER_READ => {
+            Verdict::Restore
+        }
+        // A late read still gets its quiet period, bounded by it.
+        Some(_) => Verdict::Wait,
+        None if queued || watch.since_chord >= NOT_CONFIRMED_GRACE => Verdict::Restore,
+        None => Verdict::Wait,
+    }
+}
+
 /// Who had the clipboard open when the text was rendered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reader {
@@ -347,15 +401,18 @@ pub enum Reader {
     },
 }
 
-/// Whether a render counts as the target's paste. An anonymous opener gets
-/// the benefit of the doubt; a clipboard monitor or another app does not.
-pub fn read_by_target(reader: Reader, target_pid: u32) -> bool {
+/// Whether a render counts as the target's paste. `target_pids` are the
+/// target's process and those owning its child windows: a UWP app's
+/// CoreWindow and a WebView2 host run in a process other than the frame
+/// that has focus. An anonymous opener gets the benefit of the doubt; a
+/// clipboard monitor or another app does not.
+pub fn read_by_target(reader: Reader, target_pids: &[u32]) -> bool {
     match reader {
         Reader::Anonymous => true,
         Reader::Window {
             root_is_target,
             pid,
-        } => root_is_target || pid == target_pid,
+        } => root_is_target || target_pids.contains(&pid),
     }
 }
 
@@ -420,7 +477,7 @@ pub fn test_paste(app: &AppHandle) {
     std::thread::spawn(move || {
         std::thread::sleep(TEST_PASTE_DELAY);
         let target = DeliveryTarget::capture();
-        report(&app, &deliver(&target, &test_sample()));
+        deliver(&target, &test_sample(), |result| report(&app, &result));
     });
 }
 
@@ -428,6 +485,12 @@ pub fn test_paste(app: &AppHandle) {
 /// landed.
 pub fn notice(result: &Result<DeliveryOutcome, DeliveryError>) -> Option<String> {
     match result {
+        // Routine for apps that paste without a visible receipt; not worth
+        // an info line on every Recording.
+        Ok(DeliveryOutcome::NotConfirmed) => {
+            tracing::debug!("paste sent; the target sent no clipboard receipt");
+            None
+        }
         Ok(outcome) => {
             tracing::info!(?outcome, "delivery finished");
             outcome.notice().map(str::to_owned)
@@ -460,7 +523,15 @@ mod native {
         0
     }
 
-    pub fn deliver(_hwnd: isize, _text: &str) -> Result<DeliveryOutcome, DeliveryError> {
+    pub fn deliver(
+        _hwnd: isize,
+        _text: &str,
+        _early: &mut dyn FnMut(Result<DeliveryOutcome, DeliveryError>),
+    ) -> Result<DeliveryOutcome, DeliveryError> {
+        Err(DeliveryError::Unsupported)
+    }
+
+    pub fn copy(_text: &str) -> Result<(), DeliveryError> {
         Err(DeliveryError::Unsupported)
     }
 }
@@ -469,6 +540,7 @@ mod native {
 mod native {
     use std::cell::RefCell;
     use std::ffi::c_void;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, Once};
     use std::thread::sleep;
     use std::time::{Duration, Instant};
@@ -503,19 +575,19 @@ mod native {
         VIRTUAL_KEY,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GA_ROOT, GetAncestor,
-        GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId, HWND_MESSAGE, IsWindow, MSG,
-        MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW, QS_ALLINPUT, RegisterClassW,
-        SetForegroundWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_DESTROYCLIPBOARD,
-        WM_RENDERALLFORMATS, WM_RENDERFORMAT, WNDCLASSW,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumChildWindows,
+        GA_ROOT, GetAncestor, GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId,
+        HWND_MESSAGE, IsWindow, MSG, MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW,
+        QS_ALLINPUT, RegisterClassW, SetForegroundWindow, TranslateMessage, WINDOW_EX_STYLE,
+        WINDOW_STYLE, WM_DESTROYCLIPBOARD, WM_RENDERALLFORMATS, WM_RENDERFORMAT, WNDCLASSW,
     };
-    use windows::core::{HRESULT, PCWSTR, PWSTR, w};
+    use windows::core::{BOOL, HRESULT, PCWSTR, PWSTR, w};
 
     use super::{
         CF_ENHMETAFILE, CHORD_HOLD, DeliveryError, DeliveryOutcome, Integrity, Key, MODIFIERS,
         PasteChord, Probe, Reader, SNAPSHOT_BUDGET, VK_MASK, Verdict, Watch, chord_phases,
-        clipboard_text, evaluate, may_restore, paste_chord, preflight, read_by_target,
-        release_held, snapshot_format,
+        clipboard_text, evaluate, evaluate_grace, may_restore, paste_chord, preflight,
+        read_by_target, release_held, snapshot_format,
     };
 
     const CF_UNICODETEXT: u32 = 13;
@@ -529,6 +601,11 @@ mod native {
     ];
 
     static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+    /// Deliveries waiting on `ONE_AT_A_TIME`; one waiting ends the grace
+    /// period of the delivery ahead of it.
+    static QUEUED: AtomicUsize = AtomicUsize::new(0);
+    /// Bound on the processes collected from a target's child windows.
+    const MAX_TARGET_PIDS: usize = 16;
 
     /// State the owner window's procedure shares with `paste`, on the
     /// delivering thread. Never borrowed across a Win32 call: clipboard calls
@@ -536,7 +613,7 @@ mod native {
     struct Published {
         text: Vec<u16>,
         target: HWND,
-        target_pid: u32,
+        target_pids: Vec<u32>,
         /// The target's read, the receipt that it pasted.
         read: Option<Instant>,
         sequence: u32,
@@ -555,10 +632,16 @@ mod native {
         unsafe { GetForegroundWindow() }.0 as isize
     }
 
-    pub fn deliver(hwnd: isize, text: &str) -> Result<DeliveryOutcome, DeliveryError> {
+    pub fn deliver(
+        hwnd: isize,
+        text: &str,
+        early: &mut dyn FnMut(Result<DeliveryOutcome, DeliveryError>),
+    ) -> Result<DeliveryOutcome, DeliveryError> {
+        QUEUED.fetch_add(1, Ordering::SeqCst);
         let _serial = ONE_AT_A_TIME
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        QUEUED.fetch_sub(1, Ordering::SeqCst);
         let target = HWND(hwnd as *mut c_void);
         let probe = probe(target);
         if let Some(outcome) = preflight(probe) {
@@ -572,7 +655,7 @@ mod native {
             return Ok(DeliveryOutcome::FocusLost);
         }
         let owner = owner_window()?;
-        let result = paste(owner, target, probe.pid, text, chord);
+        let result = paste(owner, target, probe.pid, text, chord, early);
         // Destroying the owner renders any still-delayed text (an unconfirmed
         // paste leaves it there on purpose), so state goes only after it.
         unsafe {
@@ -582,12 +665,53 @@ mod native {
         result
     }
 
+    pub fn copy(text: &str) -> Result<(), DeliveryError> {
+        // Queued like `deliver`, so a paste waiting out its grace period
+        // ends it early instead of holding this copy back.
+        QUEUED.fetch_add(1, Ordering::SeqCst);
+        let _serial = ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        QUEUED.fetch_sub(1, Ordering::SeqCst);
+        let owner = owner_window()?;
+        let result = open(owner).and_then(|()| {
+            let result = copy_open(text);
+            close();
+            result
+        });
+        // Nothing is delayed, so the text stays on the clipboard after its
+        // owner goes.
+        unsafe {
+            let _ = DestroyWindow(owner);
+        }
+        result
+    }
+
+    fn copy_open(text: &str) -> Result<(), DeliveryError> {
+        unsafe { EmptyClipboard() }
+            .map_err(|_| DeliveryError::Clipboard("could not clear the clipboard"))?;
+        let bytes: Vec<u8> = clipboard_text(text)
+            .iter()
+            .flat_map(|unit| unit.to_ne_bytes())
+            .collect();
+        if !set(CF_UNICODETEXT, &bytes) {
+            return Err(DeliveryError::Clipboard("could not copy the text"));
+        }
+        if !mark_private(&[]) {
+            return Err(DeliveryError::Clipboard(
+                "could not hide the text from history",
+            ));
+        }
+        Ok(())
+    }
+
     fn paste(
         owner: HWND,
         target: HWND,
         target_pid: u32,
         text: &str,
         chord: PasteChord,
+        early: &mut dyn FnMut(Result<DeliveryOutcome, DeliveryError>),
     ) -> Result<DeliveryOutcome, DeliveryError> {
         open(owner)?;
         let saved = snapshot();
@@ -597,7 +721,7 @@ mod native {
             *cell.borrow_mut() = Some(Published {
                 text: clipboard_text(text),
                 target,
-                target_pid,
+                target_pids: target_pids(target, target_pid),
                 read: None,
                 sequence: 0,
                 lost: false,
@@ -614,13 +738,43 @@ mod native {
             restore_guarded(owner, &saved);
             return Ok(DeliveryOutcome::FocusLost);
         }
+        // Answer any render already asked for (a clipboard monitor reacting
+        // to the publish) before the chord, so it is timed before the chord
+        // and an anonymous reader is not mistaken for the target's receipt.
+        pump();
         if let Err(error) = send_chord(chord) {
             restore_guarded(owner, &saved);
             return Err(error);
         }
 
         let chord_at = Instant::now();
-        let verdict = loop {
+        Ok(match watch(chord_at, evaluate) {
+            Verdict::Restore => {
+                restore_guarded(owner, &saved);
+                DeliveryOutcome::Pasted
+            }
+            Verdict::Keep => {
+                // Reported now, so the Overlay shows success without waiting
+                // out the grace period; the user's clipboard comes back after.
+                early(Ok(DeliveryOutcome::NotConfirmed));
+                let late = watch(chord_at, |state| {
+                    evaluate_grace(state, QUEUED.load(Ordering::SeqCst) > 0)
+                });
+                if late == Verdict::Restore {
+                    restore_guarded(owner, &saved);
+                }
+                tracing::debug!(?late, "unconfirmed paste settled");
+                DeliveryOutcome::NotConfirmed
+            }
+            Verdict::Abandon { pasted: true } => DeliveryOutcome::Pasted,
+            Verdict::Abandon { pasted: false } => DeliveryOutcome::ClipboardTaken,
+            Verdict::Wait => unreachable!(),
+        })
+    }
+
+    /// Pumps messages until `decide` returns anything but `Wait`.
+    fn watch(chord_at: Instant, decide: impl Fn(Watch) -> Verdict) -> Verdict {
+        loop {
             pump();
             let (read, lost) = with_published(|state| {
                 let read = state
@@ -630,7 +784,7 @@ mod native {
                 (read, state.lost)
             })
             .unwrap_or((None, true));
-            match evaluate(Watch {
+            match decide(Watch {
                 since_chord: chord_at.elapsed(),
                 read,
                 ownership_lost: lost,
@@ -638,20 +792,9 @@ mod native {
                 Verdict::Wait => unsafe {
                     MsgWaitForMultipleObjects(None, false, 25, QS_ALLINPUT);
                 },
-                verdict => break verdict,
+                verdict => return verdict,
             }
-        };
-        Ok(match verdict {
-            Verdict::Restore => {
-                restore_guarded(owner, &saved);
-                DeliveryOutcome::Pasted
-            }
-            // Restoring now would hand a late paste the old clipboard.
-            Verdict::Keep => DeliveryOutcome::NotConfirmed,
-            Verdict::Abandon { pasted: true } => DeliveryOutcome::Pasted,
-            Verdict::Abandon { pasted: false } => DeliveryOutcome::ClipboardTaken,
-            Verdict::Wait => unreachable!(),
-        })
+        }
     }
 
     // ---- Target ----
@@ -669,6 +812,32 @@ mod native {
             target: process_integrity(pid),
             own: token_integrity(unsafe { GetCurrentProcess() }),
         }
+    }
+
+    /// The target's process plus those owning its child windows (a UWP
+    /// app's CoreWindow under ApplicationFrameHost, a WebView2 host).
+    fn target_pids(target: HWND, target_pid: u32) -> Vec<u32> {
+        let mut pids = vec![target_pid];
+        unsafe {
+            let _ = EnumChildWindows(
+                Some(target),
+                Some(collect_pid),
+                LPARAM(&mut pids as *mut Vec<u32> as isize),
+            );
+        }
+        pids
+    }
+
+    unsafe extern "system" fn collect_pid(child: HWND, pids: LPARAM) -> BOOL {
+        // SAFETY: `target_pids` passes its live Vec for the duration of the
+        // synchronous enumeration.
+        let pids = unsafe { &mut *(pids.0 as *mut Vec<u32>) };
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(child, Some(&mut pid as *mut u32)) };
+        if pid != 0 && !pids.contains(&pid) {
+            pids.push(pid);
+        }
+        BOOL::from(pids.len() < MAX_TARGET_PIDS)
     }
 
     fn denied(error: &windows::core::Error) -> bool {
@@ -1117,18 +1286,19 @@ mod native {
     /// Writes the text in answer to a render request. `reader` is the app
     /// that asked, or `None` when the owner window is closing.
     fn render(reader: Option<Reader>) {
-        let Some((text, target_pid)) =
-            with_published(|state| (state.text.clone(), state.target_pid))
+        let Some((text, target_pids)) =
+            with_published(|state| (state.text.clone(), state.target_pids.clone()))
         else {
             return;
         };
         let bytes: Vec<u8> = text.iter().flat_map(|unit| unit.to_ne_bytes()).collect();
         set(CF_UNICODETEXT, &bytes);
         let sequence = unsafe { GetClipboardSequenceNumber() };
-        let by_target = reader.is_some_and(|reader| read_by_target(reader, target_pid));
+        let by_target = reader.is_some_and(|reader| read_by_target(reader, &target_pids));
         if reader.is_some() && !by_target {
             // Its read used up the delayed render, so the target's paste
-            // will go unseen and end as NotConfirmed.
+            // will go unseen and end as NotConfirmed (still reported as
+            // delivered).
             tracing::info!(?reader, "another app read the transcript first");
         }
         with_published(|state| {
@@ -1351,6 +1521,42 @@ mod tests {
     }
 
     #[test]
+    fn an_unconfirmed_paste_restores_after_the_grace_period() {
+        assert_eq!(evaluate_grace(watch(1500, None), false), Verdict::Wait);
+        assert_eq!(evaluate_grace(watch(4999, None), false), Verdict::Wait);
+        assert_eq!(evaluate_grace(watch(5000, None), false), Verdict::Restore);
+    }
+
+    #[test]
+    fn a_late_read_restores_after_its_quiet_period() {
+        assert_eq!(
+            evaluate_grace(watch(2100, Some(2000)), false),
+            Verdict::Wait
+        );
+        assert_eq!(
+            evaluate_grace(watch(2200, Some(2000)), false),
+            Verdict::Restore
+        );
+        // Even past the grace period, the read finishes first.
+        assert_eq!(evaluate_grace(watch(5050, Some(4950)), true), Verdict::Wait);
+    }
+
+    #[test]
+    fn a_queued_delivery_ends_the_grace_period() {
+        assert_eq!(evaluate_grace(watch(1600, None), true), Verdict::Restore);
+    }
+
+    #[test]
+    fn losing_the_clipboard_during_the_grace_period_leaves_it() {
+        let mut lost = watch(2000, None);
+        lost.ownership_lost = true;
+        assert_eq!(
+            evaluate_grace(lost, false),
+            Verdict::Abandon { pasted: false }
+        );
+    }
+
+    #[test]
     fn losing_the_clipboard_abandons_the_restore() {
         let mut lost = watch(100, Some(50));
         lost.ownership_lost = true;
@@ -1361,7 +1567,7 @@ mod tests {
 
     #[test]
     fn only_the_target_reading_counts_as_a_paste() {
-        let target_pid = 40;
+        let target_pid = &[40];
         assert!(read_by_target(Reader::Anonymous, target_pid));
         assert!(read_by_target(
             Reader::Window {
@@ -1385,6 +1591,19 @@ mod tests {
                 pid: 99
             },
             target_pid
+        ));
+    }
+
+    #[test]
+    fn a_child_window_process_counts_as_the_target() {
+        // A UWP app: ApplicationFrameHost has focus, the app's CoreWindow
+        // child (another process) reads the clipboard.
+        assert!(read_by_target(
+            Reader::Window {
+                root_is_target: false,
+                pid: 51
+            },
+            &[40, 51]
         ));
     }
 
@@ -1459,10 +1678,28 @@ mod tests {
     }
 
     #[test]
-    fn every_outcome_but_pasted_has_a_notice() {
+    fn a_paste_without_a_receipt_is_delivered_not_an_error() {
+        assert_eq!(notice(&Ok(DeliveryOutcome::Pasted)), None);
+        assert_eq!(notice(&Ok(DeliveryOutcome::NotConfirmed)), None);
+    }
+
+    #[test]
+    fn failed_deliveries_and_errors_are_shown() {
+        for error in [
+            DeliveryError::ClipboardBusy,
+            DeliveryError::Clipboard("x"),
+            DeliveryError::Input,
+            DeliveryError::Unsupported,
+        ] {
+            assert!(notice(&Err(error.clone())).is_some(), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn every_outcome_that_did_not_land_has_a_notice() {
         assert_eq!(DeliveryOutcome::Pasted.notice(), None);
+        assert_eq!(DeliveryOutcome::NotConfirmed.notice(), None);
         for outcome in [
-            DeliveryOutcome::NotConfirmed,
             DeliveryOutcome::ClipboardTaken,
             DeliveryOutcome::ElevatedTarget,
             DeliveryOutcome::TargetGone,

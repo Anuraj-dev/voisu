@@ -20,6 +20,7 @@ mod tray;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod trigger;
 mod updater;
+pub mod vocabulary;
 
 use std::sync::{Mutex, OnceLock};
 
@@ -31,7 +32,7 @@ use voisu_cloud::ProviderHttpClient;
 use voisu_core::{Provider, SecretStore};
 
 use platform::secrets::CredentialManagerStore;
-use settings::Settings;
+use settings::{OverlaySize, Settings};
 use setup::{KeyInputs, KeyResult};
 
 const SETTINGS_WINDOW: &str = "settings";
@@ -96,18 +97,62 @@ struct UiState {
     autostart: bool,
     version: String,
     log_dir: String,
+    auto_paste: bool,
+    overlay_size: OverlaySize,
+    boost_words: Vec<String>,
 }
 
 #[tauri::command]
 fn get_state(app: AppHandle) -> UiState {
     let mut store = CredentialManagerStore;
+    let settings = app.state::<AppState>().settings.lock().unwrap().clone();
     UiState {
         groq_saved: store.has_key(Provider::Groq),
         deepgram_saved: store.has_key(Provider::Deepgram),
         autostart: autostart_enabled(&app),
         version: app.package_info().version.to_string(),
         log_dir: paths::log_dir().display().to_string(),
+        auto_paste: settings.auto_paste,
+        overlay_size: settings.overlay_size,
+        boost_words: settings.boost_words,
     }
+}
+
+/// Applies `change`, saves, and returns the settings as now held. A failed
+/// write is logged; the change still applies for this run.
+fn update_settings(app: &AppHandle, change: impl FnOnce(&mut Settings)) -> Settings {
+    let state = app.state::<AppState>();
+    let mut settings = state.settings.lock().unwrap();
+    change(&mut settings);
+    if let Err(error) = settings.save(&paths::settings_file()) {
+        tracing::warn!(%error, "settings save failed");
+    }
+    settings.clone()
+}
+
+/// Read at each delivery, so it applies from the next Transcript.
+#[tauri::command]
+fn set_auto_paste(app: AppHandle, enabled: bool) -> bool {
+    tracing::info!(enabled, "auto-paste");
+    update_settings(&app, |settings| settings.auto_paste = enabled).auto_paste
+}
+
+#[tauri::command]
+fn set_overlay_size(app: AppHandle, size: OverlaySize) -> OverlaySize {
+    tracing::info!(?size, "overlay size");
+    let size = update_settings(&app, |settings| settings.overlay_size = size).overlay_size;
+    overlay::set_size(size);
+    overlay::preview_size(&app);
+    size
+}
+
+/// Returns the list as stored (normalized), so the window shows what will be
+/// used. Read as each Recording starts. Only the count is logged.
+#[tauri::command]
+fn set_boost_words(app: AppHandle, words: Vec<String>) -> Vec<String> {
+    let words = vocabulary::normalize(words);
+    tracing::info!(count = words.len(), "boost words saved");
+    update_settings(&app, |settings| settings.boost_words = words).boost_words
 }
 
 #[derive(Serialize)]
@@ -290,6 +335,9 @@ pub fn run() {
             get_state,
             save_keys,
             set_autostart,
+            set_auto_paste,
+            set_overlay_size,
+            set_boost_words,
             open_key_page,
             engine::last_transcript
         ])
@@ -298,6 +346,13 @@ pub fn run() {
             let ready = keys_ready();
             let tray = tray::build(handle, ready, autostart_enabled(handle))?;
             let _ = app.state::<AppState>().tray.set(tray);
+            overlay::set_size(
+                app.state::<AppState>()
+                    .settings
+                    .lock()
+                    .unwrap()
+                    .overlay_size,
+            );
             overlay::init(handle)?;
             let at_login = std::env::args().any(|arg| arg == AUTOSTART_ARG);
             tracing::info!(keys_ready = ready, at_login, "startup");

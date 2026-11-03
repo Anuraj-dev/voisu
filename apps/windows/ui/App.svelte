@@ -8,8 +8,22 @@
     { id: 'deepgram', name: 'Deepgram' },
   ];
   const GLYPH = { valid: '✓', invalid: '✕', missing: '✕', kept: '•' };
+  const SIZES = [
+    { id: 'small', name: 'Small' },
+    { id: 'medium', name: 'Medium' },
+    { id: 'large', name: 'Large' },
+  ];
 
-  let app = $state({ groqSaved: false, deepgramSaved: false, autostart: false, version: '', logDir: '' });
+  let app = $state({
+    groqSaved: false,
+    deepgramSaved: false,
+    autostart: false,
+    version: '',
+    logDir: '',
+    autoPaste: true,
+    overlaySize: 'medium',
+    boostWords: [],
+  });
   let values = $state({ groq: '', deepgram: '' });
   let shown = $state({ groq: false, deepgram: false });
   let results = $state({ groq: null, deepgram: null });
@@ -21,14 +35,24 @@
   let transcript = $state(null);
   let dictationError = $state('');
   let copied = $state(false);
+  let autoPasteBusy = $state(false);
+  // One boost word per line; saved only on "Save words".
+  let wordsDraft = $state('');
+  let wordsBusy = $state(false);
+  let wordsStatus = $state('');
 
   const saved = $derived({ groq: app.groqSaved, deepgram: app.deepgramSaved });
   const blank = $derived(!values.groq.trim() && !values.deepgram.trim());
   const canSubmit = $derived(!busy && !(blank && saved.groq && saved.deepgram));
+  const wordsDirty = $derived(wordsDraft !== app.boostWords.join('\n'));
 
   async function refresh() {
     try {
+      const saved = app.boostWords.join('\n');
       app = await invoke('get_state');
+      // Never overwrite boost words the user is editing, including any typed
+      // while this call was in flight.
+      if (wordsDraft === saved) wordsDraft = app.boostWords.join('\n');
     } catch (e) {
       error = 'Could not read app state.';
     }
@@ -50,7 +74,7 @@
       dictationError = message ?? 'Dictation failed.';
     } else if (state === 'recording') {
       dictationError = '';
-    } else if (state === 'idle') {
+    } else if (state === 'idle' || state === 'done') {
       dictationError = '';
       refreshTranscript();
     }
@@ -127,6 +151,47 @@
       // Render the backend's actual state, not the requested value.
       box.checked = app.autostart;
       autostartBusy = false;
+    }
+  }
+
+  async function toggleAutoPaste(event) {
+    const box = event.currentTarget;
+    autoPasteBusy = true;
+    try {
+      app.autoPaste = await invoke('set_auto_paste', { enabled: box.checked });
+    } catch (e) {
+      error = 'Could not change Paste automatically.';
+    } finally {
+      box.checked = app.autoPaste;
+      autoPasteBusy = false;
+    }
+  }
+
+  async function chooseSize(size) {
+    try {
+      app.overlaySize = await invoke('set_overlay_size', { size });
+    } catch (e) {
+      error = 'Could not change the overlay size.';
+      // The DOM radio moved but the stored size did not; move it back.
+      const current = document.querySelector(`input[name="overlay-size"][value="${app.overlaySize}"]`);
+      if (current) current.checked = true;
+    }
+  }
+
+  async function saveWords() {
+    if (!wordsDirty || wordsBusy) return;
+    wordsBusy = true;
+    wordsStatus = '';
+    try {
+      const words = await invoke('set_boost_words', { words: wordsDraft.split('\n') });
+      app.boostWords = words;
+      // Show what is stored: trimmed, blank lines and repeats removed.
+      wordsDraft = words.join('\n');
+      wordsStatus = words.length === 1 ? 'Saved 1 word.' : `Saved ${words.length} words.`;
+    } catch (e) {
+      error = 'Could not save boost words.';
+    } finally {
+      wordsBusy = false;
     }
   }
 
@@ -215,7 +280,62 @@
         <span class="track" aria-hidden="true"><span class="thumb"></span></span>
       </span>
     </label>
+    <label class="switch-row" for="auto-paste">
+      <span class="row-text">
+        <span>Paste automatically</span>
+        <span class="hint">Off: the transcript goes to the clipboard for you to paste.</span>
+      </span>
+      <span class="switch">
+        <input
+          id="auto-paste"
+          type="checkbox"
+          role="switch"
+          checked={app.autoPaste}
+          disabled={autoPasteBusy}
+          onchange={toggleAutoPaste}
+        />
+        <span class="track" aria-hidden="true"><span class="thumb"></span></span>
+      </span>
+    </label>
+    <div class="switch-row">
+      <span id="size-label">Overlay size</span>
+      <div class="segmented" role="radiogroup" aria-labelledby="size-label">
+        {#each SIZES as size (size.id)}
+          <label class:on={app.overlaySize === size.id}>
+            <input
+              type="radio"
+              name="overlay-size"
+              value={size.id}
+              checked={app.overlaySize === size.id}
+              onchange={() => chooseSize(size.id)}
+            />
+            {size.name}
+          </label>
+        {/each}
+      </div>
+    </div>
   </div>
+
+  <section class="card words" aria-labelledby="words-title">
+    <div class="transcript-head">
+      <h2 id="words-title">Boost words</h2>
+      <button type="button" class="copy" onclick={saveWords} disabled={!wordsDirty || wordsBusy}>
+        {wordsBusy ? 'Saving…' : 'Save words'}
+      </button>
+    </div>
+    <label class="note" for="boost-words">Names and terms Voisu should hear and spell your way, one per line.</label>
+    <textarea
+      id="boost-words"
+      rows="4"
+      spellcheck="false"
+      autocomplete="off"
+      placeholder={'Voisu\nDeepgram'}
+      bind:value={wordsDraft}
+      oninput={() => (wordsStatus = '')}
+      disabled={wordsBusy}
+    ></textarea>
+    <p class="hint" role="status">{wordsStatus}</p>
+  </section>
 
   <section class="card transcript" aria-labelledby="transcript-title">
     <div class="transcript-head">
@@ -442,6 +562,80 @@
   .note {
     margin: 0;
     color: var(--text-2);
+    font-weight: 400;
+  }
+  .card:not(.transcript):not(.words) {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .row-text {
+    display: flex;
+    flex-direction: column;
+  }
+  .hint {
+    margin: 0;
+    font-size: 12px;
+    color: var(--text-2);
+  }
+  .segmented {
+    display: flex;
+    gap: 2px;
+    padding: 2px;
+    border-radius: 32px;
+    background: var(--overlay-2);
+    border: 1px solid var(--border);
+  }
+  .segmented label {
+    position: relative;
+    padding: 2px 12px;
+    border-radius: 32px;
+    font-weight: 400;
+    color: var(--text-2);
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+  }
+  .segmented label.on {
+    background: var(--accent);
+    color: var(--surface);
+  }
+  .segmented input {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    opacity: 0;
+    cursor: pointer;
+  }
+  .segmented label:has(input:focus-visible) {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .words {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .words textarea {
+    resize: vertical;
+    min-height: 72px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 8px 12px;
+    outline: 0;
+  }
+  .words textarea:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  .words textarea::placeholder {
+    color: var(--text-2);
+    opacity: 1;
+  }
+  .words .hint:empty {
+    display: none;
   }
   .transcript {
     display: flex;

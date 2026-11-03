@@ -6,8 +6,9 @@
 //! The engine is one actor task. It reports every lifecycle change as a
 //! `recording-state` event and the mic level as `audio-level`, which the
 //! overlay (W4) listens to. The final Transcript is pasted into the window
-//! that was focused when the Recording started, and held in memory only so
-//! "Last transcript" can copy it when the paste does not land.
+//! that was focused when the Recording started (or only copied, with
+//! auto-paste off), and held in memory only so "Last transcript" can copy it
+//! when the paste does not land.
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -33,6 +34,8 @@ use crate::overlay::{
 use crate::platform::capture::{CpalCapture, LevelSink};
 use crate::platform::delivery::{self, DeliveryTarget};
 use crate::platform::secrets::CredentialManagerStore;
+use crate::settings::Settings;
+use crate::vocabulary;
 
 /// Both providers must deliver within this after stop, as on Linux.
 const PROVIDER_DEADLINE: Duration = Duration::from_secs(15);
@@ -44,6 +47,8 @@ const CLEANUP_DRAIN: Duration = Duration::from_secs(2);
 const LANGUAGE: &str = "en";
 
 const KEYS_MISSING: &str = "Add your Groq and Deepgram keys to start dictating.";
+/// Accessible label for `done` when auto-paste is off and nothing was pasted.
+const COPIED: &str = "Transcript copied to the clipboard";
 
 /// Tells the trigger that the engine finished or refused a Recording.
 pub type EndedSink = Arc<dyn Fn(u64) + Send + Sync>;
@@ -144,6 +149,9 @@ enum Captured {
         providers: ProviderCoordinator,
         limit: Option<CaptureLimit>,
         target: DeliveryTarget,
+        /// The boost words this Recording's providers started with, so
+        /// reconcile sees the same list.
+        vocabulary: Vec<String>,
     },
     /// Cancelled (`None`) or failed: release the mic and provider streams.
     Abort {
@@ -210,7 +218,8 @@ impl Engine {
                 return Captured::Done;
             }
         };
-        let streams = match self.start_providers(id) {
+        let vocabulary = vocabulary::normalize(&self.settings().boost_words);
+        let streams = match self.start_providers(id, &vocabulary) {
             Ok(streams) => streams,
             Err(error) => {
                 let _ = capture.abort().await;
@@ -225,6 +234,7 @@ impl Engine {
                 providers,
                 limit,
                 target,
+                vocabulary,
             },
             Outcome::Cancel => {
                 tracing::info!(id, "Recording cancelled");
@@ -245,7 +255,7 @@ impl Engine {
     /// The processing phase: a Transcript from a stopped Recording, or the
     /// teardown of a cancelled or failed one.
     async fn settle(&self, id: u64, captured: Captured) {
-        let (mut capture, providers, limit, target) = match captured {
+        let (mut capture, providers, limit, target, vocabulary) = match captured {
             Captured::Done => return,
             Captured::Abort {
                 capture,
@@ -263,7 +273,8 @@ impl Engine {
                 providers,
                 limit,
                 target,
-            } => (capture, providers, limit, target),
+                vocabulary,
+            } => (capture, providers, limit, target, vocabulary),
         };
         self.emit_state(Phase::Processing, None);
         let audio = match capture.finish().await {
@@ -277,7 +288,7 @@ impl Engine {
             Some(limit) => audio.with_truncation(limit),
             None => audio,
         };
-        match self.decide(providers, audio).await {
+        match self.decide(providers, audio, vocabulary).await {
             Ok(text) => {
                 tracing::info!(id, chars = text.chars().count(), "Transcript ready");
                 // Stored first: "Last transcript" + Copy is the fallback
@@ -295,22 +306,51 @@ impl Engine {
         }
     }
 
-    /// Pastes the Transcript into `target`. Delivery blocks and pumps its
-    /// own messages, so it runs on a blocking thread.
+    /// Pastes the Transcript into `target`, or with auto-paste off only puts
+    /// it on the clipboard. Delivery blocks and pumps its own messages, so it
+    /// runs on a blocking thread, which may keep the user's clipboard parked
+    /// a little after the result arrives here.
     async fn deliver(&self, id: u64, target: DeliveryTarget, text: String) {
-        let delivered =
-            tokio::task::spawn_blocking(move || delivery::deliver(&target, &text)).await;
-        let message = match delivered {
+        if !self.settings().auto_paste {
+            let copied = tokio::task::spawn_blocking(move || delivery::copy(&text)).await;
+            let message = match copied {
+                Ok(Ok(())) => return self.emit_state(Phase::Done, Some(COPIED.to_owned())),
+                Ok(Err(error)) => {
+                    tracing::warn!(id, %error, "copy failed");
+                    Some(error.to_string())
+                }
+                Err(_) => Some("Couldn't copy the Transcript".to_owned()),
+            };
+            return self.delivered(message);
+        }
+        let (settled, result) = tokio::sync::oneshot::channel();
+        tokio::task::spawn_blocking(move || {
+            delivery::deliver(&target, &text, |result| {
+                let _ = settled.send(result);
+            });
+        });
+        let message = match result.await {
             Ok(result) => delivery::notice(&result),
-            Err(join) => {
-                tracing::warn!(id, %join, "delivery task failed");
+            Err(_) => {
+                tracing::warn!(id, "delivery task ended without a result");
                 Some("Couldn't paste the Transcript".to_owned())
             }
         };
+        self.delivered(message);
+    }
+
+    /// Success unless there is something to tell the user.
+    fn delivered(&self, message: Option<String>) {
         match message {
-            None => self.emit_state(Phase::Idle, None),
+            None => self.emit_state(Phase::Done, None),
             Some(message) => self.emit_state(Phase::Error, Some(message)),
         }
+    }
+
+    fn settings(&self) -> Settings {
+        let state = self.app.state::<crate::AppState>();
+        let settings = state.settings.lock().unwrap();
+        settings.clone()
     }
 
     /// Streams capture chunks to Deepgram until the trigger stops or cancels
@@ -386,15 +426,21 @@ impl Engine {
         }
     }
 
-    fn start_providers(&self, id: u64) -> Result<ProviderStreams, BoundaryError> {
+    /// Starts both providers biased toward `vocabulary`, within the same
+    /// keyterm and prompt budgets as Linux.
+    fn start_providers(
+        &self,
+        id: u64,
+        vocabulary: &[String],
+    ) -> Result<ProviderStreams, BoundaryError> {
         let mut deepgram = DeepgramProvider::with_keyterms_and_language(
             self.host.clone(),
-            Vec::new(),
+            vocabulary::deepgram_keyterms(vocabulary),
             LANGUAGE.to_owned(),
         );
         let mut groq = GroqProvider::with_prompt_and_language(
             self.host.clone(),
-            String::new(),
+            vocabulary::whisper_prompt(vocabulary),
             LANGUAGE.to_owned(),
         );
         let deepgram = deepgram.start(id)?;
@@ -410,11 +456,13 @@ impl Engine {
 
     /// The Linux live decision path without the Linux-only formatting stages:
     /// complete both providers, sanitize, validate, and reconstruct when the
-    /// validator asks for it.
+    /// validator asks for it. The boost words are both the user vocabulary
+    /// and the whole dictionary: Windows has no built-in terms.
     async fn decide(
         &self,
         providers: ProviderCoordinator,
         audio: voisu_core::CapturedAudio,
+        vocabulary: Vec<String>,
     ) -> Result<String, BoundaryError> {
         let completed = providers.complete_with_timings(audio).await?;
         for failure in &completed.provider_failures {
@@ -422,6 +470,8 @@ impl Engine {
         }
         let mut validator = MergeResultValidator::intent_reconstruction(self.host.clone());
         validator.set_word_confidences(completed.word_confidences);
+        validator.set_user_vocabulary(vocabulary.clone());
+        validator.set_dictionary_terms(vocabulary);
         let sources = sanitize_source_transcripts(completed.sources);
         let decision = match validator.prepare(sources).await? {
             PreparedTranscriptDecision::Ready(decision) => decision,
@@ -449,7 +499,7 @@ impl Engine {
             match state {
                 Phase::Recording | Phase::HandsFree => tray.set_status("Voisu: recording…"),
                 Phase::Processing => tray.set_status("Voisu: transcribing…"),
-                Phase::Idle | Phase::Error => tray.set_ready(crate::keys_ready()),
+                Phase::Idle | Phase::Done | Phase::Error => tray.set_ready(crate::keys_ready()),
             }
         }
         let _ = self
