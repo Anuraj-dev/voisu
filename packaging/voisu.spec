@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.65.0
+Version:        0.66.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -165,6 +165,19 @@ install -D -m 0644 packaging/icons/voisu.svg %{buildroot}%{_datadir}/icons/hicol
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Tue Nov 03 2026 Voisu maintainers <voisu@example.invalid> - 0.66.0-1
+- feat(packaging): ship the Voisu logo as the Linux app icon (#292)
+- Linux overlay: level bars glide like the Windows waveform (#290)
+- Windows: settings for auto-paste, overlay size and boost words, plus a Delivered check mark (#289)
+- Windows W5: release the installer and update from GitHub (#287)
+- Windows W3: paste transcripts into the focused app and restore the clipboard (#286)
+- Windows W2: dictate with Ctrl+Win through the cloud pipeline (#285)
+- Windows W4: recording overlay capsule with live level bars (#284)
+- Windows W1: installable tray shell that saves provider keys (#283)
+- docs(adr): record cloud-only Tauri shell for Windows (#281)
+- Make the cloud pipeline portable so Voisu can build for Windows (#280)
+- Clear the cargo-audit advisories blocking CI (#282)
+
 * Tue Oct 13 2026 Voisu maintainers <voisu@example.invalid> - 0.65.0-1
 - feat(local): install Parakeet CPU as a Consented Install (#279)
 
