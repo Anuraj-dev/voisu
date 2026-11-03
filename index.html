@@ -54,9 +54,8 @@
   <section class="hero" aria-labelledby="hero-title">
     <div class="wrap">
       <div>
-        <p class="eyebrow"><span class="dot" aria-hidden="true"></span>Voice dictation for Linux and Windows</p>
         <h1 id="hero-title">Hold a key, speak. <span class="land">Your words land where you're typing.</span></h1>
-        <p class="lede">Voisu turns speech into clean text and puts it in the app you were already using: a reply, a doc, a terminal. On Windows you hold <kbd>Ctrl</kbd>&nbsp;<kbd>Win</kbd> while you talk. On Linux you press your Trigger Key to start and again to stop.</p>
+        <p class="lede">Voisu is voice dictation for Linux and Windows. It turns speech into clean text and puts it in the app you were already using: a reply, a doc, a terminal. On Windows you hold <kbd>Ctrl</kbd>&nbsp;<kbd>Win</kbd> while you talk. On Linux you press your Trigger Key to start and again to stop.</p>
         <div class="cta-row">
           <a class="btn primary" data-cta="windows" href="#install-windows">
             <svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M0 2.2 6.5 1.3v6.2H0zm7.3-1L16 0v7.5H7.3zM0 8.3h6.5v6.3L0 13.7zm7.3 0H16V16l-8.7-1.2z"/></svg>
@@ -103,24 +102,23 @@
     <div class="wrap">
       <div class="section-head">
         <div>
-          <p class="kicker">How it works</p>
           <h2 id="how-title">Three beats, no window to switch to.</h2>
         </div>
         <p>Voisu sits in the background: the tray on Windows, a user service on Linux. A small capsule floats over your screen while it listens, and gets out of the way when your text arrives.</p>
       </div>
       <ol class="beats">
         <li>
-          <span class="num">01 · Recording</span>
+          <span class="num">Recording</span>
           <h3>Press and talk</h3>
           <p>Hold <kbd>Ctrl</kbd>&nbsp;<kbd>Win</kbd> on Windows, or press your Trigger Key on Linux. The capsule shows your voice as it comes in.</p>
         </li>
         <li>
-          <span class="num">02 · Processing</span>
+          <span class="num">Processing</span>
           <h3>Let go</h3>
           <p>Release the keys, or press the Trigger Key again. Voisu turns the Recording into a clean Transcript with punctuation.</p>
         </li>
         <li>
-          <span class="num">03 · Delivered</span>
+          <span class="num">Delivered</span>
           <h3>Keep typing</h3>
           <p>The Transcript lands in the window you were typing in when you started. If it can't land there, Voisu keeps it for you instead of dropping it.</p>
         </li>
@@ -132,7 +130,6 @@
     <div class="wrap">
       <div class="section-head">
         <div>
-          <p class="kicker">Why Voisu</p>
           <h2 id="why-title">Built to get the words right and put them in the right place.</h2>
         </div>
         <p>Dictation is only useful if you can trust it with a half-written email. Voisu is careful about what it hears, where it types, and what it keeps.</p>
@@ -140,51 +137,44 @@
 
       <div class="why">
         <article class="card wide">
-          <span class="tag">accuracy</span>
           <h3>Two providers, one Transcript</h3>
           <p>Deepgram streams while you talk. When you stop, Groq transcribes the whole Recording. Voisu reconciles the two into one Transcript, so a dropped stream or a misheard word in one doesn't cost you the sentence.</p>
           <div class="flow" aria-hidden="true">
             <span class="who">Deepgram</span><span class="lane dg"><span></span></span>
             <span class="who">Groq</span><span class="lane gq"><span></span></span>
             <span class="who">Voisu</span><span class="lane out"><span></span></span>
-            <span class="axis"><span>you speak</span><span>stop</span></span>
+            <span class="axis"><span>you speak</span><span class="stop">stop</span></span>
           </div>
         </article>
 
         <article class="card">
-          <span class="tag">delivery</span>
           <h3>Lands where you were</h3>
           <p>On Windows, text goes to the window that had focus when you started, even if you clicked away, and your clipboard is put back afterwards. Terminals get their own paste chord.</p>
         </article>
 
         <article class="card">
-          <span class="tag">no lost words</span>
           <h3>Nothing vanishes</h3>
           <p>If a paste can't land, Voisu tells you why and keeps the Transcript: on your clipboard, or one click away under <em>Last transcript</em> on Windows.</p>
         </article>
 
         <article class="card">
-          <span class="tag">privacy</span>
           <h3>Your keys, your keyring</h3>
           <p>API keys live in your desktop keyring or Windows Credential Manager. Logs and history stay on your machine.</p>
         </article>
 
         <article class="card">
-          <span class="tag">linux</span>
           <h3>No root, no raw input</h3>
           <p>On Linux, Voisu uses your desktop's portals for the shortcut and typing. It never needs <code>uinput</code> or access to input devices.</p>
         </article>
 
         <article class="card half">
-          <span class="tag">windows</span>
           <h3>Hands-free when you need it</h3>
-          <p>Double-tap <kbd>Ctrl</kbd>&nbsp;<kbd>Win</kbd> to keep recording without holding the keys; press the chord again to stop. <kbd>Esc</kbd> cancels.</p>
+          <p>On Windows, double-tap <kbd>Ctrl</kbd>&nbsp;<kbd>Win</kbd> to keep recording without holding the keys; press the chord again to stop. <kbd>Esc</kbd> cancels.</p>
         </article>
 
         <article class="card half">
-          <span class="tag">linux</span>
           <h3>Say the punctuation</h3>
-          <p>Speak marks the way you'd read them: “dash dash”, “slash”, “quote … unquote”, “new paragraph”, or “first … second …” for a numbered list.</p>
+          <p>On Linux, speak marks the way you'd read them: “dash dash”, “slash”, “quote … unquote”, “new paragraph”, or “first … second …” for a numbered list.</p>
         </article>
       </div>
     </div>
@@ -291,7 +281,6 @@
   <section class="section alt" id="keys" aria-labelledby="keys-title">
     <div class="wrap byok">
       <div>
-        <p class="kicker">Bring your own keys</p>
         <h2 id="keys-title">No account. You talk to the providers directly.</h2>
         <p class="byok-body">Voisu has no sign-up and no server of its own in the middle. Your audio goes only to the speech providers you configure, using your own API keys, and you pay them for what you use.</p>
         <p><a href="docs/providers.html">Set up your providers →</a></p>

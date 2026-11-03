@@ -188,12 +188,12 @@ kbd {
   min-width: 1.9em;
   padding: 0.12em 0.5em 0.18em;
   border: 1px solid var(--line);
-  border-bottom-width: 3px;
   border-radius: 4px;
+  box-shadow: 0 2px 0 var(--line);
   background: var(--surface);
   color: var(--ink);
-  font-size: 0.82em;
-  font-weight: 600;
+  font-size: 0.76em;
+  font-weight: 500;
   line-height: 1.3;
   text-align: center;
   white-space: nowrap;
@@ -261,9 +261,10 @@ kbd {
   align-items: center;
   gap: 10px;
   color: var(--ink);
-  font-weight: 750;
+  font-weight: 800;
+  font-stretch: 112%;
   font-size: 1.2rem;
-  letter-spacing: -0.03em;
+  letter-spacing: -0.01em;
   text-decoration: none;
 }
 
@@ -384,64 +385,42 @@ kbd {
 /* ---------- Landing: hero ---------- */
 
 .hero {
-  position: relative;
-  padding: clamp(40px, 8vw, 96px) 0 clamp(56px, 8vw, 104px);
-  overflow: hidden;
-}
-
-.hero::before {
-  /* A low mint horizon behind the stage; no gradient text, no purple. */
-  content: "";
-  position: absolute;
-  inset: auto -20% -40% 30%;
-  height: 80%;
-  background: radial-gradient(closest-side, color-mix(in srgb, var(--rec) 14%, transparent), transparent);
-  pointer-events: none;
+  padding: clamp(40px, 7vw, 88px) 0 clamp(56px, 8vw, 104px);
 }
 
 .hero .wrap {
-  position: relative;
   display: grid;
-  grid-template-columns: minmax(0, 1.08fr) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
   gap: clamp(32px, 5vw, 64px);
   align-items: center;
 }
 
-.eyebrow {
-  display: inline-flex;
-  align-items: center;
-  gap: 10px;
-  margin: 0 0 22px;
-  font-family: var(--mono);
-  font-size: 0.8rem;
-  letter-spacing: 0.04em;
-  color: var(--ink-2);
-}
-
-.eyebrow .dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--rec);
-  box-shadow: 0 0 0 4px color-mix(in srgb, var(--rec) 20%, transparent);
-}
-
+/* One face, two voices: the instruction runs wide and black like a panel
+   label; the promise drops to text width. */
 .hero h1 {
   font-size: clamp(2.5rem, 4.6vw, 4rem);
-  font-weight: 760;
-  letter-spacing: -0.04em;
-  line-height: 1.02;
+  font-weight: 900;
+  font-stretch: 125%;
+  letter-spacing: -0.02em;
+  line-height: 0.98;
 }
 
 .hero h1 .land {
-  color: var(--rec-ink);
+  display: block;
+  margin-top: 0.3em;
+  font-size: 0.6em;
+  font-weight: 650;
+  font-stretch: 100%;
+  line-height: 1.12;
+  letter-spacing: -0.01em;
+  color: var(--ink-2);
 }
 
 .lede {
   max-width: 34em;
   margin: 24px 0 32px;
   color: var(--ink-2);
-  font-size: clamp(1.06rem, 1.4vw, 1.2rem);
+  font-size: clamp(1.04rem, 1.3vw, 1.15rem);
 }
 
 .cta-row {
@@ -468,28 +447,16 @@ kbd {
   position: relative;
 }
 
+/* The stage is a plate of the logo ground in both themes, so the capsule on
+   it reads exactly like the mark. */
 .stage {
   position: relative;
   aspect-ratio: 5 / 4;
-  border-radius: 22px;
-  border: 1px solid var(--line);
-  background:
-    radial-gradient(120% 90% at 50% 120%, color-mix(in srgb, var(--rec) 10%, transparent), transparent 60%),
-    linear-gradient(180deg, var(--surface-2), var(--bg-2));
-  box-shadow: var(--shadow);
+  border-radius: 10px;
+  border: 1px solid var(--plate-line);
+  background: var(--plate);
   overflow: hidden;
   isolation: isolate;
-}
-
-.stage::after {
-  /* Faint dot grid: the "desktop" the window sits on. */
-  content: "";
-  position: absolute;
-  inset: 0;
-  z-index: -1;
-  background-image: radial-gradient(color-mix(in srgb, var(--ink) 9%, transparent) 1px, transparent 1px);
-  background-size: 18px 18px;
-  mask-image: linear-gradient(180deg, #000 0%, transparent 85%);
 }
 
 .win {
@@ -497,10 +464,10 @@ kbd {
   left: 7%;
   right: 7%;
   top: 8%;
-  border-radius: 12px;
+  border-radius: 6px;
   border: 1px solid var(--line);
   background: var(--surface);
-  box-shadow: 0 18px 40px -20px rgba(0, 0, 0, 0.55);
+  box-shadow: 0 18px 40px -18px rgba(0, 0, 0, 0.7);
   overflow: hidden;
 }
 
@@ -560,12 +527,22 @@ kbd {
 
 .win-body.term {
   font-family: var(--mono);
-  font-size: clamp(0.78rem, 1.15vw, 0.9rem);
-  background: var(--code-bg);
+  font-size: clamp(0.74rem, 1.1vw, 0.86rem);
+  font-stretch: 87.5%;
+  background: var(--plate-2);
+  color: var(--plate-ink);
+}
+
+.win-body.term .ctx {
+  color: var(--plate-ink-2);
 }
 
 .win-body.term .ps {
-  color: var(--rec-ink);
+  color: var(--rec);
+}
+
+.win-body.term .caret {
+  background: var(--plate-ink);
 }
 
 .typed {
@@ -598,7 +575,7 @@ kbd {
   transform: translateX(-50%) translateY(10px) scale(0.96);
   opacity: 0;
   border-radius: 999px;
-  background: rgba(23, 25, 29, 0.96);
+  background: var(--capsule);
   /* Matches the logo: green outline, blue bars. */
   border: 2px solid var(--rec);
   box-shadow: 0 16px 40px -12px rgba(0, 0, 0, 0.6);
@@ -617,7 +594,7 @@ kbd {
   height: 62.5%;
 }
 
-/* Below the stage: the keys and the state rail. */
+/* Below the stage: the keys and the state indicator. */
 .stage-foot {
   display: flex;
   flex-wrap: wrap;
@@ -636,62 +613,81 @@ kbd {
 }
 
 .keys kbd {
-  transition: transform 0.12s, border-bottom-width 0.12s, background-color 0.12s, color 0.12s;
+  transition: transform 0.12s, box-shadow 0.12s, background-color 0.12s;
 }
 
 .keys.down kbd {
   transform: translateY(2px);
-  border-bottom-width: 1px;
-  background: color-mix(in srgb, var(--rec) 22%, var(--surface));
+  box-shadow: 0 0 0 var(--line);
+  background: color-mix(in srgb, var(--rec) 28%, var(--surface));
 }
 
+/* A three-cell indicator, like a hardware status strip. Each state has its
+   own mark (solid, dashed, tick) so it reads without colour. */
 .rail {
   display: flex;
-  gap: 6px;
   margin: 0;
   padding: 0;
   list-style: none;
-  font-size: 0.8rem;
-  font-weight: 600;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  font-size: 0.78rem;
+  font-weight: 650;
+  font-stretch: 110%;
 }
 
 .rail li {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
-  padding: 5px 10px;
-  border-radius: 999px;
-  border: 1px solid var(--line-2);
+  gap: 8px;
+  padding: 6px 12px;
   color: var(--ink-3);
-  transition: color 0.2s, border-color 0.2s, background-color 0.2s;
+  transition: color 0.2s, background-color 0.2s;
 }
 
-.rail li::before {
+.rail li + li {
+  border-left: 1px solid var(--line);
+}
+
+.rail li::before,
+.beats .num::before {
   content: "";
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
+  flex: none;
+  width: 14px;
+  height: 3px;
   background: currentColor;
-  opacity: 0.5;
+}
+
+.rail li[data-s="proc"]::before,
+.beats li:nth-child(2) .num::before {
+  background: repeating-linear-gradient(90deg, currentColor 0 3px, transparent 3px 5.5px);
+}
+
+.rail li[data-s="ok"]::before,
+.beats li:nth-child(3) .num::before {
+  width: 10px;
+  height: 5px;
+  margin: 0 2px 3px;
+  background: none;
+  border: solid currentColor;
+  border-width: 0 0 2px 2px;
+  transform: rotate(-45deg);
+}
+
+.rail li.on {
+  background: var(--surface);
 }
 
 .rail li.on[data-s="rec"] {
   color: var(--rec-ink);
-  border-color: color-mix(in srgb, var(--rec) 45%, transparent);
 }
 
 .rail li.on[data-s="proc"] {
   color: var(--proc-ink);
-  border-color: color-mix(in srgb, var(--proc) 45%, transparent);
 }
 
 .rail li.on[data-s="ok"] {
   color: var(--ok-ink);
-  border-color: color-mix(in srgb, var(--ok) 50%, transparent);
-}
-
-.rail li.on::before {
-  opacity: 1;
 }
 
 .stage-pause {
@@ -706,16 +702,14 @@ kbd {
   height: 32px;
   padding: 0;
   border-radius: 50%;
-  border: 1px solid var(--line);
-  background: var(--surface);
-  color: var(--ink-2);
+  border: 1px solid var(--plate-line);
+  background: var(--plate-2);
+  color: var(--plate-ink-2);
   cursor: pointer;
-  opacity: 0.85;
 }
 
 .stage-pause:hover {
-  opacity: 1;
-  color: var(--ink);
+  color: var(--plate-ink);
 }
 
 .stage-pause svg {
@@ -731,97 +725,88 @@ kbd {
 
 .section {
   padding: clamp(64px, 9vw, 120px) 0;
-  border-top: 1px solid var(--line-2);
+  border-top: 1px solid var(--line);
 }
 
 .section.alt {
   background: var(--bg-2);
 }
 
+/* Side heads, as in a manual: the heading owns the left column. */
 .section-head {
   display: grid;
-  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 16px 48px;
-  align-items: end;
+  align-items: start;
   margin-bottom: clamp(32px, 5vw, 56px);
 }
 
 .kicker {
   margin: 0 0 14px;
-  font-family: var(--mono);
   font-size: 0.78rem;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--rec-ink);
+  color: var(--ink-3);
 }
 
 .section h2 {
-  font-size: clamp(1.9rem, 3.6vw, 2.9rem);
-  font-weight: 740;
-  letter-spacing: -0.035em;
+  font-size: clamp(1.8rem, 3.4vw, 2.7rem);
+  font-weight: 850;
+  font-stretch: 115%;
+  letter-spacing: -0.015em;
 }
 
 .section-head p {
-  margin: 0;
+  margin: 0.35em 0 0;
   color: var(--ink-2);
   max-width: 36em;
 }
 
-/* How it works: three beats along one line. */
+/* How it works: three beats under one heavy rule. */
 .beats {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 0;
   margin: 0;
   padding: 0;
   list-style: none;
-  counter-reset: beat;
-  border-top: 1px solid var(--line);
+  border-top: 2px solid var(--ink);
 }
 
 .beats li {
-  position: relative;
-  padding: 28px 28px 8px 0;
-  counter-increment: beat;
+  padding: 22px 28px 8px 0;
 }
 
 .beats li + li {
   padding-left: 28px;
-  border-left: 1px solid var(--line-2);
+  border-left: 1px solid var(--line);
 }
 
-.beats li::before {
-  content: "";
-  position: absolute;
-  top: -5px;
-  left: 0;
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  background: var(--bg);
-  border: 2px solid var(--beat, var(--rec));
+.beats .num {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.85rem;
+  font-weight: 650;
 }
 
-.beats li + li::before {
-  left: 28px;
+.beats li:nth-child(1) .num {
+  color: var(--rec-ink);
 }
 
-.beats li:nth-child(1) {
-  --beat: var(--rec);
+.beats li:nth-child(2) .num {
+  color: var(--proc-ink);
 }
 
-.beats li:nth-child(2) {
-  --beat: var(--proc);
+.beats li:nth-child(3) .num {
+  color: var(--ok-ink);
 }
 
-.beats li:nth-child(3) {
-  --beat: var(--ok);
+.beats .num::before {
+  width: 22px;
+  height: 4px;
 }
 
 .beats h3 {
-  margin: 4px 0 10px;
+  margin: 10px 0 10px;
   font-size: 1.3rem;
-  font-weight: 700;
 }
 
 .beats p {
@@ -829,117 +814,123 @@ kbd {
   margin: 0 0 0.6em;
 }
 
-.beats .num {
-  font-family: var(--mono);
-  font-size: 0.78rem;
-  color: var(--ink-3);
-}
-
-/* Why: asymmetric grid. */
+/* Why: a ruled spec sheet, two columns of entries. */
 .why {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
-  gap: 16px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  column-gap: clamp(28px, 5vw, 64px);
 }
 
 .card {
-  grid-column: span 2;
-  padding: 26px 26px 24px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--surface);
-}
-
-.card.wide {
-  grid-column: span 4;
-}
-
-.card.half {
-  grid-column: span 3;
+  padding: 22px 0 28px;
+  border-top: 1px solid var(--line);
 }
 
 .card h3 {
-  font-size: 1.18rem;
-  font-weight: 700;
-  margin-bottom: 10px;
+  font-size: 1.12rem;
+  font-weight: 750;
+  font-stretch: 110%;
+  margin-bottom: 8px;
 }
 
 .card p {
   margin: 0;
   color: var(--ink-2);
+  max-width: 36em;
 }
 
 .card p + p {
   margin-top: 0.7em;
 }
 
-.card .tag {
-  display: inline-block;
-  margin-bottom: 14px;
-  font-family: var(--mono);
-  font-size: 0.72rem;
-  color: var(--ink-3);
-  letter-spacing: 0.03em;
+.card.wide {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr);
+  grid-template-rows: auto 1fr;
+  gap: 0 clamp(28px, 5vw, 64px);
+  padding-bottom: 40px;
+  border-top: 2px solid var(--ink);
 }
 
-/* Two-provider diagram inside the wide card. */
+.card.wide > h3,
+.card.wide > p {
+  grid-column: 1;
+}
+
+/* Two-provider timing diagram, drawn on a plate. */
 .flow {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
-  gap: 10px 14px;
-  align-items: center;
-  margin-top: 22px;
-  font-size: 0.85rem;
+  gap: 14px 16px;
+  align-items: end;
+  padding: 22px 22px 14px;
+  border-radius: 8px;
+  background: var(--plate);
+}
+
+.card.wide > .flow {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  align-self: start;
 }
 
 .flow .who {
-  font-family: var(--mono);
-  font-size: 0.78rem;
-  color: var(--ink-2);
+  font-size: 0.8rem;
+  font-weight: 650;
+  font-stretch: 112%;
+  line-height: 1;
+  color: var(--plate-ink);
 }
 
 .flow .lane {
   position: relative;
-  height: 26px;
-  border-radius: 999px;
-  background: var(--surface-2);
-  border: 1px solid var(--line-2);
-  overflow: hidden;
+  height: 14px;
+  border-bottom: 1px solid var(--plate-line);
 }
 
 .flow .lane span {
   position: absolute;
-  top: 5px;
-  bottom: 5px;
-  border-radius: 999px;
+  bottom: 3px;
+  height: 9px;
 }
 
 .flow .lane.dg span {
-  left: 6px;
+  left: 0;
   right: 22%;
-  background: repeating-linear-gradient(90deg, var(--rec) 0 6px, transparent 6px 10px);
-  opacity: 0.85;
+  background: repeating-linear-gradient(90deg, var(--rec) 0 2px, transparent 2px 6px);
 }
 
 .flow .lane.gq span {
   left: 78%;
-  right: 6px;
+  right: 0;
   background: var(--proc);
 }
 
 .flow .lane.out span {
-  left: 84%;
-  right: 6px;
+  left: 86%;
+  right: 0;
   background: var(--ok);
 }
 
 .flow .axis {
   grid-column: 2;
-  display: flex;
-  justify-content: space-between;
+  position: relative;
+  height: 1.6em;
   font-family: var(--mono);
-  font-size: 0.72rem;
-  color: var(--ink-3);
+  font-size: 0.64rem;
+  color: var(--plate-ink-2);
+}
+
+.flow .axis span {
+  position: absolute;
+  top: 2px;
+  left: 0;
+}
+
+.flow .axis .stop {
+  left: 78%;
+  transform: translateX(-50%);
 }
 
 /* Install */
@@ -1210,7 +1201,8 @@ details.more > :last-child {
 
 .provider-list {
   display: grid;
-  gap: 12px;
+  gap: 0;
+  border-top: 2px solid var(--ink);
   margin: 0;
   padding: 0;
   list-style: none;
@@ -1243,19 +1235,21 @@ details.more > :last-child {
 .provider-list li {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
-  gap: 4px 14px;
-  padding: 16px 18px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--surface);
+  gap: 4px 16px;
+  padding: 18px 0;
+  border-bottom: 1px solid var(--line);
 }
 
+/* Same marks as the state strip: Deepgram streams, Groq finishes. */
 .provider-list .sw {
   grid-row: span 2;
-  width: 10px;
-  height: 10px;
-  margin-top: 8px;
-  border-radius: 50%;
+  width: 22px;
+  height: 4px;
+  margin-top: 11px;
+}
+
+.provider-list .sw-rec {
+  background: repeating-linear-gradient(90deg, var(--rec) 0 2px, transparent 2px 5px);
 }
 
 .provider-list strong {
@@ -1284,10 +1278,10 @@ details.more > :last-child {
 
 .foot-grid h2 {
   margin: 0 0 12px;
-  font-size: 0.78rem;
-  font-family: var(--mono);
-  font-weight: 500;
-  letter-spacing: 0.06em;
+  font-size: 0.72rem;
+  font-weight: 750;
+  font-stretch: 118%;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--ink-3);
 }
@@ -1710,17 +1704,14 @@ ol.steps > li::before {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .why {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  }
-
-  .card,
-  .card.half {
-    grid-column: span 1;
-  }
-
   .card.wide {
-    grid-column: span 2;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .card.wide > .flow {
+    grid-column: 1;
+    grid-row: auto;
+    margin-top: 22px;
   }
 
   .foot-grid {
@@ -1792,32 +1783,24 @@ ol.steps > li::before {
 
   .beats {
     grid-template-columns: minmax(0, 1fr);
-    border-top: 0;
-    border-left: 1px solid var(--line);
-    margin-left: 4px;
   }
 
   .beats li,
   .beats li + li {
-    padding: 0 0 26px 24px;
+    padding: 20px 0 14px;
     border-left: 0;
   }
 
-  .beats li::before,
-  .beats li + li::before {
-    top: 6px;
-    left: -6px;
+  .beats li + li {
+    border-top: 1px solid var(--line);
   }
 
   .why {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .card,
-  .card.wide,
-  .card.half {
-    grid-column: span 1;
-    padding: 22px 20px;
+  .rail li {
+    padding: 6px 9px;
   }
 
   .stage {
