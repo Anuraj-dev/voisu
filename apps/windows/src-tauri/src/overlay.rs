@@ -34,8 +34,9 @@ const GLOW_PAD: f64 = 8.0;
 const BOTTOM_MARGIN: f64 = 24.0;
 /// Long enough to read a one-line error, then the capsule hides.
 const ERROR_DISPLAY: Duration = Duration::from_secs(3);
-/// The Delivered check mark, as long as the Linux overlay's terminal phases.
-const DONE_DISPLAY: Duration = Duration::from_secs(2);
+/// The Delivered check mark, as brief as the Linux overlay's: the Transcript
+/// is already in the focused app, so the confirmation only needs to register.
+const DONE_DISPLAY: Duration = Duration::from_millis(600);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -644,7 +645,7 @@ mod tests {
         assert_eq!(presenter.on_hide_timer(timer.unwrap()), Step::Hide);
         assert_eq!(
             RecordingState::Done.display_time(),
-            Some(Duration::from_secs(2))
+            Some(Duration::from_millis(600))
         );
     }
 
