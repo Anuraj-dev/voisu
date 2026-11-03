@@ -104,11 +104,11 @@
 <ul class="state-list">
   <li><span class="sw sw-rec"></span><strong>Recording</strong><span>Live level bars follow your voice. On Windows, a green dot at the left means hands-free.</span></li>
   <li><span class="sw sw-proc"></span><strong>Processing</strong><span>A light sweeps across the bars while the providers finish and Voisu builds the Transcript.</span></li>
-  <li><span class="sw sw-ok"></span><strong>Delivered</strong><span>The capsule goes away and your text appears. On Linux it briefly shows success first.</span></li>
+  <li><span class="sw sw-ok"></span><strong>Delivered</strong><span>Your text appears, a check mark shows for a moment, and the capsule goes away.</span></li>
   <li><span class="sw sw-fail"></span><strong>Problem</strong><span>A short message says what went wrong, such as no microphone, nothing heard, or a paste that couldn't land.</span></li>
 </ul>
 <p>The capsule is optional on Linux: it's the <code>voisu-overlay</code> package on Fedora and the <code>overlay@voisu.app</code> GNOME Shell extension on Ubuntu. On X11 the same feedback arrives as desktop notifications. On Windows the tray's <strong>Preview overlay</strong> item shows it without recording.</p>
-<p><span class="badge soon">Coming soon</span>A check mark when a Transcript lands on Windows, and a choice of capsule size.</p>
+<p>On Windows you can make the capsule smaller or larger under <strong>Overlay size</strong> in <a href="settings.html#windows">Settings</a>.</p>
 
 <h2 id="delivery">Where the text goes</h2>
 <p><strong>Windows.</strong> Voisu pastes into the window that had focus when you <em>started</em> the Recording, even if you clicked somewhere else while talking. It then puts your previous clipboard back. Terminals get the paste shortcut they expect: <kbd>Ctrl</kbd>&nbsp;<kbd>Shift</kbd>&nbsp;<kbd>V</kbd> for Windows Terminal, Alacritty and WezTerm, <kbd>Shift</kbd>&nbsp;<kbd>Insert</kbd> for the classic console, PuTTY, Git Bash and ConEmu. Voisu's paste is kept out of Windows clipboard history (<kbd>Win</kbd>&nbsp;<kbd>V</kbd>).</p>
@@ -124,7 +124,7 @@
 </table>
 </div>
 <p>Change it with <code>voisu delivery type</code>, <code>voisu delivery clipboard</code> or <code>voisu delivery guarded</code>.</p>
-<p><span class="badge soon">Coming soon</span>A Windows setting to turn automatic pasting off and always leave the Transcript on the clipboard.</p>
+<p>On Windows, turn off <strong>Paste automatically</strong> in <a href="settings.html#windows">Settings</a> to have Voisu only put the Transcript on your clipboard, without pressing any keys for you.</p>
 
 <h2 id="last">Your last Transcript</h2>
 <p>When a paste doesn't land, the words aren't lost.</p>
@@ -137,9 +137,8 @@
 <ul>
   <li>Speak naturally, in full sentences. Voisu adds punctuation and capitals for you.</li>
   <li>On Linux you can also say marks the way you'd read them: “dash dash”, “slash”, “quote … unquote”, “new paragraph”, or “first … second …” for a numbered list.</li>
-  <li>Teach Voisu names and jargon it gets wrong with the Linux dictionary: <code>voisu dictionary add &lt;term&gt;</code>. See <a href="settings.html#linux">Settings</a>.</li>
+  <li>Teach Voisu names and jargon it gets wrong. On Windows, add them under <strong>Boost words</strong> in <a href="settings.html#windows">Settings</a>. On Linux, use <code>voisu dictionary add &lt;term&gt;</code> (see <a href="settings.html#linux">Settings</a>).</li>
 </ul>
-<p><span class="badge soon">Coming soon</span>Boost words on Windows: a list of names and terms to favour.</p>
 
     <nav class="pager" aria-label="Docs pages">
       <a class="prev" href="getting-started.html"><small>Previous</small>Getting started</a><a class="next" href="providers.html"><small>Next</small>Providers &amp; API keys</a>
