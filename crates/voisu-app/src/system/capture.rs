@@ -249,6 +249,62 @@ impl<R: Read> Read for WavHeaderStripper<R> {
     }
 }
 
+/// The pw-record spawn: `stdbuf -o0 pw-record` when `unbuffered`, else plain
+/// `pw-record`. [`stdbuf_unbuffers_pw_record`] decides `unbuffered`.
+///
+/// pw-record writes PCM through stdio, and stdio fully buffers a pipe: 4 KiB,
+/// which is 128 ms of 16 kHz s16 audio. Reads then arrive in 128 ms bursts, so
+/// the Overlay's level meter (and the provider stream) advance in visible
+/// steps. `stdbuf -o0` turns that buffer off and the audio arrives at the
+/// node's own quantum, about every 20 ms. Measured on PipeWire 1.6.9: p90 read
+/// gap 128 ms buffered, 21 ms with `stdbuf -o0`; `--latency` alone does not
+/// change it. Without `stdbuf` (coreutils), capture still works, only bursty.
+pub(super) fn pw_record_command(unbuffered: bool) -> std::process::Command {
+    if unbuffered {
+        let mut command = restricted_command("stdbuf");
+        command.args(["-o0", "pw-record"]);
+        command
+    } else {
+        restricted_command("pw-record")
+    }
+}
+
+/// Whether capture may wrap pw-record in `stdbuf -o0`, probed once per
+/// process. A missing or broken `stdbuf` must fall back to plain pw-record,
+/// never break capture: when its preload library cannot load, ld.so warns on
+/// pw-record's stderr and every graceful stop would read as a failure.
+fn stdbuf_unbuffers_pw_record() -> bool {
+    static UNBUFFERED: OnceLock<bool> = OnceLock::new();
+    *UNBUFFERED
+        .get_or_init(|| stdbuf_usable(std::env::var_os("PATH").as_deref(), Duration::from_secs(2)))
+}
+
+/// `stdbuf` and `pw-record` both resolve on `path`, and `stdbuf -o0 true`
+/// runs cleanly: exit 0 and nothing on stderr, so its preload library loads.
+pub(super) fn stdbuf_usable(path: Option<&std::ffi::OsStr>, deadline: Duration) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    let Some(stdbuf) = super::readiness::resolve_on_path(path, "stdbuf") else {
+        return false;
+    };
+    if super::readiness::resolve_on_path(path, "pw-record").is_none() {
+        return false;
+    }
+    let Some(stdbuf) = stdbuf.to_str() else {
+        return false;
+    };
+    voisu_cloud::process::run_restricted_with_deadline(
+        stdbuf,
+        &["-o0", "true"],
+        None,
+        false,
+        deadline,
+        None,
+    )
+    .is_ok_and(|outcome| outcome.success && outcome.stderr.trim_ascii().is_empty())
+}
+
 impl AudioCapture for PipeWireCapture {
     fn begin(&mut self, _recording_id: u64) -> Result<Box<dyn ActiveCapture>, BoundaryError> {
         let maximum = resolve_recording_maximum(std::env::var("VOISU_RECORDING_DEADLINE_MS").ok());
@@ -259,7 +315,7 @@ impl AudioCapture for PipeWireCapture {
         // Unavailable probe still takes the WAV path — the spawn below fails
         // cleanly if pw-record is truly missing.
         let raw_supported = pw_record_capture_mode() == PwRecordProbe::Raw;
-        let mut command = restricted_command("pw-record");
+        let mut command = pw_record_command(stdbuf_unbuffers_pw_record());
         if raw_supported {
             command.arg("--raw");
         }
@@ -680,5 +736,73 @@ fn process_diagnostic(prefix: &str, stderr: &[u8]) -> String {
         prefix.to_owned()
     } else {
         format!("{prefix}: {detail}")
+    }
+}
+
+#[cfg(test)]
+mod pw_record_command_tests {
+    use super::{pw_record_command, stdbuf_usable};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use std::time::Duration;
+
+    fn args(command: &std::process::Command) -> Vec<String> {
+        std::iter::once(command.get_program())
+            .chain(command.get_args())
+            .map(|part| part.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn script(dir: &Path, name: &str, body: &str) {
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn usable(dir: &Path) -> bool {
+        stdbuf_usable(Some(dir.as_os_str()), Duration::from_secs(5))
+    }
+
+    #[test]
+    fn capture_runs_pw_record_unbuffered_only_when_told_to() {
+        assert_eq!(
+            args(&pw_record_command(true)),
+            ["stdbuf", "-o0", "pw-record"]
+        );
+        assert_eq!(args(&pw_record_command(false)), ["pw-record"]);
+    }
+
+    #[test]
+    fn a_clean_stdbuf_with_pw_record_unbuffers_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        script(dir.path(), "stdbuf", "exit 0");
+        script(dir.path(), "pw-record", "exit 0");
+        assert!(usable(dir.path()));
+    }
+
+    #[test]
+    fn a_broken_or_incomplete_stdbuf_falls_back_to_plain_pw_record() {
+        let dir = tempfile::tempdir().unwrap();
+        // pw-record missing: stdbuf would only fail later, at every Recording.
+        script(dir.path(), "stdbuf", "exit 0");
+        assert!(!usable(dir.path()));
+
+        script(dir.path(), "pw-record", "exit 0");
+        // The preload library loads with a warning: pw-record's stderr would
+        // turn every graceful stop into a failure.
+        script(
+            dir.path(),
+            "stdbuf",
+            "echo \"ERROR: ld.so: object 'libstdbuf.so' cannot be preloaded: ignored.\" >&2",
+        );
+        assert!(!usable(dir.path()));
+
+        // The library is missing: GNU stdbuf exits 125.
+        script(dir.path(), "stdbuf", "exit 125");
+        assert!(!usable(dir.path()));
+
+        assert!(!stdbuf_usable(None, Duration::from_secs(5)));
+        let empty = tempfile::tempdir().unwrap();
+        assert!(!usable(empty.path()));
     }
 }
