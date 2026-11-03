@@ -249,6 +249,28 @@ impl<R: Read> Read for WavHeaderStripper<R> {
     }
 }
 
+/// The pw-record spawn, unbuffered when `stdbuf` is on `PATH`.
+///
+/// pw-record writes PCM through stdio, and stdio fully buffers a pipe: 4 KiB,
+/// which is 128 ms of 16 kHz s16 audio. Reads then arrive in 128 ms bursts, so
+/// the Overlay's level meter (and the provider stream) advance in visible
+/// steps. `stdbuf -o0` turns that buffer off and the audio arrives at the
+/// node's own quantum, about every 20 ms. Measured on PipeWire 1.6.9: p90 read
+/// gap 128 ms buffered, 21 ms with `stdbuf -o0`; `--latency` alone does not
+/// change it. Without `stdbuf` (coreutils), capture still works, only bursty.
+pub(super) fn pw_record_command(path: Option<&std::ffi::OsStr>) -> std::process::Command {
+    if path
+        .and_then(|path| super::readiness::resolve_on_path(path, "stdbuf"))
+        .is_some()
+    {
+        let mut command = restricted_command("stdbuf");
+        command.args(["-o0", "pw-record"]);
+        command
+    } else {
+        restricted_command("pw-record")
+    }
+}
+
 impl AudioCapture for PipeWireCapture {
     fn begin(&mut self, _recording_id: u64) -> Result<Box<dyn ActiveCapture>, BoundaryError> {
         let maximum = resolve_recording_maximum(std::env::var("VOISU_RECORDING_DEADLINE_MS").ok());
@@ -259,7 +281,7 @@ impl AudioCapture for PipeWireCapture {
         // Unavailable probe still takes the WAV path — the spawn below fails
         // cleanly if pw-record is truly missing.
         let raw_supported = pw_record_capture_mode() == PwRecordProbe::Raw;
-        let mut command = restricted_command("pw-record");
+        let mut command = pw_record_command(std::env::var_os("PATH").as_deref());
         if raw_supported {
             command.arg("--raw");
         }
@@ -680,5 +702,39 @@ fn process_diagnostic(prefix: &str, stderr: &[u8]) -> String {
         prefix.to_owned()
     } else {
         format!("{prefix}: {detail}")
+    }
+}
+
+#[cfg(test)]
+mod pw_record_command_tests {
+    use super::pw_record_command;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn args(command: &std::process::Command) -> Vec<String> {
+        std::iter::once(command.get_program())
+            .chain(command.get_args())
+            .map(|part| part.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn capture_runs_pw_record_unbuffered_when_stdbuf_is_on_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let stdbuf = dir.path().join("stdbuf");
+        std::fs::write(&stdbuf, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&stdbuf, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let command = pw_record_command(Some(dir.path().as_os_str()));
+        assert_eq!(args(&command), ["stdbuf", "-o0", "pw-record"]);
+    }
+
+    #[test]
+    fn capture_falls_back_to_buffered_pw_record_without_stdbuf() {
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            args(&pw_record_command(Some(empty.path().as_os_str()))),
+            ["pw-record"]
+        );
+        assert_eq!(args(&pw_record_command(None)), ["pw-record"]);
     }
 }
