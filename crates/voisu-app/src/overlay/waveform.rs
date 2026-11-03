@@ -29,7 +29,8 @@ const RELEASE: f64 = 0.16;
 /// seconds of motion in one frame; it also bounds the per-call work.
 pub const MAX_FRAME_SECS: f64 = 0.25;
 /// Band levels are dB-scaled over this range (see `audio_level::Biquad::level`),
-/// and the meter reads the summed level on the same scale as Windows' RMS.
+/// and the meter reads the summed level on the same -60..0 dB range Windows
+/// meters its RMS on.
 const FLOOR_DB: f64 = -60.0;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -137,8 +138,10 @@ impl Waveform {
 
 /// One mic level, 0.0..=1.0, from a 20-band frame. Each band carries its own
 /// dB level over the -60..0 dBFS meter range; summing the band powers gives
-/// the frame's overall loudness, which maps back onto the same dB range —
-/// the scale the Windows overlay meters its RMS on.
+/// the frame's overall loudness, which maps back onto the same dB range.
+/// The range matches the Windows RMS meter, but the value is not identical:
+/// the bandpasses overlap, so any signal, a pure tone included, also counts
+/// in neighbouring bands and reads a few dB above its true RMS.
 pub fn level_from_bands(bands: &[u8; 20]) -> f64 {
     let power: f64 = bands
         .iter()
