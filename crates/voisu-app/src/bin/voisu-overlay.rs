@@ -18,7 +18,7 @@ use voisu_app::feedback::{
     select_feedback_backend,
 };
 use voisu_app::local_overlay::TriggerRepeatLatch;
-use voisu_app::overlay::waveform::{Waveform, level_from_frames};
+use voisu_app::overlay::waveform::{Waveform, poll_target};
 use voisu_app::overlay::{
     LIMIT_WARNING_CLASS, LevelPollAction, LevelPollLatch, LimitWarning, LimitWarningLatch,
     NoSpeechNotifyLatch, ObservedSignal, OverlayPhase, OverlayView, PresentationController,
@@ -1093,19 +1093,13 @@ impl LevelWorker {
         thread::spawn(move || {
             let mut cursor = 0_u64;
             while !thread_stop.load(Ordering::Relaxed) {
-                let target = match read_levels(cursor, Instant::now() + LEVEL_POLL_DEADLINE) {
-                    Some(frames) => {
-                        if let Some(last) = frames.last() {
-                            cursor = last.seq;
-                        }
-                        // No new frames: the current target holds.
-                        level_from_frames(&frames)
-                    }
-                    // Isolation rule: a failed Level poll only decays the
-                    // bars. Daemon liveness belongs to the status poll alone.
-                    None => Some(0.0),
-                };
-                if let Some(target) = target {
+                let poll = read_levels(cursor, Instant::now() + LEVEL_POLL_DEADLINE);
+                if let Some(last) = poll.as_ref().and_then(|frames| frames.last()) {
+                    cursor = last.seq;
+                }
+                // Isolation rule: a failed Level poll only decays the bars.
+                // Daemon liveness belongs to the status poll alone.
+                if let Some(target) = poll_target(poll.as_deref()) {
                     *thread_latest.lock().unwrap() = Some(target);
                 }
                 thread::sleep(LEVEL_POLL_PERIOD);

@@ -154,14 +154,19 @@ pub fn level_from_bands(bands: &[u8; 20]) -> f64 {
     ((10.0 * power.log10() - FLOOR_DB) / -FLOOR_DB).clamp(0.0, 1.0)
 }
 
-/// The target for one Level poll: the loudest of the frames it returned, so
-/// a peak that arrived between two polls still reaches the meter. `None` when
-/// the poll brought no new frames and the current target should hold.
-pub fn level_from_frames(frames: &[LevelFrame]) -> Option<f64> {
-    frames
-        .iter()
-        .map(|frame| level_from_bands(&frame.bands))
-        .reduce(f64::max)
+/// The target one Level poll publishes. A poll that returned frames targets
+/// the loudest of them, so a peak that arrived between two polls still reaches
+/// the meter. A poll that returned no new frames publishes nothing, and the
+/// current target holds. A failed poll (`None`) targets silence: the bars ease
+/// down rather than freeze, and daemon liveness stays with the status poll.
+pub fn poll_target(poll: Option<&[LevelFrame]>) -> Option<f64> {
+    match poll {
+        None => Some(0.0),
+        Some(frames) => frames
+            .iter()
+            .map(|frame| level_from_bands(&frame.bands))
+            .reduce(f64::max),
+    }
 }
 
 #[cfg(test)]
@@ -334,11 +339,12 @@ mod tests {
     }
 
     #[test]
-    fn a_poll_keeps_the_loudest_frame_and_an_empty_poll_holds() {
+    fn a_poll_keeps_the_loudest_frame_an_empty_poll_holds_and_a_failure_is_silence() {
         let quiet = frame([40; 20]);
         let loud = frame([220; 20]);
-        let level = level_from_frames(&[quiet, loud, quiet]).unwrap();
+        let level = poll_target(Some(&[quiet, loud, quiet])).unwrap();
         assert!((level - level_from_bands(&loud.bands)).abs() < EPS);
-        assert_eq!(level_from_frames(&[]), None);
+        assert_eq!(poll_target(Some(&[])), None);
+        assert_eq!(poll_target(None), Some(0.0));
     }
 }

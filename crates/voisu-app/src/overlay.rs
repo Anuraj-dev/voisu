@@ -1117,7 +1117,7 @@ mod tests {
         meter.set_target(0.8);
         meter.advance(0.2);
         let before = meter.slot_level(0);
-        meter.set_target(0.0);
+        meter.set_target(waveform::poll_target(None).expect("a failed poll publishes a target"));
         meter.advance(0.05);
         assert!(meter.slot_level(0) < before && meter.slot_level(0) > 0.0);
         assert_eq!(
