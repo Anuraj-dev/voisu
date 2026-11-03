@@ -125,6 +125,7 @@ install -D -m 0644 packaging/voisu-overlay.service %{buildroot}%{_userunitdir}/v
 # Desktop entry makes a resolvable app_id (voisu) available to portal
 # backends that support it; the stable session token is the primary fix.
 install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/voisu.desktop
+install -D -m 0644 packaging/icons/voisu.svg %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/voisu.svg
 
 %post
 %systemd_user_post voisu.service
@@ -157,6 +158,7 @@ install -D -m 0644 packaging/voisu.desktop %{buildroot}%{_datadir}/applications/
 %{_bindir}/voisu-daemon
 %{_userunitdir}/voisu.service
 %{_datadir}/applications/voisu.desktop
+%{_datadir}/icons/hicolor/scalable/apps/voisu.svg
 
 %files overlay
 %{_bindir}/voisu-overlay

@@ -67,6 +67,7 @@ assets = [
     ["../../packaging/voisu.service", "usr/lib/systemd/user/", "644"],
     ["../../packaging/voisu-overlay.service", "usr/lib/systemd/user/", "644"],
     ["../../packaging/voisu.desktop", "usr/share/applications/", "644"],
+    ["../../packaging/icons/voisu.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
     ["../../packaging/gnome-shell/overlay@voisu.app/metadata.json", "usr/share/gnome-shell/extensions/overlay@voisu.app/metadata.json", "644"],
     ["../../packaging/gnome-shell/overlay@voisu.app/extension.js", "usr/share/gnome-shell/extensions/overlay@voisu.app/extension.js", "644"],
     ["../../packaging/gnome-shell/overlay@voisu.app/state.mjs", "usr/share/gnome-shell/extensions/overlay@voisu.app/state.mjs", "644"],

@@ -121,6 +121,7 @@ jobs:
           install -m644 packaging/voisu.service         "$troot/voisu.service"
           install -m644 packaging/voisu-overlay.service "$troot/voisu-overlay.service"
           install -m644 packaging/voisu.desktop         "$troot/voisu.desktop"
+          install -m644 packaging/icons/voisu.svg       "$troot/voisu.svg"
           install -m644 LICENSE                         "$troot/LICENSE"
           install -m644 packaging/aur/voisu/LICENSE.ring            "$troot/ring/LICENSE"
           install -m644 packaging/aur/voisu/LICENSE.ring-BoringSSL  "$troot/ring/LICENSE-BoringSSL"
