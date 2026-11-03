@@ -48,7 +48,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "VOISU_UPDATER_PUBKEY_UNSET",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ4OEMzODc5RUZCRTc2M0UKUldRK2RyN3ZlVGlNU0M2cEZWcHRhY3BpVUZMTXgvYm4zVXhSQ1VEckdwQ2QrL3FlalI1NlhhY3IK",
       "endpoints": [
         "https://github.com/Anuraj-dev/voisu/releases/latest/download/latest.json"
       ],
