@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Troubleshooting — Voisu docs</title>
+<meta name="description" content="Fix Voisu when a paste doesn&#x27;t land, admin windows, Wayland portal permissions, SmartScreen, microphone and key problems.">
+<link rel="canonical" href="https://anuraj-dev.github.io/voisu/docs/troubleshooting.html">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0e0f12">
+<meta name="theme-color" media="(prefers-color-scheme: light)" content="#f5f4ef">
+<link rel="icon" type="image/png" sizes="32x32" href="../assets/favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="../assets/favicon-16.png">
+<link rel="apple-touch-icon" href="../assets/apple-touch-icon.png">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Voisu">
+<meta property="og:title" content="Troubleshooting — Voisu docs">
+<meta property="og:description" content="Fix Voisu when a paste doesn&#x27;t land, admin windows, Wayland portal permissions, SmartScreen, microphone and key problems.">
+<meta property="og:url" content="https://anuraj-dev.github.io/voisu/docs/troubleshooting.html">
+<meta property="og:image" content="https://anuraj-dev.github.io/voisu/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Voisu: Hold a key, speak. Your words land where you're typing.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@400..800&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<script>document.documentElement.classList.add("js")</script>
+<script src="../assets/site.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../" aria-label="Voisu home">
+      <img class="mark" src="../assets/logo.svg" alt="" width="32" height="32">
+      <span>voisu</span>
+    </a>
+    <nav aria-label="Main">
+      <ul class="site-nav">
+        <li><a href="../#install">Install</a></li>
+        <li><a href="./" aria-current="page">Docs</a></li>
+        <li><a class="gh" href="https://github.com/Anuraj-dev/voisu"><svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg><span>GitHub</span></a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap docs">
+  <nav class="docs-nav" aria-labelledby="docs-nav-title">
+    <h2 id="docs-nav-title">Docs</h2>
+    <ul>
+        <li><a href="./">Overview</a></li>
+        <li><a href="getting-started.html">Getting started</a></li>
+        <li><a href="using.html">Using Voisu</a></li>
+        <li><a href="providers.html">Providers &amp; API keys</a></li>
+        <li><a href="settings.html">Settings</a></li>
+        <li><a href="troubleshooting.html" aria-current="page">Troubleshooting</a></li>
+        <li><a href="privacy.html">Privacy</a></li>
+        <li><a href="updating.html">Updating &amp; uninstalling</a></li>
+    </ul>
+  </nav>
+
+  <main id="main" class="doc">
+<h1>Troubleshooting</h1>
+<p class="lead">Most problems are one of a handful of things: the paste couldn't land, the desktop hasn't granted a permission, or a key or microphone isn't set up. Start with the message the capsule showed you.</p>
+
+<div class="callout tip">
+  <p><strong>On Linux, run <code>voisu doctor</code> first.</strong> It checks the daemon, the shortcut and RemoteDesktop portals, the clipboard and your keys, and tells you what to do about anything that fails. <code>voisu doctor --verbose</code> shows the reasoning behind each check.</p>
+</div>
+
+<nav class="toc" aria-label="On this page">
+  <a href="#paste">The paste didn't land</a>
+  <a href="#admin">Admin windows</a>
+  <a href="#mic">Microphone</a>
+  <a href="#keys">Keys</a>
+  <a href="#smartscreen">SmartScreen</a>
+  <a href="#trigger">Trigger Key does nothing</a>
+  <a href="#portal">Wayland portal permissions</a>
+  <a href="#not-running">Not running after login</a>
+  <a href="#report">Reporting a bug</a>
+</nav>
+
+<h2 id="paste">The paste didn't land</h2>
+<p>Your words are kept either way. On Windows, copy them from <strong>Settings… → Last transcript</strong>. On Linux they're on your clipboard.</p>
+<div class="table-scroll">
+<table>
+  <thead><tr><th>Windows message</th><th>What it means</th></tr></thead>
+  <tbody>
+    <tr><td data-label="Windows message">Transcript is on your clipboard — press Ctrl+V</td><td data-label="What it means">Voisu pressed paste but the app never read the clipboard. Some apps paste slowly or ignore synthetic keys; paste it yourself.</td></tr>
+    <tr><td data-label="Windows message">Can't type into an admin window</td><td data-label="What it means">See <a href="#admin">Admin windows</a>.</td></tr>
+    <tr><td data-label="Windows message">Click into another app first</td><td data-label="What it means">The Recording started while a Voisu window had focus. Click where you want the text, then dictate.</td></tr>
+    <tr><td data-label="Windows message">The window you were typing in closed</td><td data-label="What it means">The window that had focus when you started is gone. Copy the Transcript from Last transcript.</td></tr>
+    <tr><td data-label="Windows message">Couldn't return to your window</td><td data-label="What it means">Windows wouldn't bring the original window back to the front.</td></tr>
+    <tr><td data-label="Windows message">Another app replaced the clipboard; nothing pasted</td><td data-label="What it means">A clipboard manager or another app wrote to the clipboard mid-paste. Copy from Last transcript and try again.</td></tr>
+  </tbody>
+</table>
+</div>
+<p>Use <strong>Test paste (in 3 s)</strong> in the tray to check one app on its own: click into it within three seconds and watch whether the sample text appears.</p>
+<p><strong>Linux terminals.</strong> On GNOME, Voisu pastes by sending <kbd>Ctrl</kbd>&nbsp;<kbd>V</kbd>. A terminal that pastes with <kbd>Ctrl</kbd>&nbsp;<kbd>Shift</kbd>&nbsp;<kbd>V</kbd> receives nothing, but the Transcript is on the clipboard, so paste it yourself.</p>
+<p><strong>Linux, GNOME in <code>guarded</code> mode.</strong> GNOME doesn't let Voisu confirm which window has focus, so guarded Delivery leaves the Transcript on the clipboard on purpose. Switch with <code>voisu delivery type</code> if you'd rather it paste into whatever has focus.</p>
+
+<h2 id="admin">Admin windows (Windows)</h2>
+<p>Windows doesn't let an ordinary app type into a window running as administrator, such as an elevated terminal, Task Manager or an installer. It drops the keystrokes silently, so Voisu checks first and shows <em>Can't type into an admin window</em> instead of pretending it worked.</p>
+<p>Copy the Transcript from <strong>Last transcript</strong> and paste it yourself, or run the target app without elevation.</p>
+
+<h2 id="mic">Microphone (Windows)</h2>
+<ul>
+  <li><strong>No microphone found.</strong> Connect one, or choose a default input device in <em>Settings → System → Sound</em>.</li>
+  <li><strong>Windows is blocking the microphone.</strong> Open <em>Settings → Privacy &amp; security → Microphone</em> and turn on <em>Let desktop apps access your microphone</em>.</li>
+  <li><strong>The microphone stopped working.</strong> The device went away mid-Recording, for example a headset that disconnected. Reconnect it and try again.</li>
+</ul>
+
+<h2 id="keys">Keys</h2>
+<ul>
+  <li><strong>“Add your Groq and Deepgram keys to start dictating.”</strong> Windows needs both keys. Open <strong>Settings…</strong> and add them.</li>
+  <li><strong>A key fails validation.</strong> Check you copied the whole key, and that it's still active in the provider's console.</li>
+  <li><strong>Linux:</strong> <code>voisu auth verify groq</code> or <code>voisu auth verify deepgram</code> checks a saved key with its provider.</li>
+</ul>
+
+<h2 id="smartscreen">SmartScreen (Windows)</h2>
+<p>The installer isn't code-signed yet, so Microsoft Defender SmartScreen may show “Windows protected your PC” the first time you run it. Choose <strong>More info</strong>, then <strong>Run anyway</strong>. The installer comes from the project's <a href="https://github.com/Anuraj-dev/voisu/releases">GitHub releases</a>, and updates after that are signature-checked before they install.</p>
+
+<h2 id="trigger">The Trigger Key does nothing (Linux)</h2>
+<ul>
+  <li>Check the daemon is running: <code>voisu status</code>, or <code>systemctl --user status voisu.service</code>.</li>
+  <li>Check which key was approved: <code>voisu shortcut</code>.</li>
+  <li>On KDE Plasma and GNOME, the shortcut is chosen in a desktop dialog the first time the daemon starts. If you dismissed it, restart the daemon with <code>systemctl --user restart voisu.service</code> to see it again.</li>
+  <li>On Hyprland, run <code>voisu setup</code> again to reinstall the bind.</li>
+  <li>On X11 (Cinnamon, Linux Mint, Ubuntu on X11) there is no shortcut dialog. Bind <code>voisu toggle</code> under <em>Keyboard → Shortcuts → Custom Shortcuts</em>.</li>
+  <li><code>voisu doctor</code> reports a portal that has no usable global-shortcuts support.</li>
+</ul>
+
+<h2 id="portal">Wayland portal permissions (Linux)</h2>
+<p>On Wayland, Voisu asks the desktop for permission through portals instead of reading your keyboard directly. It never needs root or <code>uinput</code> access.</p>
+<ul>
+  <li><strong>Global Shortcuts</strong> gives Voisu its Trigger Key.</li>
+  <li><strong>Remote Desktop</strong> lets Voisu press paste for you in <code>type</code> mode. Your desktop asks once and Voisu remembers the grant.</li>
+</ul>
+<p>If you refused the Remote Desktop prompt, or want to be asked again, reset the grant Voisu saved:</p>
+<div class="code"><pre><span class="p">$ </span>rm ~/.local/state/voisu/remote-desktop.restore-token
+<span class="p">$ </span>systemctl --user restart voisu.service</pre></div>
+<p>This clears only Voisu's own saved grant. A permission your desktop remembers by itself isn't cleared by this.</p>
+<p>On GNOME, a few <code>voisu doctor</code> results are expected: <em>Paste action</em> and <em>Paste backend</em> show SKIP (they're Hyprland checks), and <em>Focus guard</em> shows WARN because GNOME can't report the focused window. The capsule is the <code>overlay@voisu.app</code> Shell extension there, so an inactive <code>voisu-overlay.service</code> is normal.</p>
+
+<h2 id="not-running">Voisu isn't running after login (Linux)</h2>
+<p>The daemon waits up to 20 seconds for your desktop session to come up. If <code>voisu service status</code> still shows it inactive or failed, start it once the desktop is ready and check its log:</p>
+<div class="code"><pre><span class="p">$ </span>voisu service restart
+<span class="p">$ </span>journalctl --user -u voisu.service</pre></div>
+<p>On Windows, turn on <strong>Start at login</strong> in the tray menu or settings window.</p>
+
+<h2 id="report">Reporting a bug</h2>
+<p><a href="https://github.com/Anuraj-dev/voisu/issues">Open an issue on GitHub</a> with your OS, desktop and what the capsule said. On Linux, <code>voisu history</code> lists recent Recordings with their IDs, and <code>voisu export &lt;id&gt;</code> writes a redacted export of one you can attach. On Windows, the log folder is shown at the bottom of the settings window.</p>
+<p>Nothing is sent anywhere unless you attach it yourself.</p>
+
+    <nav class="pager" aria-label="Docs pages">
+      <a class="prev" href="settings.html"><small>Previous</small>Settings</a><a class="next" href="privacy.html"><small>Next</small>Privacy</a>
+    </nav>
+  </main>
+</div>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="foot-grid">
+      <div class="foot-brand">
+        <a class="brand" href="../"><img class="mark" src="../assets/logo.svg" alt="" width="32" height="32"><span>voisu</span></a>
+        <p>Voice dictation for Linux and Windows. MIT licensed. © 2026 Anuraj Jit Saikia.</p>
+      </div>
+      <div>
+        <h2>Docs</h2>
+        <ul>
+          <li><a href="getting-started.html">Getting started</a></li>
+          <li><a href="using.html">Using Voisu</a></li>
+          <li><a href="providers.html">Providers &amp; API keys</a></li>
+          <li><a href="troubleshooting.html">Troubleshooting</a></li>
+          <li><a href="privacy.html">Privacy</a></li>
+        </ul>
+      </div>
+      <div>
+        <h2>Project</h2>
+        <ul>
+          <li><a href="https://github.com/Anuraj-dev/voisu">Source on GitHub</a></li>
+          <li><a href="https://github.com/Anuraj-dev/voisu/releases">Releases</a></li>
+          <li><a href="https://github.com/Anuraj-dev/voisu/issues">Report a problem</a></li>
+          <li><a href="https://github.com/Anuraj-dev/voisu/blob/main/LICENSE">MIT License</a></li>
+        </ul>
+      </div>
+    </div>
+    <p class="foot-key">apt signing key · 4149 EE38 68B3 6B60 0759 2966 D08B CFDC 3412 5B28</p>
+  </div>
+</footer>
+</body>
+</html>

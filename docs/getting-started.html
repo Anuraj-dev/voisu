@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Getting started — Voisu docs</title>
+<meta name="description" content="Install Voisu on Windows, Fedora, Arch or Debian/Ubuntu, add your API keys and make your first Recording.">
+<link rel="canonical" href="https://anuraj-dev.github.io/voisu/docs/getting-started.html">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0e0f12">
+<meta name="theme-color" media="(prefers-color-scheme: light)" content="#f5f4ef">
+<link rel="icon" type="image/png" sizes="32x32" href="../assets/favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="../assets/favicon-16.png">
+<link rel="apple-touch-icon" href="../assets/apple-touch-icon.png">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Voisu">
+<meta property="og:title" content="Getting started — Voisu docs">
+<meta property="og:description" content="Install Voisu on Windows, Fedora, Arch or Debian/Ubuntu, add your API keys and make your first Recording.">
+<meta property="og:url" content="https://anuraj-dev.github.io/voisu/docs/getting-started.html">
+<meta property="og:image" content="https://anuraj-dev.github.io/voisu/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Voisu: Hold a key, speak. Your words land where you're typing.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@400..800&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<script>document.documentElement.classList.add("js")</script>
+<script src="../assets/site.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../" aria-label="Voisu home">
+      <img class="mark" src="../assets/logo.svg" alt="" width="32" height="32">
+      <span>voisu</span>
+    </a>
+    <nav aria-label="Main">
+      <ul class="site-nav">
+        <li><a href="../#install">Install</a></li>
+        <li><a href="./" aria-current="page">Docs</a></li>
+        <li><a class="gh" href="https://github.com/Anuraj-dev/voisu"><svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg><span>GitHub</span></a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap docs">
+  <nav class="docs-nav" aria-labelledby="docs-nav-title">
+    <h2 id="docs-nav-title">Docs</h2>
+    <ul>
+        <li><a href="./">Overview</a></li>
+        <li><a href="getting-started.html" aria-current="page">Getting started</a></li>
+        <li><a href="using.html">Using Voisu</a></li>
+        <li><a href="providers.html">Providers &amp; API keys</a></li>
+        <li><a href="settings.html">Settings</a></li>
+        <li><a href="troubleshooting.html">Troubleshooting</a></li>
+        <li><a href="privacy.html">Privacy</a></li>
+        <li><a href="updating.html">Updating &amp; uninstalling</a></li>
+    </ul>
+  </nav>
+
+  <main id="main" class="doc">
+<h1>Getting started</h1>
+<p class="lead">Install Voisu, give it your Deepgram and Groq API keys, and make your first Recording. It takes a few minutes on either platform.</p>
+
+<p>Before you start, create an API key with each provider: <a href="https://console.groq.com/keys">Groq</a> and <a href="https://console.deepgram.com">Deepgram</a>. <a href="providers.html">Providers &amp; API keys</a> explains what each one does.</p>
+
+<nav class="toc" aria-label="On this page">
+  <a href="#windows">Windows</a>
+  <a href="#linux">Linux</a>
+  <a href="#fedora">Fedora</a>
+  <a href="#arch">Arch</a>
+  <a href="#debian">Debian / Ubuntu</a>
+  <a href="#other">Other desktops</a>
+</nav>
+
+<h2 id="windows">Windows</h2>
+<p class="meta">Windows 10 / 11 · x64 · installs for your user, no admin needed</p>
+<ol class="steps">
+  <li>
+    <p><strong>Download the installer.</strong></p>
+    <p><a class="btn primary" href="https://github.com/Anuraj-dev/voisu/releases/latest/download/Voisu-Setup-x64.exe"><svg viewBox="0 0 16 16" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" d="M8 2v8.5M4.5 7 8 10.5 11.5 7M3 13.5h10"/></svg><span>Download for Windows <small>Voisu-Setup-x64.exe</small></span></a></p>
+  </li>
+  <li>
+    <p><strong>Run it.</strong> The installer isn't code-signed yet, so SmartScreen may warn on first run: choose <strong>More info</strong> → <strong>Run anyway</strong>. Voisu installs for your user account only.</p>
+  </li>
+  <li>
+    <p><strong>Add your keys.</strong> Voisu opens its settings on first launch. Paste your Groq and Deepgram API keys and choose <strong>Validate &amp; save</strong>. Voisu checks each key with its provider before saving it. Both keys are required.</p>
+  </li>
+  <li>
+    <p><strong>Dictate.</strong> Click into any text field, hold <kbd>Ctrl</kbd>&nbsp;<kbd>Win</kbd>, speak, and release. The capsule appears while you talk, and your words are pasted where your cursor was.</p>
+  </li>
+</ol>
+<p>Voisu now lives in the tray and turns on <strong>Start at login</strong> after your first successful setup. You can close the settings window; it reopens from the tray's <strong>Settings…</strong> item.</p>
+
+<h2 id="linux">Linux</h2>
+<p>Voisu runs as a systemd <em>user</em> service, so nothing needs root after the package is installed. Fedora KDE Plasma on Wayland is the primary target; GNOME, Hyprland and X11 desktops work with the differences noted below.</p>
+
+<h3 id="fedora">Fedora</h3>
+<div class="code"><pre><span class="p">$ </span>sudo dnf copr enable anuraj-dev/voisu
+<span class="p">$ </span>sudo dnf install voisu
+<span class="c"># optional on-screen overlay:</span>
+<span class="p">$ </span>sudo dnf install voisu-overlay</pre></div>
+<p>Enable the daemon for your user and run the setup wizard:</p>
+<div class="code"><pre><span class="p">$ </span>systemctl --user daemon-reload
+<span class="p">$ </span>systemctl --user enable --now voisu.service
+<span class="p">$ </span>voisu setup</pre></div>
+<p>If you installed the overlay package, turn it on too:</p>
+<div class="code"><pre><span class="p">$ </span>systemctl --user enable --now voisu-overlay.service</pre></div>
+<p>On KDE Plasma and GNOME, your desktop shows a dialog the first time the daemon starts. Choose the Trigger Key there; the choice persists.</p>
+
+<h3 id="arch">Arch</h3>
+<div class="code"><pre><span class="p">$ </span>yay -S voisu-bin</pre></div>
+<p>To build from source instead, install <code>voisu</code>. The two packages conflict, so pick one. Then run:</p>
+<div class="code"><pre><span class="p">$ </span>voisu setup</pre></div>
+<p>On Hyprland there is no shortcut dialog, so setup binds the Trigger Key for you: <kbd>Caps Lock</kbd> if you accept the default, or <kbd>Right Alt</kbd> if you decline or Caps Lock is already bound. It also saves your keys and starts Voisu's services. Using Caps Lock as the Trigger Key stops it toggling caps on that key.</p>
+
+<h3 id="debian">Debian / Ubuntu</h3>
+<p class="meta">Ubuntu 26.04 LTS · GNOME Wayland · amd64</p>
+<div class="code"><pre><span class="c"># 1. Add Voisu's signing key.</span>
+<span class="p">$ </span>sudo install -d -m 0755 /etc/apt/keyrings
+<span class="p">$ </span>curl -fsSL https://anuraj-dev.github.io/voisu/voisu-archive-keyring.asc \
+    | sudo tee /etc/apt/keyrings/voisu-archive-keyring.asc &gt;/dev/null
+
+<span class="c"># 2. Add the repository.</span>
+<span class="p">$ </span>echo 'deb [signed-by=/etc/apt/keyrings/voisu-archive-keyring.asc arch=amd64] https://anuraj-dev.github.io/voisu stable main' \
+    | sudo tee /etc/apt/sources.list.d/voisu.list
+
+<span class="c"># 3. Install.</span>
+<span class="p">$ </span>sudo apt-get update &amp;&amp; sudo apt-get install -y voisu</pre></div>
+<p class="fp"><b>Signing key fingerprint</b><br>4149 EE38 68B3 6B60 0759 2966 D08B CFDC 3412 5B28</p>
+<details class="more">
+  <summary>Verify the key first</summary>
+  <div class="code"><pre><span class="c"># Fetch the key to a temp file and check its fingerprint before trusting it.</span>
+<span class="p">$ </span>EXPECT=4149EE3868B36B6007592966D08BCFDC34125B28
+<span class="p">$ </span>curl -fsSL https://anuraj-dev.github.io/voisu/voisu-archive-keyring.asc -o /tmp/voisu.asc
+<span class="p">$ </span>gpg --show-keys --with-colons /tmp/voisu.asc \
+    | awk -F: '$1=="fpr"{print $10; exit}'
+<span class="c"># The printed fingerprint must equal $EXPECT before you add the key above.</span></pre></div>
+</details>
+<p>Then run the wizard:</p>
+<div class="code"><pre><span class="p">$ </span>voisu setup</pre></div>
+<p>Setup asks for your API keys, enables the daemon and the native GNOME capsule, and uses <kbd>Ctrl</kbd>&nbsp;<kbd>Space</kbd> as the Trigger Key by default. If it asks, log out and back in, or reboot.</p>
+
+<h3 id="other">Other desktops (X11, Cinnamon)</h3>
+<p>X11 sessions have no shortcut portal, so bind the Trigger Key yourself. In <em>System Settings → Keyboard → Shortcuts → Custom Shortcuts</em>, add a shortcut that runs:</p>
+<div class="code"><pre><span class="p">$ </span>voisu toggle</pre></div>
+<p>On X11 Voisu uses <code>xclip</code> for the clipboard, and its feedback arrives as desktop notifications instead of the capsule.</p>
+
+<h3 id="first">Your first Recording</h3>
+<ol class="steps">
+  <li><p>Click into a text field: an editor, a chat box, a browser address bar.</p></li>
+  <li><p>Press your Trigger Key. The capsule appears and shows your voice.</p></li>
+  <li><p>Say a sentence, then press the Trigger Key again.</p></li>
+  <li><p>The capsule switches to Processing, then the Transcript lands at your cursor.</p></li>
+</ol>
+<p>If nothing happens, run <code>voisu doctor</code>. It checks the daemon, the shortcut portal, Delivery and your keys, and <code>voisu doctor --verbose</code> explains each result. <a href="troubleshooting.html">Troubleshooting</a> covers the common cases.</p>
+
+    <nav class="pager" aria-label="Docs pages">
+      <a class="prev" href="./"><small>Previous</small>Overview</a><a class="next" href="using.html"><small>Next</small>Using Voisu</a>
+    </nav>
+  </main>
+</div>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="foot-grid">
+      <div class="foot-brand">
+        <a class="brand" href="../"><img class="mark" src="../assets/logo.svg" alt="" width="32" height="32"><span>voisu</span></a>
+        <p>Voice dictation for Linux and Windows. MIT licensed. © 2026 Anuraj Jit Saikia.</p>
+      </div>
+      <div>
+        <h2>Docs</h2>
+        <ul>
+          <li><a href="getting-started.html">Getting started</a></li>
+          <li><a href="using.html">Using Voisu</a></li>
+          <li><a href="providers.html">Providers &amp; API keys</a></li>
+          <li><a href="troubleshooting.html">Troubleshooting</a></li>
+          <li><a href="privacy.html">Privacy</a></li>
+        </ul>
+      </div>
+      <div>
+        <h2>Project</h2>
+        <ul>
+          <li><a href="https://github.com/Anuraj-dev/voisu">Source on GitHub</a></li>
+          <li><a href="https://github.com/Anuraj-dev/voisu/releases">Releases</a></li>
+          <li><a href="https://github.com/Anuraj-dev/voisu/issues">Report a problem</a></li>
+          <li><a href="https://github.com/Anuraj-dev/voisu/blob/main/LICENSE">MIT License</a></li>
+        </ul>
+      </div>
+    </div>
+    <p class="foot-key">apt signing key · 4149 EE38 68B3 6B60 0759 2966 D08B CFDC 3412 5B28</p>
+  </div>
+</footer>
+</body>
+</html>

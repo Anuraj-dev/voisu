@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Providers &amp; API keys — Voisu docs</title>
+<meta name="description" content="What Deepgram and Groq do in Voisu, where to get keys, and where Voisu stores them.">
+<link rel="canonical" href="https://anuraj-dev.github.io/voisu/docs/providers.html">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0e0f12">
+<meta name="theme-color" media="(prefers-color-scheme: light)" content="#f5f4ef">
+<link rel="icon" type="image/png" sizes="32x32" href="../assets/favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="../assets/favicon-16.png">
+<link rel="apple-touch-icon" href="../assets/apple-touch-icon.png">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Voisu">
+<meta property="og:title" content="Providers &amp; API keys — Voisu docs">
+<meta property="og:description" content="What Deepgram and Groq do in Voisu, where to get keys, and where Voisu stores them.">
+<meta property="og:url" content="https://anuraj-dev.github.io/voisu/docs/providers.html">
+<meta property="og:image" content="https://anuraj-dev.github.io/voisu/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Voisu: Hold a key, speak. Your words land where you're typing.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@400..800&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<script>document.documentElement.classList.add("js")</script>
+<script src="../assets/site.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../" aria-label="Voisu home">
+      <img class="mark" src="../assets/logo.svg" alt="" width="32" height="32">
+      <span>voisu</span>
+    </a>
+    <nav aria-label="Main">
+      <ul class="site-nav">
+        <li><a href="../#install">Install</a></li>
+        <li><a href="./" aria-current="page">Docs</a></li>
+        <li><a class="gh" href="https://github.com/Anuraj-dev/voisu"><svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg><span>GitHub</span></a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap docs">
+  <nav class="docs-nav" aria-labelledby="docs-nav-title">
+    <h2 id="docs-nav-title">Docs</h2>
+    <ul>
+        <li><a href="./">Overview</a></li>
+        <li><a href="getting-started.html">Getting started</a></li>
+        <li><a href="using.html">Using Voisu</a></li>
+        <li><a href="providers.html" aria-current="page">Providers &amp; API keys</a></li>
+        <li><a href="settings.html">Settings</a></li>
+        <li><a href="troubleshooting.html">Troubleshooting</a></li>
+        <li><a href="privacy.html">Privacy</a></li>
+        <li><a href="updating.html">Updating &amp; uninstalling</a></li>
+    </ul>
+  </nav>
+
+  <main id="main" class="doc">
+<h1>Providers &amp; API keys</h1>
+<p class="lead">Voisu has no account and no server of its own. It sends your audio straight to the speech providers you configure, with your own API keys, and you pay them directly for what you use.</p>
+
+<h2 id="why-two">Why two providers</h2>
+<ul class="state-list">
+  <li><span class="sw sw-rec"></span><strong>Deepgram</strong><span>Streams your audio while you talk and returns a live transcript.</span></li>
+  <li><span class="sw sw-proc"></span><strong>Groq</strong><span>Transcribes the whole Recording once you stop. Long Recordings are sent in overlapping pieces.</span></li>
+</ul>
+<p>Each gives Voisu a Source Transcript. Voisu reconciles the two into the one Transcript it delivers, so a dropped stream or a misheard word from one provider doesn't cost you the sentence. Groq's language model also helps with that reconciliation and formatting, so Groq receives the Source Transcript text as well as the audio.</p>
+<p>On Windows both keys are required. On Linux, Deepgram streaming can be switched off with <code>voisu deepgram off</code> (and back on with <code>voisu deepgram on</code>).</p>
+
+<h2 id="get-keys">Get your keys</h2>
+<ol class="steps">
+  <li><p><strong>Groq.</strong> Sign in to the <a href="https://console.groq.com/keys">Groq console</a>, open <em>API Keys</em> and create a key.</p></li>
+  <li><p><strong>Deepgram.</strong> Sign in to the <a href="https://console.deepgram.com">Deepgram console</a> and create an API key for your project.</p></li>
+</ol>
+<p>Check each provider's own site for current pricing and free allowances. Voisu doesn't add any charge of its own.</p>
+
+<h2 id="windows">Adding keys on Windows</h2>
+<ol class="steps">
+  <li><p>Open <strong>Settings…</strong> from the Voisu tray icon. It opens by itself on first launch.</p></li>
+  <li><p>Paste each key into its field. <strong>Show</strong> reveals what you pasted; <strong>Get a key</strong> opens the provider's console.</p></li>
+  <li><p>Choose <strong>Validate &amp; save</strong>. Voisu checks every new key with its provider and saves only when they all pass.</p></li>
+</ol>
+<p>Keys are stored in <strong>Windows Credential Manager</strong> under your user account, as <code>groq-api-key.Voisu</code> and <code>deepgram-api-key.Voisu</code>. Once saved, a field shows “Saved — leave blank to keep”. Paste a new key over it to replace one.</p>
+
+<h2 id="linux">Adding keys on Linux</h2>
+<p><code>voisu setup</code> asks for both keys and checks them. To change one later:</p>
+<div class="code"><pre><span class="p">$ </span>voisu auth set groq
+<span class="p">$ </span>voisu auth set deepgram
+<span class="c"># check a saved key with its provider:</span>
+<span class="p">$ </span>voisu auth verify groq</pre></div>
+<p><code>voisu auth set</code> reads the key from standard input, so it never appears in your shell history as an argument.</p>
+<p>Keys are stored in your desktop's keyring through the Secret Service (KWallet on KDE Plasma, GNOME Keyring on GNOME). If no Secret Service is available, Voisu falls back to a file only you can read, <code>~/.config/voisu/credentials</code>, and says so loudly when it writes there.</p>
+
+<div class="callout tip">
+  <p><strong>Keys never leave your machine</strong> except in requests to the provider they belong to, and they live in your OS keyring rather than in Voisu's settings files. See <a href="privacy.html">Privacy</a>.</p>
+</div>
+
+<h2 id="local">Local transcription on Linux</h2>
+<p>On Linux, <code>voisu setup</code> also offers <strong>Local</strong>: a model downloaded once, with your consent, that then runs offline with no provider keys. It's English only.</p>
+<ul>
+  <li>With an NVIDIA GPU that has at least 3.5 GB of memory: <code>distil-large-v3.5-int8</code> (about 2.98 GB download, MIT licence).</li>
+  <li>Any other computer: <code>parakeet-tdt-0.6b-v3</code> on the CPU (about 770 MB download, CC-BY-4.0 licence).</li>
+</ul>
+<p>Nothing downloads until you agree to the size and licence. Local never falls back to the cloud: if the model isn't ready, the Recording fails instead. Switch with <code>voisu mode local</code> or <code>voisu mode cloud</code>, and remove the model with <code>voisu local remove</code>.</p>
+
+    <nav class="pager" aria-label="Docs pages">
+      <a class="prev" href="using.html"><small>Previous</small>Using Voisu</a><a class="next" href="settings.html"><small>Next</small>Settings</a>
+    </nav>
+  </main>
+</div>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="foot-grid">
+      <div class="foot-brand">
+        <a class="brand" href="../"><img class="mark" src="../assets/logo.svg" alt="" width="32" height="32"><span>voisu</span></a>
+        <p>Voice dictation for Linux and Windows. MIT licensed. © 2026 Anuraj Jit Saikia.</p>
+      </div>
+      <div>
+        <h2>Docs</h2>
+        <ul>
+          <li><a href="getting-started.html">Getting started</a></li>
+          <li><a href="using.html">Using Voisu</a></li>
+          <li><a href="providers.html">Providers &amp; API keys</a></li>
+          <li><a href="troubleshooting.html">Troubleshooting</a></li>
+          <li><a href="privacy.html">Privacy</a></li>
+        </ul>
+      </div>
+      <div>
+        <h2>Project</h2>
+        <ul>
+          <li><a href="https://github.com/Anuraj-dev/voisu">Source on GitHub</a></li>
+          <li><a href="https://github.com/Anuraj-dev/voisu/releases">Releases</a></li>
+          <li><a href="https://github.com/Anuraj-dev/voisu/issues">Report a problem</a></li>
+          <li><a href="https://github.com/Anuraj-dev/voisu/blob/main/LICENSE">MIT License</a></li>
+        </ul>
+      </div>
+    </div>
+    <p class="foot-key">apt signing key · 4149 EE38 68B3 6B60 0759 2966 D08B CFDC 3412 5B28</p>
+  </div>
+</footer>
+</body>
+</html>

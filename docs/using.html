@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Using Voisu — Voisu docs</title>
+<meta name="description" content="Gestures on Windows and Linux, hands-free, the recording capsule, where the text goes and getting your last Transcript back.">
+<link rel="canonical" href="https://anuraj-dev.github.io/voisu/docs/using.html">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0e0f12">
+<meta name="theme-color" media="(prefers-color-scheme: light)" content="#f5f4ef">
+<link rel="icon" type="image/png" sizes="32x32" href="../assets/favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="../assets/favicon-16.png">
+<link rel="apple-touch-icon" href="../assets/apple-touch-icon.png">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Voisu">
+<meta property="og:title" content="Using Voisu — Voisu docs">
+<meta property="og:description" content="Gestures on Windows and Linux, hands-free, the recording capsule, where the text goes and getting your last Transcript back.">
+<meta property="og:url" content="https://anuraj-dev.github.io/voisu/docs/using.html">
+<meta property="og:image" content="https://anuraj-dev.github.io/voisu/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Voisu: Hold a key, speak. Your words land where you're typing.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@400..800&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<script>document.documentElement.classList.add("js")</script>
+<script src="../assets/site.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../" aria-label="Voisu home">
+      <img class="mark" src="../assets/logo.svg" alt="" width="32" height="32">
+      <span>voisu</span>
+    </a>
+    <nav aria-label="Main">
+      <ul class="site-nav">
+        <li><a href="../#install">Install</a></li>
+        <li><a href="./" aria-current="page">Docs</a></li>
+        <li><a class="gh" href="https://github.com/Anuraj-dev/voisu"><svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg><span>GitHub</span></a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap docs">
+  <nav class="docs-nav" aria-labelledby="docs-nav-title">
+    <h2 id="docs-nav-title">Docs</h2>
+    <ul>
+        <li><a href="./">Overview</a></li>
+        <li><a href="getting-started.html">Getting started</a></li>
+        <li><a href="using.html" aria-current="page">Using Voisu</a></li>
+        <li><a href="providers.html">Providers &amp; API keys</a></li>
+        <li><a href="settings.html">Settings</a></li>
+        <li><a href="troubleshooting.html">Troubleshooting</a></li>
+        <li><a href="privacy.html">Privacy</a></li>
+        <li><a href="updating.html">Updating &amp; uninstalling</a></li>
+    </ul>
+  </nav>
+
+  <main id="main" class="doc">
+<h1>Using Voisu</h1>
+<p class="lead">Start a Recording, speak, stop, and the Transcript lands at your cursor. This page covers the gestures on each platform, what the capsule is telling you, and how to get your words back when a paste doesn't land.</p>
+
+<nav class="toc" aria-label="On this page">
+  <a href="#windows">Windows gestures</a>
+  <a href="#linux">Linux Trigger Key</a>
+  <a href="#overlay">The capsule</a>
+  <a href="#delivery">Where the text goes</a>
+  <a href="#last">Your last Transcript</a>
+  <a href="#speaking">Speaking tips</a>
+</nav>
+
+<h2 id="windows">Windows: hold <kbd>Ctrl</kbd>&nbsp;<kbd>Win</kbd></h2>
+<div class="table-scroll">
+<table>
+  <thead><tr><th>Do this</th><th>What happens</th></tr></thead>
+  <tbody>
+    <tr><td data-label="Do this">Hold <kbd>Ctrl</kbd>&nbsp;<kbd>Win</kbd> and speak</td><td data-label="What happens">Recording runs while you hold the keys. Release them to stop and transcribe.</td></tr>
+    <tr><td data-label="Do this">Double-tap <kbd>Ctrl</kbd>&nbsp;<kbd>Win</kbd></td><td data-label="What happens">Hands-free: the Recording keeps going after you let go. Press <kbd>Ctrl</kbd>&nbsp;<kbd>Win</kbd> again to stop.</td></tr>
+    <tr><td data-label="Do this"><kbd>Esc</kbd></td><td data-label="What happens">Cancels the Recording. Nothing is transcribed or pasted.</td></tr>
+    <tr><td data-label="Do this">Press another key while holding</td><td data-label="What happens">Also cancels, so a <kbd>Ctrl</kbd>&nbsp;<kbd>Win</kbd> shortcut you meant for Windows doesn't turn into a Recording.</td></tr>
+  </tbody>
+</table>
+</div>
+<p>A quick tap shorter than about a third of a second isn't a Recording. Voisu starts listening on the first press, so the start of your sentence isn't clipped while it decides.</p>
+
+<h2 id="linux">Linux: press, speak, press</h2>
+<p>On Linux the Trigger Key is the shortcut your desktop approved for Voisu (or the bind setup made on Hyprland, or the custom shortcut you made on X11). It doesn't need holding:</p>
+<ol class="steps">
+  <li><p>Press the Trigger Key. Recording starts.</p></li>
+  <li><p>Speak as long as you like.</p></li>
+  <li><p>Press the Trigger Key again. Voisu transcribes and delivers.</p></li>
+</ol>
+<p>The same thing works from a terminal or a script with <code>voisu toggle</code>. <code>voisu shortcut</code> shows which key your desktop approved.</p>
+
+<h2 id="overlay">The capsule</h2>
+<p>The Overlay is a small capsule near the bottom of your screen. It never takes focus, so it can't steal your cursor.</p>
+<ul class="state-list">
+  <li><span class="sw sw-rec"></span><strong>Recording</strong><span>Live level bars follow your voice. On Windows, a green dot at the left means hands-free.</span></li>
+  <li><span class="sw sw-proc"></span><strong>Processing</strong><span>A light sweeps across the bars while the providers finish and Voisu builds the Transcript.</span></li>
+  <li><span class="sw sw-ok"></span><strong>Delivered</strong><span>The capsule goes away and your text appears. On Linux it briefly shows success first.</span></li>
+  <li><span class="sw sw-fail"></span><strong>Problem</strong><span>A short message says what went wrong, such as no microphone, nothing heard, or a paste that couldn't land.</span></li>
+</ul>
+<p>The capsule is optional on Linux: it's the <code>voisu-overlay</code> package on Fedora and the <code>overlay@voisu.app</code> GNOME Shell extension on Ubuntu. On X11 the same feedback arrives as desktop notifications. On Windows the tray's <strong>Preview overlay</strong> item shows it without recording.</p>
+<p><span class="badge soon">Coming soon</span>A check mark when a Transcript lands on Windows, and a choice of capsule size.</p>
+
+<h2 id="delivery">Where the text goes</h2>
+<p><strong>Windows.</strong> Voisu pastes into the window that had focus when you <em>started</em> the Recording, even if you clicked somewhere else while talking. It then puts your previous clipboard back. Terminals get the paste shortcut they expect: <kbd>Ctrl</kbd>&nbsp;<kbd>Shift</kbd>&nbsp;<kbd>V</kbd> for Windows Terminal, Alacritty and WezTerm, <kbd>Shift</kbd>&nbsp;<kbd>Insert</kbd> for the classic console, PuTTY, Git Bash and ConEmu. Voisu's paste is kept out of Windows clipboard history (<kbd>Win</kbd>&nbsp;<kbd>V</kbd>).</p>
+<p><strong>Linux.</strong> How the Transcript arrives depends on the Delivery mode, which <code>voisu setup</code> picks for your desktop:</p>
+<div class="table-scroll">
+<table>
+  <thead><tr><th>Mode</th><th>Behaviour</th></tr></thead>
+  <tbody>
+    <tr><td data-label="Mode"><code>type</code></td><td data-label="Behaviour">Puts the Transcript on the clipboard and pastes it into the focused window through the desktop's RemoteDesktop portal.</td></tr>
+    <tr><td data-label="Mode"><code>clipboard</code></td><td data-label="Behaviour">Used on Hyprland: puts the Transcript on the clipboard, then asks Hyprland to press a verified paste shortcut.</td></tr>
+    <tr><td data-label="Mode"><code>guarded</code></td><td data-label="Behaviour">Pastes only when Voisu can confirm which window has focus. Where it can't (GNOME), the Transcript stays on the clipboard for you to paste.</td></tr>
+  </tbody>
+</table>
+</div>
+<p>Change it with <code>voisu delivery type</code>, <code>voisu delivery clipboard</code> or <code>voisu delivery guarded</code>.</p>
+<p><span class="badge soon">Coming soon</span>A Windows setting to turn automatic pasting off and always leave the Transcript on the clipboard.</p>
+
+<h2 id="last">Your last Transcript</h2>
+<p>When a paste doesn't land, the words aren't lost.</p>
+<ul>
+  <li><strong>Windows:</strong> open <strong>Settings…</strong> from the tray. The <strong>Last transcript</strong> card shows your most recent Transcript with a <strong>Copy</strong> button. It's held in memory only and is gone when Voisu quits.</li>
+  <li><strong>Linux:</strong> the Transcript is usually still on your clipboard, so paste it with <kbd>Ctrl</kbd>&nbsp;<kbd>V</kbd> (or <kbd>Ctrl</kbd>&nbsp;<kbd>Shift</kbd>&nbsp;<kbd>V</kbd> in a terminal). <code>voisu history</code> lists recent Recordings, newest first, with the start of each Transcript, and <code>voisu history --json</code> gives the full text.</li>
+</ul>
+
+<h2 id="speaking">Speaking tips</h2>
+<ul>
+  <li>Speak naturally, in full sentences. Voisu adds punctuation and capitals for you.</li>
+  <li>On Linux you can also say marks the way you'd read them: “dash dash”, “slash”, “quote … unquote”, “new paragraph”, or “first … second …” for a numbered list.</li>
+  <li>Teach Voisu names and jargon it gets wrong with the Linux dictionary: <code>voisu dictionary add &lt;term&gt;</code>. See <a href="settings.html#linux">Settings</a>.</li>
+</ul>
+<p><span class="badge soon">Coming soon</span>Boost words on Windows: a list of names and terms to favour.</p>
+
+    <nav class="pager" aria-label="Docs pages">
+      <a class="prev" href="getting-started.html"><small>Previous</small>Getting started</a><a class="next" href="providers.html"><small>Next</small>Providers &amp; API keys</a>
+    </nav>
+  </main>
+</div>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="foot-grid">
+      <div class="foot-brand">
+        <a class="brand" href="../"><img class="mark" src="../assets/logo.svg" alt="" width="32" height="32"><span>voisu</span></a>
+        <p>Voice dictation for Linux and Windows. MIT licensed. © 2026 Anuraj Jit Saikia.</p>
+      </div>
+      <div>
+        <h2>Docs</h2>
+        <ul>
+          <li><a href="getting-started.html">Getting started</a></li>
+          <li><a href="using.html">Using Voisu</a></li>
+          <li><a href="providers.html">Providers &amp; API keys</a></li>
+          <li><a href="troubleshooting.html">Troubleshooting</a></li>
+          <li><a href="privacy.html">Privacy</a></li>
+        </ul>
+      </div>
+      <div>
+        <h2>Project</h2>
+        <ul>
+          <li><a href="https://github.com/Anuraj-dev/voisu">Source on GitHub</a></li>
+          <li><a href="https://github.com/Anuraj-dev/voisu/releases">Releases</a></li>
+          <li><a href="https://github.com/Anuraj-dev/voisu/issues">Report a problem</a></li>
+          <li><a href="https://github.com/Anuraj-dev/voisu/blob/main/LICENSE">MIT License</a></li>
+        </ul>
+      </div>
+    </div>
+    <p class="foot-key">apt signing key · 4149 EE38 68B3 6B60 0759 2966 D08B CFDC 3412 5B28</p>
+  </div>
+</footer>
+</body>
+</html>

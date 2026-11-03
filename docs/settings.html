@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Settings — Voisu docs</title>
+<meta name="description" content="The Voisu settings window and tray on Windows, and the voisu commands on Linux.">
+<link rel="canonical" href="https://anuraj-dev.github.io/voisu/docs/settings.html">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0e0f12">
+<meta name="theme-color" media="(prefers-color-scheme: light)" content="#f5f4ef">
+<link rel="icon" type="image/png" sizes="32x32" href="../assets/favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="../assets/favicon-16.png">
+<link rel="apple-touch-icon" href="../assets/apple-touch-icon.png">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Voisu">
+<meta property="og:title" content="Settings — Voisu docs">
+<meta property="og:description" content="The Voisu settings window and tray on Windows, and the voisu commands on Linux.">
+<meta property="og:url" content="https://anuraj-dev.github.io/voisu/docs/settings.html">
+<meta property="og:image" content="https://anuraj-dev.github.io/voisu/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Voisu: Hold a key, speak. Your words land where you're typing.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@400..800&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<script>document.documentElement.classList.add("js")</script>
+<script src="../assets/site.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../" aria-label="Voisu home">
+      <img class="mark" src="../assets/logo.svg" alt="" width="32" height="32">
+      <span>voisu</span>
+    </a>
+    <nav aria-label="Main">
+      <ul class="site-nav">
+        <li><a href="../#install">Install</a></li>
+        <li><a href="./" aria-current="page">Docs</a></li>
+        <li><a class="gh" href="https://github.com/Anuraj-dev/voisu"><svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg><span>GitHub</span></a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap docs">
+  <nav class="docs-nav" aria-labelledby="docs-nav-title">
+    <h2 id="docs-nav-title">Docs</h2>
+    <ul>
+        <li><a href="./">Overview</a></li>
+        <li><a href="getting-started.html">Getting started</a></li>
+        <li><a href="using.html">Using Voisu</a></li>
+        <li><a href="providers.html">Providers &amp; API keys</a></li>
+        <li><a href="settings.html" aria-current="page">Settings</a></li>
+        <li><a href="troubleshooting.html">Troubleshooting</a></li>
+        <li><a href="privacy.html">Privacy</a></li>
+        <li><a href="updating.html">Updating &amp; uninstalling</a></li>
+    </ul>
+  </nav>
+
+  <main id="main" class="doc">
+<h1>Settings</h1>
+<p class="lead">Voisu keeps settings to a minimum. On Windows they live in a small settings window and the tray menu. On Linux everything is a <code>voisu</code> command.</p>
+
+<nav class="toc" aria-label="On this page">
+  <a href="#windows">Windows settings window</a>
+  <a href="#tray">Windows tray menu</a>
+  <a href="#linux">Linux commands</a>
+  <a href="#files">Where files live</a>
+</nav>
+
+<h2 id="windows">Windows settings window</h2>
+<p>Open it from the tray icon with <strong>Settings…</strong>. It opens by itself the first time you run Voisu.</p>
+<div class="table-scroll">
+<table>
+  <thead><tr><th>Setting</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td data-label="Setting">Groq key</td><td data-label="What it does">Your Groq API key. Leave the field blank to keep the saved key.</td></tr>
+    <tr><td data-label="Setting">Deepgram key</td><td data-label="What it does">Your Deepgram API key. Leave the field blank to keep the saved key.</td></tr>
+    <tr><td data-label="Setting">Validate &amp; save</td><td data-label="What it does">Checks new keys with each provider, then saves them to Credential Manager. Nothing is saved unless every key passes.</td></tr>
+    <tr><td data-label="Setting">Start at login</td><td data-label="What it does">Starts Voisu in the tray when you sign in to Windows. Turned on after your first successful setup.</td></tr>
+    <tr><td data-label="Setting">Last transcript</td><td data-label="What it does">Your most recent Transcript, with a <strong>Copy</strong> button. Held in memory only.</td></tr>
+  </tbody>
+</table>
+</div>
+<p>The footer shows the installed version and the folder Voisu writes its logs to.</p>
+<p><span class="badge soon">Coming soon</span>Turning automatic pasting off, choosing the capsule size, and boost words.</p>
+
+<h2 id="tray">Windows tray menu</h2>
+<div class="table-scroll">
+<table>
+  <thead><tr><th>Item</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td data-label="Item">Settings…</td><td data-label="What it does">Opens the settings window.</td></tr>
+    <tr><td data-label="Item">Preview overlay</td><td data-label="What it does">Shows the capsule so you can see where it appears, without recording.</td></tr>
+    <tr><td data-label="Item">Test paste (in 3 s)</td><td data-label="What it does">Waits three seconds so you can click into an app, then pastes a sample text there. A quick way to check Delivery into a particular app.</td></tr>
+    <tr><td data-label="Item">Start at login</td><td data-label="What it does">Same switch as in the settings window.</td></tr>
+    <tr><td data-label="Item">Update to v…</td><td data-label="What it does">Appears when a new version has downloaded. Installs it and relaunches Voisu.</td></tr>
+    <tr><td data-label="Item">Quit Voisu</td><td data-label="What it does">Stops Voisu. If an update has downloaded, it installs on the way out.</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="linux">Linux commands</h2>
+<p>Run <code>voisu setup</code> again any time to redo the guided setup. Individual settings:</p>
+<div class="table-scroll">
+<table>
+  <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td data-label="Command"><code>voisu shortcut</code></td><td data-label="What it does">Shows the Trigger Key your desktop approved.</td></tr>
+    <tr><td data-label="Command"><code>voisu delivery [type|clipboard|guarded]</code></td><td data-label="What it does">Shows or sets the Delivery mode. See <a href="using.html#delivery">Where the text goes</a>.</td></tr>
+    <tr><td data-label="Command"><code>voisu writing [smart|literal]</code></td><td data-label="What it does"><code>smart</code> tidies and formats what you said. <code>literal</code> keeps your wording as spoken.</td></tr>
+    <tr><td data-label="Command"><code>voisu rendering [natural|adaptive|structured]</code></td><td data-label="What it does">How much layout Voisu adds. <code>natural</code> keeps prose; <code>adaptive</code> may lay out lists and sections when your speech calls for it; <code>structured</code> always tries to.</td></tr>
+    <tr><td data-label="Command"><code>voisu deepgram [on|off]</code></td><td data-label="What it does">Turns Deepgram streaming on or off.</td></tr>
+    <tr><td data-label="Command"><code>voisu mode [cloud|local]</code></td><td data-label="What it does">Switches between the cloud providers and a local model you've installed.</td></tr>
+    <tr><td data-label="Command"><code>voisu dictionary add &lt;term&gt;</code></td><td data-label="What it does">Adds a name or term to your personal dictionary. <code>remove</code> and <code>list</code> manage it.</td></tr>
+    <tr><td data-label="Command"><code>voisu auth set &lt;groq|deepgram&gt;</code></td><td data-label="What it does">Stores a provider key, read from standard input. <code>auth verify</code> checks it.</td></tr>
+  </tbody>
+</table>
+</div>
+<p>Controlling the daemon:</p>
+<div class="table-scroll">
+<table>
+  <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td data-label="Command"><code>voisu toggle</code></td><td data-label="What it does">Starts or stops a Recording, the same as the Trigger Key.</td></tr>
+    <tr><td data-label="Command"><code>voisu start</code> / <code>stop</code> / <code>status</code></td><td data-label="What it does">Controls and inspects the daemon.</td></tr>
+    <tr><td data-label="Command"><code>voisu service install|start|stop|restart|status|uninstall</code></td><td data-label="What it does">Manages Voisu's systemd user services.</td></tr>
+    <tr><td data-label="Command"><code>voisu doctor [--verbose]</code></td><td data-label="What it does">Checks that this computer is ready: portals, Delivery, clipboard, keys.</td></tr>
+    <tr><td data-label="Command"><code>voisu history [--json]</code></td><td data-label="What it does">Lists recent Recordings from local history.</td></tr>
+    <tr><td data-label="Command"><code>voisu export &lt;id&gt;</code></td><td data-label="What it does">Writes a redacted diagnostic export of one Recording, for a bug report.</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="files">Where files live</h2>
+<div class="table-scroll">
+<table>
+  <thead><tr><th>What</th><th>Linux</th><th>Windows</th></tr></thead>
+  <tbody>
+    <tr><td data-label="What">Settings</td><td data-label="Linux"><code>~/.config/voisu/config.toml</code></td><td data-label="Windows"><code>%APPDATA%\Voisu\settings.json</code></td></tr>
+    <tr><td data-label="What">Dictionary</td><td data-label="Linux"><code>~/.config/voisu/dictionary.txt</code></td><td data-label="Windows">—</td></tr>
+    <tr><td data-label="What">API keys</td><td data-label="Linux">Desktop keyring (Secret Service)</td><td data-label="Windows">Credential Manager</td></tr>
+    <tr><td data-label="What">Logs and history</td><td data-label="Linux"><code>~/.local/state/voisu/</code></td><td data-label="Windows"><code>%LOCALAPPDATA%\Voisu\logs</code></td></tr>
+  </tbody>
+</table>
+</div>
+
+    <nav class="pager" aria-label="Docs pages">
+      <a class="prev" href="providers.html"><small>Previous</small>Providers &amp; API keys</a><a class="next" href="troubleshooting.html"><small>Next</small>Troubleshooting</a>
+    </nav>
+  </main>
+</div>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="foot-grid">
+      <div class="foot-brand">
+        <a class="brand" href="../"><img class="mark" src="../assets/logo.svg" alt="" width="32" height="32"><span>voisu</span></a>
+        <p>Voice dictation for Linux and Windows. MIT licensed. © 2026 Anuraj Jit Saikia.</p>
+      </div>
+      <div>
+        <h2>Docs</h2>
+        <ul>
+          <li><a href="getting-started.html">Getting started</a></li>
+          <li><a href="using.html">Using Voisu</a></li>
+          <li><a href="providers.html">Providers &amp; API keys</a></li>
+          <li><a href="troubleshooting.html">Troubleshooting</a></li>
+          <li><a href="privacy.html">Privacy</a></li>
+        </ul>
+      </div>
+      <div>
+        <h2>Project</h2>
+        <ul>
+          <li><a href="https://github.com/Anuraj-dev/voisu">Source on GitHub</a></li>
+          <li><a href="https://github.com/Anuraj-dev/voisu/releases">Releases</a></li>
+          <li><a href="https://github.com/Anuraj-dev/voisu/issues">Report a problem</a></li>
+          <li><a href="https://github.com/Anuraj-dev/voisu/blob/main/LICENSE">MIT License</a></li>
+        </ul>
+      </div>
+    </div>
+    <p class="foot-key">apt signing key · 4149 EE38 68B3 6B60 0759 2966 D08B CFDC 3412 5B28</p>
+  </div>
+</footer>
+</body>
+</html>
