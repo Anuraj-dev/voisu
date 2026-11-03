@@ -34,9 +34,8 @@ choose *More info → Run anyway*.
 On first launch the settings window opens. Paste your Groq and Deepgram keys
 and choose *Validate & save*. Then hold `Ctrl`+`Win`, speak, and let go.
 
-- **Trigger Key:** `Ctrl`+`Win` by default. Pick a preset in settings
-  (`Ctrl`+`` ` ``, Right `Ctrl`, Caps Lock, `Ctrl`+`Shift`+`Space`) or choose
-  *Custom…* and press your own shortcut.
+- **Trigger Key:** `Ctrl`+`Win` by default. Or pick one of the presets in
+  settings: `Ctrl`+`` ` ``, Right `Ctrl`, Caps Lock or `Ctrl`+`Shift`+`Space`.
 - **Settings window** (tray → *Settings…*): provider keys, Trigger Key, *Paste
   automatically* (off = clipboard only), overlay size, boost words, start at
   login, and the last Transcript with a Copy button.

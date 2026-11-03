@@ -39,7 +39,7 @@ pub struct Settings {
     /// re-save never re-enables what they turned off.
     pub autostart_default_applied: bool,
     /// The Trigger Key, in its written form (`Ctrl+Win`). A value that does
-    /// not parse or is no longer allowed falls back to Ctrl+Win.
+    /// not parse or is not one of the presets falls back to Ctrl+Win.
     #[serde(deserialize_with = "lenient_trigger_key")]
     pub hotkey: TriggerChord,
     /// Paste the Transcript into the focused app. Off, it only goes to the
@@ -217,6 +217,43 @@ mod tests {
             let settings = Settings::load(&path);
             assert_eq!(settings.hotkey, TriggerChord::CTRL_WIN, "{value}");
             assert!(!settings.auto_paste, "{value} wiped another setting");
+        }
+    }
+
+    #[test]
+    fn every_preset_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        for preset in &crate::trigger_key::PRESETS {
+            let settings = Settings {
+                hotkey: preset.chord,
+                ..Settings::default()
+            };
+            settings.save(&path).unwrap();
+            assert_eq!(Settings::load(&path), settings, "{}", preset.name);
+        }
+    }
+
+    #[test]
+    fn a_custom_chord_saved_by_v0_68_or_v0_69_loads_as_ctrl_win() {
+        // The removed Custom… recorder could store any allowed chord.
+        for value in [
+            "Ctrl+Alt",
+            "Right Alt",
+            "F13",
+            "Alt+Shift+F12",
+            "Ctrl+Alt+R",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("settings.json");
+            let json = format!(
+                r#"{{"autostart_default_applied": true, "hotkey": "{value}", "boost_words": ["Voisu"]}}"#
+            );
+            fs::write(&path, json).unwrap();
+            let settings = Settings::load(&path);
+            assert_eq!(settings.hotkey, TriggerChord::CTRL_WIN, "{value}");
+            assert!(settings.autostart_default_applied, "{value}");
+            assert_eq!(settings.boost_words, ["Voisu"], "{value}");
         }
     }
 

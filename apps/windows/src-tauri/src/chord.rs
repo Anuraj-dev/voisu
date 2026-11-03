@@ -1,8 +1,7 @@
 //! The hook-side half of the Trigger Key: a pure, allocation-free tracker
 //! that turns raw key transitions into chord signals for the configured
 //! [`TriggerChord`] and decides, per event, whether the key passes through and
-//! whether the mask key must be injected. [`Recorder`] is the same hook's
-//! capture mode, used by the settings window's shortcut recorder.
+//! whether the mask key must be injected.
 //!
 //! The Windows keyboard hook (`platform::hotkey`) filters injected and AltGr
 //! events, classifies the virtual key and feeds this tracker inside the hook
@@ -17,7 +16,7 @@
 //! and up so it never types into the focused app.
 
 pub use crate::trigger_key::{Modifier, Side};
-use crate::trigger_key::{Need, Rejection, TriggerChord, key_at, key_name, scan_code};
+use crate::trigger_key::{Need, TriggerChord, scan_code};
 
 /// The unassigned virtual key injected as the mask, the one AutoHotkey and
 /// PowerToys use.
@@ -195,10 +194,6 @@ impl ChordTracker {
         }
     }
 
-    pub fn chord(&self) -> TriggerChord {
-        self.chord
-    }
-
     /// Clears all tracked state, for example after the hook is reinstalled and
     /// key-ups may have been missed. Returns Interrupted when the chord was
     /// held, so the gesture thread never keeps a Recording nobody can end.
@@ -208,10 +203,9 @@ impl ChordTracker {
         signal
     }
 
-    /// Switches to another chord (the same one when recording starts or
-    /// ends), forgetting the tracked modifiers. Interrupts a held chord, and
-    /// keeps swallowing a key whose key-down was swallowed, so the focused
-    /// app never sees a stray key-up or repeat.
+    /// Switches to another chord, forgetting the tracked modifiers.
+    /// Interrupts a held chord, and keeps swallowing a key whose key-down was
+    /// swallowed, so the focused app never sees a stray key-up or repeat.
     pub fn set_chord(&mut self, chord: TriggerChord) -> Option<ChordSignal> {
         let signal = self.active.then_some(ChordSignal::Interrupted);
         let carried = match self.chord.key() {
@@ -225,9 +219,8 @@ impl ChordTracker {
         signal
     }
 
-    /// Swallows the rest of a carried key: its repeats and its key-up. The
-    /// recorder's branch calls this too.
-    pub fn carried(&mut self, key: Key, down: bool) -> bool {
+    /// Swallows the rest of a carried key: its repeats and its key-up.
+    fn carried(&mut self, key: Key, down: bool) -> bool {
         match (key, self.carried) {
             (Key::Other(vk, scan), Some((key_vk, key_scan)))
                 if same_key(vk, scan, key_vk, key_scan) =>
@@ -438,171 +431,6 @@ impl ChordTracker {
     }
 }
 
-/// What the shortcut recorder reports to the settings window.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Capture {
-    /// The keys pressed so far.
-    Preview(TriggerChord),
-    /// Everything pressed was released; this is the recorded chord.
-    Done(TriggerChord),
-    /// The keys pressed cannot form a chord: a key no chord can use (Enter,
-    /// an arrow, a numpad key...), or both sides of one modifier.
-    Invalid(Rejection),
-    /// Esc ended the recording.
-    Cancelled,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CaptureVerdict {
-    pub pass: bool,
-    pub inject_mask: bool,
-    pub update: Option<Capture>,
-}
-
-/// The hook's capture mode. It records the keys held together and finishes
-/// once they are all released. Modifiers still pass through, with the mask
-/// key injected under Win and Alt, under a second modifier, and with every
-/// key swallowed under a modifier, so no release opens Start or switches the
-/// layout. Ordinary keys are swallowed so recording Win+D does not show the
-/// desktop.
-#[derive(Debug, Default)]
-pub struct Recorder {
-    /// Modifier sides pressed since recording began.
-    seen: [SideSet; 4],
-    /// Modifier sides held now.
-    held: [SideSet; 4],
-    /// Ordinary keys whose key-down was swallowed and are still down, one bit
-    /// per virtual key.
-    down: [u64; 4],
-    /// The recorded key's position, as its US virtual key.
-    key: Option<u8>,
-    unsupported: bool,
-    /// A key went up: the chord is fixed, and later presses are ignored.
-    frozen: bool,
-}
-
-impl Recorder {
-    /// `held_before` is true when the key was already down before this event,
-    /// as the OS sees it. A key down since before recording began then passes
-    /// and is not recorded: its repeats and key-up finish in the app it
-    /// started in.
-    pub fn handle(&mut self, key: Key, down: bool, held_before: bool) -> CaptureVerdict {
-        let mut verdict = CaptureVerdict {
-            pass: true,
-            inject_mask: false,
-            update: None,
-        };
-        let any_mod_held = self.held.iter().any(|s| s.any());
-        match key {
-            Key::Other(VK_PACKET, _) => return verdict,
-            Key::Escape => {
-                if down {
-                    verdict.pass = false;
-                    verdict.update = Some(Capture::Cancelled);
-                }
-                return verdict;
-            }
-            Key::Mod(modifier, side) => {
-                let others_held = Modifier::ALL
-                    .iter()
-                    .any(|&m| m != modifier && self.held[m as usize].any());
-                let held = &mut self.held[modifier as usize];
-                if down && !held.get(side) && held_before {
-                    return verdict;
-                }
-                if down && !held.get(side) {
-                    // Mask Start and the menu bar, and the layout switch a
-                    // second modifier (Ctrl+Shift, Alt+Shift) arms.
-                    verdict.inject_mask = others_held
-                        || (!held.any() && matches!(modifier, Modifier::Win | Modifier::Alt));
-                    held.set(side, true);
-                    if !self.frozen {
-                        self.seen[modifier as usize].set(side, true);
-                        verdict.update = Some(Capture::Preview(self.chord()));
-                    }
-                } else if !down && held.get(side) {
-                    held.set(side, false);
-                    self.frozen = true;
-                }
-            }
-            Key::Other(vk, scan) => {
-                let (word, bit) = (usize::from(vk / 64), 1u64 << (vk % 64));
-                let fresh = self.down[word] & bit == 0;
-                if down && fresh && held_before {
-                    return verdict;
-                }
-                if down {
-                    verdict.pass = false;
-                    // A swallowed key under a modifier would otherwise leave
-                    // its release free to open Start or switch the layout.
-                    verdict.inject_mask = fresh && any_mod_held;
-                    if fresh && !self.frozen {
-                        let position = match scan {
-                            0 => key_name(vk).map(|_| vk),
-                            _ => key_at(scan),
-                        };
-                        match position {
-                            None => self.unsupported = true,
-                            Some(key) if self.key.is_none() => {
-                                self.key = Some(key);
-                                verdict.update = Some(Capture::Preview(self.chord()));
-                            }
-                            Some(_) => {}
-                        }
-                    }
-                    self.down[word] |= bit;
-                } else if self.down[word] & bit != 0 {
-                    self.down[word] &= !bit;
-                    verdict.pass = false;
-                    self.frozen = true;
-                }
-            }
-        }
-        if self.frozen && !self.anything_held() {
-            let both_sides = self.seen.iter().any(|s| s.left && s.right);
-            verdict.update = Some(if self.unsupported {
-                Capture::Invalid(Rejection::Unsupported)
-            } else if both_sides {
-                Capture::Invalid(Rejection::BothSides)
-            } else {
-                Capture::Done(self.chord())
-            });
-        }
-        verdict
-    }
-
-    /// While recording, an injected ordinary key may be recorded (a remapped
-    /// F24), but never Voisu's own mask or an injected modifier.
-    pub fn admits_injected(key: Key, tagged: bool) -> bool {
-        !tagged && matches!(key, Key::Other(vk, _) if vk != VK_PACKET)
-    }
-
-    fn anything_held(&self) -> bool {
-        self.held.iter().any(|s| s.any()) || self.down.iter().any(|&w| w != 0)
-    }
-
-    /// Modifiers match either side, except a lone modifier, which keeps the
-    /// side it was pressed on (Right Alt is not Left Alt).
-    fn chord(&self) -> TriggerChord {
-        let lone = self.key.is_none() && self.seen.iter().filter(|s| s.any()).count() == 1;
-        let mut chord = TriggerChord::EMPTY;
-        for modifier in Modifier::ALL {
-            let seen = self.seen[modifier as usize];
-            let need = match (seen.left, seen.right) {
-                (false, false) => continue,
-                (true, false) if lone => Need::Only(Side::Left),
-                (false, true) if lone => Need::Only(Side::Right),
-                _ => Need::Either,
-            };
-            chord = chord.with(modifier, need);
-        }
-        match self.key {
-            Some(vk) => chord.with_key(vk),
-            None => chord,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -611,14 +439,12 @@ mod tests {
     const RCTRL: Key = Key::Mod(Modifier::Ctrl, Side::Right);
     const LWIN: Key = Key::Mod(Modifier::Win, Side::Left);
     const LALT: Key = Key::Mod(Modifier::Alt, Side::Left);
-    const RALT: Key = Key::Mod(Modifier::Alt, Side::Right);
     const LSHIFT: Key = Key::Mod(Modifier::Shift, Side::Left);
     const SPACE: Key = Key::Other(0x20, 0x39);
     const D: Key = Key::Other(b'D', 0x20);
     const C: Key = Key::Other(b'C', 0x2E);
     const T: Key = Key::Other(b'T', 0x14);
     const Z: Key = Key::Other(b'Z', 0x2C);
-    const ENTER: Key = Key::Other(0x0D, 0x1C);
     /// The key below Esc on a US layout.
     const BACKTICK: Key = Key::Other(0xC0, 0x29);
     const CAPS: Key = Key::Other(0x14, 0x3A);
@@ -1127,9 +953,6 @@ mod tests {
         assert!(!t.admits_injected(D, false));
         assert!(!t.admits_injected(Key::Escape, false));
         assert!(!ChordTracker::default().admits_injected(f24, false));
-        assert!(!Recorder::admits_injected(Key::Other(MASK_VK, 0), true));
-        assert!(Recorder::admits_injected(f24, false));
-        assert!(!Recorder::admits_injected(LWIN, false));
     }
 
     #[test]
@@ -1182,7 +1005,7 @@ mod tests {
     }
 
     #[test]
-    fn injected_unicode_text_never_triggers_or_records() {
+    fn injected_unicode_text_never_triggers() {
         // A password manager typing ":" as Unicode text: VK_PACKET, with the
         // UTF-16 unit 0x3A where Caps Lock's scan code would be.
         let colon = Key::Other(VK_PACKET, 0x3A);
@@ -1191,11 +1014,6 @@ mod tests {
         assert!(!t.admits_injected(colon.injected(), false));
         let v = feed(&mut t, &[(colon, true), (colon, false)], false);
         assert!(signals(&v).is_empty() && v.iter().all(|v| v.pass));
-
-        assert!(!Recorder::admits_injected(colon, false));
-        let mut r = Recorder::default();
-        let v = r.handle(colon, true, false);
-        assert!(v.pass && v.update.is_none(), "never recorded");
     }
 
     #[test]
@@ -1245,150 +1063,5 @@ mod tests {
         assert!(v[2].pass, "a fresh press types again");
         assert!(signals(&v).is_empty());
         assert_eq!(t.set_chord(chord("Ctrl+Win")), None, "nothing was held");
-    }
-
-    // The shortcut recorder.
-
-    fn record(events: &[(Key, bool)]) -> Vec<CaptureVerdict> {
-        let mut r = Recorder::default();
-        events.iter().map(|&(k, d)| r.handle(k, d, false)).collect()
-    }
-
-    fn updates(verdicts: &[CaptureVerdict]) -> Vec<Capture> {
-        verdicts.iter().filter_map(|v| v.update).collect()
-    }
-
-    #[test]
-    fn recording_ctrl_alt_previews_then_finishes_on_full_release() {
-        let v = record(&[(LCTRL, true), (LALT, true), (LALT, false), (LCTRL, false)]);
-        assert_eq!(
-            updates(&v),
-            [
-                Capture::Preview(chord("Left Ctrl")),
-                Capture::Preview(chord("Ctrl+Alt")),
-                Capture::Done(chord("Ctrl+Alt")),
-            ]
-        );
-        assert!(v.iter().all(|v| v.pass), "modifiers pass through");
-        assert!(v[1].inject_mask && !v[0].inject_mask);
-    }
-
-    #[test]
-    fn recording_swallows_the_ordinary_key() {
-        let v = record(&[
-            (LWIN, true),
-            (D, true),
-            (D, true),
-            (D, false),
-            (LWIN, false),
-        ]);
-        assert_eq!(updates(&v).last(), Some(&Capture::Done(chord("Win+D"))));
-        assert!(v[0].inject_mask, "Start never opens while recording");
-        assert!(v[1].inject_mask && !v[2].inject_mask);
-        assert!(!v[1].pass && !v[2].pass && !v[3].pass);
-    }
-
-    #[test]
-    fn recording_a_lone_modifier_keeps_its_side() {
-        let v = record(&[(RALT, true), (RALT, false)]);
-        assert_eq!(updates(&v).last(), Some(&Capture::Done(chord("Right Alt"))));
-    }
-
-    #[test]
-    fn recording_ignores_presses_after_the_first_release() {
-        let v = record(&[
-            (LCTRL, true),
-            (LSHIFT, true),
-            (LSHIFT, false),
-            (LALT, true),
-            (LALT, false),
-            (LCTRL, false),
-        ]);
-        assert_eq!(
-            updates(&v).last(),
-            Some(&Capture::Done(chord("Ctrl+Shift")))
-        );
-    }
-
-    #[test]
-    fn recording_reports_an_unusable_key() {
-        let v = record(&[(LCTRL, true), (ENTER, true), (ENTER, false), (LCTRL, false)]);
-        assert_eq!(
-            updates(&v).last(),
-            Some(&Capture::Invalid(Rejection::Unsupported))
-        );
-    }
-
-    #[test]
-    fn recording_both_sides_of_a_modifier_is_invalid() {
-        let v = record(&[(LCTRL, true), (RCTRL, true), (RCTRL, false), (LCTRL, false)]);
-        assert_eq!(
-            updates(&v).last(),
-            Some(&Capture::Invalid(Rejection::BothSides))
-        );
-    }
-
-    #[test]
-    fn recording_stores_the_position_not_the_layout_key() {
-        // German layout: the key below Esc reports VK_OEM_5.
-        let v = record(&[
-            (LCTRL, true),
-            (Key::Other(0xDC, 0x29), true),
-            (Key::Other(0xDC, 0x29), false),
-            (LCTRL, false),
-        ]);
-        assert_eq!(updates(&v).last(), Some(&Capture::Done(chord("Ctrl+`"))));
-    }
-
-    #[test]
-    fn escape_cancels_recording() {
-        let v = record(&[(LCTRL, true), (Key::Escape, true)]);
-        assert_eq!(updates(&v).last(), Some(&Capture::Cancelled));
-        assert!(!v[1].pass);
-    }
-
-    #[test]
-    fn recording_ignores_a_key_held_since_before_it_began() {
-        let mut r = Recorder::default();
-        // The backtick was already down: this is its auto-repeat.
-        let repeat = r.handle(BACKTICK, true, true);
-        let up = r.handle(BACKTICK, false, false);
-        assert!(
-            repeat.pass && up.pass,
-            "it finishes in the app it started in"
-        );
-        assert!(repeat.update.is_none() && up.update.is_none());
-        let v = [
-            r.handle(LCTRL, true, false),
-            r.handle(D, true, false),
-            r.handle(D, false, false),
-            r.handle(LCTRL, false, false),
-        ];
-        assert_eq!(v[3].update, Some(Capture::Done(chord("Ctrl+D"))));
-    }
-
-    #[test]
-    fn recording_masks_every_key_swallowed_under_a_modifier() {
-        // Otherwise releasing Ctrl+Shift after Space switches the layout.
-        let v = record(&[
-            (LCTRL, true),
-            (LSHIFT, true),
-            (SPACE, true),
-            (SPACE, true),
-            (SPACE, false),
-            (LSHIFT, false),
-            (LCTRL, false),
-        ]);
-        assert!(!v[0].inject_mask);
-        assert!(v[1].inject_mask, "a second modifier masks the first");
-        assert!(v[2].inject_mask && !v[3].inject_mask);
-        assert!(!record(&[(SPACE, true)])[0].inject_mask);
-    }
-
-    #[test]
-    fn key_ups_from_before_recording_pass_and_do_not_finish_it() {
-        let v = record(&[(LCTRL, false), (D, false), (LALT, true)]);
-        assert!(v[0].pass && v[1].pass);
-        assert_eq!(updates(&v), [Capture::Preview(chord("Left Alt"))]);
     }
 }
