@@ -229,6 +229,22 @@ fn check_compares_the_installed_version_with_the_latest_release() {
 }
 
 #[test]
+fn check_points_the_source_package_at_the_prebuilt_switch() {
+    let host = FakeHost::new();
+    host.pacman_owner("voisu");
+    host.tool(
+        "curl",
+        "printf '%s' '{\"tag_name\":\"v99.0.0\",\"html_url\":\"https://example.invalid/v99.0.0\"}'",
+    );
+
+    let output = host.voisu(&["update", "--check"]);
+
+    assert!(output.status.success(), "{output:?}");
+    let out = stdout(&output);
+    assert!(out.contains("voisu update --switch-to-bin"), "{out}");
+}
+
+#[test]
 fn check_reports_an_unreachable_release_feed() {
     let host = FakeHost::new();
     host.tool(

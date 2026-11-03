@@ -334,6 +334,17 @@ pub fn run(args: &[String]) -> u8 {
     0
 }
 
+/// What `--check` suggests when a newer release exists. The source package
+/// is never rebuilt by a plain `voisu update`, so it points at the switch.
+fn update_hint(owner: Option<&PackageOwner>) -> &'static str {
+    match owner {
+        Some(owner) if owner.manager == OwnerManager::Pacman && owner.package == "voisu" => {
+            "Update available: run `voisu update --switch-to-bin` to install the prebuilt release."
+        }
+        _ => "Update available: run `voisu update` to install it.",
+    }
+}
+
 fn check(installed: &str, owner: Option<&PackageOwner>) -> u8 {
     println!("Installed: {installed} ({})", install_source(owner));
     let latest = match latest_release_tag() {
@@ -347,9 +358,7 @@ fn check(installed: &str, owner: Option<&PackageOwner>) -> u8 {
     println!("Latest release: {latest_display}");
     match compare_release(installed, &latest) {
         ReleaseComparison::UpToDate => println!("Voisu is up to date."),
-        ReleaseComparison::UpdateAvailable => {
-            println!("Update available: run `voisu update` to install it.")
-        }
+        ReleaseComparison::UpdateAvailable => println!("{}", update_hint(owner)),
         ReleaseComparison::InstalledNewer => {
             println!("The installed version is newer than the latest release.")
         }
