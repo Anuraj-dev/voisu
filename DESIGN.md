@@ -22,6 +22,7 @@ introduce visual tokens outside this list.
 | Processing | `#8FB4FF` | processing accent |
 | Success | `#B8E986` | completed Delivery |
 | Failure | `#FF8A8A` | Quality Failure or unavailable daemon |
+| Caution | `#FFB454` | no speech, clipboard-only Delivery |
 | Primary text | `#F4F5F7` | state label |
 | Secondary text | `#B5BAC5` | supporting label |
 | Radius | 32 px | capsule corners |
@@ -39,7 +40,10 @@ label and an accessible description.
   continuous animation.
 - Processing: `Processing` label and a static progress glyph; no spinner is
   required.
-- Success: `Delivered` label, shown briefly, then hidden.
+- Success: check mark the moment the Transcript is pasted, even while the
+  daemon is still finishing up; hidden after 600 ms.
+- Copied: `Copied · Ctrl+V` in amber when direct Delivery fell back to the
+  clipboard; a calm prompt, not a failure. Hidden after 2 s.
 - Failure: `Quality Failure` label (or `Daemon unavailable`) with a static
   warning glyph, shown briefly, then hidden.
 - Idle: fully hidden.

@@ -35,6 +35,10 @@ pub enum OverlayPhase {
     /// capsule shows calm amber resting bars and a gentle notification, never
     /// red. Detection stays daemon-side (parked quality-gate decision).
     NoSpeech,
+    /// Terminal "the Transcript is on the clipboard, not pasted": direct
+    /// Delivery was unavailable and the daemon fell back to the clipboard.
+    /// Calm amber, never red — the words carry what the user must do next.
+    Copied,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,6 +67,7 @@ impl OverlayView {
                 accessible_label: "Transcript Delivered",
             },
             OverlayOutcome::QualityFailure => Self::no_speech(),
+            OverlayOutcome::Copied => Self::copied(),
             _ => Self {
                 phase: OverlayPhase::Failure,
                 visible_label: "Failure",
@@ -108,10 +113,20 @@ impl OverlayView {
         }
     }
 
+    /// The calm clipboard-fallback terminal view: the Transcript was copied
+    /// but not pasted, so the capsule says what to press.
+    pub const fn copied() -> Self {
+        Self {
+            phase: OverlayPhase::Copied,
+            visible_label: "Copied · Ctrl+V",
+            accessible_label: "Transcript copied to the clipboard; press Ctrl+V to paste",
+        }
+    }
+
     /// What the GTK capsule's text label shows. Graphics-first phases render
-    /// through the bar meter / glyph instead of words; only phases whose meaning
-    /// text still carries (Failure, daemon-unavailable) keep their label. The
-    /// notification rung keeps using `visible_label` unchanged.
+    /// through the bar meter / glyph instead of words; only phases whose
+    /// meaning text still carries (Failure, daemon-unavailable, Copied) keep
+    /// their label. The notification rung keeps using `visible_label` unchanged.
     pub const fn capsule_text(&self) -> &'static str {
         match self.phase {
             OverlayPhase::Recording
@@ -121,6 +136,7 @@ impl OverlayView {
             OverlayPhase::Loading
             | OverlayPhase::Unavailable
             | OverlayPhase::Failure
+            | OverlayPhase::Copied
             | OverlayPhase::Hidden => self.visible_label,
         }
     }
@@ -142,11 +158,35 @@ pub const fn phase_glyph(phase: OverlayPhase) -> &'static str {
         | OverlayPhase::Loading
         | OverlayPhase::Unavailable
         | OverlayPhase::NoSpeech
+        | OverlayPhase::Copied
         | OverlayPhase::Hidden => "",
     }
 }
 
+/// How long a terminal view that asks something of the user stays up: a
+/// failure, no speech, the clipboard fallback, or the daemon-unavailable flash.
 const TERMINAL_DISPLAY: Duration = Duration::from_secs(2);
+
+/// How long the pasted check mark stays up. The Transcript is already in the
+/// focused app, so the confirmation only needs to register, not to be read.
+const SUCCESS_DISPLAY: Duration = Duration::from_millis(600);
+
+const fn terminal_hold(view: OverlayView) -> Duration {
+    match view.phase {
+        OverlayPhase::Success => SUCCESS_DISPLAY,
+        _ => TERMINAL_DISPLAY,
+    }
+}
+
+/// Whether `response` carries a terminal event the daemon retained for the
+/// Recording it still reports as Processing. The daemon retains the event the
+/// moment Delivery lands, while it is still writing diagnostics, so this is
+/// what lets the check mark appear without waiting for Idle.
+fn current_recording_event(response: &Response) -> Option<&OverlayEvent> {
+    let event = response.overlay_event.as_ref()?;
+    let identity = recording_identity(response)?;
+    (event.correlation_id.as_deref() == Some(identity)).then_some(event)
+}
 
 #[derive(Debug, Default)]
 pub struct PresentationController {
@@ -176,20 +216,30 @@ impl PresentationController {
         // Any live in-progress state (Recording or Processing) is driven straight
         // from status and supersedes the previous terminal feedback window. The
         // retained observer event stays attached to every OverlayStatus response,
-        // so it must be ignored while the daemon is not Idle.
-        if matches!(
-            response.state,
-            Some(DaemonState::Recording) | Some(DaemonState::Processing)
-        ) {
-            self.terminal_until = None;
-            return OverlayView::from_response(response);
-        }
+        // so it must be ignored while the daemon is not Idle — except an event
+        // retained for the very Recording still Processing, which is that
+        // Recording's own Delivery landing early.
+        let early = match response.state {
+            Some(DaemonState::Recording) => {
+                self.terminal_until = None;
+                return OverlayView::from_response(response);
+            }
+            Some(DaemonState::Processing) => {
+                if current_recording_event(response).is_none() {
+                    self.terminal_until = None;
+                    return OverlayView::from_response(response);
+                }
+                true
+            }
+            _ => false,
+        };
         if let Some(event) = response.overlay_event.as_ref()
             && self.displayed_event != Some((event.instance, event.id))
         {
             self.displayed_event = Some((event.instance, event.id));
-            self.terminal_until = Some(now + TERMINAL_DISPLAY);
-            return OverlayView::from_terminal_event(event);
+            let view = OverlayView::from_terminal_event(event);
+            self.terminal_until = Some(now + terminal_hold(view));
+            return view;
         }
         if self.terminal_until.is_some_and(|until| now < until) {
             return response
@@ -199,6 +249,11 @@ impl PresentationController {
                 .unwrap_or(OverlayView::HIDDEN);
         }
         self.terminal_until = None;
+        if early {
+            // The Transcript already landed; a slow tail must not bring the
+            // Processing sweep back after the confirmation expired.
+            return OverlayView::HIDDEN;
+        }
         OverlayView::from_response(response)
     }
 
@@ -824,6 +879,40 @@ pub const MAX_STATUS_RESPONSE_BYTES: usize =
 /// status poll period.
 pub const STATUS_POLL_PERIOD: Duration = Duration::from_millis(200);
 
+/// Status cadence while the daemon is Processing: fast enough that the check
+/// mark lands within a frame or two of the paste. Each round trip stays
+/// bounded by `STATUS_ROUND_TRIP_DEADLINE`, so this only shortens the idle gap
+/// between round trips.
+pub const PROCESSING_STATUS_POLL_PERIOD: Duration = Duration::from_millis(30);
+
+/// How long the fast cadence outlives the last Processing reply. It covers the
+/// check mark's whole hold plus a margin, so the capsule hides on time instead
+/// of waiting for the next 200 ms idle poll after the hold expires.
+const FAST_POLL_TAIL: Duration = Duration::from_millis(SUCCESS_DISPLAY.as_millis() as u64 + 100);
+
+/// The status cadence: fast while Processing (the phase whose end the user is
+/// waiting on) and through the check mark's hold that follows it, idle-slow
+/// otherwise.
+#[derive(Debug, Default)]
+pub struct StatusCadence {
+    fast_until: Option<Instant>,
+}
+
+impl StatusCadence {
+    /// The wait before the next round trip, after observing `response` at `now`.
+    pub fn next(&mut self, response: Option<&Response>, now: Instant) -> Duration {
+        if response.and_then(|response| response.state) == Some(DaemonState::Processing) {
+            self.fast_until = Some(now + FAST_POLL_TAIL);
+        }
+        if self.fast_until.is_some_and(|until| now < until) {
+            PROCESSING_STATUS_POLL_PERIOD
+        } else {
+            self.fast_until = None;
+            STATUS_POLL_PERIOD
+        }
+    }
+}
+
 /// One bounded OverlayStatus round trip against the daemon's observer socket:
 /// connect, write the request, and read the reply under one total deadline,
 /// refusing a reply that outgrows [`MAX_STATUS_RESPONSE_BYTES`]. Returns None
@@ -977,6 +1066,9 @@ pub fn read_until_eof_within(
 #[derive(Debug)]
 pub struct StatusObservation {
     pub response: Option<Response>,
+    /// The cadence the worker chose after this round trip; the GTK tick that
+    /// consumes observations follows it so it never lags the worker.
+    pub period: Duration,
 }
 
 /// The dedicated status-fetch worker. ALL OverlayStatus IPC runs on this
@@ -1006,10 +1098,12 @@ impl StatusWorker {
         let thread_stop = Arc::clone(&stop);
         let thread_latest = Arc::clone(&latest);
         thread::spawn(move || {
+            let mut cadence = StatusCadence::default();
             while !thread_stop.load(Ordering::Relaxed) {
                 let response = fetch();
-                *thread_latest.lock().unwrap() = Some(StatusObservation { response });
-                thread::sleep(STATUS_POLL_PERIOD);
+                let period = cadence.next(response.as_ref(), Instant::now());
+                *thread_latest.lock().unwrap() = Some(StatusObservation { response, period });
+                thread::sleep(period);
             }
         });
         Self { stop, latest }
@@ -1136,7 +1230,40 @@ mod tests {
             instance,
             outcome,
             message: "exact public outcome".into(),
+            correlation_id: None,
         }
+    }
+
+    /// A terminal event the daemon retained for one specific Recording.
+    fn event_for(id: u64, outcome: OverlayOutcome, correlation: &str) -> OverlayEvent {
+        OverlayEvent {
+            correlation_id: Some(correlation.to_owned()),
+            ..event(id, outcome)
+        }
+    }
+
+    /// An `OverlayStatus` reply about one live Recording, in the wire shape
+    /// the daemon sends: evidence carries the Recording's correlation ID.
+    fn live_status(
+        state: DaemonState,
+        correlation: &str,
+        retained: Option<OverlayEvent>,
+    ) -> Response {
+        let mut response: Response = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "ok": true,
+            "state": state,
+            "message": state.cli_label(),
+            "evidence": {
+                "recording_id": 1,
+                "correlation_id": correlation,
+                "stages": [],
+                "delivery_count": 0,
+            },
+        }))
+        .unwrap();
+        response.overlay_event = retained;
+        response
     }
 
     /// Mirrors a real `OverlayStatus` reply: the observer path always attaches
@@ -1219,9 +1346,11 @@ mod tests {
         // rendered.
         *worker.latest.lock().unwrap() = Some(StatusObservation {
             response: Some(overlay_status(DaemonState::Idle, None)),
+            period: STATUS_POLL_PERIOD,
         });
         *worker.latest.lock().unwrap() = Some(StatusObservation {
             response: Some(overlay_status(DaemonState::Recording, None)),
+            period: STATUS_POLL_PERIOD,
         });
         let taken = worker.take_latest().unwrap();
         assert_eq!(taken.response.unwrap().state, Some(DaemonState::Recording));
@@ -1401,6 +1530,278 @@ mod tests {
     }
 
     #[test]
+    fn a_pasted_confirmation_clears_after_600_ms_while_other_terminal_views_hold_two_seconds() {
+        let t0 = Instant::now();
+        let mut pasted = PresentationController::default();
+        let delivered =
+            overlay_status(DaemonState::Idle, Some(event(1, OverlayOutcome::Delivered)));
+        assert_eq!(pasted.observe(&delivered, t0).phase, OverlayPhase::Success);
+        assert_eq!(
+            pasted
+                .observe(&delivered, t0 + Duration::from_millis(599))
+                .phase,
+            OverlayPhase::Success,
+        );
+        assert_eq!(
+            pasted
+                .observe(&delivered, t0 + Duration::from_millis(600))
+                .phase,
+            OverlayPhase::Hidden,
+        );
+        for (outcome, phase) in [
+            (OverlayOutcome::DeliveryFailure, OverlayPhase::Failure),
+            (OverlayOutcome::QualityFailure, OverlayPhase::NoSpeech),
+            (OverlayOutcome::Copied, OverlayPhase::Copied),
+        ] {
+            let mut controller = PresentationController::default();
+            let terminal = overlay_status(DaemonState::Idle, Some(event(2, outcome.clone())));
+            assert_eq!(controller.observe(&terminal, t0).phase, phase);
+            assert_eq!(
+                controller
+                    .observe(&terminal, t0 + Duration::from_millis(1999))
+                    .phase,
+                phase,
+                "{outcome:?} must hold for two seconds",
+            );
+            assert_eq!(
+                controller
+                    .observe(&terminal, t0 + Duration::from_secs(2))
+                    .phase,
+                OverlayPhase::Hidden,
+            );
+        }
+    }
+
+    #[test]
+    fn a_delivery_for_the_current_recording_shows_while_the_daemon_still_reports_processing() {
+        // The daemon retains the Delivered event the moment the paste lands,
+        // but stays Processing while it writes diagnostics and drains the
+        // provider reaper. The check mark must not wait for Idle.
+        let t0 = Instant::now();
+        let mut controller = PresentationController::default();
+        assert_eq!(
+            controller
+                .observe(&live_status(DaemonState::Processing, "rec-a", None), t0)
+                .phase,
+            OverlayPhase::Processing,
+        );
+        let landed = event_for(4, OverlayOutcome::Delivered, "rec-a");
+        let processing = live_status(DaemonState::Processing, "rec-a", Some(landed.clone()));
+        assert_eq!(
+            controller.observe(&processing, t0).phase,
+            OverlayPhase::Success
+        );
+        // Still Processing on the next poll: the check mark stays, the sweep
+        // does not come back.
+        let t1 = t0 + Duration::from_millis(30);
+        assert_eq!(
+            controller.observe(&processing, t1).phase,
+            OverlayPhase::Success
+        );
+        // Completed lands: the same event, now at Idle, keeps the SAME window.
+        let idle = overlay_status(DaemonState::Idle, Some(landed));
+        assert_eq!(
+            controller
+                .observe(&idle, t0 + Duration::from_millis(400))
+                .phase,
+            OverlayPhase::Success,
+        );
+        assert_eq!(
+            controller.observe(&idle, t0 + SUCCESS_DISPLAY).phase,
+            OverlayPhase::Hidden,
+        );
+    }
+
+    #[test]
+    fn an_expired_confirmation_stays_hidden_if_the_daemon_is_still_processing() {
+        let t0 = Instant::now();
+        let mut controller = PresentationController::default();
+        let processing = live_status(
+            DaemonState::Processing,
+            "rec-a",
+            Some(event_for(4, OverlayOutcome::Delivered, "rec-a")),
+        );
+        assert_eq!(
+            controller.observe(&processing, t0).phase,
+            OverlayPhase::Success
+        );
+        // A slow reaper drain outlasts the check mark: the Transcript is
+        // already pasted, so the capsule hides instead of sweeping again.
+        assert_eq!(
+            controller.observe(&processing, t0 + SUCCESS_DISPLAY).phase,
+            OverlayPhase::Hidden,
+        );
+    }
+
+    #[test]
+    fn a_previous_recordings_event_is_ignored_during_recording_and_processing() {
+        let now = Instant::now();
+        for stale in [
+            // Retained for an earlier Recording.
+            event_for(3, OverlayOutcome::Delivered, "rec-a"),
+            // From a daemon that predates per-Recording events.
+            event(3, OverlayOutcome::Delivered),
+        ] {
+            for state in [DaemonState::Recording, DaemonState::Processing] {
+                let mut controller = PresentationController::default();
+                let live = live_status(state, "rec-b", Some(stale.clone()));
+                assert_eq!(
+                    controller.observe(&live, now),
+                    OverlayView::from_response(&live),
+                    "{state:?} must ignore {stale:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_new_recording_supersedes_the_early_confirmation_at_once() {
+        let t0 = Instant::now();
+        let mut controller = PresentationController::default();
+        let landed = event_for(4, OverlayOutcome::Delivered, "rec-a");
+        assert_eq!(
+            controller
+                .observe(
+                    &live_status(DaemonState::Processing, "rec-a", Some(landed.clone())),
+                    t0
+                )
+                .phase,
+            OverlayPhase::Success,
+        );
+        let t1 = t0 + Duration::from_millis(100);
+        assert_eq!(
+            controller
+                .observe(
+                    &live_status(DaemonState::Recording, "rec-b", Some(landed.clone())),
+                    t1
+                )
+                .phase,
+            OverlayPhase::Recording,
+        );
+        // Its own Processing does not resurrect the earlier check mark.
+        assert_eq!(
+            controller
+                .observe(
+                    &live_status(DaemonState::Processing, "rec-b", Some(landed)),
+                    t1
+                )
+                .phase,
+            OverlayPhase::Processing,
+        );
+    }
+
+    #[test]
+    fn the_early_confirmation_and_the_idle_reply_after_it_announce_once() {
+        // The notification rung announces on view identity changes. The
+        // Processing->Idle switch behind an early check mark must not read as a
+        // second Delivery.
+        let t0 = Instant::now();
+        let mut controller = PresentationController::default();
+        let landed = event_for(4, OverlayOutcome::Delivered, "rec-a");
+        let replies = [
+            (live_status(DaemonState::Processing, "rec-a", None), t0),
+            (
+                live_status(DaemonState::Processing, "rec-a", Some(landed.clone())),
+                t0 + Duration::from_millis(30),
+            ),
+            (
+                live_status(DaemonState::Processing, "rec-a", Some(landed.clone())),
+                t0 + Duration::from_millis(60),
+            ),
+            (
+                overlay_status(DaemonState::Idle, Some(landed)),
+                t0 + Duration::from_millis(90),
+            ),
+        ];
+        let mut previous = OverlayView::HIDDEN;
+        let mut announced = Vec::new();
+        for (reply, at) in &replies {
+            let view = controller.observe(reply, *at);
+            if let Some(RungNotification::Label(label)) =
+                notification_rung_choice(view, previous.phase, previous.visible_label, false, false)
+            {
+                announced.push(label);
+            }
+            previous = view;
+        }
+        assert_eq!(
+            announced,
+            ["Processing Recording", "Transcript Delivered"],
+            "exactly one Delivered announcement",
+        );
+    }
+
+    #[test]
+    fn clipboard_only_delivery_maps_to_a_calm_copied_view() {
+        let view = OverlayView::from_terminal_event(&event(6, OverlayOutcome::Copied));
+        assert_eq!(view.phase, OverlayPhase::Copied);
+        assert_eq!(view.capsule_text(), "Copied · Ctrl+V");
+        assert_eq!(
+            view.accessible_label,
+            "Transcript copied to the clipboard; press Ctrl+V to paste"
+        );
+        // Not a failure: no warning glyph.
+        assert_eq!(phase_glyph(OverlayPhase::Copied), "");
+    }
+
+    #[test]
+    fn copied_outcome_and_recording_correlation_round_trip_on_the_wire() {
+        let event = event_for(6, OverlayOutcome::Copied, "rec-a");
+        let wire = serde_json::to_value(&event).unwrap();
+        assert_eq!(wire["outcome"], "copied");
+        assert_eq!(wire["correlation_id"], "rec-a");
+        assert_eq!(serde_json::from_value::<OverlayEvent>(wire).unwrap(), event);
+        // An event from a daemon that predates the field still parses, and a
+        // field-free event serializes without it.
+        let legacy: OverlayEvent =
+            serde_json::from_str(r#"{"id":1,"outcome":"delivered","message":"Delivered"}"#)
+                .unwrap();
+        assert_eq!(legacy.correlation_id, None);
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("correlation_id")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn status_polls_fast_while_processing_and_through_the_check_marks_hold() {
+        assert!(PROCESSING_STATUS_POLL_PERIOD <= Duration::from_millis(30));
+        let t0 = Instant::now();
+        let mut idle = StatusCadence::default();
+        for state in [DaemonState::Idle, DaemonState::Recording] {
+            assert_eq!(
+                idle.next(Some(&overlay_status(state, None)), t0),
+                STATUS_POLL_PERIOD,
+            );
+        }
+        assert_eq!(idle.next(None, t0), STATUS_POLL_PERIOD);
+
+        let mut cadence = StatusCadence::default();
+        assert_eq!(
+            cadence.next(Some(&overlay_status(DaemonState::Processing, None)), t0),
+            PROCESSING_STATUS_POLL_PERIOD,
+        );
+        // Idle replies right after Processing keep the fast cadence until the
+        // check mark's hold has passed, so the capsule hides on time.
+        let idle_reply = overlay_status(DaemonState::Idle, None);
+        assert_eq!(
+            cadence.next(Some(&idle_reply), t0 + SUCCESS_DISPLAY),
+            PROCESSING_STATUS_POLL_PERIOD,
+        );
+        assert_eq!(
+            cadence.next(Some(&idle_reply), t0 + FAST_POLL_TAIL),
+            STATUS_POLL_PERIOD,
+        );
+        assert_eq!(
+            cadence.next(Some(&idle_reply), t0 + SUCCESS_DISPLAY),
+            STATUS_POLL_PERIOD,
+            "once relaxed, the cadence stays slow until Processing returns",
+        );
+    }
+
+    #[test]
     fn the_exact_terminal_id_reused_by_a_restarted_daemon_is_still_shown() {
         // A restarted daemon resets its id counter to 1, so its first terminal
         // event reuses the EXACT id (1) the observer just displayed. Identity is
@@ -1459,11 +1860,12 @@ mod tests {
         // that would stretch a nominal 2-second capsule to nearly 4 seconds.
         let mut controller = PresentationController::default();
         let t0 = Instant::now();
-        let delivered = event(3, OverlayOutcome::Delivered);
-        let terminal = overlay_status(DaemonState::Idle, Some(delivered));
+        // A failure, because it holds the full two-second window.
+        let failed = event(3, OverlayOutcome::DeliveryFailure);
+        let terminal = overlay_status(DaemonState::Idle, Some(failed));
         assert_eq!(
             controller.observe(&terminal, t0).phase,
-            OverlayPhase::Success
+            OverlayPhase::Failure
         );
         // Daemon drops just before the terminal window expires: the
         // unavailable capsule flashes on its own deadline.
@@ -1482,14 +1884,17 @@ mod tests {
         // Symmetric containment: a terminal window survives an unreachable
         // blip unchanged — shown for its remainder, hidden at its own expiry.
         let mut symmetric = PresentationController::default();
-        let fresh = overlay_status(DaemonState::Idle, Some(event(4, OverlayOutcome::Delivered)));
-        assert_eq!(symmetric.observe(&fresh, t0).phase, OverlayPhase::Success);
+        let fresh = overlay_status(
+            DaemonState::Idle,
+            Some(event(4, OverlayOutcome::DeliveryFailure)),
+        );
+        assert_eq!(symmetric.observe(&fresh, t0).phase, OverlayPhase::Failure);
         symmetric.observe_unreachable(t0 + Duration::from_millis(500));
         assert_eq!(
             symmetric
                 .observe(&fresh, t0 + Duration::from_millis(600))
                 .phase,
-            OverlayPhase::Success,
+            OverlayPhase::Failure,
         );
         assert_eq!(
             symmetric.observe(&fresh, t0 + TERMINAL_DISPLAY).phase,

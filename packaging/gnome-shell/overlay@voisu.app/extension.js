@@ -5,10 +5,9 @@ import Shell from 'gi://Shell';
 import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
-import {MAX_RESPONSE_BYTES, RequestLifecycle, capsuleForResponse, parseBoundedResponse} from './state.mjs';
+import {MAX_RESPONSE_BYTES, RequestLifecycle, TERMINAL_HOLD_MS, capsuleForResponse, parseBoundedResponse} from './state.mjs';
 
 const PROTOCOL_VERSION = 1;
-const VISIBLE_MS = 1400;
 const ROUND_TRIP_MS = 750;
 
 export default class VoisuOverlay extends Extension {
@@ -180,7 +179,7 @@ export default class VoisuOverlay extends Extension {
     const capsule = capsuleForResponse(response, this._lastEvent);
     if (capsule.eventIdentity) this._lastEvent = capsule.eventIdentity;
     if (capsule.visible)
-      return this._show(capsule.text, capsule.styleClass, capsule.terminal);
+      return this._show(capsule.text, capsule.styleClass, capsule.terminal, capsule.holdMs);
     if (response.overlay_event) {
       // A retained terminal event already shown stays hidden instead of
       // resurfacing on every observer poll.
@@ -189,15 +188,15 @@ export default class VoisuOverlay extends Extension {
     this._capsule.hide();
   }
 
-  _show(text, phaseClass, terminal) {
-    for (const name of ['voisu-recording', 'voisu-processing', 'voisu-success', 'voisu-failure', 'voisu-nospeech'])
+  _show(text, phaseClass, terminal, holdMs = TERMINAL_HOLD_MS) {
+    for (const name of ['voisu-recording', 'voisu-processing', 'voisu-success', 'voisu-failure', 'voisu-nospeech', 'voisu-copied'])
       this._capsule.remove_style_class_name(name);
     this._capsule.add_style_class_name(phaseClass);
     this._capsule.text = text;
     this._capsule.show();
     this._position();
     if (this._hideId) GLib.source_remove(this._hideId);
-    if (terminal) this._hideId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, VISIBLE_MS, () => {
+    if (terminal) this._hideId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, holdMs, () => {
       this._capsule.hide();
       this._hideId = 0;
       return GLib.SOURCE_REMOVE;

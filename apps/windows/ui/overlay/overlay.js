@@ -21,8 +21,9 @@ const FRAME_MS = 1000 / 30;
 // (overlay.rs ERROR_DISPLAY); the page holds it a little longer so it never
 // blanks before the window hides.
 const ERROR_HOLD_MS = 3500;
-// Same for the Delivered check mark (overlay.rs DONE_DISPLAY, 2 s).
-const DONE_HOLD_MS = 2500;
+// The Delivered check mark clears with the window (overlay.rs DONE_DISPLAY,
+// 600 ms): it confirms a paste that already landed, so it stays brief.
+const DONE_HOLD_MS = 600;
 // Hands-free shows a Recording-green dot in place of the leftmost bars, so the
 // state is told by shape and position, not colour alone.
 const HANDS_FREE_RGB = '101, 214, 160';
