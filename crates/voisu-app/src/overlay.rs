@@ -10,6 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+pub mod waveform;
+
 use voisu_core::{
     Command, DaemonState, OverlayEvent, OverlayOutcome, Request, Response, socket_path,
 };
@@ -310,48 +312,10 @@ impl LevelPollLatch {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct BarSmoother {
-    levels: [f32; 20],
-}
-
-impl BarSmoother {
-    pub fn observe(&mut self, bands: [u8; 20]) -> [u8; 20] {
-        for (current, target) in self.levels.iter_mut().zip(bands) {
-            let coefficient = if target as f32 > *current { 0.65 } else { 0.16 };
-            *current += coefficient * (target as f32 - *current);
-        }
-        self.current()
-    }
-
-    pub fn observe_all(&mut self, frames: impl IntoIterator<Item = [u8; 20]>) -> [u8; 20] {
-        for frame in frames {
-            self.observe(frame);
-        }
-        self.current()
-    }
-
-    pub fn observe_failure(&mut self) -> [u8; 20] {
-        self.observe([0; 20])
-    }
-
-    pub fn reset(&mut self) -> [u8; 20] {
-        self.levels = [0.0; 20];
-        self.current()
-    }
-
-    pub fn current(&self) -> [u8; 20] {
-        std::array::from_fn(|index| self.levels[index].round().clamp(0.0, 255.0) as u8)
-    }
-}
-
 // ---- Waveform drawing math (pure; the cairo adapter in the bin consumes it) ----
 
-/// Number of bars actually drawn in the meter row. The IPC contract carries
-/// exactly 20 frequency bands (`[u8; 20]`, see `LevelFrame`); the extra visual
-/// bars are synthesised in the draw code by linear interpolation between those
-/// 20 bands (`interpolate_bands`) so the waveform reads as denser and more
-/// reactive without changing the wire format.
+/// Number of bars drawn in the meter row: 22 slots of level history mirrored
+/// about the centre (see `waveform`), as on the Windows overlay.
 pub const VISUAL_BAR_COUNT: usize = 44;
 
 /// Spec floor for the edge-falloff ramp: outermost bars sit at ~45% opacity.
@@ -369,28 +333,6 @@ const SWEEP_SIGMA_BARS: f64 = 4.4;
 const SWEEP_BASE_BRIGHTNESS: f64 = 0.35;
 const SWEEP_REDUCED_MOTION_BRIGHTNESS: f64 = 0.6;
 
-/// Resample the 20 IPC bands up (or down) to `count` visual levels by linear
-/// interpolation, returning levels in `0.0..=255.0`. For visual bar `i` the
-/// sample position in band space is `(i + 0.5) / count * 20 - 0.5`; the two
-/// neighbouring band indices are clamped to `0..=19` and lerped. `count == 20`
-/// returns the bands unchanged (as f64).
-pub fn interpolate_bands(bands: &[u8; 20], count: usize) -> Vec<f64> {
-    if count == 20 {
-        return bands.iter().map(|&b| f64::from(b)).collect();
-    }
-    (0..count)
-        .map(|i| {
-            let pos = (i as f64 + 0.5) / count as f64 * 20.0 - 0.5;
-            let lo = pos.floor().clamp(0.0, 19.0) as usize;
-            let hi = pos.ceil().clamp(0.0, 19.0) as usize;
-            let lo_v = f64::from(bands[lo]);
-            let hi_v = f64::from(bands[hi]);
-            let frac = (pos - lo as f64).clamp(0.0, 1.0);
-            lo_v + (hi_v - lo_v) * frac
-        })
-        .collect()
-}
-
 /// Per-bar opacity: a half-sine ramp from `EDGE_FALLOFF_MIN` at the row's ends
 /// to 1.0 at its center, so the waveform fades out softly instead of stopping.
 pub fn edge_falloff_alpha(index: usize, count: usize) -> f64 {
@@ -404,11 +346,11 @@ pub fn resting_floor(drawable_height: f64) -> f64 {
     (0.10 * drawable_height).max(1.5)
 }
 
-/// Recording bar height: level 0 rests exactly on the floor, level 255 fills
-/// the drawable height, linear in between.
-pub fn recording_bar_height(level: u8, drawable_height: f64) -> f64 {
+/// Recording bar height: level 0.0 rests exactly on the floor, 1.0 fills the
+/// drawable height, linear in between.
+pub fn recording_bar_height(level: f64, drawable_height: f64) -> f64 {
     let floor = resting_floor(drawable_height);
-    floor + f64::from(level) / 255.0 * (drawable_height - floor)
+    floor + level.clamp(0.0, 1.0) * (drawable_height - floor)
 }
 
 /// Processing light-sweep brightness for one bar. A gaussian bump travels
@@ -1100,26 +1042,6 @@ mod tests {
     use voisu_core::{DaemonState, OverlayEvent, OverlayOutcome, Response, VersionEnvelope};
 
     #[test]
-    fn red_bar_smoothing_attacks_quickly_and_releases_monotonically() {
-        let mut smoother = BarSmoother::default();
-        let first = smoother.observe([200; 20]);
-        let second = smoother.observe([200; 20]);
-        assert!(first[0] >= 100 && second[0] > first[0]);
-        let release_one = smoother.observe([0; 20]);
-        let release_two = smoother.observe([0; 20]);
-        assert!(release_one[0] < second[0] && release_two[0] < release_one[0]);
-    }
-
-    #[test]
-    fn red_coalesced_level_frames_preserve_an_intermediate_peak() {
-        let mut coalesced = BarSmoother::default();
-        let result = coalesced.observe_all([[20; 20], [240; 20], [20; 20]]);
-        let mut last_only = BarSmoother::default();
-        let last = last_only.observe([20; 20]);
-        assert!(result[0] > last[0]);
-    }
-
-    #[test]
     fn red_level_poll_timer_uses_observed_recording_edges() {
         let mut latch = LevelPollLatch::default();
         assert_eq!(
@@ -1189,9 +1111,15 @@ mod tests {
             controller.observe(&response, now).phase,
             OverlayPhase::Recording
         );
-        let mut smoother = BarSmoother::default();
-        smoother.observe([200; 20]);
-        assert!(smoother.observe_failure()[0] < 200);
+        // A failed poll publishes silence as the target, so the bars ease
+        // down instead of freezing or blanking.
+        let mut meter = waveform::Waveform::default();
+        meter.set_target(0.8);
+        meter.advance(0.2);
+        let before = meter.slot_level(0);
+        meter.set_target(0.0);
+        meter.advance(0.05);
+        assert!(meter.slot_level(0) < before && meter.slot_level(0) > 0.0);
         assert_eq!(
             controller.observe(&response, now).phase,
             OverlayPhase::Recording
@@ -2166,10 +2094,11 @@ mod tests {
             "floor never collapses below the old 1.5px minimum"
         );
         // Silence (level 0) sits exactly on the floor; full level fills the height.
-        assert!((recording_bar_height(0, 38.0) - floor).abs() < 1e-9);
-        assert!((recording_bar_height(255, 38.0) - 38.0).abs() < 1e-9);
-        // Monotone in level.
-        assert!(recording_bar_height(80, 38.0) < recording_bar_height(200, 38.0));
+        assert!((recording_bar_height(0.0, 38.0) - floor).abs() < 1e-9);
+        assert!((recording_bar_height(1.0, 38.0) - 38.0).abs() < 1e-9);
+        // Monotone in level, and out-of-range levels stay inside the meter.
+        assert!(recording_bar_height(0.3, 38.0) < recording_bar_height(0.8, 38.0));
+        assert!((recording_bar_height(4.0, 38.0) - 38.0).abs() < 1e-9);
     }
 
     #[test]
@@ -2199,88 +2128,6 @@ mod tests {
                 assert!((0.25..=1.0).contains(&b), "b={b} at index={index} t={t}");
             }
         }
-    }
-
-    #[test]
-    fn interpolate_bands_length_matches_count() {
-        let bands = [7u8; 20];
-        assert_eq!(
-            interpolate_bands(&bands, VISUAL_BAR_COUNT).len(),
-            VISUAL_BAR_COUNT
-        );
-        assert_eq!(interpolate_bands(&bands, 44).len(), 44);
-        assert_eq!(interpolate_bands(&bands, 20).len(), 20);
-    }
-
-    #[test]
-    fn interpolate_bands_is_identity_at_count_20() {
-        let bands: [u8; 20] = std::array::from_fn(|i| (i * 13 % 256) as u8);
-        let out = interpolate_bands(&bands, 20);
-        for (i, &b) in bands.iter().enumerate() {
-            assert!(
-                (out[i] - f64::from(b)).abs() < 1e-9,
-                "identity broke at {i}"
-            );
-        }
-    }
-
-    #[test]
-    fn interpolate_bands_stays_in_range() {
-        let bands: [u8; 20] = std::array::from_fn(|i| ((i * 37 + 11) % 256) as u8);
-        for &v in &interpolate_bands(&bands, VISUAL_BAR_COUNT) {
-            assert!((0.0..=255.0).contains(&v), "out of range: {v}");
-        }
-    }
-
-    #[test]
-    fn interpolate_bands_preserves_monotonic_ramp() {
-        // A monotonically increasing input must stay monotonic after resampling.
-        let bands: [u8; 20] = std::array::from_fn(|i| (i * 13) as u8); // 0,13,...,247
-        let out = interpolate_bands(&bands, VISUAL_BAR_COUNT);
-        for w in out.windows(2) {
-            assert!(
-                w[1] >= w[0] - 1e-9,
-                "ramp not monotonic: {} -> {}",
-                w[0],
-                w[1]
-            );
-        }
-    }
-
-    #[test]
-    fn interpolate_bands_endpoints_are_exactly_the_clamped_bands() {
-        // For count 44, the first sample position is (0.5/44)*20 - 0.5 < 0 and the
-        // last is (43.5/44)*20 - 0.5 > 19, so both clamp onto band 0 / band 19 and
-        // the endpoints equal the first/last band EXACTLY (no half-band slack).
-        let bands: [u8; 20] = std::array::from_fn(|i| (i * 13) as u8); // 0..=247
-        let out = interpolate_bands(&bands, VISUAL_BAR_COUNT);
-        assert!((out[0] - 0.0).abs() < 1e-9, "first bar hugs band 0 exactly");
-        assert!(
-            (out[VISUAL_BAR_COUNT - 1] - 247.0).abs() < 1e-9,
-            "last bar hugs band 19 exactly"
-        );
-    }
-
-    #[test]
-    fn interpolate_bands_lerps_interior_44_bar_values_exactly() {
-        // Sentinel: a single spike at band 10 so the exact lerp weights are legible.
-        let mut bands = [0u8; 20];
-        bands[10] = 255;
-        let out = interpolate_bands(&bands, VISUAL_BAR_COUNT);
-        // Visual bar 22: pos = (22.5/44)*20 - 0.5 = 107/11 = 9.7272..., so it lerps
-        // band 9 (0) -> band 10 (255) with frac 8/11 -> 255 * 8/11 = 2040/11.
-        assert!(
-            (out[22] - 2040.0 / 11.0).abs() < 1e-9,
-            "bar 22 = {}, want 2040/11",
-            out[22]
-        );
-        // Visual bar 23: pos = (23.5/44)*20 - 0.5 = 112/11 = 10.1818..., lerps
-        // band 10 (255) -> band 11 (0) with frac 2/11 -> 255 * 9/11 = 2295/11.
-        assert!(
-            (out[23] - 2295.0 / 11.0).abs() < 1e-9,
-            "bar 23 = {}, want 2295/11",
-            out[23]
-        );
     }
 
     #[test]

@@ -18,16 +18,16 @@ use voisu_app::feedback::{
     select_feedback_backend,
 };
 use voisu_app::local_overlay::TriggerRepeatLatch;
+use voisu_app::overlay::waveform::{Waveform, level_from_frames};
 use voisu_app::overlay::{
-    BarSmoother, LIMIT_WARNING_CLASS, LevelPollAction, LevelPollLatch, LimitWarning,
-    LimitWarningLatch, NoSpeechNotifyLatch, ObservedSignal, OverlayPhase, OverlayView,
-    PresentationController, PresentationTracker, RecordingNotifyLatch, RungNotification,
-    STATUS_POLL_PERIOD, STATUS_ROUND_TRIP_DEADLINE, StatusWorker, TickAction, TickObservation,
-    VISUAL_BAR_COUNT, connect_within, edge_falloff_alpha, fetch_status, interpolate_bands,
-    limit_notification_body, limit_warning_class, limit_warning_from_response,
-    notification_rung_choice, phase_glyph, poll_tick, read_until_eof_within, recording_bar_height,
-    recording_bar_rgb, recording_identity, recording_remaining, resting_floor, sweep_brightness,
-    write_within,
+    LIMIT_WARNING_CLASS, LevelPollAction, LevelPollLatch, LimitWarning, LimitWarningLatch,
+    NoSpeechNotifyLatch, ObservedSignal, OverlayPhase, OverlayView, PresentationController,
+    PresentationTracker, RecordingNotifyLatch, RungNotification, STATUS_POLL_PERIOD,
+    STATUS_ROUND_TRIP_DEADLINE, StatusWorker, TickAction, TickObservation, VISUAL_BAR_COUNT,
+    connect_within, edge_falloff_alpha, fetch_status, limit_notification_body, limit_warning_class,
+    limit_warning_from_response, notification_rung_choice, phase_glyph, poll_tick,
+    read_until_eof_within, recording_bar_height, recording_bar_rgb, recording_identity,
+    recording_remaining, resting_floor, sweep_brightness, write_within,
 };
 use voisu_core::{Command, Request, Response, socket_path};
 
@@ -334,26 +334,29 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
     glyph.add_css_class("meter");
     glyph.set_hexpand(true);
     glyph.set_halign(gtk::Align::Center);
-    let rendered_bars = Rc::new(RefCell::new([0_u8; 20]));
+    let waveform = Rc::new(RefCell::new(Waveform::default()));
     let reduced_motion = gtk::Settings::default()
         .map(|settings| !settings.is_gtk_enable_animations())
         .unwrap_or(true);
-    let sweep_started = Instant::now();
+    // Reset on each entry into Processing so the sweep always enters from the
+    // left, as on Windows.
+    let sweep_started = Rc::new(Cell::new(Instant::now()));
     // What the meter is currently painted for. One cell, not two: the phase and
     // its warning stage are always set together, and the draw func runs on
     // GTK's schedule rather than the poll's, so it must never see a half-update.
     let rendered = Rc::new(Cell::new(MeterState::HIDDEN));
     meter.set_draw_func({
-        let rendered_bars = Rc::clone(&rendered_bars);
+        let waveform = Rc::clone(&waveform);
         let rendered = Rc::clone(&rendered);
+        let sweep_started = Rc::clone(&sweep_started);
         move |_, context, width, height| {
             draw_meter(
                 context,
                 width,
                 height,
-                &rendered_bars.borrow(),
+                &waveform.borrow(),
                 rendered.get(),
-                sweep_started,
+                sweep_started.get(),
                 reduced_motion,
             );
         }
@@ -409,8 +412,10 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
             meter,
             glyph,
             capsule,
-            rendered_bars,
+            waveform,
             rendered,
+            sweep_started,
+            reduced_motion,
             switched,
             status_worker,
         },
@@ -428,8 +433,10 @@ struct CapsuleFeedback {
     meter: gtk::DrawingArea,
     glyph: gtk::Label,
     capsule: gtk::Box,
-    rendered_bars: Rc<RefCell<[u8; 20]>>,
+    waveform: Rc<RefCell<Waveform>>,
     rendered: Rc<Cell<MeterState>>,
+    sweep_started: Rc<Cell<Instant>>,
+    reduced_motion: bool,
     switched: Rc<Cell<bool>>,
     status_worker: Rc<StatusWorker>,
 }
@@ -447,8 +454,10 @@ fn install_surface_feedback(
         meter,
         glyph,
         capsule,
-        rendered_bars,
+        waveform,
         rendered,
+        sweep_started,
+        reduced_motion,
         switched,
         status_worker,
     } = feedback;
@@ -463,23 +472,21 @@ fn install_surface_feedback(
     let no_speech_latch = Rc::new(RefCell::new(NoSpeechNotifyLatch::default()));
     let limit_latch = Rc::new(RefCell::new(LimitWarningLatch::default()));
     let level_latch = Rc::new(RefCell::new(LevelPollLatch::default()));
-    let level_poll = Rc::new(RefCell::new(None::<(gtk::glib::SourceId, Rc<LevelWorker>)>));
+    let level_worker = Rc::new(RefCell::new(None::<LevelWorker>));
+    let animation = MeterAnimation::default();
     let trigger_latch = Rc::new(RefCell::new(TriggerRepeatLatch::default()));
     gtk::glib::timeout_add_local(STATUS_POLL_PERIOD, move || {
         if switched.get() {
             // A genuine surface-creation failure handed feedback to the
             // notification backend; stop driving the retired window.
-            if let Some((source, worker)) = level_poll.borrow_mut().take() {
-                source.remove();
+            animation.stop();
+            if let Some(worker) = level_worker.borrow_mut().take() {
                 worker.stop();
             }
             status_worker.stop();
             return gtk::glib::ControlFlow::Break;
         }
         let Some(observation) = status_worker.take_latest() else {
-            if rendered.get().phase == OverlayPhase::Processing {
-                meter.queue_draw();
-            }
             return gtk::glib::ControlFlow::Continue;
         };
         let now = Instant::now();
@@ -507,6 +514,11 @@ fn install_surface_feedback(
                 None,
             ),
         };
+        if view.phase == OverlayPhase::Processing
+            && rendered.get().phase != OverlayPhase::Processing
+        {
+            sweep_started.set(Instant::now());
+        }
         render_surface(
             CapsuleSurface {
                 window: &window,
@@ -519,28 +531,35 @@ fn install_surface_feedback(
             view,
             warning,
         );
-        if view.phase == OverlayPhase::Processing {
-            meter.queue_draw();
-        }
         match level_latch.borrow_mut().observe(signal) {
             LevelPollAction::Arm => {
-                let worker = Rc::new(LevelWorker::spawn());
-                let source = install_level_drain(
-                    meter.clone(),
-                    Rc::clone(&rendered_bars),
-                    Rc::clone(&worker),
-                );
-                *level_poll.borrow_mut() = Some((source, worker));
+                // A new Recording starts from silence, never from the last
+                // one's tail.
+                waveform.borrow_mut().reset();
+                *level_worker.borrow_mut() = Some(LevelWorker::spawn());
             }
             LevelPollAction::Disarm => {
-                if let Some((source, worker)) = level_poll.borrow_mut().take() {
-                    source.remove();
+                if let Some(worker) = level_worker.borrow_mut().take() {
                     worker.stop();
                 }
-                *rendered_bars.borrow_mut() = [0; 20];
+                waveform.borrow_mut().reset();
                 meter.queue_draw();
             }
             LevelPollAction::Keep => {}
+        }
+        // Frames are drawn only while something on the meter moves: live
+        // levels while Recording, the light sweep while Processing (static
+        // under reduced motion). Every other phase, hidden included, has no
+        // tick callback at all.
+        let animating = match view.phase {
+            OverlayPhase::Recording => true,
+            OverlayPhase::Processing => !reduced_motion,
+            _ => false,
+        };
+        if animating {
+            animation.start(&meter, &waveform, &level_worker);
+        } else {
+            animation.stop();
         }
         // render_surface realizes the window on its first real show; the realize
         // callback may have found no surface and handed feedback to the
@@ -568,8 +587,8 @@ fn install_surface_feedback(
         );
         match action {
             TickAction::Break => {
-                if let Some((source, worker)) = level_poll.borrow_mut().take() {
-                    source.remove();
+                animation.stop();
+                if let Some(worker) = level_worker.borrow_mut().take() {
                     worker.stop();
                 }
                 gtk::glib::ControlFlow::Break
@@ -1043,8 +1062,8 @@ fn render_surface(
     meter.queue_draw();
 }
 
-/// Cadence of the Level poll on its dedicated worker thread, and of the GTK
-/// drain that repaints from it.
+/// Cadence of the Level poll on its dedicated worker thread. The meter itself
+/// repaints on the frame clock, independent of this.
 const LEVEL_POLL_PERIOD: Duration = Duration::from_millis(20);
 /// One absolute deadline for a whole Level round trip — connect, write, and
 /// read together. A skipped frame is invisible; a stalled poll must never be.
@@ -1054,15 +1073,15 @@ const LEVEL_POLL_DEADLINE: Duration = Duration::from_millis(10);
 const MAX_LEVEL_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// The dedicated Level-poll worker. ALL Level IPC runs on this thread; the
-/// GTK main thread only ever takes the latest smoothed bars nonblockingly,
-/// so a stalled socket backlog or trickling peer can never freeze drawing,
-/// the 200 ms status poll, or timer disarming. The worker owns the stateless
-/// cursor and the BarSmoother: every polled frame passes through the
-/// smoother in order (coalesced peaks survive), and only the newest smoothed
-/// result is published, which keeps the hand-off slot bounded at one value.
+/// GTK main thread only ever takes the latest target level nonblockingly, so
+/// a stalled socket backlog or trickling peer can never freeze drawing, the
+/// 200 ms status poll, or timer disarming. The worker owns the stateless
+/// cursor and turns each poll into one target: the loudest new frame (a
+/// coalesced peak survives), or silence after a failed poll. The hand-off slot
+/// holds at most one value; the easing itself runs on the frame clock.
 struct LevelWorker {
     stop: Arc<AtomicBool>,
-    latest: Arc<Mutex<Option<[u8; 20]>>>,
+    latest: Arc<Mutex<Option<f64>>>,
 }
 
 impl LevelWorker {
@@ -1073,29 +1092,32 @@ impl LevelWorker {
         let thread_latest = Arc::clone(&latest);
         thread::spawn(move || {
             let mut cursor = 0_u64;
-            let mut smoother = BarSmoother::default();
             while !thread_stop.load(Ordering::Relaxed) {
-                let bars = match read_levels(cursor, Instant::now() + LEVEL_POLL_DEADLINE) {
+                let target = match read_levels(cursor, Instant::now() + LEVEL_POLL_DEADLINE) {
                     Some(frames) => {
                         if let Some(last) = frames.last() {
                             cursor = last.seq;
                         }
-                        smoother.observe_all(frames.into_iter().map(|frame| frame.bands))
+                        // No new frames: the current target holds.
+                        level_from_frames(&frames)
                     }
                     // Isolation rule: a failed Level poll only decays the
                     // bars. Daemon liveness belongs to the status poll alone.
-                    None => smoother.observe_failure(),
+                    None => Some(0.0),
                 };
-                *thread_latest.lock().unwrap() = Some(bars);
+                if let Some(target) = target {
+                    *thread_latest.lock().unwrap() = Some(target);
+                }
                 thread::sleep(LEVEL_POLL_PERIOD);
             }
         });
         Self { stop, latest }
     }
 
-    /// Nonblocking: the newest published bars, if any arrived since the last
-    /// take. `try_lock` keeps the GTK thread from ever waiting on the worker.
-    fn take_latest(&self) -> Option<[u8; 20]> {
+    /// Nonblocking: the newest published target, if any arrived since the
+    /// last take. `try_lock` keeps the GTK thread from ever waiting on the
+    /// worker.
+    fn take_latest(&self) -> Option<f64> {
         self.latest.try_lock().ok().and_then(|mut slot| slot.take())
     }
 
@@ -1110,28 +1132,63 @@ impl Drop for LevelWorker {
     }
 }
 
-/// The GTK-side drain: nonblocking channel read plus drawing, nothing else.
-fn install_level_drain(
-    meter: gtk::DrawingArea,
-    rendered_bars: Rc<RefCell<[u8; 20]>>,
-    worker: Rc<LevelWorker>,
-) -> gtk::glib::SourceId {
-    gtk::glib::timeout_add_local(LEVEL_POLL_PERIOD, move || {
-        if let Some(bars) = worker.take_latest() {
-            *rendered_bars.borrow_mut() = bars;
+/// The meter's frame-clock animation. While installed, GTK calls it once per
+/// display frame: it takes the newest level target, advances the waveform by
+/// the real frame interval, and repaints. Removing it leaves the overlay with
+/// no per-frame work at all.
+#[derive(Default)]
+struct MeterAnimation {
+    tick: RefCell<Option<gtk::TickCallbackId>>,
+}
+
+impl MeterAnimation {
+    fn start(
+        &self,
+        meter: &gtk::DrawingArea,
+        waveform: &Rc<RefCell<Waveform>>,
+        level_worker: &Rc<RefCell<Option<LevelWorker>>>,
+    ) {
+        let mut tick = self.tick.borrow_mut();
+        if tick.is_some() {
+            return;
         }
-        // Redraw every tick regardless: keeps the meter live even on a tick
-        // where the worker published no new bars.
-        meter.queue_draw();
-        gtk::glib::ControlFlow::Continue
-    })
+        let waveform = Rc::clone(waveform);
+        let level_worker = Rc::clone(level_worker);
+        // Frame time of the previous tick, in the clock's microseconds. The
+        // first tick after a start advances nothing, so a re-armed meter
+        // never fast-forwards over the time it was stopped.
+        let previous_frame = Cell::new(None::<i64>);
+        *tick = Some(meter.add_tick_callback(move |meter, clock| {
+            let now = clock.frame_time();
+            let frame_secs = previous_frame
+                .replace(Some(now))
+                .map_or(0.0, |previous| (now - previous) as f64 / 1_000_000.0);
+            let mut waveform = waveform.borrow_mut();
+            if let Some(target) = level_worker
+                .borrow()
+                .as_ref()
+                .and_then(LevelWorker::take_latest)
+            {
+                waveform.set_target(target);
+            }
+            waveform.advance(frame_secs);
+            meter.queue_draw();
+            gtk::glib::ControlFlow::Continue
+        }));
+    }
+
+    fn stop(&self) {
+        if let Some(tick) = self.tick.borrow_mut().take() {
+            tick.remove();
+        }
+    }
 }
 
 fn draw_meter(
     context: &gtk::cairo::Context,
     width: i32,
     height: i32,
-    bands: &[u8; 20],
+    waveform: &Waveform,
     state: MeterState,
     sweep_started: Instant,
     reduced_motion: bool,
@@ -1151,19 +1208,10 @@ fn draw_meter(
     // so the pill spans ~42.3px vertically vs a 38px max bar (19px each side).
     // 19 < 21.2, so even a full-height peak bar stays inside the rounded corner.
     let elapsed = sweep_started.elapsed().as_secs_f64();
-    // Only the Recording phase reads per-bar levels; the resting phases draw a
-    // flat floor, so skip the interpolation allocation entirely for them.
-    // Rounded to u8 to keep `recording_bar_height`'s signature — sub-pixel diff.
-    let levels = matches!(phase, OverlayPhase::Recording).then(|| interpolate_bands(bands, count));
     for index in 0..count {
         let (bar_height, alpha, colour) = match phase {
             OverlayPhase::Recording => (
-                recording_bar_height(
-                    levels.as_ref().expect("levels present for Recording")[index]
-                        .round()
-                        .clamp(0.0, 255.0) as u8,
-                    drawable,
-                ),
+                recording_bar_height(waveform.bar_level(index, count), drawable),
                 edge_falloff_alpha(index, count),
                 // Amber from the moment the limit is approaching; the colour is
                 // decided purely in `overlay.rs` so it stays testable.
