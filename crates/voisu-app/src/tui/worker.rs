@@ -180,13 +180,23 @@ pub fn execute(job: Job, replies: &Sender<Reply>) {
 }
 
 fn load_settings() -> SettingsSnapshot {
+    // A legacy `clipboard` means different things in different sessions, and
+    // this terminal may not be in the service's session, so it is never resolved
+    // here.
+    let legacy_delivery =
+        config::stored_delivery() == Some(config::StoredDelivery::LegacyClipboard);
     SettingsSnapshot {
         engine: if crate::local_setup::is_local_mode() {
             AsrMode::Local
         } else {
             AsrMode::Cloud
         },
-        delivery: config::delivery_mode(),
+        delivery: if legacy_delivery {
+            config::DeliveryMode::Paste
+        } else {
+            config::delivery_mode()
+        },
+        legacy_delivery,
         writing: config::writing_mode(),
         rendering: config::rendering_policy(),
         deepgram: config::deepgram_enabled(),

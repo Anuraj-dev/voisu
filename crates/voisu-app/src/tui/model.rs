@@ -96,7 +96,12 @@ pub enum DaemonView {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SettingsSnapshot {
     pub engine: AsrMode,
+    /// Where the Delivery picker starts. Not what Voisu does while
+    /// `legacy_delivery` is set.
     pub delivery: DeliveryMode,
+    /// The config holds an older Voisu's `clipboard`, whose meaning depends on
+    /// the session the service runs in.
+    pub legacy_delivery: bool,
     pub writing: WritingMode,
     pub rendering: RenderingPolicy,
     pub deepgram: bool,
@@ -315,6 +320,15 @@ pub fn engine_label(mode: AsrMode) -> &'static str {
 
 pub fn delivery_label(mode: DeliveryMode) -> &'static str {
     DELIVERY_CHOICES[position(&DELIVERIES, mode)].label
+}
+
+/// What the Delivery setting does, stated only as far as this process can know.
+pub fn delivery_value(settings: &SettingsSnapshot) -> &'static str {
+    if settings.legacy_delivery {
+        "Paste if it can, else Copy"
+    } else {
+        delivery_label(settings.delivery)
+    }
 }
 
 pub fn writing_label(mode: WritingMode) -> &'static str {
@@ -742,8 +756,9 @@ impl App {
         Some((parts.join(" · "), tone))
     }
 
-    /// The doctor list as lines: FAIL, then WARN, then PASS, with the action
-    /// under each failure.
+    /// The doctor list as lines: FAIL, then WARN, then PASS. A failure or warning
+    /// shows all of its value and its action, since it is what the person came
+    /// here to read; plain `voisu doctor` hides a warning's action.
     pub fn check_lines(&self) -> Vec<CheckLine> {
         let mut lines = Vec::new();
         for status in [
@@ -757,15 +772,30 @@ impl App {
                 .flatten()
                 .filter(|row| row.status == status)
             {
+                let value = row.value.clone().unwrap_or_default();
+                if status == ReadinessStatus::Pass {
+                    lines.push(CheckLine::Row {
+                        status,
+                        label: row.label.clone(),
+                        value,
+                    });
+                    continue;
+                }
+                let width = self.size.0 as usize;
+                let mut parts =
+                    text::wrap(&value, width.saturating_sub(CHECK_VALUE_COLUMN + 1)).into_iter();
                 lines.push(CheckLine::Row {
                     status,
                     label: row.label.clone(),
-                    value: row.value.clone().unwrap_or_default(),
+                    value: parts.next().unwrap_or_default(),
                 });
-                if status == ReadinessStatus::Fail
-                    && let Some(action) = &row.action
-                {
-                    lines.push(CheckLine::Action(action.clone()));
+                lines.extend(parts.map(CheckLine::More));
+                if let Some(action) = &row.action {
+                    lines.extend(
+                        text::wrap(action, width.saturating_sub(CHECK_ACTION_COLUMN + 1))
+                            .into_iter()
+                            .map(CheckLine::Action),
+                    );
                 }
             }
         }
@@ -786,7 +816,7 @@ impl App {
                 .engine()
                 .map_or_else(loading, |mode| plain(engine_label(mode).to_owned())),
             SettingsRow::Delivery => self.settings.map_or_else(loading, |settings| {
-                plain(delivery_label(settings.delivery).to_owned())
+                plain(delivery_value(&settings).to_owned())
             }),
             SettingsRow::Writing => self.settings.map_or_else(loading, |settings| {
                 plain(writing_label(settings.writing).to_owned())
@@ -1239,11 +1269,20 @@ impl App {
         })
     }
 
+    /// The value to mark as in effect. A legacy Delivery has none: either choice
+    /// is a real change, because it replaces the old value.
+    pub fn choice_in_effect(&self, row: SettingsRow) -> Option<usize> {
+        if row == SettingsRow::Delivery && self.settings.is_some_and(|s| s.legacy_delivery) {
+            return None;
+        }
+        self.current_choice(row)
+    }
+
     /// `↵` in an open choice. Picking the value already in effect changes
     /// nothing. The screen moves at once and the reload that follows confirms
     /// it, except Engine, which waits for the worker: Local needs consent.
     fn choose(&mut self, row: SettingsRow, picked: usize, effects: &mut Vec<Effect>) {
-        if self.current_choice(row) == Some(picked) {
+        if self.choice_in_effect(row) == Some(picked) {
             return;
         }
         let daemon_says_local_ready = self.daemon_says_local_ready();
@@ -1258,6 +1297,7 @@ impl App {
             }
             SettingsRow::Delivery => {
                 settings.delivery = DELIVERIES[picked];
+                settings.legacy_delivery = false;
                 Job::SetDelivery(settings.delivery)
             }
             SettingsRow::Writing => {
@@ -1364,6 +1404,9 @@ impl App {
 
 /// Rows the hero uses at the top of Home, including its trailing blank line.
 pub const HERO_HEIGHT: usize = 3;
+/// Where a check's value and its action start, for lines that wrap.
+pub const CHECK_VALUE_COLUMN: usize = 27;
+pub const CHECK_ACTION_COLUMN: usize = 11;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CheckLine {
@@ -1372,6 +1415,8 @@ pub enum CheckLine {
         label: String,
         value: String,
     },
+    /// A long value's next line.
+    More(String),
     Action(String),
 }
 
@@ -1502,6 +1547,7 @@ pub(super) mod test_support {
         SettingsSnapshot {
             engine: AsrMode::Cloud,
             delivery: DeliveryMode::Paste,
+            legacy_delivery: false,
             writing: WritingMode::Smart,
             rendering: RenderingPolicy::Adaptive,
             deepgram: true,
@@ -2054,12 +2100,85 @@ mod tests {
             .map(|line| match line {
                 CheckLine::Row { label, .. } => label.clone(),
                 CheckLine::Action(action) => format!("-> {action}"),
+                CheckLine::More(more) => format!("+ {more}"),
             })
             .collect();
         assert_eq!(
             labels,
             ["Socket", "-> voisu service start", "Warn me", "Pass me"]
         );
+    }
+
+    #[test]
+    fn a_warning_shows_all_of_its_value_and_its_action() {
+        let mut app = ready_app();
+        let mut warning = row(
+            "Delivery",
+            "No paste shortcut found in your Hyprland config. Your words stay on the clipboard.",
+            ReadinessStatus::Warn,
+        );
+        warning.action =
+            Some("add a paste shortcut to your Hyprland config, or run voisu delivery copy".into());
+        let _ = update(&mut app, Msg::Reply(Reply::Doctor(vec![warning])), at(0));
+        assert_eq!(app.hero(), Hero::Ready, "a warning doesn't take over Home");
+        assert_eq!(app.fix(), None, "and offers nothing to run");
+        let shown = app
+            .check_lines()
+            .iter()
+            .map(|line| match line {
+                CheckLine::Row { value, .. } => value.clone(),
+                CheckLine::More(text) | CheckLine::Action(text) => text.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            shown,
+            "No paste shortcut found in your Hyprland config. Your words stay on the \
+             clipboard. add a paste shortcut to your Hyprland config, or run voisu delivery copy"
+        );
+    }
+
+    #[test]
+    fn a_desktop_that_could_not_be_checked_is_a_warning_not_a_failure() {
+        let mut app = ready_app();
+        let unknown = row(
+            "Delivery",
+            "couldn't check whether this desktop allows pasting",
+            ReadinessStatus::Warn,
+        );
+        let _ = update(&mut app, Msg::Reply(Reply::Doctor(vec![unknown])), at(0));
+        assert_eq!(app.hero(), Hero::Ready);
+        assert_eq!(
+            app.health(),
+            Some(("0 passed · 1 warning".to_owned(), Tone::Caution))
+        );
+    }
+
+    #[test]
+    fn a_legacy_delivery_is_never_stated_as_paste_or_copy() {
+        let mut app = ready_app();
+        let legacy = SettingsSnapshot {
+            legacy_delivery: true,
+            ..settings()
+        };
+        let _ = update(&mut app, Msg::Reply(Reply::Settings(legacy)), at(0));
+        assert_eq!(delivery_value(&legacy), "Paste if it can, else Copy");
+        assert_eq!(
+            app.setting_value(SettingsRow::Delivery).0,
+            "Paste if it can, else Copy"
+        );
+        assert_eq!(app.choice_in_effect(SettingsRow::Delivery), None);
+
+        // Even the value the picker starts on is a real choice: it replaces the
+        // old setting with an explicit one.
+        let start = app.current_choice(SettingsRow::Delivery).expect("loaded");
+        let mut effects = Vec::new();
+        app.choose(SettingsRow::Delivery, start, &mut effects);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Job(Job::SetDelivery(DeliveryMode::Paste))]
+        ));
+        assert_eq!(app.choice_in_effect(SettingsRow::Delivery), Some(start));
     }
 
     // --- Doctor coalescing ------------------------------------------------------

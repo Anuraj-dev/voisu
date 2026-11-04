@@ -135,9 +135,10 @@ fn guide_lines(
     wrap: bool,
 ) -> Vec<Line<'static>> {
     let choices = row.choices();
-    let Some(current) = app.current_choice(row) else {
+    if app.current_choice(row).is_none() {
         return Vec::new();
-    };
+    }
+    let current = app.choice_in_effect(row);
     let picked = match app.prompt {
         Some(Prompt::Choice { row: open, picked }) if open == row => Some(picked),
         _ => None,
@@ -154,12 +155,12 @@ fn guide_lines(
         let lead = format!(
             "{indent}{}{} ",
             if picking { PICKING } else { NOT_PICKING },
-            if index == current { "●" } else { " " },
+            if current == Some(index) { "●" } else { " " },
         );
         let label = format!("{:<label_width$}", choice.label);
         let hang = text::width(&lead) + label_width;
         let room = width.saturating_sub(hang + 1).max(1);
-        let label_tone = match (picking, index == current) {
+        let label_tone = match (picking, current == Some(index)) {
             (true, _) => Tone::Accent,
             (false, true) => Tone::Bold,
             (false, false) => Tone::Plain,
