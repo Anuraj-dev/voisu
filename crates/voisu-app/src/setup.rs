@@ -81,6 +81,26 @@ pub trait HyprlandSetupActions {
     }
 }
 
+/// Installs the Trigger Key in the live Hyprland config. `prefer_caps_lock`
+/// decides from what is bound today; an `Err` from it installs nothing.
+pub fn install_live_trigger(
+    config: &Path,
+    prefer_caps_lock: &mut dyn FnMut(&TriggerOccupancy) -> Result<bool, String>,
+) -> Result<TriggerKey, String> {
+    let files = LocalBindingFileSystem;
+    let source = files
+        .read_to_string(config)
+        .map_err(|error| format!("cannot read {}: {error}", config.display()))?
+        .unwrap_or_default();
+    let occupancy = inspect_trigger_occupancy(config, &source, &files)
+        .map_err(|detail| TriggerBindingError::Unparseable { detail }.to_string())?;
+    let prefer_caps_lock = prefer_caps_lock(&occupancy)?;
+    let mut hyprland = LiveHyprlandController;
+    install_trigger_binding(config, &files, &mut hyprland, prefer_caps_lock)
+        .map(|report| report.key)
+        .map_err(|error| error.to_string())
+}
+
 /// Runs the Hyprland setup steps in their dependency order. Every mutating
 /// step is behind an injected seam so the ordering and failure boundaries are
 /// testable without a compositor, systemd user manager, or daemon process.
@@ -123,18 +143,9 @@ impl HyprlandSetupActions for LiveHyprlandSetupActions<'_> {
     }
 
     fn install_trigger_binding(&mut self, config: &Path) -> Result<TriggerKey, String> {
-        let files = LocalBindingFileSystem;
-        let source = files
-            .read_to_string(config)
-            .map_err(|error| format!("cannot read {}: {error}", config.display()))?
-            .unwrap_or_default();
-        let occupancy = inspect_trigger_occupancy(config, &source, &files)
-            .map_err(|detail| TriggerBindingError::Unparseable { detail }.to_string())?;
-        let prefer_caps_lock = caps_lock_trigger_preferred(&occupancy, self.io)?;
-        let mut hyprland = LiveHyprlandController;
-        install_trigger_binding(config, &files, &mut hyprland, prefer_caps_lock)
-            .map(|report| report.key)
-            .map_err(|error| error.to_string())
+        install_live_trigger(config, &mut |occupancy| {
+            caps_lock_trigger_preferred(occupancy, self.io)
+        })
     }
 
     fn discover_paste_action(&mut self) -> Option<VerifiedPasteAction> {

@@ -74,6 +74,15 @@ pub trait SetupQuestions {
     fn cloud_keys(&mut self) -> SetupOutcome;
     /// Delivery, the Trigger Key and the services on Hyprland.
     fn hyprland(&mut self, config: &Path) -> Result<HyprlandSetupOutcome, String>;
+    /// Whether the person walked out of setup. [`run`] then stops without
+    /// asking anything else, and undoes a switch to Local nobody confirmed.
+    fn left(&self) -> bool {
+        false
+    }
+    /// On a desktop that binds the Trigger Key itself (the portal's own window),
+    /// a chance to walk the person through it. The text wizard leaves this to
+    /// the daemon.
+    fn desktop_trigger(&mut self) {}
 }
 
 /// The text wizard: plain lines on stdout, the stop reason on stderr, answers
@@ -187,6 +196,9 @@ pub fn run(q: &mut dyn SetupQuestions, interactive: bool, wizard_only: bool) -> 
         interactive,
         consented: &consented,
     });
+    if q.left() {
+        return SETUP_INCOMPLETE;
+    }
     // The engine screen skipped its own switch warning because the consent
     // prompt below confirms the switch; declining it must keep Cloud.
     let consent_confirms_switch = choice == EngineChoice::Switch(AsrMode::Local)
@@ -224,6 +236,9 @@ pub fn run(q: &mut dyn SetupQuestions, interactive: bool, wizard_only: bool) -> 
                 }
             }
         }
+        if q.left() {
+            return SETUP_INCOMPLETE;
+        }
     }
     if local {
         // A first-time Local user without Cloud keys is asked once; No keeps
@@ -231,6 +246,9 @@ pub fn run(q: &mut dyn SetupQuestions, interactive: bool, wizard_only: bool) -> 
         let declined_marker = production_cloud_declined_marker();
         if q.cloud_after_local(interactive, &deepgram, &groq, declined_marker.as_deref()) {
             q.cloud_keys();
+        }
+        if q.left() {
+            return SETUP_INCOMPLETE;
         }
         if wizard_only {
             q.say(&production_local_complete_message());
@@ -253,10 +271,16 @@ pub fn run(q: &mut dyn SetupQuestions, interactive: bool, wizard_only: bool) -> 
         if discovery.profile == SetupProfile::UbuntuWayland {
             return finish_ubuntu(q, &production_local_complete_message());
         }
+        if discovery.profile == SetupProfile::FedoraWayland {
+            q.desktop_trigger();
+        }
         q.say(&production_local_complete_message());
         return 0;
     }
     let outcome = q.cloud_keys();
+    if q.left() {
+        return SETUP_INCOMPLETE;
+    }
     // A run that stored/kept no usable key (every provider skipped or its store
     // failed) did not accomplish setup's job, so it must not report success.
     let usable = |outcome: ProviderOutcome| {
@@ -292,6 +316,9 @@ pub fn run(q: &mut dyn SetupQuestions, interactive: bool, wizard_only: bool) -> 
     } else if discovery.profile == SetupProfile::UbuntuWayland {
         finish_ubuntu(q, SETUP_COMPLETE_MESSAGE)
     } else {
+        if discovery.profile == SetupProfile::FedoraWayland {
+            q.desktop_trigger();
+        }
         q.say(SETUP_COMPLETE_MESSAGE);
         0
     }

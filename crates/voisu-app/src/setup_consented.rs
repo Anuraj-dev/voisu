@@ -644,6 +644,17 @@ pub fn production_local_complete_message() -> String {
 
 /// Fetches and installs only when the setup offer calls this after an explicit yes.
 pub fn production_install(consent: ConsentedConsent) -> Result<(), ConsentedError> {
+    production_install_with(consent, |total| {
+        Box::new(TerminalProgress::stdout(total))
+    })
+}
+
+/// [`production_install`], reporting to whatever `progress` builds from the
+/// entry's total download size.
+pub fn production_install_with(
+    consent: ConsentedConsent,
+    progress: impl FnOnce(u64) -> Box<dyn InstallProgress>,
+) -> Result<(), ConsentedError> {
     let models =
         models_dir_from_state(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
             .map_err(ConsentedError::Store)?;
@@ -660,7 +671,7 @@ pub fn production_install(consent: ConsentedConsent) -> Result<(), ConsentedErro
         .ok_or(ConsentedError::Consent)?;
     let health = ConsentedWorkerHealth::for_entry(state, entry);
     let maintenance = SetupMaintenance::default();
-    let progress = TerminalProgress::stdout(entry.total_download_bytes);
+    let progress = progress(entry.total_download_bytes);
     crate::local_model::install_consented_install(ConsentedInstallRequest {
         store: &store,
         consent,
@@ -670,7 +681,7 @@ pub fn production_install(consent: ConsentedConsent) -> Result<(), ConsentedErro
         maintenance: &maintenance,
         io: InstallIo::default(),
         clock: InstallClock::default(),
-        progress: &progress,
+        progress: &*progress,
     })
     .map(|_| ())
 }
