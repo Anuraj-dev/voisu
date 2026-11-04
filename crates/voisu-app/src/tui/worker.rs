@@ -111,7 +111,7 @@ pub fn execute(job: Job, replies: &Sender<Reply>) {
         Job::LoadHistory => send(Reply::History(load_history())),
         Job::LoadDictionary => send(Reply::Dictionary(crate::dictionary::user_terms())),
         Job::LoadShortcut => send(Reply::Shortcut(load_shortcut())),
-        // The daemon reads Delivery and Deepgram once at start, Rendering per
+        // The daemon reads Delivery and Deepgram once at start, Layout per
         // Recording, and Writing per Recording except Intent Reconstruction,
         // which is chosen at start.
         Job::SetDelivery(mode) => send(applied_setting(
@@ -242,7 +242,10 @@ pub fn history_item(record: &DiagnosticRecord, now_ms: u64) -> HistoryItem {
     let failure = transcript.is_none().then(|| {
         let reason = history_view::failure_reason(&value)
             .unwrap_or_else(|| "Voisu didn't say why.".to_owned());
-        format!("No Transcript. {}", text::clean_line(&reason))
+        format!(
+            "No Transcript. {}",
+            text::capitalized(&text::clean_line(&reason))
+        )
     });
     HistoryItem {
         recorded_at_ms: record.recorded_at_unix_ms,
@@ -319,7 +322,7 @@ fn consented_install(status: ConsentedStatus) -> bool {
 /// An offline change waits for the next daemon start, and the words say so.
 fn engine_applied_text(mode: AsrMode, message: &str) -> String {
     let name = engine_label(mode);
-    if message.contains("next supported daemon start") {
+    if message.contains(crate::asr_mode::ENGINE_WAITS_FOR_START) {
         format!("Engine set to {name}. It applies when Voisu next starts.")
     } else {
         format!("Engine set to {name}.")
@@ -569,13 +572,26 @@ mod tests {
         assert_eq!(
             engine_applied_text(
                 AsrMode::Cloud,
-                "ASR mode set to cloud; it applies at the next supported daemon start"
+                &crate::asr_mode::engine_saved_for_next_start(AsrMode::Cloud)
             ),
             "Engine set to Cloud. It applies when Voisu next starts."
         );
         assert_eq!(
-            engine_applied_text(AsrMode::Local, "ASR mode set to local"),
+            engine_applied_text(
+                AsrMode::Local,
+                "Engine set to Local for your next Recording"
+            ),
             "Engine set to Local."
+        );
+    }
+
+    #[test]
+    fn a_silent_recording_reads_as_a_sentence_in_history() {
+        let mut record = DiagnosticRecord::new("silent".to_owned(), 1);
+        record.fallback_reason = Some("no words heard".to_owned());
+        assert_eq!(
+            history_item(&record, 1).failure.as_deref(),
+            Some("No Transcript. No words heard")
         );
     }
 

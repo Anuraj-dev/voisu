@@ -636,6 +636,17 @@ pub fn engine_name(mode: AsrMode) -> &'static str {
     }
 }
 
+/// What the CLI says when no daemon answered, so the Engine waits for a start.
+/// The TUI reads [`ENGINE_WAITS_FOR_START`] out of this to word its own toast.
+pub(crate) fn engine_saved_for_next_start(mode: AsrMode) -> String {
+    format!(
+        "Engine set to {}; {ENGINE_WAITS_FOR_START}",
+        engine_name(mode)
+    )
+}
+
+pub(crate) const ENGINE_WAITS_FOR_START: &str = "it applies when Voisu next starts";
+
 pub fn apply_cli_mode(mode: AsrMode) -> Result<String, CliModeError> {
     match try_connect_daemon() {
         Ok(stream) => set_mode_over_ipc(stream, mode),
@@ -687,10 +698,7 @@ fn set_mode_offline(mode: AsrMode) -> Result<String, CliModeError> {
                     .map_err(|error| CliModeError::new(4, error.message().to_owned()))?;
                 Ok(crate::local_packaging::annotate_mode_message(
                     commit.mode,
-                    format!(
-                        "Engine set to {}; it applies when Voisu next starts",
-                        engine_name(commit.mode)
-                    ),
+                    engine_saved_for_next_start(commit.mode),
                 ))
             }
         },

@@ -330,8 +330,8 @@ fn key_word(value: &str) -> String {
     match value {
         "valid" => "Works".to_owned(),
         "invalid" => "Rejected".to_owned(),
-        "rate-limited" => "Busy, try again soon".to_owned(),
-        "quota exhausted" => "Out of free use".to_owned(),
+        "too many requests, try later" => "Busy, try again soon".to_owned(),
+        "out of credit" => "Out of free use".to_owned(),
         "unreachable" => "Can't reach it".to_owned(),
         other => text::capitalized(other),
     }
@@ -1501,7 +1501,7 @@ pub(super) mod test_support {
     pub fn settings() -> SettingsSnapshot {
         SettingsSnapshot {
             engine: AsrMode::Cloud,
-            delivery: DeliveryMode::Copy,
+            delivery: DeliveryMode::Paste,
             writing: WritingMode::Smart,
             rendering: RenderingPolicy::Adaptive,
             deepgram: true,
@@ -1837,6 +1837,23 @@ mod tests {
         );
         assert!(app.restart_pending.is_empty());
         assert_eq!(app.setting_value(SettingsRow::Deepgram).0, "Off");
+    }
+
+    #[test]
+    fn a_keys_check_result_reads_in_the_same_plain_words_as_setup() {
+        // These are the values `voisu doctor` puts on a key row.
+        for (doctor_value, word) in [
+            ("valid", "Works"),
+            ("invalid", "Rejected"),
+            ("too many requests, try later", "Busy, try again soon"),
+            ("out of credit", "Out of free use"),
+            ("unreachable", "Can't reach it"),
+        ] {
+            let mut app = ready_app();
+            let rows = vec![row("Groq key", doctor_value, ReadinessStatus::Warn)];
+            let _ = update(&mut app, Msg::Reply(Reply::Doctor(rows)), at(0));
+            assert_eq!(app.setting_value(SettingsRow::GroqKey).0, word);
+        }
     }
 
     #[test]
@@ -2236,7 +2253,6 @@ mod tests {
         let mut app = ready_app();
         app.tab = Tab::Settings;
         app.settings_selected = 1;
-        app.settings.as_mut().expect("loaded").delivery = DeliveryMode::Paste;
         let current = app.current_choice(SettingsRow::Delivery).expect("loaded");
 
         assert!(press(&mut app, KeyCode::Enter, 0).is_empty());

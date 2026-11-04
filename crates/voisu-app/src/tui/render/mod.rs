@@ -380,7 +380,7 @@ mod tests {
         let mut app = app_on('2');
         let records = vec![
             item(Some("Hey, so the current CLI is okay."), None),
-            item(None, Some("No Transcript. Recording contains no speech")),
+            item(None, Some("No Transcript. No words heard")),
         ];
         let _ = update(&mut app, Msg::Reply(Reply::History(Ok(records))), at(0));
         app
@@ -461,12 +461,9 @@ mod tests {
         let lines = screen(&mut app, &UNICODE, (80, 24));
         assert_eq!(lines[6], " ▌ Delivery      Paste");
         assert_eq!(lines[15], "   How your words reach your window.");
-        assert_eq!(
-            lines[16],
-            "     ● Paste       Puts your words into your window."
-        );
-        assert!(lines[17].starts_with("       Type        Types your words"));
-        assert!(lines[18].starts_with("       Safe paste  Copies instead"));
+        assert_eq!(lines[16], "     ● Paste  Puts your words into your window.");
+        assert_eq!(lines[17], "       Copy   Copies only; you press Ctrl+V.");
+        assert_eq!(lines[18], "", "Delivery offers exactly two choices");
     }
 
     #[test]
@@ -478,12 +475,12 @@ mod tests {
         let lines = screen(&mut app, &UNICODE, (80, 24));
         // `●` stays on the value in effect; `▌` follows the highlight.
         assert!(lines[16].starts_with("     ● Paste"), "{}", lines[16]);
-        assert!(lines[17].starts_with("   ▌   Type"), "{}", lines[17]);
+        assert!(lines[17].starts_with("   ▌   Copy"), "{}", lines[17]);
         assert_eq!(lines[22], "", "the toast line stays free");
         assert_eq!(lines[23], " ↑↓ pick   ↵ choose   Esc cancel");
         let ascii = screen(&mut app, &ASCII, (80, 24));
         assert!(ascii[16].starts_with("     * Paste"), "{}", ascii[16]);
-        assert!(ascii[17].starts_with("   >   Type"), "{}", ascii[17]);
+        assert!(ascii[17].starts_with("   >   Copy"), "{}", ascii[17]);
     }
 
     #[test]
@@ -822,11 +819,7 @@ mod tests {
         let body = joined(&lines);
         assert!(lines[5].starts_with(" ▌ "), "{}", lines[5]);
         assert!(lines[5].contains("Hey, so the current CLI"), "{}", lines[5]);
-        assert!(
-            lines[6].contains("Recording contains no speech"),
-            "{}",
-            lines[6]
-        );
+        assert!(lines[6].contains("No words heard"), "{}", lines[6]);
         assert!(body.contains("Groq 300ms"), "{body}");
 
         let _ = press(&mut app, KeyCode::Down, 0);
@@ -837,7 +830,7 @@ mod tests {
             pane.contains("No Transcript"),
             "failed record says so: {pane}"
         );
-        assert!(pane.contains("Recording contains no speech"), "{pane}");
+        assert!(pane.contains("No words heard"), "{pane}");
     }
 
     #[test]
