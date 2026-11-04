@@ -10,7 +10,7 @@ use voisu_core::{
     resolve_session,
 };
 
-use crate::config::DeliveryMode;
+use crate::config::StoredDelivery;
 use crate::system::{
     FedoraReadiness, ProviderHttpClient, RemoteDesktopAccess, SecretToolStore,
     remote_desktop_access,
@@ -214,7 +214,7 @@ fn daemon_readiness_rows(readiness: &DaemonReadiness) -> Vec<DoctorRow> {
 
     rows.push(delivery_row(
         readiness,
-        crate::config::delivery_mode(),
+        crate::config::stored_delivery(),
         remote_desktop_access,
     ));
 
@@ -254,16 +254,32 @@ fn daemon_readiness_rows(readiness: &DaemonReadiness) -> Vec<DoctorRow> {
     rows
 }
 
+/// Whether the running service leaves the Transcript on the clipboard by
+/// choice. A pre-rename service reports `clipboard`, which copied unless it
+/// found a Hyprland paste shortcut.
+fn service_copies_only(readiness: &DaemonReadiness) -> bool {
+    match readiness.delivery_mode.as_str() {
+        "copy" => true,
+        "clipboard" => readiness.paste_backend == PasteBackend::NotRequired,
+        _ => false,
+    }
+}
+
 /// The one Delivery row: what the running Voisu service will do with a
-/// Transcript, and the fix when it cannot paste. `access` probes the
-/// RemoteDesktop portal; it runs only for Paste outside Hyprland.
+/// Transcript, and the fix when it cannot paste. The service's answer is the
+/// truth; the file can only prove it stale when it holds an explicit `paste`
+/// or `copy`, because a legacy value resolves differently per session.
+/// `access` probes the RemoteDesktop portal; it runs only for Paste outside
+/// Hyprland.
 fn delivery_row(
     readiness: &DaemonReadiness,
-    configured: DeliveryMode,
+    stored: Option<StoredDelivery>,
     access: impl FnOnce() -> RemoteDesktopAccess,
 ) -> DoctorRow {
     const LABEL: &str = "Delivery";
-    if readiness.delivery_mode != configured.as_str() {
+    if let Some(StoredDelivery::Mode(chosen)) = stored
+        && readiness.delivery_mode != chosen.as_str()
+    {
         return DoctorRow::new(
             LABEL,
             ReadinessStatus::Fail,
@@ -276,7 +292,7 @@ fn delivery_row(
         .action("voisu service restart")
         .fix(DoctorFix::RestartVoisu);
     }
-    if configured == DeliveryMode::Copy {
+    if service_copies_only(readiness) {
         return DoctorRow::new(
             LABEL,
             ReadinessStatus::Pass,
@@ -602,6 +618,10 @@ fn provider_key_rows(runtime: &tokio::runtime::Runtime) -> Vec<DoctorRow> {
 #[cfg(test)]
 mod delivery_row_tests {
     use super::*;
+    use crate::config::DeliveryMode;
+
+    const PASTE: Option<StoredDelivery> = Some(StoredDelivery::Mode(DeliveryMode::Paste));
+    const COPY: Option<StoredDelivery> = Some(StoredDelivery::Mode(DeliveryMode::Copy));
 
     fn readiness(mode: &str, action: PasteActionState, backend: PasteBackend) -> DaemonReadiness {
         DaemonReadiness {
@@ -638,7 +658,7 @@ mod delivery_row_tests {
             PasteActionState::ClipboardOnly,
             PasteBackend::NotRequired,
         );
-        let row = delivery_row(&stale, DeliveryMode::Paste, no_probe);
+        let row = delivery_row(&stale, PASTE, no_probe);
         assert_eq!(
             shown(&row),
             (
@@ -651,13 +671,71 @@ mod delivery_row_tests {
     }
 
     #[test]
+    fn a_legacy_stored_value_never_reads_as_a_stale_service() {
+        // The service found a Hyprland shortcut for `clipboard`; this shell may
+        // have no Hyprland session and would resolve it to copy.
+        let mut pasting = readiness("paste", PasteActionState::Verified, PasteBackend::Hyprland);
+        pasting.paste_shortcut = Some("SUPER + V".to_owned());
+        for stored in [
+            Some(StoredDelivery::LegacyClipboard),
+            Some(StoredDelivery::LegacyPaste),
+            None,
+        ] {
+            let row = delivery_row(&pasting, stored, no_probe);
+            assert_eq!(
+                shown(&row),
+                ("paste · SUPER + V", ReadinessStatus::Pass, None),
+                "{stored:?}"
+            );
+        }
+
+        let copying = readiness(
+            "copy",
+            PasteActionState::ClipboardOnly,
+            PasteBackend::NotRequired,
+        );
+        let row = delivery_row(&copying, Some(StoredDelivery::LegacyClipboard), no_probe);
+        assert_eq!(
+            shown(&row),
+            ("copy · you paste with Ctrl+V", ReadinessStatus::Pass, None)
+        );
+    }
+
+    #[test]
+    fn a_pre_rename_service_is_described_by_what_it_does() {
+        // `voisu` is newer than the running service, which still says `clipboard`.
+        let mut pasting = readiness(
+            "clipboard",
+            PasteActionState::Verified,
+            PasteBackend::Hyprland,
+        );
+        pasting.paste_shortcut = Some("SUPER + V".to_owned());
+        let row = delivery_row(&pasting, Some(StoredDelivery::LegacyClipboard), no_probe);
+        assert_eq!(
+            shown(&row),
+            ("paste · SUPER + V", ReadinessStatus::Pass, None)
+        );
+
+        let copying = readiness(
+            "clipboard",
+            PasteActionState::ClipboardOnly,
+            PasteBackend::NotRequired,
+        );
+        let row = delivery_row(&copying, Some(StoredDelivery::LegacyClipboard), no_probe);
+        assert_eq!(
+            shown(&row),
+            ("copy · you paste with Ctrl+V", ReadinessStatus::Pass, None)
+        );
+    }
+
+    #[test]
     fn copy_says_the_user_pastes() {
         let copy = readiness(
             "copy",
             PasteActionState::ClipboardOnly,
             PasteBackend::NotRequired,
         );
-        let row = delivery_row(&copy, DeliveryMode::Copy, no_probe);
+        let row = delivery_row(&copy, COPY, no_probe);
         assert_eq!(
             shown(&row),
             ("copy · you paste with Ctrl+V", ReadinessStatus::Pass, None)
@@ -668,7 +746,7 @@ mod delivery_row_tests {
     fn hyprland_paste_names_its_shortcut_or_says_how_to_add_one() {
         let mut verified = readiness("paste", PasteActionState::Verified, PasteBackend::Hyprland);
         verified.paste_shortcut = Some("SUPER + V".to_owned());
-        let row = delivery_row(&verified, DeliveryMode::Paste, no_probe);
+        let row = delivery_row(&verified, PASTE, no_probe);
         assert_eq!(
             shown(&row),
             ("paste · SUPER + V", ReadinessStatus::Pass, None)
@@ -679,7 +757,7 @@ mod delivery_row_tests {
             PasteActionState::ClipboardOnly,
             PasteBackend::Unavailable,
         );
-        let row = delivery_row(&missing, DeliveryMode::Paste, no_probe);
+        let row = delivery_row(&missing, PASTE, no_probe);
         assert_eq!(
             shown(&row),
             (
@@ -698,7 +776,7 @@ mod delivery_row_tests {
             PasteActionState::ClipboardOnly,
             PasteBackend::NotRequired,
         );
-        let row = delivery_row(&disabled, DeliveryMode::Paste, no_probe);
+        let row = delivery_row(&disabled, PASTE, no_probe);
         assert_eq!(
             shown(&row),
             (
@@ -739,7 +817,7 @@ mod delivery_row_tests {
             ),
         ];
         for (access, expected) in cases {
-            let row = delivery_row(&portal, DeliveryMode::Paste, || access);
+            let row = delivery_row(&portal, PASTE, || access);
             assert_eq!(shown(&row), expected, "{access:?}");
         }
     }

@@ -12320,6 +12320,20 @@ fn delivery_cli_sets_gets_and_persists_paste_or_copy_while_rejecting_other_modes
     );
     assert_eq!(stdout(&run(&["delivery"])), "Delivery: paste\n");
 
+    // A legacy `clipboard` depends on the session, so it is described, not
+    // resolved, and reading it does not rewrite it.
+    fs::write(&config_file, "delivery_mode = \"clipboard\"\n").unwrap();
+    assert_eq!(
+        stdout(&run(&["delivery"])),
+        "Delivery: paste if Hyprland has a paste shortcut, otherwise copy (saved by an older Voisu). Choose one: voisu delivery paste or voisu delivery copy\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&config_file).unwrap(),
+        "delivery_mode = \"clipboard\"\n"
+    );
+    fs::write(&config_file, "delivery_mode = \"type\"\n").unwrap();
+    assert_eq!(stdout(&run(&["delivery"])), "Delivery: paste\n");
+
     // Earlier releases' names load from config but are not CLI aliases.
     for old in ["type", "clipboard", "guarded", "future"] {
         let bad = run(&["delivery", old]);

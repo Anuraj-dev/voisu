@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 use std::process::ExitCode;
 
-use voisu_app::config::{DeliveryMode, RenderingPolicy, WritingMode};
+use voisu_app::config::{DeliveryMode, RenderingPolicy, StoredDelivery, WritingMode};
 use voisu_app::doctor::DoctorRow;
 use voisu_app::service::{UserServiceAction, manage_user_service};
 use voisu_app::system::{ProviderHttpClient, SecretToolStore};
@@ -587,9 +587,19 @@ fn set_deepgram(enabled: bool) -> ExitCode {
 
 /// Reads or persists the Delivery mode. A running daemon resolves configuration
 /// only at start, so writes apply after the next restart.
+///
+/// A legacy `clipboard` means different things in different sessions, and this
+/// shell may not be in the service's session, so it reports what the value
+/// does instead of resolving it here.
 fn delivery(mode: Option<DeliveryMode>) -> ExitCode {
     let Some(mode) = mode else {
-        println!("Delivery: {}", voisu_app::config::delivery_mode().as_str());
+        if voisu_app::config::stored_delivery() == Some(StoredDelivery::LegacyClipboard) {
+            println!(
+                "Delivery: paste if Hyprland has a paste shortcut, otherwise copy (saved by an older Voisu). Choose one: voisu delivery paste or voisu delivery copy"
+            );
+        } else {
+            println!("Delivery: {}", voisu_app::config::delivery_mode().as_str());
+        }
         return ExitCode::SUCCESS;
     };
     match voisu_app::config::set_delivery_mode(mode) {

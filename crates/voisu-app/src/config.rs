@@ -117,12 +117,17 @@ impl DeliveryMode {
 
 /// A persisted `delivery_mode` value. Older releases stored `type`,
 /// `clipboard`, and `guarded`; they load as data and are rewritten only on
-/// the next Delivery change. `clipboard` meant "press the Hyprland paste
-/// shortcut" on Hyprland but "copy only" elsewhere, so its meaning depends on
-/// the desktop and is resolved separately.
+/// the next Delivery change. `type` and `guarded` both pasted. `clipboard`
+/// meant "press the Hyprland paste shortcut" on Hyprland but "copy only"
+/// elsewhere, so its meaning depends on the session of the process asking:
+/// only the running service's answer is authoritative for it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum StoredDelivery {
+pub enum StoredDelivery {
+    /// The user chose `paste` or `copy` under the current names.
     Mode(DeliveryMode),
+    /// `type` or `guarded`.
+    LegacyPaste,
+    /// `clipboard`.
     LegacyClipboard,
 }
 
@@ -273,6 +278,12 @@ pub fn delivery_mode() -> DeliveryMode {
         read_delivery_mode(&config_path()),
         legacy_clipboard_had_paste_shortcut,
     )
+}
+
+/// The Delivery value in the config file, without resolving what it means in
+/// this process's session. `None` when missing, unreadable, or unrecognised.
+pub fn stored_delivery() -> Option<StoredDelivery> {
+    read_delivery_mode(&config_path())
 }
 
 /// Whether a legacy `clipboard` value was pasting: true only in a Hyprland
@@ -486,6 +497,7 @@ fn resolve_delivery_mode(
     match persisted {
         None => DeliveryMode::default(),
         Some(StoredDelivery::Mode(mode)) => mode,
+        Some(StoredDelivery::LegacyPaste) => DeliveryMode::Paste,
         Some(StoredDelivery::LegacyClipboard) if legacy_clipboard_pastes() => DeliveryMode::Paste,
         Some(StoredDelivery::LegacyClipboard) => DeliveryMode::Copy,
     }
@@ -744,7 +756,9 @@ fn parse_delivery_mode(contents: &str) -> Option<StoredDelivery> {
             "\"paste\"" | "'paste'" => Some(DeliveryMode::Paste.into()),
             "\"copy\"" | "'copy'" => Some(DeliveryMode::Copy.into()),
             // Earlier releases: `type` and `guarded` both pasted.
-            "\"type\"" | "'type'" | "\"guarded\"" | "'guarded'" => Some(DeliveryMode::Paste.into()),
+            "\"type\"" | "'type'" | "\"guarded\"" | "'guarded'" => {
+                Some(StoredDelivery::LegacyPaste)
+            }
             "\"clipboard\"" | "'clipboard'" => Some(StoredDelivery::LegacyClipboard),
             _ => None,
         };
@@ -1333,6 +1347,13 @@ other_key = 5
 
     #[test]
     fn earlier_release_delivery_values_load_as_paste_or_copy() {
+        for old in ["type", "guarded"] {
+            assert_eq!(
+                parse_delivery_mode(&format!("delivery_mode = \"{old}\"\n")),
+                Some(StoredDelivery::LegacyPaste),
+                "{old} is not an explicit choice under the current names"
+            );
+        }
         for old in ["type", "guarded"] {
             let contents = format!("delivery_mode = \"{old}\"\n");
             assert_eq!(
