@@ -807,7 +807,7 @@ impl BoundaryError {
             BoundaryKind::TooShortRecording => "Too short to transcribe",
             BoundaryKind::SilentRecording => "Didn't hear any words",
             BoundaryKind::RecordingDeadline => "Stopped at the time limit",
-            BoundaryKind::Provider => "Couldn't reach Groq or Deepgram",
+            BoundaryKind::Provider => "Groq or Deepgram couldn't give us text",
             BoundaryKind::Validation => "Held back text that looked wrong",
             BoundaryKind::Delivery => "Couldn't put the text in your window",
             BoundaryKind::SecretStorage => {

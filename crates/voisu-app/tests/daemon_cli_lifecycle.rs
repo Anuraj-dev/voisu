@@ -1642,7 +1642,10 @@ while [ "$i" -lt 60 ]; do sleep 1; i=$((i + 1)); done
 
     let rejected = voisu(runtime.path(), "start");
     assert_eq!(rejected.status.code(), Some(4));
-    assert_eq!(stderr(&rejected), "Couldn't reach Groq or Deepgram\n");
+    assert_eq!(
+        stderr(&rejected),
+        "Groq or Deepgram couldn't give us text\n"
+    );
     assert!(!stderr(&rejected).contains("controlled-secret"));
     assert!(!stderr(&rejected).contains("example.invalid"));
     assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
@@ -1718,7 +1721,10 @@ fn production_groq_5xx_is_recoverable_through_the_public_cli() {
     wait_for_marker(commands.path(), "pw-record.ready");
     let rejected = voisu(runtime.path(), "stop");
     assert_eq!(rejected.status.code(), Some(4));
-    assert_eq!(stderr(&rejected), "Couldn't reach Groq or Deepgram\n");
+    assert_eq!(
+        stderr(&rejected),
+        "Groq or Deepgram couldn't give us text\n"
+    );
     request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     server.join().unwrap();
     assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
@@ -1758,7 +1764,10 @@ fn production_slow_groq_endpoint_is_bounded_and_recoverable() {
     let started = Instant::now();
     let rejected = voisu(runtime.path(), "stop");
     assert_eq!(rejected.status.code(), Some(4));
-    assert_eq!(stderr(&rejected), "Couldn't reach Groq or Deepgram\n");
+    assert_eq!(
+        stderr(&rejected),
+        "Groq or Deepgram couldn't give us text\n"
+    );
     assert!(started.elapsed() < PROCESSING_RESPONSE_DEADLINE);
     request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     server.join().unwrap();
@@ -9435,7 +9444,7 @@ fn partial_provider_start_failure_aborts_the_capture_and_surfaces_abort_errors()
     // must abort the capture and reject with a redacted public message.
     let failed = voisu(runtime.path(), "start");
     assert_eq!(failed.status.code(), Some(4));
-    assert_eq!(stderr(&failed), "Couldn't reach Groq or Deepgram\n");
+    assert_eq!(stderr(&failed), "Groq or Deepgram couldn't give us text\n");
     assert!(!stderr(&failed).contains("controlled"));
     assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
 
@@ -9472,7 +9481,7 @@ fn start_during_recovery_is_rejected_retryably_then_succeeds() {
     // recovery until the bounded abort timeout acknowledges completion.
     let failed = voisu(runtime.path(), "start");
     assert_eq!(failed.status.code(), Some(4));
-    assert_eq!(stderr(&failed), "Couldn't reach Groq or Deepgram\n");
+    assert_eq!(stderr(&failed), "Groq or Deepgram couldn't give us text\n");
 
     // During recovery the daemon is publicly idle and Start is rejected with a
     // distinct retryable message rather than deferred: no reordering against

@@ -2658,10 +2658,10 @@ async fn process_recording(
                     local_asr = local_routing::current_local_asr_error(error.message().as_str());
                     local_routing::mark_recovery_failed(&rec_id, recovery);
                     local_routing::abandon_live(&rec_id);
-                    return Err(BoundaryError::new(
-                        BoundaryKind::Validation,
-                        error.message(),
-                    ));
+                    return Err(
+                        BoundaryError::new(BoundaryKind::Validation, error.message())
+                            .with_public_message("The Local engine failed"),
+                    );
                 }
             }
         }
@@ -3070,7 +3070,8 @@ async fn complete_with_grammar_capability(
             return Err(BoundaryError::new(
                 BoundaryKind::Validation,
                 "provider or grammar credential preparation panicked",
-            ));
+            )
+            .with_public_message("Couldn't read your keys"));
         }
     };
     let credential = CredentialGateEvidence {
