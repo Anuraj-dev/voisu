@@ -70,6 +70,7 @@ impl Look {
                 '✕' => out.push('x'),
                 '✓' => out.push('+'),
                 '━' => out.push('='),
+                '│' => out.push('|'),
                 '↵' => out.push_str("Enter"),
                 '←' => out.push_str("Left"),
                 '→' => out.push_str("Right"),
@@ -135,7 +136,7 @@ mod tests {
             color: false,
             ascii: true,
         };
-        let text = look.text("▌ ● ✕ ✓ ━ ↵ ←→ ↑↓ … · — • 日本");
+        let text = look.text("▌ ● ✕ ✓ ━ │ ↵ ←→ ↑↓ … · — • 日本");
         assert!(text.is_ascii(), "{text}");
         assert_eq!(look.text("←→ tabs"), "<-> tabs");
     }

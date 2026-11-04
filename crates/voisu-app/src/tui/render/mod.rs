@@ -486,6 +486,107 @@ mod tests {
         assert!(ascii[17].starts_with("   >   Type"), "{}", ascii[17]);
     }
 
+    #[test]
+    fn wide_terminals_put_the_guide_in_a_panel_beside_the_rows() {
+        let mut app = app_on('4');
+        let lines = screen(&mut app, &UNICODE, (120, 40));
+        let beside = |row: &str, panel: &str| format!("{row:<44} │ {panel}").trim_end().to_owned();
+        assert_eq!(lines[5], beside(" ▌ Engine        Cloud", "Engine"));
+        assert_eq!(
+            lines[6],
+            beside("   Delivery      Paste", "Where your speech becomes text.")
+        );
+        assert_eq!(lines[7], beside("   Writing       Clean", ""));
+        assert_eq!(
+            lines[8],
+            beside(
+                "   Layout        Auto",
+                "  ● Cloud  Fast and accurate. Needs internet."
+            )
+        );
+        assert_eq!(
+            lines[9],
+            beside(
+                "   Deepgram      On",
+                "    Local  Private. Stays on this computer."
+            )
+        );
+        assert_eq!(lines[13], beside("   Run setup", ""));
+        assert_eq!(lines[14], "", "nothing below the rows");
+
+        // Picking happens in the panel, the same lines gaining the highlight.
+        let _ = press(&mut app, KeyCode::Enter, 0);
+        let _ = press(&mut app, KeyCode::Down, 0);
+        let lines = screen(&mut app, &UNICODE, (120, 40));
+        assert!(lines[8].ends_with("│   ● Cloud  Fast and accurate. Needs internet."));
+        assert!(lines[9].ends_with("│ ▌   Local  Private. Stays on this computer."));
+        let ascii = screen(&mut app, &ASCII, (120, 40));
+        assert!(ascii[9].ends_with("| >   Local  Private. Stays on this computer."));
+    }
+
+    #[test]
+    fn a_narrow_panel_wraps_each_choice_instead_of_cutting_it() {
+        let mut app = app_on('4');
+        let _ = press(&mut app, KeyCode::Down, 0);
+        let _ = press(&mut app, KeyCode::Down, 0);
+        let lines = screen(&mut app, &UNICODE, (90, 24));
+        let at = lines
+            .iter()
+            .position(|line| line.ends_with("│   ● Clean  Fixes punctuation, grammar and"))
+            .expect("Clean's first line");
+        assert!(lines[at + 1].ends_with("│            misheard words."));
+        assert!(lines[at + 2].ends_with("│     Exact  Your words, exactly as spoken."));
+    }
+
+    #[test]
+    fn every_panel_guide_shows_whole_at_both_wide_sizes() {
+        for size in [(90, 24), (120, 40)] {
+            for index in 0..SettingsRow::ALL.len() {
+                let mut app = app_on('4');
+                app.settings_selected = index;
+                let row = app.selected_setting();
+                let lines = screen(&mut app, &UNICODE, size);
+                let body = joined(&lines);
+                assert!(!body.contains('…'), "{size:?} {index}: cut\n{body}");
+                for other in SettingsRow::ALL {
+                    assert!(
+                        body.contains(other.label()),
+                        "{size:?} lost {}",
+                        other.label()
+                    );
+                }
+                let panel: Vec<&str> = lines
+                    .iter()
+                    .filter_map(|line| line.split_once('│').map(|(_, panel)| panel))
+                    .flat_map(str::split_whitespace)
+                    .collect();
+                let flat = panel.join(" ");
+                assert!(flat.contains(row.description()), "{size:?} {index}\n{body}");
+                for choice in row.choices() {
+                    assert!(
+                        flat.contains(choice.line),
+                        "{size:?} {}\n{body}",
+                        choice.label
+                    );
+                }
+                for line in &lines {
+                    assert!(text::width(line) <= size.0 as usize, "{line}");
+                }
+            }
+        }
+
+        // The longest value a row can hold still shows whole beside the panel.
+        let mut app = app_on('4');
+        let _ = update(
+            &mut app,
+            Msg::Reply(Reply::Status(StatusPoll::Unavailable)),
+            at(0),
+        );
+        let body = joined(&screen(&mut app, &UNICODE, (90, 24)));
+        assert!(body.contains("Unknown until Voisu runs"), "{body}");
+        assert!(!body.contains('…'), "{body}");
+    }
+
     // --- Every tab at every size --------------------------------------------------
 
     #[test]
