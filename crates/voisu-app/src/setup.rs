@@ -110,8 +110,8 @@ pub struct LiveHyprlandSetupActions<'a> {
 
 impl HyprlandSetupActions for LiveHyprlandSetupActions<'_> {
     fn select_clipboard_delivery(&mut self) -> Result<(), String> {
-        // Type Delivery is unusable on Hyprland. Reruns rewrite type/guarded.
-        config::set_delivery_mode(DeliveryMode::Clipboard).map(|_| ())
+        // On Hyprland, Paste presses the verified paste shortcut.
+        config::set_delivery_mode(DeliveryMode::Paste).map(|_| ())
     }
 
     fn install_services(&mut self) -> Result<(), String> {
@@ -1112,19 +1112,17 @@ mod tests {
     }
 
     #[test]
-    fn hyprland_setup_overwrites_type_and_guarded_delivery_with_clipboard() {
+    fn hyprland_setup_selects_paste_delivery() {
         let dir = tempfile::tempdir().unwrap();
         let _lock = xdg_config_test_lock();
         let _guard = XdgConfigHomeGuard::set(dir.path());
         let mut io = FakeIo::new(vec![], vec![]);
         let mut actions = LiveHyprlandSetupActions { io: &mut io };
 
-        for existing in [DeliveryMode::Type, DeliveryMode::Guarded] {
-            config::set_delivery_mode(existing).unwrap();
-            assert_eq!(config::delivery_mode(), existing);
-            actions.select_clipboard_delivery().unwrap();
-            assert_eq!(config::delivery_mode(), DeliveryMode::Clipboard);
-        }
+        config::set_delivery_mode(DeliveryMode::Copy).unwrap();
+        assert_eq!(config::delivery_mode(), DeliveryMode::Copy);
+        actions.select_clipboard_delivery().unwrap();
+        assert_eq!(config::delivery_mode(), DeliveryMode::Paste);
     }
 
     #[test]

@@ -25,7 +25,7 @@ commands:
   auth verify <groq|deepgram>
   deepgram <on|off>
   mode <local|cloud>
-  delivery [type|clipboard|guarded]
+  delivery [paste|copy]
   writing [smart|literal]
   rendering [natural|adaptive|structured]
   dictionary add <term>

@@ -628,7 +628,7 @@ fn clipboard_empty_selection(stderr: &str) -> bool {
 /// specifically; an installed xclip cannot make a missing or broken
 /// wl-clipboard backend usable.
 pub fn verify_clipboard_delivery() -> Result<(), String> {
-    // Hyprland's Clipboard, Type, and Guarded adapters all preserve through
+    // On Hyprland, both the Paste and Copy adapters preserve through
     // WlClipboard. Do not use the doctor's Unknown-session fallback here:
     // xclip being installed cannot satisfy a missing wl-copy/wl-paste pair.
     let finding = clipboard_finding_for_backend(ClipboardTool::WlClipboard);

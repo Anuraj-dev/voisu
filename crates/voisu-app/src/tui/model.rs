@@ -343,15 +343,11 @@ impl SettingsRow {
 
     /// One plain line about what the setting does, kept short enough to fit
     /// two rows at the minimum width.
-    pub fn description(self, delivery: Option<DeliveryMode>) -> &'static str {
+    pub fn description(self, _delivery: Option<DeliveryMode>) -> &'static str {
         match self {
             SettingsRow::Engine => {
                 "Where your speech becomes text. Cloud uses Groq and Deepgram; \
                  Local stays on this computer."
-            }
-            SettingsRow::Delivery if delivery == Some(DeliveryMode::Guarded) => {
-                "How your words reach the app. Guarded pastes when it can check \
-                 the window, else leaves them copied."
             }
             SettingsRow::Delivery => {
                 "How your words reach the app. Clipboard copies and pastes; Type types them."
@@ -1262,9 +1258,8 @@ pub enum CheckLine {
 
 fn next_delivery(current: DeliveryMode) -> DeliveryMode {
     match current {
-        DeliveryMode::Type => DeliveryMode::Clipboard,
-        DeliveryMode::Clipboard => DeliveryMode::Guarded,
-        DeliveryMode::Guarded => DeliveryMode::Type,
+        DeliveryMode::Paste => DeliveryMode::Copy,
+        DeliveryMode::Copy => DeliveryMode::Paste,
     }
 }
 
@@ -1402,7 +1397,7 @@ pub(super) mod test_support {
     pub fn settings() -> SettingsSnapshot {
         SettingsSnapshot {
             engine: AsrMode::Cloud,
-            delivery: DeliveryMode::Clipboard,
+            delivery: DeliveryMode::Copy,
             writing: WritingMode::Smart,
             rendering: RenderingPolicy::Adaptive,
             deepgram: true,
@@ -2091,11 +2086,7 @@ mod tests {
         app.tab = Tab::Settings;
 
         app.settings_selected = 1;
-        for expected in [
-            DeliveryMode::Guarded,
-            DeliveryMode::Type,
-            DeliveryMode::Clipboard,
-        ] {
+        for expected in [DeliveryMode::Paste, DeliveryMode::Copy] {
             let effects = press(&mut app, KeyCode::Enter, 0);
             assert!(
                 matches!(effects.as_slice(), [Effect::Job(Job::SetDelivery(mode))] if *mode == expected)

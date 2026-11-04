@@ -3497,7 +3497,7 @@ fn doctor_reports_clipboard_only_when_hyprland_paste_is_unverified() {
     fs::create_dir_all(&voisu_config).unwrap();
     fs::write(
         voisu_config.join("config.toml"),
-        "delivery_mode = \"clipboard\"\n",
+        "delivery_mode = \"copy\"\n",
     )
     .unwrap();
     let commands = TempDir::new().unwrap();
@@ -3553,7 +3553,7 @@ fn daemon_readiness_reports_clipboard_only_when_direct_delivery_is_disabled() {
     fs::create_dir_all(voisu_config.join("hypr")).unwrap();
     fs::write(
         voisu_config.join("config.toml"),
-        "deepgram_enabled = false\ndelivery_mode = \"clipboard\"\n",
+        "deepgram_enabled = false\ndelivery_mode = \"paste\"\n",
     )
     .unwrap();
     fs::write(
@@ -3631,7 +3631,7 @@ fn doctor_reports_hyprland_paste_backend_when_action_is_verified() {
     fs::create_dir_all(&voisu_config).unwrap();
     fs::write(
         voisu_config.join("config.toml"),
-        "deepgram_enabled = false\ndelivery_mode = \"clipboard\"\n",
+        "deepgram_enabled = false\ndelivery_mode = \"paste\"\n",
     )
     .unwrap();
     let commands = TempDir::new().unwrap();
@@ -3692,77 +3692,6 @@ fn doctor_reports_hyprland_paste_backend_when_action_is_verified() {
     );
     assert!(
         output.contains("emits the verified Paste Action through Hyprland send_key_state"),
-        "{output}"
-    );
-}
-
-#[test]
-fn doctor_reports_hyprland_paste_backend_unavailable_without_press_path() {
-    let config_home = TempDir::new().unwrap();
-    let voisu_config = config_home.path().join("voisu");
-    fs::create_dir_all(&voisu_config).unwrap();
-    fs::write(
-        voisu_config.join("config.toml"),
-        "deepgram_enabled = false\ndelivery_mode = \"clipboard\"\n",
-    )
-    .unwrap();
-    let commands = TempDir::new().unwrap();
-    hyprland_paste_fixture(config_home.path(), commands.path());
-    let path = format!(
-        "{}:{}",
-        commands.path().display(),
-        std::env::var("PATH").unwrap()
-    );
-    let runtime = TempDir::new().unwrap();
-    let _daemon = Daemon::start_production_with_env(
-        runtime.path(),
-        &[
-            ("PATH", &path),
-            ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap()),
-            ("XDG_SESSION_TYPE", "wayland"),
-            ("WAYLAND_DISPLAY", "wayland-9"),
-            ("HYPRLAND_INSTANCE_SIGNATURE", ""),
-            ("VOISU_DISABLE_SHORTCUTS", "1"),
-            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/voisu-no-portal"),
-        ],
-    );
-
-    let status = ipc_request(
-        runtime.path(),
-        &format!(r#"{{"version":{PROTOCOL_VERSION},"command":"status"}}"#),
-    );
-    assert_eq!(status["readiness"]["paste_action"], "verified");
-    assert_eq!(status["readiness"]["paste_backend"], "unavailable");
-
-    let doctor = voisu_isolated(
-        runtime.path(),
-        config_home.path(),
-        &["doctor", "--verbose"],
-        &[
-            ("XDG_SESSION_TYPE", "wayland"),
-            ("WAYLAND_DISPLAY", "wayland-9"),
-            ("HYPRLAND_INSTANCE_SIGNATURE", ""),
-            ("VOISU_TEST_READINESS", "pass"),
-            ("VOISU_TEST_FOCUS_BACKEND", "hyprland"),
-            ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
-        ],
-    );
-    let output = stdout(&doctor);
-    assert!(doctor.status.success(), "{output}");
-    assert!(
-        output.contains(&doctor_line("Paste action", "verified", "PASS")),
-        "{output}"
-    );
-    assert!(
-        output.contains(&doctor_line("Paste backend", "unavailable", "WARN")),
-        "{output}"
-    );
-    assert!(
-        output.contains("Hyprland Paste Action binding was verified by the daemon"),
-        "{output}"
-    );
-    assert!(
-        output.contains("the Hyprland press path cannot run"),
         "{output}"
     );
 }
@@ -12261,7 +12190,7 @@ fn deepgram_cli_toggle_persists_the_setting_across_starts() {
 }
 
 #[test]
-fn delivery_cli_sets_gets_and_persists_guarded_while_rejecting_invalid_modes() {
+fn delivery_cli_sets_gets_and_persists_paste_or_copy_while_rejecting_other_modes() {
     let config = TempDir::new().unwrap();
     let run = |arguments: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_voisu"))
@@ -12274,82 +12203,47 @@ fn delivery_cli_sets_gets_and_persists_guarded_while_rejecting_invalid_modes() {
 
     let initial = run(&["delivery"]);
     assert!(initial.status.success(), "{}", stderr(&initial));
-    assert_eq!(stdout(&initial), "delivery mode: type\n");
+    assert_eq!(stdout(&initial), "delivery mode: paste\n");
 
-    let clipboard = run(&["delivery", "clipboard"]);
-    assert!(clipboard.status.success(), "{}", stderr(&clipboard));
+    let copy = run(&["delivery", "copy"]);
+    assert!(copy.status.success(), "{}", stderr(&copy));
     assert!(
         fs::read_to_string(&config_file)
             .unwrap()
-            .contains("delivery_mode = \"clipboard\""),
-        "clipboard mode persists"
+            .contains("delivery_mode = \"copy\""),
+        "copy mode persists"
     );
-    assert_eq!(stdout(&run(&["delivery"])), "delivery mode: clipboard\n");
+    assert_eq!(stdout(&run(&["delivery"])), "delivery mode: copy\n");
 
-    let guarded = run(&["delivery", "guarded"]);
-    assert!(guarded.status.success(), "{}", stderr(&guarded));
+    let paste = run(&["delivery", "paste"]);
+    assert!(paste.status.success(), "{}", stderr(&paste));
     assert_eq!(
-        stdout(&guarded),
-        "Delivery mode set to guarded for new Recordings; restart the daemon to apply (voisu service restart)\n"
+        stdout(&paste),
+        "Delivery mode set to paste for new Recordings; restart the daemon to apply (voisu service restart)\n"
     );
-    assert_eq!(stdout(&run(&["delivery"])), "delivery mode: guarded\n");
+    assert_eq!(stdout(&run(&["delivery"])), "delivery mode: paste\n");
 
-    let bad = run(&["delivery", "future"]);
-    assert_eq!(bad.status.code(), Some(2), "{}", stderr(&bad));
-    assert!(
-        stderr(&bad).contains("delivery mode must be type, clipboard, or guarded"),
-        "{}",
-        stderr(&bad)
-    );
+    // Earlier releases' names load from config but are not CLI aliases.
+    for old in ["type", "clipboard", "guarded", "future"] {
+        let bad = run(&["delivery", old]);
+        assert_eq!(bad.status.code(), Some(2), "{old}: {}", stderr(&bad));
+        assert!(
+            stderr(&bad).contains("delivery must be paste or copy"),
+            "{old}: {}",
+            stderr(&bad)
+        );
+    }
 }
 
 #[test]
-fn writing_cli_reports_intent_reconstruction_from_writing_mode_not_process_env() {
-    let config = TempDir::new().unwrap();
-    let run = |arguments: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_voisu"))
-            .args(arguments)
-            .env("XDG_CONFIG_HOME", config.path())
-            .env("VOISU_ENABLE_INTENT_RECONSTRUCTION", "0")
-            .output()
-            .unwrap()
-    };
-
-    let initial = run(&["writing"]);
-    assert!(initial.status.success(), "{}", stderr(&initial));
-    assert_eq!(
-        stdout(&initial),
-        "writing mode: smart (Intent Reconstruction on unless the daemon env forces it off)\n"
-    );
-
-    let literal = run(&["writing", "literal"]);
-    assert!(literal.status.success(), "{}", stderr(&literal));
-    assert_eq!(
-        stdout(&literal),
-        "Writing mode set to literal for new Recordings (Intent Reconstruction off); restart the daemon to apply (voisu service restart)\n"
-    );
-    assert_eq!(
-        stdout(&run(&["writing"])),
-        "writing mode: literal (Intent Reconstruction off)\n"
-    );
-
-    let smart = run(&["writing", "smart"]);
-    assert!(smart.status.success(), "{}", stderr(&smart));
-    assert_eq!(
-        stdout(&smart),
-        "Writing mode set to smart for new Recordings (Intent Reconstruction on unless the daemon env forces it off); restart the daemon to apply (voisu service restart)\n"
-    );
-}
-
-#[test]
-fn clipboard_delivery_mode_uses_the_clipboard_only_adapter() {
+fn copy_delivery_mode_uses_the_clipboard_only_adapter() {
     let runtime = TempDir::new().unwrap();
     let config = TempDir::new().unwrap();
     let config_dir = config.path().join("voisu");
     fs::create_dir_all(&config_dir).unwrap();
     fs::write(
         config_dir.join("config.toml"),
-        "deepgram_enabled = false\ndelivery_mode = \"clipboard\"\n",
+        "deepgram_enabled = false\ndelivery_mode = \"copy\"\n",
     )
     .unwrap();
 
@@ -12385,7 +12279,7 @@ cat > "$dir/clipboard"
             ("PATH", &path),
             ("XDG_CONFIG_HOME", config.path().to_str().unwrap()),
             // Keep the production adapter selection active while keeping any
-            // portal connection hermetic. Clipboard mode must not touch it.
+            // portal connection hermetic. Copy mode must not touch it.
             ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/voisu-no-portal"),
             ("VOISU_DISABLE_SHORTCUTS", "1"),
             ("VOISU_TEST_SECRET_STORE", "unavailable"),
@@ -12408,8 +12302,8 @@ cat > "$dir/clipboard"
     assert_eq!(record["delivery_method"], "clipboard_fallback", "{history}");
     assert_eq!(
         record["delivery_fallback_reason"],
-        "no verified Hyprland Paste Action; Transcript remains on the clipboard",
-        "clipboard mode must skip the emulated-input adapter: {history}"
+        "Delivery is set to copy; Transcript is on the clipboard",
+        "copy mode must skip the emulated-input adapter: {history}"
     );
 
     daemon.terminate();

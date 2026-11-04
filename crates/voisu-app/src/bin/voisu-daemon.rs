@@ -27,7 +27,6 @@ use voisu_app::dpr_pipeline::{
     DprCloudCapability, DprPipelineClockOrigin, DprTransformInput, SystemDprPipelineClock,
     dpr_pipeline_clock_origin, dpr_protected_tokens, dpr_source_context, dpr_transform_and_deliver,
 };
-use voisu_app::focus::SharedFocusProbe;
 use voisu_app::local_recovery;
 use voisu_app::local_routing;
 use voisu_app::local_routing::LocalStopResult;
@@ -41,11 +40,11 @@ use voisu_app::smart_writing::{
 };
 use voisu_app::system::{
     CAPTURE_FINALIZE_DEADLINE, CredentialPreparationOwner, DIAGNOSTIC_RESPONSE_DEADLINE,
-    DeepgramProvider, DesktopNotifier, FedoraShortcutPortal, GrammarCapability, GroqProvider,
-    GuardedDelivery, INTENT_RECONSTRUCTION_DEADLINE, MergeResultValidator,
-    PROCESSING_RESPONSE_DEADLINE, PROVIDER_COMPLETION_DEADLINE, PipeWireCapture,
-    PortalClipboardDelivery, ProviderReaper, RECONCILIATION_DEADLINE, RECOVERY_ABORT_DEADLINE,
-    WlClipboard, clipboard_backend_display_reachable,
+    DeepgramProvider, FedoraShortcutPortal, GrammarCapability, GroqProvider,
+    INTENT_RECONSTRUCTION_DEADLINE, MergeResultValidator, PROCESSING_RESPONSE_DEADLINE,
+    PROVIDER_COMPLETION_DEADLINE, PipeWireCapture, PortalClipboardDelivery, ProviderReaper,
+    RECONCILIATION_DEADLINE, RECOVERY_ABORT_DEADLINE, WlClipboard,
+    clipboard_backend_display_reachable,
 };
 use voisu_core::{
     ActiveCapture, AsrMode, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture, BoundaryKind,
@@ -212,19 +211,9 @@ async fn run() -> Result<(), String> {
     let delivery_mode = voisu_app::config::delivery_mode();
     let controlled =
         std::env::var_os("VOISU_TEST_MODE").as_deref() == Some(std::ffi::OsStr::new("controlled"));
-    let focus_probe = if delivery_mode == DeliveryMode::Guarded
-        && !controlled
-        && std::env::var_os("VOISU_DISABLE_DIRECT_DELIVERY").is_none()
-    {
-        let (backend, probe) = voisu_app::focus::initialize_focus_probe(parent).await;
-        eprintln!("focus guard backend: {}", backend.as_str());
-        Some(probe)
-    } else {
-        None
-    };
 
     let (initial_delivery, initial_paste_action, initial_paste_backend) =
-        build_delivery_adapter(controlled, delivery_mode, focus_probe.clone());
+        build_delivery_adapter(controlled, delivery_mode);
     let daemon_readiness =
         daemon_readiness_snapshot(delivery_mode, initial_paste_action, initial_paste_backend);
     let (actor_tx, actor_rx) = mpsc::channel(64);
@@ -239,7 +228,6 @@ async fn run() -> Result<(), String> {
         diagnostics,
         reaper.clone(),
         delivery_mode,
-        focus_probe,
         levels.clone(),
         daemon_readiness,
         initial_delivery,
@@ -546,7 +534,6 @@ async fn actor_loop(
     diagnostics: Option<Arc<DiagnosticStore>>,
     reaper: ProviderReaper,
     delivery_mode: DeliveryMode,
-    focus_probe: Option<SharedFocusProbe>,
     levels: LevelRegistry,
     daemon_readiness: Option<DaemonReadiness>,
     initial_delivery: Box<dyn DeliveryAdapter>,
@@ -581,8 +568,8 @@ async fn actor_loop(
     // adapter is a no-network stand-in so `begin_recording` never opens a Deepgram
     // stream and the completion barrier waits on Groq alone.
     let deepgram_enabled = voisu_app::config::deepgram_enabled();
-    // Delivery mode and any guarded focus probe were resolved once before the
-    // actor started. A running daemon keeps those choices until its next restart.
+    // Delivery mode was resolved once before the actor started. A running
+    // daemon keeps that choice until its next restart.
     // Production adapters are built only at a Recording or replay boundary,
     // after resolving that operation's dictionary snapshot below. Controlled
     // adapters keep their existing one-shot failure seams across retries.
@@ -788,7 +775,6 @@ async fn actor_loop(
                                 controlled,
                                 deepgram_enabled,
                                 delivery_mode,
-                                focus_probe.clone(),
                                 configured_providers.clone(),
                                 Some(reply),
                                 false,
@@ -1545,7 +1531,6 @@ async fn actor_loop(
                         controlled,
                         deepgram_enabled,
                         delivery_mode,
-                        focus_probe.clone(),
                         configured_providers.clone(),
                         None,
                         true,
@@ -1725,7 +1710,6 @@ async fn actor_loop(
                             controlled,
                             deepgram_enabled,
                             delivery_mode,
-                            focus_probe.clone(),
                             configured_providers.clone(),
                             None,
                             false,
@@ -1776,7 +1760,6 @@ fn spawn_recording_processing(
     controlled: bool,
     deepgram_enabled: bool,
     delivery_mode: DeliveryMode,
-    focus_probe: Option<SharedFocusProbe>,
     configured_providers: Vec<Provider>,
     reply: Option<oneshot::Sender<Response>>,
     publish_terminal_outcome: bool,
@@ -1825,7 +1808,6 @@ fn spawn_recording_processing(
         controlled,
         deepgram_enabled,
         delivery_mode,
-        focus_probe,
         configured_providers,
         panic_evidence,
         reply,
@@ -3083,7 +3065,6 @@ async fn supervise_recording(
     controlled: bool,
     deepgram_enabled: bool,
     delivery_mode: DeliveryMode,
-    focus_probe: Option<SharedFocusProbe>,
     configured_providers: Vec<Provider>,
     panic_evidence: LifecycleEvidence,
     reply: Option<oneshot::Sender<Response>>,
@@ -3138,7 +3119,7 @@ async fn supervise_recording(
                 ));
             }
             let (validator, delivery) =
-                rebuild_recording_adapters(controlled, delivery_mode, focus_probe.clone(), &reaper);
+                rebuild_recording_adapters(controlled, delivery_mode, &reaper);
             RecordingResult {
                 result: Err(error),
                 evidence: panic_evidence,
@@ -3183,7 +3164,6 @@ fn log_best_effort(message: std::fmt::Arguments<'_>) {
 fn rebuild_recording_adapters(
     controlled: bool,
     delivery_mode: DeliveryMode,
-    focus_probe: Option<SharedFocusProbe>,
     reaper: &ProviderReaper,
 ) -> (Box<dyn TranscriptValidator>, Box<dyn DeliveryAdapter>) {
     let intent_reconstruction = voisu_app::config::intent_reconstruction_enabled();
@@ -3199,7 +3179,7 @@ fn rebuild_recording_adapters(
             } else {
                 Box::new(MergeResultValidator::new(reaper.clone()))
             },
-            build_delivery_adapter(false, delivery_mode, focus_probe).0,
+            build_delivery_adapter(false, delivery_mode).0,
         )
     }
 }
@@ -3207,98 +3187,74 @@ fn rebuild_recording_adapters(
 /// Builds the Delivery adapter from the daemon-start mode. The environment
 /// override is an emergency opt-out and deliberately wins over persisted
 /// configuration, matching the Deepgram toggle's precedence shape.
+///
+/// `Paste` presses the user's own paste shortcut on Hyprland (whose portal
+/// offers no keyboard control) and uses the RemoteDesktop portal everywhere
+/// else. `Copy` only puts the Transcript on the clipboard.
 fn build_delivery_adapter(
     controlled: bool,
     delivery_mode: DeliveryMode,
-    focus_probe: Option<SharedFocusProbe>,
 ) -> (Box<dyn DeliveryAdapter>, PasteActionState, PasteBackend) {
+    let copy_state = if delivery_mode == DeliveryMode::Copy {
+        PasteActionState::ClipboardOnly
+    } else {
+        PasteActionState::NotRequired
+    };
     if controlled {
-        (
+        // The controlled adapter has no paste side effect; model the
+        // configured mode without probing the live desktop.
+        return (
             Box::new(ControlledDelivery),
-            if delivery_mode == DeliveryMode::Clipboard {
-                // The controlled adapter has no paste side effect; model the
-                // configured clipboard mode without probing the live desktop.
-                PasteActionState::ClipboardOnly
-            } else {
-                PasteActionState::NotRequired
-            },
+            copy_state,
             PasteBackend::NotRequired,
-        )
-    } else if std::env::var_os("VOISU_DISABLE_DIRECT_DELIVERY").is_some() {
-        (
+        );
+    }
+    if std::env::var_os("VOISU_DISABLE_DIRECT_DELIVERY").is_some() {
+        return (
             Box::new(PortalClipboardDelivery::clipboard_only_with_reason(
                 Box::new(WlClipboard),
                 "direct Delivery disabled by VOISU_DISABLE_DIRECT_DELIVERY; Transcript remains on the clipboard",
             )),
-            if delivery_mode == DeliveryMode::Clipboard {
-                PasteActionState::ClipboardOnly
-            } else {
-                PasteActionState::NotRequired
-            },
+            PasteActionState::ClipboardOnly,
             PasteBackend::NotRequired,
-        )
-    } else {
-        match delivery_mode {
-            DeliveryMode::Type => (
-                Box::new(PortalClipboardDelivery::default()),
-                PasteActionState::NotRequired,
-                PasteBackend::NotRequired,
-            ),
-            DeliveryMode::Clipboard => {
-                let (paste_action, verified) = paste_action_selection();
-                match (
-                    verified,
-                    voisu_app::hyprland_bindings::hyprland_press_path_available(),
-                ) {
-                    (Some(action), true) => {
-                        eprintln!("verified Hyprland Paste Action: {}", action.description);
-                        (
-                            Box::new(PortalClipboardDelivery::with_hyprland_paste(action)),
-                            paste_action,
-                            PasteBackend::Hyprland,
-                        )
-                    }
-                    (Some(action), false) => {
-                        eprintln!(
-                            "verified Hyprland Paste Action {}; press path unavailable; Delivery will remain clipboard-only",
-                            action.description
-                        );
-                        (
-                            Box::new(PortalClipboardDelivery::clipboard_only()),
-                            paste_action,
-                            PasteBackend::Unavailable,
-                        )
-                    }
-                    (None, _) => {
-                        eprintln!(
-                            "no verified Hyprland Paste Action; Delivery will remain clipboard-only"
-                        );
-                        (
-                            Box::new(PortalClipboardDelivery::clipboard_only()),
-                            paste_action,
-                            PasteBackend::NotRequired,
-                        )
-                    }
+        );
+    }
+    match delivery_mode {
+        DeliveryMode::Copy => (
+            Box::new(PortalClipboardDelivery::clipboard_only_with_reason(
+                Box::new(WlClipboard),
+                "Delivery is set to copy; Transcript is on the clipboard",
+            )),
+            PasteActionState::ClipboardOnly,
+            PasteBackend::NotRequired,
+        ),
+        DeliveryMode::Paste if voisu_app::hyprland_bindings::hyprland_press_path_available() => {
+            match paste_action_selection() {
+                (paste_action, Some(action)) => {
+                    eprintln!("verified Hyprland Paste Action: {}", action.description);
+                    (
+                        Box::new(PortalClipboardDelivery::with_hyprland_paste(action)),
+                        paste_action,
+                        PasteBackend::Hyprland,
+                    )
+                }
+                (paste_action, None) => {
+                    eprintln!(
+                        "no verified Hyprland Paste Action; Delivery will remain clipboard-only"
+                    );
+                    (
+                        Box::new(PortalClipboardDelivery::clipboard_only()),
+                        paste_action,
+                        PasteBackend::NotRequired,
+                    )
                 }
             }
-            DeliveryMode::Guarded => {
-                let focus = focus_probe.unwrap_or_else(|| {
-                    Arc::new(tokio::sync::Mutex::new(Box::new(
-                        voisu_app::focus::NullFocusProbe,
-                    )))
-                });
-                (
-                    Box::new(GuardedDelivery::with_boundaries(
-                        focus,
-                        Box::new(PortalClipboardDelivery::default()),
-                        Box::new(PortalClipboardDelivery::clipboard_only()),
-                        Box::new(DesktopNotifier),
-                    )),
-                    PasteActionState::NotRequired,
-                    PasteBackend::NotRequired,
-                )
-            }
         }
+        DeliveryMode::Paste => (
+            Box::new(PortalClipboardDelivery::default()),
+            PasteActionState::NotRequired,
+            PasteBackend::NotRequired,
+        ),
     }
 }
 
@@ -4834,8 +4790,7 @@ mod tests {
             processing,
             true,
             true,
-            DeliveryMode::Type,
-            None,
+            DeliveryMode::Paste,
             vec![Provider::Groq],
             evidence,
             None,

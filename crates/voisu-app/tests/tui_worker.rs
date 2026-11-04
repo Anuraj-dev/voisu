@@ -63,11 +63,11 @@ fn the_interface_and_the_cli_read_and_write_the_same_settings() {
     }
 
     // A setting lands where the CLI reads it, and the toast says so in words.
-    let (kind, text) = toast(Job::SetDelivery(DeliveryMode::Type));
+    let (kind, text) = toast(Job::SetDelivery(DeliveryMode::Copy));
     assert_eq!(kind, Tone::Success, "{text}");
-    assert!(text.starts_with("Delivery set to Type."), "{text}");
+    assert!(text.starts_with("Delivery set to Copy."), "{text}");
     assert!(text.ends_with("Restart Voisu to apply."), "{text}");
-    assert!(cli(&dirs, &["delivery"]).contains("type"));
+    assert!(cli(&dirs, &["delivery"]).contains("copy"));
 
     // The daemon picks its Intent Reconstruction validator at start.
     let (kind, text) = toast(Job::SetWriting(WritingMode::Literal));

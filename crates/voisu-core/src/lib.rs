@@ -515,11 +515,11 @@ pub enum PasteActionState {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PasteBackend {
-    /// Clipboard Delivery selected the native Hyprland paste adapter.
+    /// Paste Delivery selected the native Hyprland paste adapter.
     Hyprland,
     /// A verified action exists (or would) but the Hyprland press path cannot run.
     Unavailable,
-    /// Type, guarded, opt-out, or clipboard-only with no action.
+    /// Portal paste, copy, or the opt-out, with no Hyprland action.
     #[default]
     NotRequired,
 }
@@ -4483,7 +4483,7 @@ mod daemon_readiness_additivity_tests {
             "session_type": "wayland",
             "wayland_display": "wayland-0",
             "x11_display": null,
-            "delivery_mode": "clipboard",
+            "delivery_mode": "copy",
             "paste_action": "verified",
             "clipboard_usable": true
         }"#;

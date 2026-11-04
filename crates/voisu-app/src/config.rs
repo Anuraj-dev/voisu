@@ -94,26 +94,41 @@ pub const TRANSCRIPTION_LANGUAGE_ENV: &str = "VOISU_TRANSCRIPTION_LANGUAGE";
 /// not a language code and is refused.
 pub const MAX_LANGUAGE_TAG_BYTES: usize = 16;
 
-/// How Voisu delivers a final Transcript after preserving it on the clipboard.
+/// How Voisu delivers a final Transcript. Both modes first put the
+/// Transcript on the clipboard.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum DeliveryMode {
-    /// Preserve the Transcript and submit it through the compositor.
+    /// Paste the Transcript into the focused window.
     #[default]
-    Type,
-    /// Preserve the Transcript without emulated input.
-    Clipboard,
-    /// Reserved for the focus guard that ships in ticket 04.
-    Guarded,
+    Paste,
+    /// Leave the Transcript on the clipboard for the user to paste.
+    Copy,
 }
 
 impl DeliveryMode {
     /// The hand-authored TOML value persisted for this mode.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Type => "type",
-            Self::Clipboard => "clipboard",
-            Self::Guarded => "guarded",
+            Self::Paste => "paste",
+            Self::Copy => "copy",
         }
+    }
+}
+
+/// A persisted `delivery_mode` value. Older releases stored `type`,
+/// `clipboard`, and `guarded`; they load as data and are rewritten only on
+/// the next Delivery change. `clipboard` meant "press the Hyprland paste
+/// shortcut" on Hyprland but "copy only" elsewhere, so its meaning depends on
+/// the desktop and is resolved separately.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StoredDelivery {
+    Mode(DeliveryMode),
+    LegacyClipboard,
+}
+
+impl From<DeliveryMode> for StoredDelivery {
+    fn from(mode: DeliveryMode) -> Self {
+        Self::Mode(mode)
     }
 }
 
@@ -225,10 +240,24 @@ pub(crate) fn set_deepgram_enabled_at(path: &Path, enabled: bool) -> Result<Path
     Ok(path.to_path_buf())
 }
 
-/// The configured Delivery mode, defaulting safely to compositor submission.
-/// Missing, unreadable, and unrecognised values all degrade to [`DeliveryMode::Type`].
+/// The configured Delivery mode. Missing, unreadable, and unrecognised values
+/// all degrade to [`DeliveryMode::Paste`].
 pub fn delivery_mode() -> DeliveryMode {
-    resolve_delivery_mode(read_delivery_mode(&config_path()))
+    resolve_delivery_mode(
+        read_delivery_mode(&config_path()),
+        legacy_clipboard_had_paste_shortcut,
+    )
+}
+
+/// Whether a legacy `clipboard` value was pasting: true only in a Hyprland
+/// session with a verified paste shortcut. Discovery runs `hyprctl`, so the
+/// answer is cached for the life of the process.
+fn legacy_clipboard_had_paste_shortcut() -> bool {
+    static PASTES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PASTES.get_or_init(|| {
+        crate::hyprland_bindings::hyprland_press_path_available()
+            && crate::hyprland_bindings::discover_live_paste_action().is_some()
+    })
 }
 
 /// Persists the Delivery mode, creating the `voisu` config directory if needed,
@@ -421,10 +450,19 @@ fn resolve(disable_env_present: bool, persisted: Option<bool>) -> bool {
     persisted.unwrap_or(DEFAULT_DEEPGRAM_ENABLED)
 }
 
-/// Resolves a persisted Delivery mode, defaulting to the historic direct
-/// Delivery behavior when no recognised root-scope value is present.
-fn resolve_delivery_mode(persisted: Option<DeliveryMode>) -> DeliveryMode {
-    persisted.unwrap_or_default()
+/// Resolves a persisted Delivery mode, defaulting to Paste when no recognised
+/// root-scope value is present. A legacy `clipboard` keeps pasting only where
+/// it used to: with a verified Hyprland paste shortcut.
+fn resolve_delivery_mode(
+    persisted: Option<StoredDelivery>,
+    legacy_clipboard_pastes: impl FnOnce() -> bool,
+) -> DeliveryMode {
+    match persisted {
+        None => DeliveryMode::default(),
+        Some(StoredDelivery::Mode(mode)) => mode,
+        Some(StoredDelivery::LegacyClipboard) if legacy_clipboard_pastes() => DeliveryMode::Paste,
+        Some(StoredDelivery::LegacyClipboard) => DeliveryMode::Copy,
+    }
 }
 
 /// Pure Writing Mode resolution. Missing → Smart; fail-closed → Literal;
@@ -574,7 +612,7 @@ fn read_setting(path: &Path) -> Option<bool> {
 
 /// Reads the persisted Delivery mode, applying the same failure handling as
 /// the Deepgram switch.
-fn read_delivery_mode(path: &Path) -> Option<DeliveryMode> {
+fn read_delivery_mode(path: &Path) -> Option<StoredDelivery> {
     match std::fs::read_to_string(path) {
         Ok(contents) => parse_delivery_mode(&contents),
         Err(error) if error.kind() == ErrorKind::NotFound => None,
@@ -659,7 +697,7 @@ fn parse_deepgram_enabled(contents: &str) -> Option<bool> {
 
 /// Parses the root-scope `delivery_mode` string from the minimal TOML document.
 /// Its tolerance and table scoping deliberately mirror [`parse_deepgram_enabled`].
-fn parse_delivery_mode(contents: &str) -> Option<DeliveryMode> {
+fn parse_delivery_mode(contents: &str) -> Option<StoredDelivery> {
     for line in contents.lines() {
         let line = strip_comment(line).trim();
         if line.is_empty() {
@@ -677,9 +715,11 @@ fn parse_delivery_mode(contents: &str) -> Option<DeliveryMode> {
         // Both TOML string forms are accepted so a hand-edited single-quoted
         // literal string is honored rather than silently defaulting.
         return match value.trim() {
-            "\"type\"" | "'type'" => Some(DeliveryMode::Type),
-            "\"clipboard\"" | "'clipboard'" => Some(DeliveryMode::Clipboard),
-            "\"guarded\"" | "'guarded'" => Some(DeliveryMode::Guarded),
+            "\"paste\"" | "'paste'" => Some(DeliveryMode::Paste.into()),
+            "\"copy\"" | "'copy'" => Some(DeliveryMode::Copy.into()),
+            // Earlier releases: `type` and `guarded` both pasted.
+            "\"type\"" | "'type'" | "\"guarded\"" | "'guarded'" => Some(DeliveryMode::Paste.into()),
+            "\"clipboard\"" | "'clipboard'" => Some(StoredDelivery::LegacyClipboard),
             _ => None,
         };
     }
@@ -1142,10 +1182,10 @@ mod tests {
         let path = dir.path().join("voisu").join("config.toml");
 
         write_setting(&path, false).unwrap();
-        write_delivery_mode(&path, DeliveryMode::Clipboard).unwrap();
+        write_delivery_mode(&path, DeliveryMode::Copy).unwrap();
 
         assert_eq!(read_setting(&path), Some(false));
-        assert_eq!(read_delivery_mode(&path), Some(DeliveryMode::Clipboard));
+        assert_eq!(read_delivery_mode(&path), Some(DeliveryMode::Copy.into()));
         let contents = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
             contents.matches(DEEPGRAM_ENABLED_KEY).count(),
@@ -1161,21 +1201,21 @@ mod tests {
         let path = dir.path().join("voisu").join("config.toml");
 
         write_setting(&path, false).unwrap();
-        write_delivery_mode(&path, DeliveryMode::Clipboard).unwrap();
+        write_delivery_mode(&path, DeliveryMode::Copy).unwrap();
         write_writing_mode(&path, WritingMode::Literal).unwrap();
 
         // Rewrite each key once more; the other two must survive every write.
         write_setting(&path, true).unwrap();
         assert_eq!(read_setting(&path), Some(true));
-        assert_eq!(read_delivery_mode(&path), Some(DeliveryMode::Clipboard));
+        assert_eq!(read_delivery_mode(&path), Some(DeliveryMode::Copy.into()));
         assert_eq!(
             read_writing_mode(&path),
             WritingModeLoad::Known(WritingMode::Literal)
         );
 
-        write_delivery_mode(&path, DeliveryMode::Guarded).unwrap();
+        write_delivery_mode(&path, DeliveryMode::Paste).unwrap();
         assert_eq!(read_setting(&path), Some(true));
-        assert_eq!(read_delivery_mode(&path), Some(DeliveryMode::Guarded));
+        assert_eq!(read_delivery_mode(&path), Some(DeliveryMode::Paste.into()));
         assert_eq!(
             read_writing_mode(&path),
             WritingModeLoad::Known(WritingMode::Literal)
@@ -1183,7 +1223,7 @@ mod tests {
 
         write_writing_mode(&path, WritingMode::Smart).unwrap();
         assert_eq!(read_setting(&path), Some(true));
-        assert_eq!(read_delivery_mode(&path), Some(DeliveryMode::Guarded));
+        assert_eq!(read_delivery_mode(&path), Some(DeliveryMode::Paste.into()));
         assert_eq!(
             read_writing_mode(&path),
             WritingModeLoad::Known(WritingMode::Smart)
@@ -1230,37 +1270,68 @@ other_key = 5
     }
 
     #[test]
-    fn delivery_modes_parse_and_unknown_or_missing_values_default_to_type() {
-        assert_eq!(
-            parse_delivery_mode("delivery_mode = \"type\"\n"),
-            Some(DeliveryMode::Type)
-        );
-        assert_eq!(
-            parse_delivery_mode("delivery_mode = \"clipboard\"\n"),
-            Some(DeliveryMode::Clipboard)
-        );
-        assert_eq!(
-            parse_delivery_mode("delivery_mode = \"guarded\"\n"),
-            Some(DeliveryMode::Guarded)
-        );
-        assert_eq!(
-            resolve_delivery_mode(parse_delivery_mode("delivery_mode = \"future\"\n")),
-            DeliveryMode::Type
-        );
+    fn delivery_modes_parse_and_unknown_or_missing_values_default_to_paste() {
+        let resolve =
+            |contents: &str| resolve_delivery_mode(parse_delivery_mode(contents), || false);
+        assert_eq!(resolve("delivery_mode = \"paste\"\n"), DeliveryMode::Paste);
+        assert_eq!(resolve("delivery_mode = \"copy\"\n"), DeliveryMode::Copy);
+        assert_eq!(resolve("delivery_mode = \"future\"\n"), DeliveryMode::Paste);
         assert_eq!(parse_delivery_mode("other_key = true\n"), None);
-        assert_eq!(resolve_delivery_mode(None), DeliveryMode::Type);
+        assert_eq!(resolve_delivery_mode(None, || false), DeliveryMode::Paste);
     }
 
     #[test]
     fn single_quoted_delivery_modes_are_honored() {
         assert_eq!(
-            parse_delivery_mode("delivery_mode = 'clipboard'\n"),
-            Some(DeliveryMode::Clipboard)
+            parse_delivery_mode("delivery_mode = 'copy'\n"),
+            Some(DeliveryMode::Copy.into())
         );
         assert_eq!(
-            parse_delivery_mode("delivery_mode = 'guarded'\n"),
-            Some(DeliveryMode::Guarded)
+            parse_delivery_mode("delivery_mode = 'clipboard'\n"),
+            Some(StoredDelivery::LegacyClipboard)
         );
+    }
+
+    #[test]
+    fn earlier_release_delivery_values_load_as_paste_or_copy() {
+        for old in ["type", "guarded"] {
+            let contents = format!("delivery_mode = \"{old}\"\n");
+            assert_eq!(
+                resolve_delivery_mode(parse_delivery_mode(&contents), || unreachable!()),
+                DeliveryMode::Paste,
+                "{old}"
+            );
+        }
+        let clipboard = "delivery_mode = \"clipboard\"\n";
+        // Hyprland with a verified paste shortcut kept pasting under `clipboard`.
+        assert_eq!(
+            resolve_delivery_mode(parse_delivery_mode(clipboard), || true),
+            DeliveryMode::Paste
+        );
+        // Everywhere else `clipboard` only copied.
+        assert_eq!(
+            resolve_delivery_mode(parse_delivery_mode(clipboard), || false),
+            DeliveryMode::Copy
+        );
+    }
+
+    #[test]
+    fn an_earlier_release_value_is_rewritten_only_on_the_next_delivery_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("voisu").join("config.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "delivery_mode = \"clipboard\"\n").unwrap();
+
+        write_writing_mode(&path, WritingMode::Literal).unwrap();
+        assert_eq!(
+            read_delivery_mode(&path),
+            Some(StoredDelivery::LegacyClipboard)
+        );
+
+        write_delivery_mode(&path, DeliveryMode::Copy).unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("delivery_mode = \"copy\""), "{contents}");
+        assert!(!contents.contains("clipboard"), "{contents}");
     }
 
     #[test]
@@ -1274,14 +1345,14 @@ other_key = 5
             deepgram_enabled = false\n";
         std::fs::write(&path, legacy).unwrap();
 
-        write_delivery_mode(&path, DeliveryMode::Clipboard).unwrap();
+        write_delivery_mode(&path, DeliveryMode::Copy).unwrap();
 
         let contents = std::fs::read_to_string(&path).unwrap();
         for line in LEGACY_MANAGED_LINES {
             assert!(!contents.contains(line), "{contents}");
         }
         assert_eq!(read_setting(&path), Some(false));
-        assert_eq!(read_delivery_mode(&path), Some(DeliveryMode::Clipboard));
+        assert_eq!(read_delivery_mode(&path), Some(DeliveryMode::Copy.into()));
     }
 
     #[test]
@@ -1728,13 +1799,13 @@ other_key = 5
         let path = dir.path().join("voisu").join("config.toml");
 
         write_setting(&path, false).unwrap();
-        write_delivery_mode(&path, DeliveryMode::Clipboard).unwrap();
+        write_delivery_mode(&path, DeliveryMode::Copy).unwrap();
         write_writing_mode(&path, WritingMode::Literal).unwrap();
         write_rendering_policy(&path, RenderingPolicy::Structured).unwrap();
 
         write_rendering_policy(&path, RenderingPolicy::Natural).unwrap();
         assert_eq!(read_setting(&path), Some(false));
-        assert_eq!(read_delivery_mode(&path), Some(DeliveryMode::Clipboard));
+        assert_eq!(read_delivery_mode(&path), Some(DeliveryMode::Copy.into()));
         assert_eq!(
             read_writing_mode(&path),
             WritingModeLoad::Known(WritingMode::Literal)

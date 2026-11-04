@@ -875,10 +875,9 @@ fn parse_toggle(value: &str) -> Result<bool, String> {
 
 fn parse_delivery_mode(value: &str) -> Result<DeliveryMode, String> {
     match value {
-        "type" => Ok(DeliveryMode::Type),
-        "clipboard" => Ok(DeliveryMode::Clipboard),
-        "guarded" => Ok(DeliveryMode::Guarded),
-        _ => Err("delivery mode must be type, clipboard, or guarded".to_owned()),
+        "paste" => Ok(DeliveryMode::Paste),
+        "copy" => Ok(DeliveryMode::Copy),
+        _ => Err("delivery must be paste or copy".to_owned()),
     }
 }
 
@@ -922,7 +921,7 @@ commands:
   auth verify <groq|deepgram>
   deepgram <on|off>
   mode <local|cloud>
-  delivery [type|clipboard|guarded]
+  delivery [paste|copy]
   writing [smart|literal]
   rendering [natural|adaptive|structured]
   dictionary add <term>
