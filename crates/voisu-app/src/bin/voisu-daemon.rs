@@ -2713,7 +2713,11 @@ async fn process_recording(
                 } else {
                     evidence.validation_reason = Some(error.diagnostic().to_owned());
                 }
-                return Err(error);
+                return Err(silence_needs_every_provider(
+                    error,
+                    &provider_failures,
+                    deepgram_enabled,
+                ));
             }
         };
         // Eligibility and deterministic fallback selection are complete before
@@ -3300,6 +3304,24 @@ impl PasteReadiness {
             shortcut: None,
         }
     }
+}
+
+/// Silence is a claim about the speaker, so it holds only when every Provider
+/// that ran answered: a failed one might have heard what the other missed. A
+/// Deepgram the user turned off has no say. Everything the silence error knew
+/// is already in the Recording's evidence.
+fn silence_needs_every_provider(
+    error: BoundaryError,
+    provider_failures: &[ProviderFailure],
+    deepgram_enabled: bool,
+) -> BoundaryError {
+    let a_provider_failed = provider_failures
+        .iter()
+        .any(|failure| failure.provider != Provider::Deepgram || deepgram_enabled);
+    if error.kind() == BoundaryKind::SilentRecording && a_provider_failed {
+        return BoundaryError::new(BoundaryKind::Provider, error.diagnostic());
+    }
+    error
 }
 
 /// Enforces the no-silent-absence invariant: every configured provider must end

@@ -1654,8 +1654,10 @@ while [ "$i" -lt 60 ]; do sleep 1; i=$((i + 1)); done
     assert!(!diagnostics.contains("example.invalid"));
 }
 
-#[test]
-fn production_groq_blank_transcript_reads_as_no_words_through_the_public_cli() {
+/// Runs one production Recording whose Groq transcript comes back blank and
+/// asserts the public CLI's reason. Without an override the harness points
+/// Deepgram at an unreachable endpoint, so Deepgram fails.
+fn assert_production_groq_blank_reads_as(extra_environment: &[(&str, &str)], reason: &str) {
     let runtime = TempDir::new().unwrap();
     let commands = TempDir::new().unwrap();
     write_fake_command(
@@ -1670,23 +1672,35 @@ fn production_groq_blank_transcript_reads_as_no_words_through_the_public_cli() {
         commands.path().display(),
         std::env::var("PATH").unwrap()
     );
-    let _daemon = Daemon::start_production_with_env(
-        runtime.path(),
-        &[
-            ("PATH", &path),
-            ("VOISU_GROQ_API_KEY", "controlled-secret"),
-            ("VOISU_GROQ_TRANSCRIPTION_URL", &endpoint),
-        ],
-    );
+    let mut environment = vec![
+        ("PATH", path.as_str()),
+        ("VOISU_GROQ_API_KEY", "controlled-secret"),
+        ("VOISU_GROQ_TRANSCRIPTION_URL", endpoint.as_str()),
+    ];
+    environment.extend_from_slice(extra_environment);
+    let _daemon = Daemon::start_production_with_env(runtime.path(), &environment);
     assert!(voisu(runtime.path(), "start").status.success());
     wait_for_marker(commands.path(), "pw-record.ready");
     let rejected = voisu(runtime.path(), "stop");
     assert_eq!(rejected.status.code(), Some(4));
-    assert_eq!(stderr(&rejected), "Didn't hear any words\n");
+    assert_eq!(stderr(&rejected), reason);
     request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     server.join().unwrap();
     assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
     assert!(voisu(runtime.path(), "start").status.success());
+}
+
+#[test]
+fn production_groq_blank_transcript_reads_as_no_words_through_the_public_cli() {
+    assert_production_groq_blank_reads_as(
+        &[("VOISU_DISABLE_DEEPGRAM", "1")],
+        "Didn't hear any words\n",
+    );
+}
+
+#[test]
+fn production_groq_blank_with_deepgram_down_is_not_called_silence() {
+    assert_production_groq_blank_reads_as(&[], "Groq or Deepgram couldn't give us text\n");
 }
 
 #[test]
@@ -5761,6 +5775,63 @@ fn overlay_status_reports_outro_only_speech_as_silence_not_a_quality_failure() {
     assert_eq!(stopped["ok"], false, "{stopped}");
     assert_eq!(stopped["message"], "Didn't hear any words", "{stopped}");
 
+    let observed = ipc_request(runtime.path(), OVERLAY_STATUS);
+    assert_eq!(
+        observed["overlay_event"]["outcome"], "silent_recording",
+        "{observed}"
+    );
+}
+
+/// Silence is a claim about the speaker, so it needs every Provider that ran to
+/// have answered. A failed Provider might have heard the words the other missed.
+#[test]
+fn a_failed_provider_is_not_reported_as_silence() {
+    for other_answer in ["", "   ", "Thank you for watching!"] {
+        let runtime = TempDir::new().unwrap();
+        let _daemon = Daemon::start_with_env(
+            runtime.path(),
+            &[
+                ("VOISU_TEST_PROVIDER_COMPLETE_FAILURE", "groq"),
+                ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", other_answer),
+            ],
+        );
+
+        assert!(voisu(runtime.path(), "start").status.success());
+        let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+        assert_eq!(stopped["ok"], false, "{other_answer:?}: {stopped}");
+        assert_eq!(
+            stopped["message"], "Groq or Deepgram couldn't give us text",
+            "{other_answer:?}: {stopped}"
+        );
+
+        let observed = ipc_request(runtime.path(), OVERLAY_STATUS);
+        assert_eq!(
+            observed["overlay_event"]["outcome"], "provider_failure",
+            "{other_answer:?}: {observed}"
+        );
+    }
+}
+
+/// A Provider that is off never had a chance to hear anything, so the one that
+/// ran still decides.
+#[test]
+fn a_disabled_deepgram_does_not_stop_groq_from_reporting_silence() {
+    let runtime = TempDir::new().unwrap();
+    let config = TempDir::new().unwrap();
+    let config_dir = config.path().join("voisu");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(config_dir.join("config.toml"), "deepgram_enabled = false\n").unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("XDG_CONFIG_HOME", config.path().to_str().unwrap()),
+            ("VOISU_TEST_GROQ_TRANSCRIPT", "Thank you for watching!"),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["message"], "Didn't hear any words", "{stopped}");
     let observed = ipc_request(runtime.path(), OVERLAY_STATUS);
     assert_eq!(
         observed["overlay_event"]["outcome"], "silent_recording",
