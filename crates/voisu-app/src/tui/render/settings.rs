@@ -5,7 +5,7 @@ use ratatui::text::Line;
 use super::super::look::{Look, Tone};
 use super::super::model::{App, SettingsRow};
 use super::super::text;
-use super::{Pieces, SELECTED, UNSELECTED, single, value_tone};
+use super::{Pieces, SELECTED, UNSELECTED, single};
 
 const LABEL_WIDTH: usize = 14;
 
@@ -32,10 +32,10 @@ pub(super) fn lines(app: &App, look: &Look, width: usize, height: usize) -> Vec<
         let label_tone = if selected { Tone::Bold } else { Tone::Plain };
         let (value, tone) = app.setting_value(*row);
         let room = width.saturating_sub(UNSELECTED.len() + LABEL_WIDTH + 1);
-        let tone = if selected && tone == super::ValueTone::Plain {
+        let tone = if selected && tone == Tone::Plain {
             Tone::Bold
         } else {
-            value_tone(tone)
+            tone
         };
         let label = if value.is_empty() {
             row.label().to_owned()

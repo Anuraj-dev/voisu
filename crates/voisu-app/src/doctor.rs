@@ -24,6 +24,16 @@ pub struct DoctorRow {
     pub status: ReadinessStatus,
     pub action: Option<String>,
     pub detail: String,
+    /// The fix the TUI can run for this row, if any. Never printed.
+    pub fix: Option<DoctorFix>,
+}
+
+/// A fix the TUI can perform itself, named by the row that needs it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DoctorFix {
+    RunSetup,
+    StartVoisu,
+    RestartVoisu,
 }
 
 impl DoctorRow {
@@ -34,6 +44,7 @@ impl DoctorRow {
             status,
             action: None,
             detail: detail.into(),
+            fix: None,
         }
     }
 
@@ -44,6 +55,11 @@ impl DoctorRow {
 
     fn action(mut self, action: impl Into<String>) -> Self {
         self.action = Some(action.into());
+        self
+    }
+
+    fn fix(mut self, fix: DoctorFix) -> Self {
+        self.fix = Some(fix);
         self
     }
 }
@@ -65,6 +81,7 @@ pub fn collect_rows() -> Vec<DoctorRow> {
             status: finding.status,
             action: finding.action,
             detail: finding.detail,
+            fix: None,
         })
         .collect();
 
@@ -105,7 +122,8 @@ pub fn collect_rows() -> Vec<DoctorRow> {
                     .unwrap_or("Ubuntu native GNOME Shell Overlay is missing, disabled, or broken"),
             )
             .value("unavailable")
-            .action("run `voisu setup`"),
+            .action("run `voisu setup`")
+            .fix(DoctorFix::RunSetup),
         });
         rows.push(match state.trigger {
             TriggerState::Active => DoctorRow::new(
@@ -185,6 +203,10 @@ fn local_doctor_row(check: crate::local_doctor::DoctorCheck) -> DoctorRow {
     if let Some(action) = check.action {
         row = row.action(action);
     }
+    // The one failing Local row is a missing model, which setup installs.
+    if check.status == ReadinessStatus::Fail {
+        row = row.fix(DoctorFix::RunSetup);
+    }
     row
 }
 
@@ -228,7 +250,8 @@ fn daemon_readiness_rows(readiness: &DaemonReadiness) -> Vec<DoctorRow> {
             },
         )
         .value(readiness.delivery_mode.clone())
-        .action("voisu service restart"),
+        .action("voisu service restart")
+        .fix(DoctorFix::RestartVoisu),
     );
 
     rows.push(match readiness.paste_action {
@@ -292,6 +315,7 @@ fn daemon_readiness_rows(readiness: &DaemonReadiness) -> Vec<DoctorRow> {
         )
         .value(clipboard_value)
         .action("voisu service restart")
+        .fix(DoctorFix::RestartVoisu)
     } else {
         DoctorRow::new(
             "Daemon clipboard",
@@ -336,6 +360,7 @@ fn daemon_session_row(readiness: &DaemonReadiness) -> DoctorRow {
         )
         .value(value)
         .action("voisu service restart")
+        .fix(DoctorFix::RestartVoisu)
     }
 }
 
@@ -426,7 +451,8 @@ fn overlay_readiness_row() -> DoctorRow {
                 "Hyprland Overlay is enabled but not active",
             )
             .value("stopped")
-            .action("voisu service start"),
+            .action("voisu service start")
+            .fix(DoctorFix::StartVoisu),
             _ => DoctorRow::new(
                 "Overlay",
                 ReadinessStatus::Fail,
@@ -450,7 +476,8 @@ fn overlay_readiness_row() -> DoctorRow {
             "Hyprland Overlay is enabled but not active",
         )
         .value("stopped")
-        .action("voisu service start"),
+        .action("voisu service start")
+        .fix(DoctorFix::StartVoisu),
         Ok(_) => DoctorRow::new(
             "Overlay",
             ReadinessStatus::Fail,
@@ -511,7 +538,7 @@ fn provider_key_rows(runtime: &tokio::runtime::Runtime) -> Vec<DoctorRow> {
                 match status {
                     ProviderKeyStatus::InvalidKey => {
                         detail = format!("{detail}; {}", provider_free_tier_hint(provider));
-                        row = row.action("run `voisu setup`");
+                        row = row.action("run `voisu setup`").fix(DoctorFix::RunSetup);
                     }
                     ProviderKeyStatus::QuotaExhausted => {
                         detail = format!("{detail}; {}", provider_free_tier_hint(provider));

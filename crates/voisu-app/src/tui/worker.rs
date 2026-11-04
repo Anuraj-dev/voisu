@@ -11,7 +11,7 @@ use voisu_core::{
 };
 
 use crate::config;
-use crate::daemon_client::{DaemonClientError, send_command};
+use crate::daemon_client::{DaemonClientError, PROTOCOL_MISMATCH_CODE, send_command};
 use crate::history_view::{self, RenderStyle};
 use crate::service::{UserServiceAction, manage_user_service};
 use crate::setup::{KeyValidator, LiveKeyValidator};
@@ -19,13 +19,14 @@ use crate::setup_engine::ConsentedStatus;
 use crate::system::{ClipboardBoundary, SecretToolStore, WlClipboard};
 
 use super::model::{
-    DaemonSnapshot, HistoryItem, Job, Refresh, Reply, ServiceVerb, SettingsSnapshot, StatusPoll,
-    ToastKind, local_switch_allowed, trigger_key_value,
+    DaemonSnapshot, HistoryItem, Job, Refresh, Reply, ServiceVerb, SettingsRow, SettingsSnapshot,
+    StatusPoll, Tone, local_switch_allowed, trigger_key_value,
 };
 use super::text;
 
 const STATUS_INTERVAL: Duration = Duration::from_millis(500);
-const RESTART_HINT: &str = "Restart Voisu to apply.";
+/// The daemon caches keys for five minutes (`CREDENTIAL_CACHE_TTL`).
+const KEY_APPLIES: &str = "Applies within 5 min or on restart.";
 
 /// The two job queues. Slow work has its own thread so a doctor run on a bad
 /// network cannot delay a settings change.
@@ -82,6 +83,10 @@ fn status_poll() -> StatusPoll {
             None => StatusPoll::Failed,
         },
         Ok(_) => StatusPoll::Failed,
+        Err(DaemonClientError::Failed {
+            code: PROTOCOL_MISMATCH_CODE,
+            ..
+        }) => StatusPoll::Mismatch,
         Err(DaemonClientError::Failed { .. }) => StatusPoll::Failed,
         Err(DaemonClientError::Unavailable | DaemonClientError::Socket(_)) => {
             StatusPoll::Unavailable
@@ -105,21 +110,40 @@ pub fn execute(job: Job, replies: &Sender<Reply>) {
         Job::LoadHistory => send(Reply::History(load_history())),
         Job::LoadDictionary => send(Reply::Dictionary(crate::dictionary::user_terms())),
         Job::LoadShortcut => send(Reply::Shortcut(load_shortcut())),
+        // The daemon reads Delivery and Deepgram once at start, Rendering per
+        // Recording, and Writing per Recording except Intent Reconstruction,
+        // which is chosen at start.
         Job::SetDelivery(mode) => send(applied_setting(
             config::set_delivery_mode(mode),
             format!("Delivery set to {}.", text::capitalized(mode.as_str())),
+            "Restart Voisu to apply.",
+            &[
+                Refresh::Settings,
+                Refresh::Doctor,
+                Refresh::PendingRestart(SettingsRow::Delivery),
+            ],
         )),
         Job::SetWriting(mode) => send(applied_setting(
             config::set_writing_mode(mode),
             format!("Writing set to {}.", text::capitalized(mode.as_str())),
+            "Restart Voisu to apply it fully.",
+            &[Refresh::Settings, Refresh::Doctor],
         )),
         Job::SetRendering(policy) => send(applied_setting(
             config::set_rendering_policy(policy),
             format!("Rendering set to {}.", text::capitalized(policy.as_str())),
+            "It applies to your next Recording.",
+            &[Refresh::Settings, Refresh::Doctor],
         )),
         Job::SetDeepgram(enabled) => send(applied_setting(
             config::set_deepgram_enabled(enabled),
             format!("Deepgram turned {}.", if enabled { "on" } else { "off" }),
+            "Restart Voisu to apply.",
+            &[
+                Refresh::Settings,
+                Refresh::Doctor,
+                Refresh::PendingRestart(SettingsRow::Deepgram),
+            ],
         )),
         Job::SetEngine { mode, local_ready } => send(set_engine(mode, local_ready)),
         Job::AddTerm(term) => send(dictionary_result(
@@ -235,15 +259,20 @@ fn load_shortcut() -> Option<String> {
     }
 }
 
-fn applied_setting(result: Result<std::path::PathBuf, String>, done: String) -> Reply {
+fn applied_setting(
+    result: Result<std::path::PathBuf, String>,
+    done: String,
+    applies: &str,
+    refresh: &'static [Refresh],
+) -> Reply {
     match result {
         Ok(_) => Reply::Applied {
-            kind: ToastKind::Success,
-            text: format!("{done} {RESTART_HINT}"),
-            refresh: &[Refresh::Settings, Refresh::Doctor],
+            kind: Tone::Success,
+            text: format!("{done} {applies}"),
+            refresh,
         },
         Err(message) => Reply::Applied {
-            kind: ToastKind::Failure,
+            kind: Tone::Failure,
             text: format!("Nothing changed. {message}"),
             refresh: &[Refresh::Settings],
         },
@@ -258,19 +287,19 @@ fn set_engine(mode: AsrMode, local_ready: bool) -> Reply {
         )
     {
         return Reply::Applied {
-            kind: ToastKind::Caution,
+            kind: Tone::Caution,
             text: "Local isn't ready yet. Choose Run setup to install it.".to_owned(),
             refresh: &[Refresh::Settings],
         };
     }
     match crate::asr_mode::apply_cli_mode(mode) {
         Ok(message) => Reply::Applied {
-            kind: ToastKind::Success,
+            kind: Tone::Success,
             text: engine_applied_text(mode, &message),
             refresh: &[Refresh::Settings, Refresh::Doctor],
         },
         Err(error) => Reply::Applied {
-            kind: ToastKind::Failure,
+            kind: Tone::Failure,
             text: format!("Engine not changed. {}", error.message),
             refresh: &[Refresh::Settings],
         },
@@ -293,9 +322,9 @@ fn engine_applied_text(mode: AsrMode, message: &str) -> String {
 
 fn dictionary_result(result: Result<bool, String>, changed: String, unchanged: String) -> Reply {
     let (kind, text) = match result {
-        Ok(true) => (ToastKind::Success, changed),
-        Ok(false) => (ToastKind::Caution, unchanged),
-        Err(message) => (ToastKind::Failure, message),
+        Ok(true) => (Tone::Success, changed),
+        Ok(false) => (Tone::Caution, unchanged),
+        Err(message) => (Tone::Failure, message),
     };
     Reply::Applied {
         kind,
@@ -312,13 +341,13 @@ pub fn save_key(
     credential: Credential,
     validator: &mut dyn KeyValidator,
     store: &mut dyn SecretStore,
-) -> (ToastKind, String) {
+) -> (Tone, String) {
     let name = text::capitalized(provider.cli_label());
     match validator.validate(provider, &credential) {
         ProviderKeyStatus::Valid => {}
         ProviderKeyStatus::InvalidKey => {
             return (
-                ToastKind::Failure,
+                Tone::Failure,
                 format!("{name} rejected that key. Nothing was saved."),
             );
         }
@@ -326,14 +355,14 @@ pub fn save_key(
         | ProviderKeyStatus::QuotaExhausted
         | ProviderKeyStatus::Unreachable => {
             return (
-                ToastKind::Caution,
+                Tone::Caution,
                 format!("Couldn't check that key with {name} right now. Nothing was saved."),
             );
         }
     }
     if store.replace(provider, credential).is_err() {
         return (
-            ToastKind::Failure,
+            Tone::Failure,
             format!("{name} accepted that key, but it couldn't be stored. Try Run setup."),
         );
     }
@@ -342,27 +371,29 @@ pub fn save_key(
             location: KeyLocation::PlaintextFile,
             ..
         } => (
-            ToastKind::Caution,
-            format!("{name} key saved to a private file, because no keyring is available."),
+            Tone::Caution,
+            format!(
+                "{name} key saved to a private file, because no keyring is available. {KEY_APPLIES}"
+            ),
         ),
         KeyDiagnosis::Found {
             location: KeyLocation::EnvOverride,
             ..
         }
         | KeyDiagnosis::EnvOverrideInvalid => (
-            ToastKind::Caution,
+            Tone::Caution,
             format!(
                 "{name} key saved, but {} overrides it.",
                 provider.environment_variable()
             ),
         ),
-        _ => (ToastKind::Success, format!("{name} key saved.")),
+        _ => (Tone::Success, format!("{name} key saved. {KEY_APPLIES}")),
     }
 }
 
 fn copy(transcript: String) -> Reply {
     let failed = |text: String| Reply::Applied {
-        kind: ToastKind::Failure,
+        kind: Tone::Failure,
         text,
         refresh: &[],
     };
@@ -375,7 +406,7 @@ fn copy(transcript: String) -> Reply {
     let mut clipboard = WlClipboard;
     match runtime.block_on(clipboard.preserve(&Transcript(transcript))) {
         Ok(()) => Reply::Applied {
-            kind: ToastKind::Success,
+            kind: Tone::Success,
             text: "Transcript copied.".to_owned(),
             refresh: &[],
         },
@@ -389,13 +420,13 @@ fn run_service(verb: ServiceVerb) -> Reply {
         ServiceVerb::Restart => (UserServiceAction::Restart, "Voisu restarted.", "restart"),
     };
     let (kind, text) = match manage_user_service(action) {
-        Ok(report) if report.exit_code == 0 => (ToastKind::Success, done.to_owned()),
+        Ok(report) if report.exit_code == 0 => (Tone::Success, done.to_owned()),
         Ok(report) => (
-            ToastKind::Failure,
+            Tone::Failure,
             format!("Couldn't {verb_word} Voisu. {}", report.message),
         ),
         Err(message) => (
-            ToastKind::Failure,
+            Tone::Failure,
             format!("Couldn't {verb_word} Voisu. {message}"),
         ),
     };
@@ -465,9 +496,14 @@ mod tests {
             &mut Canned(ProviderKeyStatus::Valid),
             &mut store,
         );
-        assert_eq!(kind, ToastKind::Success);
+        assert_eq!(kind, Tone::Success);
         assert_eq!(store.saved, [Provider::Groq]);
         assert!(!text.contains("gsk_secret"));
+        // The daemon caches keys for five minutes, so "saved" alone would overstate.
+        assert!(
+            text.ends_with("Applies within 5 min or on restart."),
+            "{text}"
+        );
     }
 
     #[test]
@@ -498,8 +534,12 @@ mod tests {
             &mut Canned(ProviderKeyStatus::Valid),
             &mut store,
         );
-        assert_eq!(kind, ToastKind::Caution);
+        assert_eq!(kind, Tone::Caution);
         assert!(text.contains("private file"), "{text}");
+        assert!(
+            text.ends_with("Applies within 5 min or on restart."),
+            "{text}"
+        );
     }
 
     #[test]
@@ -514,7 +554,7 @@ mod tests {
             &mut Canned(ProviderKeyStatus::Valid),
             &mut store,
         );
-        assert_eq!(kind, ToastKind::Failure);
+        assert_eq!(kind, Tone::Failure);
         assert!(!text.contains("gsk_secret"));
     }
 

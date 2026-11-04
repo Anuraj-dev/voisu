@@ -10,9 +10,11 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use voisu_core::{AsrMode, AsrModeStatus, Credential, DaemonState, Provider, ReadinessStatus};
 
 use crate::config::{DeliveryMode, RenderingPolicy, WritingMode};
+pub use crate::doctor::DoctorFix as Fix;
 use crate::doctor::DoctorRow;
 
 use super::keys::{self, Action, Context};
+pub use super::look::Tone;
 use super::text;
 
 /// Smallest size the interface can lay out.
@@ -23,6 +25,8 @@ const ROOMY_HEIGHT: u16 = 20;
 /// Dictated keystrokes can keep arriving after the daemon reports Idle.
 const GUARD_AFTER_MS: u64 = 1_000;
 const TOAST_MS: u64 = 5_000;
+/// Failed status replies in a row before the daemon is shown as unreadable.
+const FAILED_POLLS_UNREADABLE: u8 = 3;
 /// Longest line a prompt accepts. Real keys and dictionary terms are far shorter.
 const PROMPT_LIMIT: usize = 4_096;
 
@@ -76,12 +80,16 @@ pub enum StatusPoll {
     Unavailable,
     /// A connection was made and the round trip failed, as a busy daemon can.
     Failed,
+    /// The daemon speaks another protocol version: an old one after an update.
+    Mismatch,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DaemonView {
     Unknown,
     Unavailable,
+    /// Something answers but cannot be read. It may still be dictating.
+    Unreadable,
     Up(DaemonSnapshot),
 }
 
@@ -102,16 +110,9 @@ pub struct HistoryItem {
     pub providers: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ToastKind {
-    Success,
-    Caution,
-    Failure,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Toast {
-    pub kind: ToastKind,
+    pub kind: Tone,
     pub text: String,
     until_mono_ms: u64,
 }
@@ -123,6 +124,8 @@ pub enum Refresh {
     Doctor,
     Dictionary,
     Shortcut,
+    /// The daemon reads this setting only when it starts.
+    PendingRestart(SettingsRow),
 }
 
 /// The answer to a [`Job`]. Never contains a secret.
@@ -138,16 +141,16 @@ pub enum Reply {
     History(Result<Vec<HistoryItem>, String>),
     Dictionary(Result<Vec<String>, String>),
     Applied {
-        kind: ToastKind,
+        kind: Tone,
         text: String,
         refresh: &'static [Refresh],
     },
     KeyChecked {
-        kind: ToastKind,
+        kind: Tone,
         text: String,
     },
     ServiceDone {
-        kind: ToastKind,
+        kind: Tone,
         text: String,
     },
 }
@@ -259,13 +262,6 @@ pub enum Prompt {
 }
 
 /// One Home problem's fix: the one key rule 3 promises.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Fix {
-    RunSetup,
-    StartVoisu,
-    RestartVoisu,
-}
-
 impl Fix {
     pub fn label(self) -> &'static str {
         match self {
@@ -279,6 +275,8 @@ impl Fix {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Hero {
     Checking,
+    /// Running but unreadable, as an old daemon is after an update.
+    NeedsRestart,
     NotSetUp,
     NotRunning,
     Failing {
@@ -386,25 +384,6 @@ impl SettingsRow {
     }
 }
 
-/// How a key row's value reads, from the doctor's verdict on that key.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ValueTone {
-    Plain,
-    Good,
-    Warn,
-    Bad,
-}
-
-/// What changes the screen as time passes, without any message arriving.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct ClockKey {
-    recording_seconds: Option<u64>,
-    toast_visible: bool,
-    guarded: bool,
-    newest_age: Option<String>,
-    wall_minute: u64,
-}
-
 pub struct App {
     pub tab: Tab,
     pub size: (u16, u16),
@@ -431,10 +410,12 @@ pub struct App {
     pub toast: Option<Toast>,
     pub key_in_check: Option<Provider>,
     pub service_busy: Option<ServiceVerb>,
+    /// Settings changed since the daemon started, which it reads only then.
+    pub restart_pending: Vec<SettingsRow>,
     pub should_quit: bool,
+    failed_polls: u8,
     guard_until_mono_ms: u64,
     recording_since_mono_ms: Option<u64>,
-    clock: ClockKey,
     dirty: bool,
 }
 
@@ -466,10 +447,11 @@ impl App {
             toast: None,
             key_in_check: None,
             service_busy: None,
+            restart_pending: Vec::new(),
             should_quit: false,
+            failed_polls: 0,
             guard_until_mono_ms: 0,
             recording_since_mono_ms: None,
-            clock: ClockKey::default(),
             dirty: true,
         }
     }
@@ -504,11 +486,24 @@ impl App {
         (self.size.1 as usize).saturating_sub(chrome)
     }
 
+    /// An unreadable daemon counts: it may be dictating into this terminal.
     fn daemon_active(&self) -> bool {
+        match &self.daemon {
+            DaemonView::Up(snapshot) => snapshot.state != DaemonState::Idle,
+            DaemonView::Unreadable => true,
+            DaemonView::Unknown | DaemonView::Unavailable => false,
+        }
+    }
+
+    pub fn daemon_down(&self) -> bool {
         matches!(
-            &self.daemon,
-            DaemonView::Up(snapshot) if snapshot.state != DaemonState::Idle
+            self.daemon,
+            DaemonView::Unavailable | DaemonView::Unreadable
         )
+    }
+
+    fn can_restart(&self) -> bool {
+        self.service_busy.is_none()
     }
 
     /// True while keystrokes may be the user's own dictation arriving here.
@@ -530,13 +525,16 @@ impl App {
             },
             Tab::Settings => Context::Settings {
                 enter: self.selected_setting().enter_label(),
+                restart: !self.restart_pending.is_empty() && self.can_restart(),
             },
         }
     }
 
     pub fn context(&self) -> Context {
         if self.guarded() {
-            Context::Guarded
+            Context::Guarded {
+                restart: self.daemon == DaemonView::Unreadable && self.can_restart(),
+            }
         } else if self.too_small() {
             Context::TooSmall
         } else if let Some(prompt) = &self.prompt {
@@ -558,6 +556,9 @@ impl App {
 
     /// The most important thing right now. First match wins.
     pub fn hero(&self) -> Hero {
+        if self.daemon == DaemonView::Unreadable {
+            return Hero::NeedsRestart;
+        }
         if self.setup_needed == Some(true) {
             return Hero::NotSetUp;
         }
@@ -579,7 +580,7 @@ impl App {
                 label: row.label.clone(),
                 value: row.value.clone(),
                 action: row.action.clone(),
-                fix: row.action.as_deref().and_then(fix_for_action),
+                fix: row.fix,
             };
         }
         match &self.daemon {
@@ -604,6 +605,9 @@ impl App {
             Hero::NotSetUp => Some(Fix::RunSetup),
             Hero::NotRunning => Some(Fix::StartVoisu),
             Hero::Failing { fix, .. } => fix,
+            // Below any real problem or live Recording, a change that waits for
+            // a restart offers one.
+            Hero::Ready if !self.restart_pending.is_empty() => Some(Fix::RestartVoisu),
             _ => None,
         }
     }
@@ -624,7 +628,7 @@ impl App {
 
     /// `All 16 checks passed`, or `15 passed · 1 warning`. SKIP rows are checks
     /// that do not apply here, so they count for nothing.
-    pub fn health(&self) -> Option<(String, ValueTone)> {
+    pub fn health(&self) -> Option<(String, Tone)> {
         let rows = self.doctor.as_ref()?;
         let count = |status| rows.iter().filter(|row| row.status == status).count();
         let (passed, warned, failed) = (
@@ -633,7 +637,7 @@ impl App {
             count(ReadinessStatus::Fail),
         );
         if warned == 0 && failed == 0 {
-            return Some((format!("All {passed} checks passed"), ValueTone::Good));
+            return Some((format!("All {passed} checks passed"), Tone::Success));
         }
         let mut parts = vec![format!("{passed} passed")];
         if failed > 0 {
@@ -646,9 +650,9 @@ impl App {
             ));
         }
         let tone = if failed > 0 {
-            ValueTone::Bad
+            Tone::Failure
         } else {
-            ValueTone::Warn
+            Tone::Caution
         };
         Some((parts.join(" · "), tone))
     }
@@ -689,10 +693,10 @@ impl App {
     }
 
     /// The display value and tone of a settings row.
-    pub fn setting_value(&self, row: SettingsRow) -> (String, ValueTone) {
-        let plain = |text: String| (text, ValueTone::Plain);
-        let loading = || ("Checking…".to_owned(), ValueTone::Plain);
-        match row {
+    pub fn setting_value(&self, row: SettingsRow) -> (String, Tone) {
+        let plain = |text: String| (text, Tone::Plain);
+        let loading = || ("Checking…".to_owned(), Tone::Plain);
+        let (value, tone) = match row {
             SettingsRow::Engine => self
                 .engine()
                 .map_or_else(loading, |mode| plain(text::capitalized(mode.as_str()))),
@@ -712,32 +716,36 @@ impl App {
             SettingsRow::DeepgramKey => self.key_value(Provider::Deepgram),
             SettingsRow::TriggerKey => match (&self.shortcut, &self.daemon) {
                 (Some(value), _) => plain(value.clone()),
-                (None, DaemonView::Unavailable) => plain("Unknown until Voisu runs".to_owned()),
+                (None, _) if self.daemon_down() => plain("Unknown until Voisu runs".to_owned()),
                 (None, _) => loading(),
             },
             SettingsRow::RunSetup => plain(String::new()),
+        };
+        if self.restart_pending.contains(&row) && self.settings.is_some() {
+            return (format!("{value} · after restart"), Tone::Caution);
         }
+        (value, tone)
     }
 
-    fn key_value(&self, provider: Provider) -> (String, ValueTone) {
+    fn key_value(&self, provider: Provider) -> (String, Tone) {
         if self.key_in_check == Some(provider) {
-            return ("Checking…".to_owned(), ValueTone::Plain);
+            return ("Checking…".to_owned(), Tone::Plain);
         }
         let Some(rows) = &self.doctor else {
-            return ("Checking…".to_owned(), ValueTone::Plain);
+            return ("Checking…".to_owned(), Tone::Plain);
         };
         let label = format!("{} key", provider.cli_label());
         let Some(row) = rows
             .iter()
             .find(|row| row.label.eq_ignore_ascii_case(&label))
         else {
-            return ("Not checked".to_owned(), ValueTone::Plain);
+            return ("Not checked".to_owned(), Tone::Plain);
         };
         let tone = match row.status {
-            ReadinessStatus::Pass => ValueTone::Good,
-            ReadinessStatus::Warn => ValueTone::Warn,
-            ReadinessStatus::Fail => ValueTone::Bad,
-            ReadinessStatus::Skip => ValueTone::Plain,
+            ReadinessStatus::Pass => Tone::Success,
+            ReadinessStatus::Warn => Tone::Caution,
+            ReadinessStatus::Fail => Tone::Failure,
+            ReadinessStatus::Skip => Tone::Plain,
         };
         (
             text::capitalized(row.value.as_deref().unwrap_or("Unknown")),
@@ -781,23 +789,7 @@ impl App {
             .saturating_sub(pane)
     }
 
-    fn clock_key(&self) -> ClockKey {
-        ClockKey {
-            recording_seconds: self.recording_seconds(),
-            toast_visible: self.toast.is_some(),
-            guarded: self.guarded(),
-            newest_age: self
-                .history
-                .as_ref()
-                .and_then(|items| items.first())
-                .map(|item| {
-                    crate::history_view::relative_time(self.now.wall_ms, item.recorded_at_ms)
-                }),
-            wall_minute: self.now.wall_ms / 60_000,
-        }
-    }
-
-    fn show(&mut self, kind: ToastKind, text: impl Into<String>) {
+    fn show(&mut self, kind: Tone, text: impl Into<String>) {
         self.toast = Some(Toast {
             kind,
             text: text.into(),
@@ -822,18 +814,29 @@ impl App {
                 Refresh::Doctor => self.request_doctor(effects),
                 Refresh::Dictionary => effects.push(Effect::Job(Job::LoadDictionary)),
                 Refresh::Shortcut => effects.push(Effect::Job(Job::LoadShortcut)),
+                Refresh::PendingRestart(row) => {
+                    if !self.restart_pending.contains(row) {
+                        self.restart_pending.push(*row);
+                    }
+                }
             }
         }
     }
 
     fn on_status(&mut self, poll: StatusPoll, effects: &mut Vec<Effect>) {
+        self.failed_polls = if poll == StatusPoll::Failed {
+            self.failed_polls.saturating_add(1)
+        } else {
+            0
+        };
         let next = match poll {
             StatusPoll::Up(snapshot) => DaemonView::Up(snapshot),
             StatusPoll::Unavailable => DaemonView::Unavailable,
-            // A daemon too busy to answer mid-Recording is still dictating, so
-            // the guard must not lapse on a slow reply.
-            StatusPoll::Failed if self.daemon_active() => return,
-            StatusPoll::Failed => DaemonView::Unavailable,
+            StatusPoll::Mismatch => DaemonView::Unreadable,
+            // One slow reply, as a busy daemon can give mid-Recording, changes
+            // nothing; only a daemon that keeps failing to answer is shown.
+            StatusPoll::Failed if self.failed_polls < FAILED_POLLS_UNREADABLE => return,
+            StatusPoll::Failed => DaemonView::Unreadable,
         };
         if next == self.daemon {
             return;
@@ -841,6 +844,7 @@ impl App {
         let was_active = self.daemon_active();
         let was_known = self.daemon != DaemonView::Unknown;
         let was_up = matches!(self.daemon, DaemonView::Up(_));
+        let was_stopped = self.daemon == DaemonView::Unavailable;
         self.daemon = next;
         self.dirty = true;
         let is_up = matches!(self.daemon, DaemonView::Up(_));
@@ -858,6 +862,11 @@ impl App {
             self.recording_since_mono_ms = Some(self.now.mono_ms);
         }
         if was_up != is_up {
+            // A daemon seen stopped and back has read every setting afresh. One
+            // that was only unreadable may simply have been slow.
+            if is_up && was_stopped {
+                self.restart_pending.clear();
+            }
             if is_up {
                 effects.push(Effect::Job(Job::LoadHistory));
                 effects.push(Effect::Job(Job::LoadShortcut));
@@ -936,6 +945,9 @@ impl App {
             }
             Reply::ServiceDone { kind, text } => {
                 self.service_busy = None;
+                if kind == Tone::Success {
+                    self.restart_pending.clear();
+                }
                 self.show(kind, text);
                 self.request_doctor(effects);
             }
@@ -979,6 +991,11 @@ impl App {
             Action::PageUp => self.scroll_detail(-1),
             Action::PageDown => self.scroll_detail(1),
             Action::Activate => self.activate(effects),
+            Action::Restart => {
+                if self.can_restart() {
+                    self.start_service(ServiceVerb::Restart, effects);
+                }
+            }
             Action::ToggleChecks => {
                 self.checks_open = !self.checks_open;
                 self.checks_scroll = 0;
@@ -1153,10 +1170,7 @@ impl App {
     fn copy_selected(&mut self, effects: &mut Vec<Effect>) {
         match self.selected_record().map(|item| item.transcript.clone()) {
             Some(Some(transcript)) => effects.push(Effect::Job(Job::Copy(transcript))),
-            Some(None) => self.show(
-                ToastKind::Caution,
-                "This Recording has no Transcript to copy.",
-            ),
+            Some(None) => self.show(Tone::Caution, "This Recording has no Transcript to copy."),
             None => {}
         }
     }
@@ -1204,7 +1218,7 @@ impl App {
                     }
                     Err(_) => {
                         self.prompt = Some(Prompt::Key(provider, text));
-                        self.show(ToastKind::Caution, "Enter a key, or press Esc to cancel.");
+                        self.show(Tone::Caution, "Enter a key, or press Esc to cancel.");
                     }
                 }
             }
@@ -1246,20 +1260,6 @@ pub enum CheckLine {
     Action(String),
 }
 
-/// Maps a doctor action to the key that can perform it. An action that names
-/// anything else stays as plain instructions.
-fn fix_for_action(action: &str) -> Option<Fix> {
-    if action.contains("voisu setup") {
-        Some(Fix::RunSetup)
-    } else if action.contains("voisu service restart") {
-        Some(Fix::RestartVoisu)
-    } else if action.contains("voisu service start") {
-        Some(Fix::StartVoisu)
-    } else {
-        None
-    }
-}
-
 fn next_delivery(current: DeliveryMode) -> DeliveryMode {
     match current {
         DeliveryMode::Type => DeliveryMode::Clipboard,
@@ -1293,7 +1293,7 @@ pub fn local_switch_allowed(daemon_says_ready: bool, consented_install: bool) ->
 /// Changes `app` for one message and says what should happen next.
 pub fn update(app: &mut App, msg: Msg, now: Now) -> Vec<Effect> {
     let mut effects = Vec::new();
-    app.now = now;
+    let before = std::mem::replace(&mut app.now, now);
     match msg {
         Msg::Key(key) => app.on_key(key, &mut effects),
         Msg::Paste(pasted) => app.on_paste(pasted),
@@ -1305,9 +1305,9 @@ pub fn update(app: &mut App, msg: Msg, now: Now) -> Vec<Effect> {
         Msg::Reply(reply) => app.on_reply(reply, &mut effects),
         Msg::SetupReturned { completed } => {
             if completed {
-                app.show(ToastKind::Success, "Setup finished.");
+                app.show(Tone::Success, "Setup finished.");
             } else {
-                app.show(ToastKind::Caution, "Setup didn't finish.");
+                app.show(Tone::Caution, "Setup didn't finish.");
             }
             app.setup_needed = None;
             effects.push(Effect::Job(Job::LoadSettings));
@@ -1321,12 +1321,23 @@ pub fn update(app: &mut App, msg: Msg, now: Now) -> Vec<Effect> {
         .is_some_and(|toast| now.mono_ms >= toast.until_mono_ms)
     {
         app.toast = None;
-    }
-    let clock = app.clock_key();
-    if clock != app.clock {
-        app.clock = clock;
         app.dirty = true;
     }
+    // What time alone changes on screen: the Recording timer, the guard
+    // lapsing, "48s ago", and the minute.
+    let face = |time: Now| {
+        (
+            app.recording_since_mono_ms
+                .map(|since| time.mono_ms.saturating_sub(since) / 1_000),
+            time.mono_ms < app.guard_until_mono_ms,
+            app.history
+                .as_ref()
+                .and_then(|items| items.first())
+                .map(|item| crate::history_view::relative_time(time.wall_ms, item.recorded_at_ms)),
+            time.wall_ms / 60_000,
+        )
+    };
+    app.dirty |= face(before) != face(now);
     effects
 }
 
@@ -1374,6 +1385,7 @@ pub(super) mod test_support {
             status,
             action: None,
             detail: String::new(),
+            fix: None,
         }
     }
 
@@ -1530,6 +1542,72 @@ mod tests {
         assert!(app.should_quit);
     }
 
+    fn poll(app: &mut App, poll: StatusPoll, mono_ms: u64) -> Vec<Effect> {
+        update(app, Msg::Reply(Reply::Status(poll)), at(mono_ms))
+    }
+
+    #[test]
+    fn one_failed_poll_keeps_what_was_last_seen() {
+        let mut app = ready_app();
+        let _ = poll(&mut app, StatusPoll::Failed, 500);
+        assert_eq!(app.daemon, DaemonView::Up(snapshot(DaemonState::Idle)));
+        assert_eq!(app.hero(), Hero::Ready);
+    }
+
+    #[test]
+    fn a_daemon_that_keeps_failing_to_answer_keeps_the_guard_on() {
+        let mut app = ready_app();
+        for mono_ms in [500, 1_000, 1_500] {
+            let _ = poll(&mut app, StatusPoll::Failed, mono_ms);
+        }
+        assert!(app.guarded(), "it may still be dictating");
+        assert!(press(&mut app, KeyCode::Enter, 1_600).is_empty());
+        let _ = press(&mut app, KeyCode::Char('q'), 1_600);
+        assert!(!app.should_quit, "a dictated q quit");
+    }
+
+    #[test]
+    fn a_daemon_that_keeps_failing_to_answer_asks_for_a_restart() {
+        let mut app = ready_app();
+        for mono_ms in [500, 1_000] {
+            let _ = poll(&mut app, StatusPoll::Failed, mono_ms);
+        }
+        assert_eq!(app.hero(), Hero::Ready, "two slow replies are not a fault");
+        let _ = poll(&mut app, StatusPoll::Failed, 1_500);
+        assert_eq!(app.hero(), Hero::NeedsRestart);
+        // A good reply in between starts the count again.
+        let _ = poll(&mut app, StatusPoll::Up(snapshot(DaemonState::Idle)), 2_000);
+        for mono_ms in [2_500, 3_000] {
+            let _ = poll(&mut app, StatusPoll::Failed, mono_ms);
+        }
+        assert_eq!(app.hero(), Hero::Ready);
+    }
+
+    #[test]
+    fn a_protocol_mismatch_asks_for_a_restart_at_once_and_stays_guarded() {
+        let mut app = ready_app();
+        let _ = poll(&mut app, StatusPoll::Mismatch, 500);
+        assert_eq!(app.hero(), Hero::NeedsRestart);
+        assert!(app.guarded(), "the old daemon may still be dictating");
+        assert_eq!(app.fix(), None, "a dictated newline must not be the fix");
+        for code in [KeyCode::Char('q'), KeyCode::Enter, KeyCode::Char('4')] {
+            assert!(press(&mut app, code, 600).is_empty(), "{code:?}");
+        }
+        assert!(!app.should_quit);
+        assert_eq!(app.tab, Tab::Home);
+
+        let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        let effects = update(&mut app, Msg::Key(ctrl_r), at(700));
+        assert!(matches!(
+            &effects[..],
+            [Effect::Job(Job::Service(ServiceVerb::Restart))]
+        ));
+        assert!(
+            update(&mut app, Msg::Key(ctrl_r), at(800)).is_empty(),
+            "one restart at a time"
+        );
+    }
+
     #[test]
     fn dictation_cannot_type_into_an_open_prompt() {
         let mut app = ready_app();
@@ -1588,6 +1666,7 @@ mod tests {
 
         let mut failing = row("Microphone", "absent", ReadinessStatus::Fail);
         failing.action = Some("voisu service restart".to_owned());
+        failing.fix = Some(Fix::RestartVoisu);
         let mut rows = healthy_rows();
         rows.push(failing);
         let _ = update(&mut app, Msg::Reply(Reply::Doctor(rows)), at(0));
@@ -1606,6 +1685,118 @@ mod tests {
         let _ = update(&mut app, Msg::Reply(Reply::SetupNeeded(true)), at(0));
         assert_eq!(app.hero(), Hero::NotSetUp);
         assert_eq!(app.fix(), Some(Fix::RunSetup));
+
+        let _ = poll(&mut app, StatusPoll::Mismatch, 0);
+        assert_eq!(
+            app.hero(),
+            Hero::NeedsRestart,
+            "it outranks every other problem"
+        );
+    }
+
+    fn deepgram_turned_off(app: &mut App) {
+        app.tab = Tab::Settings;
+        app.settings_selected = 4;
+        let _ = press(app, KeyCode::Enter, 0);
+        let _ = update(
+            app,
+            Msg::Reply(Reply::Applied {
+                kind: Tone::Success,
+                text: "Deepgram turned off. Restart Voisu to apply.".to_owned(),
+                refresh: &[Refresh::PendingRestart(SettingsRow::Deepgram)],
+            }),
+            at(0),
+        );
+    }
+
+    #[test]
+    fn a_setting_read_at_start_stays_marked_until_a_restart() {
+        let mut app = ready_app();
+        deepgram_turned_off(&mut app);
+        // Long after the toast has gone.
+        let _ = update(&mut app, Msg::Tick, at(60_000));
+        assert_eq!(
+            app.setting_value(SettingsRow::Deepgram),
+            ("Off · after restart".to_owned(), Tone::Caution)
+        );
+        assert!(matches!(
+            app.context(),
+            Context::Settings { restart: true, .. }
+        ));
+        let effects = press(&mut app, KeyCode::Char('r'), 60_000);
+        assert!(matches!(
+            &effects[..],
+            [Effect::Job(Job::Service(ServiceVerb::Restart))]
+        ));
+        let _ = update(
+            &mut app,
+            Msg::Reply(Reply::ServiceDone {
+                kind: Tone::Success,
+                text: "Voisu restarted.".to_owned(),
+            }),
+            at(61_000),
+        );
+        assert!(app.restart_pending.is_empty());
+        assert_eq!(app.setting_value(SettingsRow::Deepgram).0, "Off");
+    }
+
+    #[test]
+    fn a_failed_restart_keeps_the_mark() {
+        let mut app = ready_app();
+        deepgram_turned_off(&mut app);
+        let _ = update(
+            &mut app,
+            Msg::Reply(Reply::ServiceDone {
+                kind: Tone::Failure,
+                text: "Voisu didn't restart.".to_owned(),
+            }),
+            at(0),
+        );
+        assert_eq!(app.restart_pending, [SettingsRow::Deepgram]);
+    }
+
+    #[test]
+    fn a_daemon_seen_going_down_and_back_clears_the_mark() {
+        let mut app = ready_app();
+        deepgram_turned_off(&mut app);
+        for mono_ms in [100, 200, 300] {
+            let _ = poll(&mut app, StatusPoll::Failed, mono_ms);
+        }
+        let _ = poll(&mut app, StatusPoll::Up(snapshot(DaemonState::Idle)), 400);
+        assert!(!app.restart_pending.is_empty(), "slow is not restarted");
+        let _ = poll(&mut app, StatusPoll::Unavailable, 500);
+        assert!(!app.restart_pending.is_empty());
+        let _ = poll(&mut app, StatusPoll::Up(snapshot(DaemonState::Idle)), 1_000);
+        assert!(app.restart_pending.is_empty());
+    }
+
+    #[test]
+    fn home_offers_the_pending_restart_below_real_problems_and_recordings() {
+        let mut app = ready_app();
+        deepgram_turned_off(&mut app);
+        app.tab = Tab::Home;
+        assert_eq!(app.hero(), Hero::Ready);
+        assert_eq!(app.fix(), Some(Fix::RestartVoisu));
+
+        let _ = set_status(&mut app, DaemonState::Recording, 0);
+        assert_eq!(app.fix(), None);
+        assert!(
+            press(&mut app, KeyCode::Char('r'), 0).is_empty(),
+            "normal guard rules apply"
+        );
+        let _ = set_status(&mut app, DaemonState::Idle, 0);
+
+        let mut failing = row("Microphone", "absent", ReadinessStatus::Fail);
+        failing.fix = Some(Fix::RunSetup);
+        let _ = update(&mut app, Msg::Reply(Reply::Doctor(vec![failing])), at(0));
+        assert_eq!(app.fix(), Some(Fix::RunSetup), "a real failure outranks it");
+
+        let _ = update(&mut app, Msg::Reply(Reply::Doctor(healthy_rows())), at(0));
+        let effects = press(&mut app, KeyCode::Enter, 5_000);
+        assert!(matches!(
+            &effects[..],
+            [Effect::Job(Job::Service(ServiceVerb::Restart))]
+        ));
     }
 
     #[test]
@@ -1614,7 +1805,7 @@ mod tests {
         assert_eq!(app.hero(), Hero::Ready);
         let (health, tone) = app.health().expect("doctor loaded");
         assert_eq!(health, "15 passed · 1 warning");
-        assert_eq!(tone, ValueTone::Warn);
+        assert_eq!(tone, Tone::Caution);
     }
 
     #[test]
@@ -1657,7 +1848,7 @@ mod tests {
         let _ = update(
             &mut app,
             Msg::Reply(Reply::ServiceDone {
-                kind: ToastKind::Success,
+                kind: Tone::Success,
                 text: "Voisu started.".to_owned(),
             }),
             at(0),
@@ -1673,14 +1864,13 @@ mod tests {
     }
 
     #[test]
-    fn doctor_failures_map_to_a_key_only_when_one_can_do_it() {
-        assert_eq!(fix_for_action("run `voisu setup`"), Some(Fix::RunSetup));
-        assert_eq!(
-            fix_for_action("voisu service restart"),
-            Some(Fix::RestartVoisu)
-        );
-        assert_eq!(fix_for_action("voisu service start"), Some(Fix::StartVoisu));
-        assert_eq!(fix_for_action("unset or fix GROQ_API_KEY"), None);
+    fn a_failure_with_no_typed_fix_offers_no_key_however_it_reads() {
+        let mut app = ready_app();
+        let mut failing = row("Groq key", "invalid", ReadinessStatus::Fail);
+        failing.action = Some("voisu service restart".to_owned());
+        let _ = update(&mut app, Msg::Reply(Reply::Doctor(vec![failing])), at(0));
+        assert!(matches!(app.hero(), Hero::Failing { fix: None, .. }));
+        assert_eq!(app.fix(), None);
     }
 
     #[test]
@@ -1816,7 +2006,7 @@ mod tests {
         let _ = update(
             &mut app,
             Msg::Reply(Reply::Applied {
-                kind: ToastKind::Success,
+                kind: Tone::Success,
                 text: "Done.".to_owned(),
                 refresh: &[],
             }),
@@ -1947,7 +2137,13 @@ mod tests {
         app.settings_selected = 7;
         assert!(press(&mut app, KeyCode::Enter, 0).is_empty());
         assert!(app.prompt.is_none());
-        assert_eq!(app.context(), Context::Settings { enter: None });
+        assert_eq!(
+            app.context(),
+            Context::Settings {
+                enter: None,
+                restart: false
+            }
+        );
     }
 
     #[test]
@@ -2038,7 +2234,7 @@ mod tests {
         let effects = update(
             &mut app,
             Msg::Reply(Reply::KeyChecked {
-                kind: ToastKind::Success,
+                kind: Tone::Success,
                 text: "Groq key saved.".to_owned(),
             }),
             at(0),
@@ -2116,7 +2312,7 @@ mod tests {
         let _ = press(&mut app, KeyCode::Down, 0);
         let effects = press(&mut app, KeyCode::Char('c'), 0);
         assert!(effects.is_empty());
-        assert_eq!(app.toast.as_ref().map(|t| t.kind), Some(ToastKind::Caution));
+        assert_eq!(app.toast.as_ref().map(|t| t.kind), Some(Tone::Caution));
     }
 
     #[test]

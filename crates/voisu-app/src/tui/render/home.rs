@@ -2,10 +2,11 @@
 
 use ratatui::text::Line;
 
+use super::super::keys::{self, Action};
 use super::super::look::{Look, Tone};
-use super::super::model::{App, CheckLine, HERO_HEIGHT, Hero, ServiceVerb};
+use super::super::model::{App, CheckLine, Fix, HERO_HEIGHT, Hero, ServiceVerb};
 use super::super::text;
-use super::{Pieces, single, value_tone};
+use super::{Pieces, single};
 use voisu_core::ReadinessStatus;
 
 const INDENT: &str = "   ";
@@ -30,8 +31,17 @@ pub(super) fn lines(app: &App, look: &Look, width: usize, height: usize) -> Vec<
 fn hero_lines(app: &App, look: &Look, width: usize) -> Vec<Line<'static>> {
     let room = width.saturating_sub(INDENT.len());
     let fix = |label: &str| format!("↵ {label}");
+    let busy = app.service_busy.map(|verb| match verb {
+        ServiceVerb::Start => "Starting Voisu…".to_owned(),
+        ServiceVerb::Restart => "Restarting Voisu…".to_owned(),
+    });
     let (title, title_tone, detail): (String, Tone, String) = match app.hero() {
         Hero::Checking => ("Checking Voisu…".to_owned(), Tone::Bold, String::new()),
+        Hero::NeedsRestart => (
+            "Voisu needs a restart".to_owned(),
+            Tone::Failure,
+            busy.unwrap_or_else(|| key_hint(app, Action::Restart)),
+        ),
         Hero::NotSetUp => (
             "Voisu isn't set up yet".to_owned(),
             Tone::Caution,
@@ -40,11 +50,7 @@ fn hero_lines(app: &App, look: &Look, width: usize) -> Vec<Line<'static>> {
         Hero::NotRunning => (
             "Voisu isn't running".to_owned(),
             Tone::Failure,
-            match app.service_busy {
-                Some(ServiceVerb::Start) => "Starting Voisu…".to_owned(),
-                Some(ServiceVerb::Restart) => "Restarting Voisu…".to_owned(),
-                None => fix("Start Voisu"),
-            },
+            busy.unwrap_or_else(|| fix("Start Voisu")),
         ),
         Hero::Failing {
             label,
@@ -57,11 +63,7 @@ fn hero_lines(app: &App, look: &Look, width: usize) -> Vec<Line<'static>> {
                 None => label,
             },
             Tone::Failure,
-            match app.service_busy {
-                Some(ServiceVerb::Start) => "Starting Voisu…".to_owned(),
-                Some(ServiceVerb::Restart) => "Restarting Voisu…".to_owned(),
-                None => action.unwrap_or_default(),
-            },
+            busy.unwrap_or_else(|| action.unwrap_or_default()),
         ),
         Hero::Recording { seconds } => (
             format!("Recording  {}:{:02}", seconds / 60, seconds % 60),
@@ -76,7 +78,13 @@ fn hero_lines(app: &App, look: &Look, width: usize) -> Vec<Line<'static>> {
         Hero::Ready => (
             "Ready to dictate".to_owned(),
             Tone::Bold,
-            "Press your Trigger Key, speak, and press it again.".to_owned(),
+            match (busy, app.fix()) {
+                (Some(busy), _) => busy,
+                (None, Some(Fix::RestartVoisu)) => {
+                    format!("{} to apply your changes", fix(Fix::RestartVoisu.label()))
+                }
+                _ => "Press your Trigger Key, speak, and press it again.".to_owned(),
+            },
         ),
     };
     let title_style = title_tone;
@@ -91,6 +99,15 @@ fn hero_lines(app: &App, look: &Look, width: usize) -> Vec<Line<'static>> {
             Tone::Plain,
         ),
     ]
+}
+
+/// How the key table names the key for `action` right now, such as `Ctrl-R Restart Voisu`.
+fn key_hint(app: &App, action: Action) -> String {
+    keys::bindings(&app.context())
+        .into_iter()
+        .find(|binding| binding.chords.iter().any(|(_, bound)| *bound == action))
+        .map(|binding| format!("{} {}", binding.keys, binding.label))
+        .unwrap_or_default()
 }
 
 fn summary_row(look: &Look, label: &str, value: &str, tone: Tone, width: usize) -> Line<'static> {
@@ -141,9 +158,7 @@ fn summary_rows(app: &App, look: &Look, width: usize) -> Vec<Line<'static>> {
     ));
     let (health, tone) = app
         .health()
-        .map_or(("Checking…".to_owned(), Tone::Plain), |(health, tone)| {
-            (health, value_tone(tone))
-        });
+        .unwrap_or_else(|| ("Checking…".to_owned(), Tone::Plain));
     rows.push(summary_row(look, "Health", &health, tone, width));
     rows
 }

@@ -26,6 +26,9 @@ use crate::system::DIAGNOSTIC_RESPONSE_DEADLINE;
 const MAX_RESPONSE_BYTES: usize =
     voisu_core::DEFAULT_MAX_RECORDS * 4 * voisu_core::MAX_STORED_TEXT + 4 * 1024 * 1024;
 const IO_DEADLINE: Duration = Duration::from_secs(2);
+/// The [`DaemonClientError::Failed`] code, and CLI exit code, when the daemon
+/// speaks another IPC protocol version.
+pub const PROTOCOL_MISMATCH_CODE: u8 = 5;
 #[derive(Clone, Copy)]
 enum DiagnosticResponseKind {
     History,
@@ -167,7 +170,7 @@ fn read_response(
             .map_err(|_| (1, "daemon returned an invalid response".to_owned()))?;
         if envelope.version != PROTOCOL_VERSION {
             return Err((
-                5,
+                PROTOCOL_MISMATCH_CODE,
                 format!(
                     "IPC protocol mismatch: daemon uses {}, CLI uses {}",
                     envelope.version, PROTOCOL_VERSION

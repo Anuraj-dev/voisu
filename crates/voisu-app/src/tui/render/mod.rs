@@ -16,9 +16,7 @@ use ratatui::widgets::Paragraph;
 
 use super::keys::{self, Context};
 use super::look::{Look, Tone};
-use super::model::{
-    App, DaemonView, Hero, MIN_HEIGHT, MIN_WIDTH, Prompt, Tab, ToastKind, ValueTone,
-};
+use super::model::{App, Hero, MIN_HEIGHT, MIN_WIDTH, Prompt, Tab};
 use super::text;
 
 /// The selected row's marker and the indent of an unselected one.
@@ -53,15 +51,6 @@ impl<'a> Pieces<'a> {
 
 fn single(look: &Look, content: &str, tone: Tone) -> Line<'static> {
     Pieces::new(look).add(content, tone).line()
-}
-
-fn value_tone(tone: ValueTone) -> Tone {
-    match tone {
-        ValueTone::Plain => Tone::Plain,
-        ValueTone::Good => Tone::Success,
-        ValueTone::Warn => Tone::Caution,
-        ValueTone::Bad => Tone::Failure,
-    }
 }
 
 /// A list row: the marker, then the text, bold when selected. The `▌` marker is
@@ -142,6 +131,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, look: &Look) {
 fn state_summary(app: &App) -> (&'static str, Tone) {
     match app.hero() {
         Hero::Checking => ("Checking", Tone::Dim),
+        Hero::NeedsRestart => ("✕ Needs restart", Tone::Failure),
         Hero::NotSetUp => ("! Not set up", Tone::Caution),
         Hero::NotRunning => ("✕ Not running", Tone::Failure),
         Hero::Failing { .. } => ("✕ Needs attention", Tone::Failure),
@@ -250,13 +240,13 @@ fn notice_line(app: &App, look: &Look, width: usize) -> (Line<'static>, Option<u
     let Some(toast) = &app.toast else {
         return (Line::default(), None);
     };
-    let (glyph, tone) = match toast.kind {
-        ToastKind::Success => ("✓", Tone::Success),
-        ToastKind::Caution => ("!", Tone::Caution),
-        ToastKind::Failure => ("✕", Tone::Failure),
+    let glyph = match toast.kind {
+        Tone::Success => "✓",
+        Tone::Failure => "✕",
+        _ => "!",
     };
     let body = format!(" {glyph} {}", text::clean_line(&toast.text));
-    (single(look, &text::fit(&body, width), tone), None)
+    (single(look, &text::fit(&body, width), toast.kind), None)
 }
 
 /// The last `max` columns of `text`.
@@ -302,7 +292,7 @@ fn footer_line(look: &Look, context: &Context, width: usize) -> Line<'static> {
             .add(&hint.label, Tone::Dim);
         used += gap.len() + cost(hint);
     }
-    if *context == Context::Guarded && used + 30 < width {
+    if matches!(context, Context::Guarded { .. }) && used + 30 < width {
         pieces = pieces.add("   Keys pause while you dictate", Tone::Dim);
     }
     pieces.line()
@@ -310,7 +300,7 @@ fn footer_line(look: &Look, context: &Context, width: usize) -> Line<'static> {
 
 /// A short phrase for when the daemon has to answer first.
 fn daemon_needed(app: &App) -> bool {
-    app.daemon == DaemonView::Unavailable
+    app.daemon_down()
 }
 
 #[cfg(test)]
@@ -574,6 +564,21 @@ mod tests {
         assert_eq!(lines[5], "   Voisu isn't set up yet");
         assert_eq!(lines[6], "   ↵ Run setup");
         assert!(lines[0].ends_with("! Not set up"));
+    }
+
+    #[test]
+    fn a_daemon_that_cannot_be_read_asks_for_a_restart_with_a_ctrl_key() {
+        let mut app = ready_app();
+        let _ = update(
+            &mut app,
+            Msg::Reply(Reply::Status(StatusPoll::Mismatch)),
+            at(0),
+        );
+        let lines = screen(&mut app, &UNICODE, (80, 24));
+        assert!(lines[0].ends_with("✕ Needs restart"));
+        assert_eq!(lines[5], "   Voisu needs a restart");
+        assert_eq!(lines[6], "   Ctrl-R Restart Voisu");
+        assert!(lines[23].contains("Ctrl-R Restart Voisu"));
     }
 
     #[test]

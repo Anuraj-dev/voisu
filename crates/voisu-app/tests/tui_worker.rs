@@ -8,7 +8,7 @@ use std::sync::mpsc::channel;
 
 use tempfile::TempDir;
 use voisu_app::config::{DeliveryMode, RenderingPolicy, WritingMode};
-use voisu_app::tui::model::{Job, Reply, ToastKind};
+use voisu_app::tui::model::{Job, Reply, Tone};
 use voisu_app::tui::worker::execute;
 use voisu_core::AsrMode;
 
@@ -19,7 +19,7 @@ fn run(job: Job) -> Vec<Reply> {
     received.iter().collect()
 }
 
-fn toast(job: Job) -> (ToastKind, String) {
+fn toast(job: Job) -> (Tone, String) {
     let mut replies = run(job);
     match replies.pop() {
         Some(Reply::Applied { kind, text, .. }) => (kind, text),
@@ -64,29 +64,36 @@ fn the_interface_and_the_cli_read_and_write_the_same_settings() {
 
     // A setting lands where the CLI reads it, and the toast says so in words.
     let (kind, text) = toast(Job::SetDelivery(DeliveryMode::Type));
-    assert_eq!(kind, ToastKind::Success, "{text}");
+    assert_eq!(kind, Tone::Success, "{text}");
     assert!(text.starts_with("Delivery set to Type."), "{text}");
+    assert!(text.ends_with("Restart Voisu to apply."), "{text}");
     assert!(cli(&dirs, &["delivery"]).contains("type"));
 
+    // The daemon picks its Intent Reconstruction validator at start.
     let (kind, text) = toast(Job::SetWriting(WritingMode::Literal));
-    assert_eq!(kind, ToastKind::Success, "{text}");
+    assert_eq!(kind, Tone::Success, "{text}");
+    assert!(text.ends_with("Restart Voisu to apply it fully."), "{text}");
     assert!(cli(&dirs, &["writing"]).contains("literal"));
 
     let (kind, text) = toast(Job::SetRendering(RenderingPolicy::Structured));
-    assert_eq!(kind, ToastKind::Success, "{text}");
+    assert_eq!(kind, Tone::Success, "{text}");
+    assert!(
+        text.ends_with("It applies to your next Recording."),
+        "{text}"
+    );
     assert!(cli(&dirs, &["rendering"]).contains("structured"));
 
     // The dictionary is shared the same way, in both directions.
     let (kind, text) = toast(Job::AddTerm("Anuraj".to_owned()));
-    assert_eq!(kind, ToastKind::Success, "{text}");
+    assert_eq!(kind, Tone::Success, "{text}");
     assert_eq!(text, "Added \"Anuraj\".");
     assert!(cli(&dirs, &["dictionary", "list"]).contains("Anuraj"));
     let (kind, _) = toast(Job::AddTerm("Anuraj".to_owned()));
-    assert_eq!(kind, ToastKind::Caution, "adding twice changes nothing");
+    assert_eq!(kind, Tone::Caution, "adding twice changes nothing");
     let (kind, text) = toast(Job::RemoveTerm("Anuraj".to_owned()));
     assert_eq!(
         (kind, text.as_str()),
-        (ToastKind::Success, "Removed \"Anuraj\".")
+        (Tone::Success, "Removed \"Anuraj\".")
     );
     assert!(!cli(&dirs, &["dictionary", "list"]).contains("Anuraj"));
 
@@ -95,7 +102,7 @@ fn the_interface_and_the_cli_read_and_write_the_same_settings() {
         mode: AsrMode::Local,
         local_ready: false,
     });
-    assert_eq!(kind, ToastKind::Caution);
+    assert_eq!(kind, Tone::Caution);
     assert!(text.contains("Run setup"), "{text}");
     assert!(
         !voisu_app::local_setup::is_local_mode(),

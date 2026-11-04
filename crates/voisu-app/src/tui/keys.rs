@@ -13,8 +13,12 @@ pub const FOOTER_LIMIT: usize = 5;
 /// What the user is looking at, which decides what keys mean.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Context {
-    /// Voisu is dictating, possibly into this very terminal: only `Ctrl-C` acts.
-    Guarded,
+    /// Voisu may be dictating, possibly into this very terminal: only Ctrl
+    /// chords act, since a Transcript cannot type one. `restart` offers
+    /// `Ctrl-R` for a daemon that answers but cannot be read.
+    Guarded {
+        restart: bool,
+    },
     TooSmall,
     AddTermPrompt,
     KeyPrompt,
@@ -32,6 +36,8 @@ pub enum Context {
     },
     Settings {
         enter: Option<&'static str>,
+        /// A changed setting waits for a restart.
+        restart: bool,
     },
 }
 
@@ -46,6 +52,7 @@ pub enum Action {
     PageUp,
     PageDown,
     Activate,
+    Restart,
     ToggleChecks,
     Copy,
     AddTerm,
@@ -76,8 +83,12 @@ fn letter(ch: char) -> KeyEvent {
     plain(KeyCode::Char(ch))
 }
 
+fn ctrl(ch: char) -> KeyEvent {
+    KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL)
+}
+
 fn ctrl_c() -> KeyEvent {
-    KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+    ctrl('c')
 }
 
 fn tabs() -> Binding {
@@ -180,7 +191,20 @@ fn close(label: &'static str) -> Binding {
 /// The table for one context, in footer order.
 pub fn bindings(context: &Context) -> Vec<Binding> {
     match context {
-        Context::Guarded => vec![interrupt(true)],
+        Context::Guarded { restart } => {
+            let mut rows = Vec::new();
+            if *restart {
+                rows.push(Binding {
+                    keys: "Ctrl-R",
+                    all_keys: "Ctrl-R",
+                    label: "Restart Voisu".into(),
+                    in_footer: true,
+                    chords: vec![(ctrl('r'), Action::Restart)],
+                });
+            }
+            rows.push(interrupt(true));
+            rows
+        }
         Context::TooSmall => vec![quit()],
         Context::AddTermPrompt => vec![
             enter("add", Action::Submit),
@@ -259,10 +283,17 @@ pub fn bindings(context: &Context) -> Vec<Binding> {
             rows.extend([tabs(), help(), quit()]);
             rows
         }
-        Context::Settings { enter: label } => {
-            let mut rows = vec![moves("move", true)];
+        Context::Settings {
+            enter: label,
+            restart,
+        } => {
+            // Five fit: the restart offer outranks the move hint, which `?` still lists.
+            let mut rows = vec![moves("move", !*restart || label.is_none())];
             if let Some(label) = label {
                 rows.push(enter(*label, Action::Activate));
+            }
+            if *restart {
+                rows.push(simple('r', "r", "restart", Action::Restart));
             }
             rows.extend([tabs(), help(), quit()]);
             rows
@@ -293,7 +324,8 @@ pub fn action_for(context: &Context, key: KeyEvent) -> Option<Action> {
 #[cfg(test)]
 pub(super) fn every_context() -> Vec<Context> {
     let mut contexts = vec![
-        Context::Guarded,
+        Context::Guarded { restart: false },
+        Context::Guarded { restart: true },
         Context::TooSmall,
         Context::AddTermPrompt,
         Context::KeyPrompt,
@@ -310,7 +342,9 @@ pub(super) fn every_context() -> Vec<Context> {
         contexts.push(Context::Dictionary { has_terms: flag });
     }
     for enter in [None, Some("change"), Some("enter key"), Some("run setup")] {
-        contexts.push(Context::Settings { enter });
+        for restart in [false, true] {
+            contexts.push(Context::Settings { enter, restart });
+        }
     }
     contexts
 }

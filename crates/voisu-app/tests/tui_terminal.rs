@@ -14,6 +14,8 @@ use tempfile::TempDir;
 const PATIENCE: Duration = Duration::from_secs(5);
 const ENTER_ALTERNATE_SCREEN: &[u8] = b"\x1b[?1049h";
 const LEAVE_ALTERNATE_SCREEN: &[u8] = b"\x1b[?1049l";
+/// The local flags raw mode clears and leaving must restore.
+const COOKED: libc::tcflag_t = libc::ICANON | libc::ECHO;
 
 /// `voisu` with no arguments on a terminal of its own, under temporary
 /// directories and an empty `PATH`, so nothing real is reachable.
@@ -102,6 +104,31 @@ impl Interface {
             self.pump();
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// Waits for `wanted` to appear at or after byte `start` of the output.
+    fn wait_for_output_after(&mut self, start: usize, wanted: &[u8]) {
+        let deadline = Instant::now() + PATIENCE;
+        while !self.output[start..]
+            .windows(wanted.len())
+            .any(|window| window == wanted)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "never printed {:?} again",
+                String::from_utf8_lossy(wanted)
+            );
+            self.pump();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn type_keys(&mut self, keys: &[u8]) {
+        let master = self.master.as_ref().unwrap();
+        std::io::Write::write_all(&mut &*master, keys).unwrap();
+        // One read per key, so an escape sequence is never split or merged.
+        std::thread::sleep(Duration::from_millis(30));
+        self.pump();
     }
 
     fn wait_for_exit(&mut self) -> ExitStatus {
@@ -193,7 +220,7 @@ fn closing_the_terminal_ends_the_interface() {
 fn sigterm_restores_the_terminal_and_reports_the_signal() {
     let mut interface = Interface::open();
     let raw = interface.local_flags();
-    assert_eq!(raw & (libc::ICANON | libc::ECHO), 0, "should start raw");
+    assert_eq!(raw & COOKED, 0, "should start raw");
 
     interface.signal(libc::SIGTERM);
     let status = interface.wait_for_exit();
@@ -202,20 +229,54 @@ fn sigterm_restores_the_terminal_and_reports_the_signal() {
     assert_eq!(status.signal(), None);
     assert!(interface.printed(LEAVE_ALTERNATE_SCREEN));
     let restored = interface.local_flags();
-    assert_eq!(
-        restored & (libc::ICANON | libc::ECHO),
-        libc::ICANON | libc::ECHO
-    );
+    assert_eq!(restored & COOKED, COOKED);
 }
 
 #[test]
 fn quitting_with_q_restores_the_terminal_and_exits_zero() {
     let mut interface = Interface::open();
-    let master = interface.master.as_ref().unwrap();
-    std::io::Write::write_all(&mut &*master, b"q").unwrap();
+    assert_eq!(interface.local_flags() & COOKED, 0, "should start raw");
+    interface.type_keys(b"q");
 
     let status = interface.wait_for_exit();
 
     assert_eq!(status.code(), Some(0), "{status:?}");
     assert!(interface.printed(LEAVE_ALTERNATE_SCREEN));
+    assert_eq!(interface.local_flags() & COOKED, COOKED);
+}
+
+/// Setup runs on the same terminal and comes back to a raw, working interface.
+/// With no desktop session in the environment, setup fails at once, which is
+/// enough to cover the hand-off without a real wizard.
+#[test]
+fn setup_gets_the_terminal_and_hands_it_back() {
+    let mut interface = Interface::open();
+    // A fresh home is not set up, so ↵ is Run setup.
+    interface.wait_for_output(b"Not set up");
+    interface.type_keys(b"\r");
+
+    let failed = b"cannot determine the desktop session";
+    interface.wait_for_output(failed);
+    let handed_back = interface
+        .output
+        .windows(failed.len())
+        .position(|window| window == failed)
+        .unwrap();
+    interface.wait_for_output_after(handed_back, ENTER_ALTERNATE_SCREEN);
+    // Repainting asks where the cursor is; answer as a terminal emulator would.
+    interface.wait_for_output_after(handed_back, b"\x1b[6n");
+    interface.type_keys(b"\x1b[1;1R");
+    let before_setup = &interface.output[..handed_back];
+    assert!(
+        before_setup
+            .windows(LEAVE_ALTERNATE_SCREEN.len())
+            .any(|window| window == LEAVE_ALTERNATE_SCREEN),
+        "setup must run after the interface leaves the screen"
+    );
+    interface.wait_for_output_after(handed_back, b"Settings");
+    assert_eq!(interface.local_flags() & COOKED, 0, "raw again after setup");
+
+    interface.type_keys(b"q");
+    assert_eq!(interface.wait_for_exit().code(), Some(0));
+    assert_eq!(interface.local_flags() & COOKED, COOKED);
 }
