@@ -127,7 +127,12 @@ pub fn execute(job: Job, replies: &Sender<Reply>) {
             config::set_writing_mode(mode),
             format!("Writing set to {}.", text::capitalized(mode.as_str())),
             "Restart Voisu to apply it fully.",
-            &[Refresh::Settings, Refresh::Doctor],
+            // The daemon builds its Intent Reconstruction check once, at start.
+            &[
+                Refresh::Settings,
+                Refresh::Doctor,
+                Refresh::PendingRestart(SettingsRow::Writing),
+            ],
         )),
         Job::SetRendering(policy) => send(applied_setting(
             config::set_rendering_policy(policy),

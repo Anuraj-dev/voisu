@@ -406,6 +406,9 @@ pub struct App {
     pub toast: Option<Toast>,
     pub key_in_check: Option<Provider>,
     pub service_busy: Option<ServiceVerb>,
+    /// Whether the service call in flight, if it succeeds, starts a daemon that
+    /// reads every setting afresh: a Restart, or a Start of a stopped daemon.
+    fresh_daemon_on_success: bool,
     /// Settings changed since the daemon started, which it reads only then.
     pub restart_pending: Vec<SettingsRow>,
     pub should_quit: bool,
@@ -443,6 +446,7 @@ impl App {
             toast: None,
             key_in_check: None,
             service_busy: None,
+            fresh_daemon_on_success: false,
             restart_pending: Vec::new(),
             should_quit: false,
             failed_polls: 0,
@@ -941,7 +945,8 @@ impl App {
             }
             Reply::ServiceDone { kind, text } => {
                 self.service_busy = None;
-                if kind == Tone::Success {
+                // A Start that found the daemon already running reloads nothing.
+                if kind == Tone::Success && std::mem::take(&mut self.fresh_daemon_on_success) {
                     self.restart_pending.clear();
                 }
                 self.show(kind, text);
@@ -1097,6 +1102,8 @@ impl App {
 
     fn start_service(&mut self, verb: ServiceVerb, effects: &mut Vec<Effect>) {
         self.service_busy = Some(verb);
+        self.fresh_daemon_on_success =
+            verb == ServiceVerb::Restart || !matches!(self.daemon, DaemonView::Up(_));
         self.dirty = true;
         effects.push(Effect::Job(Job::Service(verb)));
     }
@@ -1748,6 +1755,53 @@ mod tests {
             at(0),
         );
         assert_eq!(app.restart_pending, [SettingsRow::Deepgram]);
+    }
+
+    fn service_done(app: &mut App, text: &str) {
+        let _ = update(
+            app,
+            Msg::Reply(Reply::ServiceDone {
+                kind: Tone::Success,
+                text: text.to_owned(),
+            }),
+            at(0),
+        );
+    }
+
+    #[test]
+    fn a_start_that_found_voisu_running_keeps_the_mark() {
+        let mut app = ready_app();
+        deepgram_turned_off(&mut app);
+        app.tab = Tab::Home;
+        let mut failing = row("Overlay", "stopped", ReadinessStatus::Fail);
+        failing.fix = Some(Fix::StartVoisu);
+        let _ = update(&mut app, Msg::Reply(Reply::Doctor(vec![failing])), at(0));
+        let effects = press(&mut app, KeyCode::Enter, 0);
+        assert!(matches!(
+            &effects[..],
+            [Effect::Job(Job::Service(ServiceVerb::Start))]
+        ));
+        service_done(&mut app, "Voisu started.");
+        assert_eq!(
+            app.restart_pending,
+            [SettingsRow::Deepgram],
+            "the running daemon still holds the old value"
+        );
+    }
+
+    #[test]
+    fn a_start_of_a_stopped_voisu_clears_the_mark() {
+        let mut app = ready_app();
+        deepgram_turned_off(&mut app);
+        app.tab = Tab::Home;
+        let _ = poll(&mut app, StatusPoll::Unavailable, 0);
+        let effects = press(&mut app, KeyCode::Enter, 0);
+        assert!(matches!(
+            &effects[..],
+            [Effect::Job(Job::Service(ServiceVerb::Start))]
+        ));
+        service_done(&mut app, "Voisu started.");
+        assert!(app.restart_pending.is_empty());
     }
 
     #[test]

@@ -8,7 +8,7 @@ use std::sync::mpsc::channel;
 
 use tempfile::TempDir;
 use voisu_app::config::{DeliveryMode, RenderingPolicy, WritingMode};
-use voisu_app::tui::model::{Job, Reply, Tone};
+use voisu_app::tui::model::{Job, Refresh, Reply, SettingsRow, Tone};
 use voisu_app::tui::worker::execute;
 use voisu_core::AsrMode;
 
@@ -70,9 +70,21 @@ fn the_interface_and_the_cli_read_and_write_the_same_settings() {
     assert!(cli(&dirs, &["delivery"]).contains("copy"));
 
     // The daemon picks its Intent Reconstruction validator at start.
-    let (kind, text) = toast(Job::SetWriting(WritingMode::Literal));
-    assert_eq!(kind, Tone::Success, "{text}");
+    let replies = run(Job::SetWriting(WritingMode::Literal));
+    let Some(Reply::Applied {
+        kind,
+        text,
+        refresh,
+    }) = replies.last()
+    else {
+        panic!("expected a result in words, got {replies:?}");
+    };
+    assert_eq!(*kind, Tone::Success, "{text}");
     assert!(text.ends_with("Restart Voisu to apply it fully."), "{text}");
+    assert!(
+        refresh.contains(&Refresh::PendingRestart(SettingsRow::Writing)),
+        "the row must say it waits for a restart: {refresh:?}"
+    );
     assert!(cli(&dirs, &["writing"]).contains("exact"));
 
     let (kind, text) = toast(Job::SetRendering(RenderingPolicy::Structured));
