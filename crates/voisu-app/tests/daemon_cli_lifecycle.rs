@@ -12953,8 +12953,8 @@ fn flagged_dpr_refuses_pure_outro_silence_without_delivery() {
     assert!(
         stopped["evidence"]["validation_reason"]
             .as_str()
-            .is_some_and(|reason| reason.contains("hallucinated suffix")),
-        "expected hallucinated-suffix validation reason: {stopped}"
+            .is_some_and(|reason| reason.contains("didn't hear any words")),
+        "expected no-words reason: {stopped}"
     );
     assert_eq!(
         stopped["evidence"]["reconciliation_requested"], false,

@@ -3295,13 +3295,9 @@ async fn pure_outro_sources_refuse_without_model_and_without_delivery() {
         .await
         .expect_err("pure-outro silence must not Deliver");
 
-    assert_eq!(error.kind(), BoundaryKind::Validation);
-    assert_eq!(
-        error.public_message(),
-        "Transcript failed quality validation"
-    );
+    assert_eq!(error.kind(), BoundaryKind::SilentRecording);
     assert!(
-        error.diagnostic().contains("hallucinated suffix"),
+        error.diagnostic().contains("didn't hear any words"),
         "{}",
         error.diagnostic()
     );

@@ -1785,23 +1785,25 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
         let sanitized_sources = sources.clone();
         sources.retain(|source| !source.text.is_empty());
         if sources.is_empty() {
+            // Nothing but ASR outro filler is silence, not a quality failure:
+            // report it like a local-engine no-words Recording.
             let validation_reason =
-                "hallucinated suffix; no Source Transcript remains after stripping ASR outros"
-                    .to_owned();
-            return Err(
-                BoundaryError::new(BoundaryKind::Validation, validation_reason.clone())
-                    .with_transcript_failure(TranscriptFailureEvidence {
-                        validation_reason,
-                        fallback_reason: Some("hallucinated suffix".to_owned()),
-                        reconciliation_requested: false,
-                        recovery_attempted: false,
-                        source_selection_diagnostic: source_selection_diagnostic(
-                            &sanitized_sources,
-                            None,
-                            None,
-                        ),
-                    }),
-            );
+                "didn't hear any words (removed filler like \"thanks for watching\")".to_owned();
+            return Err(BoundaryError::new(
+                BoundaryKind::SilentRecording,
+                validation_reason.clone(),
+            )
+            .with_transcript_failure(TranscriptFailureEvidence {
+                validation_reason,
+                fallback_reason: Some("no words heard".to_owned()),
+                reconciliation_requested: false,
+                recovery_attempted: false,
+                source_selection_diagnostic: source_selection_diagnostic(
+                    &sanitized_sources,
+                    None,
+                    None,
+                ),
+            }));
         }
         sources.sort_by_key(|source| source.provider);
         if let (Some(deepgram), Some(groq)) = (
