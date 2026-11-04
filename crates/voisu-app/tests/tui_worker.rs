@@ -73,7 +73,7 @@ fn the_interface_and_the_cli_read_and_write_the_same_settings() {
     let (kind, text) = toast(Job::SetWriting(WritingMode::Literal));
     assert_eq!(kind, Tone::Success, "{text}");
     assert!(text.ends_with("Restart Voisu to apply it fully."), "{text}");
-    assert!(cli(&dirs, &["writing"]).contains("literal"));
+    assert!(cli(&dirs, &["writing"]).contains("exact"));
 
     let (kind, text) = toast(Job::SetRendering(RenderingPolicy::Structured));
     assert_eq!(kind, Tone::Success, "{text}");
@@ -81,7 +81,7 @@ fn the_interface_and_the_cli_read_and_write_the_same_settings() {
         text.ends_with("It applies to your next Recording."),
         "{text}"
     );
-    assert!(cli(&dirs, &["rendering"]).contains("structured"));
+    assert!(cli(&dirs, &["layout"]).contains("sections"));
 
     // The dictionary is shared the same way, in both directions.
     let (kind, text) = toast(Job::AddTerm("Anuraj".to_owned()));

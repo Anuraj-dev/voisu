@@ -52,9 +52,7 @@ impl BinaryIdentity<'_> {
 pub fn annotate_mode_message(mode: AsrMode, message: String) -> String {
     match mode {
         AsrMode::Cloud => {
-            format!(
-                "{message}; Cloud is a user opt-out for subsequent Recordings, not a Local repair"
-            )
+            format!("{message}. Cloud sends your audio online; it doesn't fix the Local model")
         }
         AsrMode::Local => message,
     }

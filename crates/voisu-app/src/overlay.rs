@@ -63,14 +63,14 @@ impl OverlayView {
         match event.outcome {
             OverlayOutcome::Delivered => Self {
                 phase: OverlayPhase::Success,
-                visible_label: "Delivered",
-                accessible_label: "Transcript Delivered",
+                visible_label: "Pasted",
+                accessible_label: "Transcript pasted",
             },
             OverlayOutcome::QualityFailure => Self::no_speech(),
             OverlayOutcome::Copied => Self::copied(),
             _ => Self {
                 phase: OverlayPhase::Failure,
-                visible_label: "Failure",
+                visible_label: "Recording failed",
                 accessible_label: "Recording failed",
             },
         }
@@ -79,27 +79,26 @@ impl OverlayView {
     pub const fn success() -> Self {
         Self {
             phase: OverlayPhase::Success,
-            visible_label: "Delivered",
-            accessible_label: "Transcript Delivered",
+            visible_label: "Pasted",
+            accessible_label: "Transcript pasted",
         }
     }
 
     pub const fn failure() -> Self {
         Self {
             phase: OverlayPhase::Failure,
-            visible_label: "Quality Failure",
-            accessible_label: "Quality Failure",
+            visible_label: "Recording failed",
+            accessible_label: "Recording failed",
         }
     }
 
     /// The Failure view shown when the optional Overlay cannot reach the
-    /// daemon. Owned here so the label strings live in one place; the label
-    /// text is load-bearing for tests and users and must stay unchanged.
+    /// daemon. Owned here so the label strings live in one place.
     pub const fn daemon_unavailable() -> Self {
         Self {
             phase: OverlayPhase::Failure,
-            visible_label: "Daemon unavailable",
-            accessible_label: "Daemon unavailable; the optional Overlay cannot reach voisu-daemon",
+            visible_label: "Voisu service isn't running",
+            accessible_label: "Voisu service isn't running; the Overlay can't reach it",
         }
     }
 
@@ -109,7 +108,7 @@ impl OverlayView {
         Self {
             phase: OverlayPhase::NoSpeech,
             visible_label: "Didn't catch any speech",
-            accessible_label: "No speech detected; nothing was delivered",
+            accessible_label: "Didn't hear any words; nothing was pasted",
         }
     }
 
@@ -1726,7 +1725,7 @@ mod tests {
         }
         assert_eq!(
             announced,
-            ["Processing Recording", "Transcript Delivered"],
+            ["Processing Recording", "Transcript pasted"],
             "exactly one Delivered announcement",
         );
     }
@@ -1912,10 +1911,10 @@ mod tests {
         let view = controller.observe_unreachable(now);
         assert_eq!(view.phase, OverlayPhase::Failure);
         assert!(view.is_visible());
-        assert_eq!(view.visible_label, "Daemon unavailable");
+        assert_eq!(view.visible_label, "Voisu service isn't running");
         assert_eq!(
             view.accessible_label,
-            "Daemon unavailable; the optional Overlay cannot reach voisu-daemon",
+            "Voisu service isn't running; the Overlay can't reach it",
         );
     }
 
@@ -2433,7 +2432,7 @@ mod tests {
         assert_eq!(view.visible_label, "Didn't catch any speech");
         assert_eq!(
             view.accessible_label,
-            "No speech detected; nothing was delivered"
+            "Didn't hear any words; nothing was pasted"
         );
     }
 
@@ -2451,7 +2450,7 @@ mod tests {
         // Text-bearing phases keep their words on the capsule.
         assert_eq!(
             OverlayView::daemon_unavailable().capsule_text(),
-            "Daemon unavailable"
+            "Voisu service isn't running"
         );
         assert_eq!(OverlayView::no_speech().capsule_text(), "");
         // The notification rung still gets full labels everywhere.
@@ -2459,7 +2458,7 @@ mod tests {
             OverlayView::from_response(&recording_response()).visible_label,
             "Recording"
         );
-        assert_eq!(OverlayView::success().visible_label, "Delivered");
+        assert_eq!(OverlayView::success().visible_label, "Pasted");
     }
 
     #[test]

@@ -1284,7 +1284,7 @@ printf '%s' "$((count + 1))" > "$dir/delivery.count"
         );
         assert_eq!(
             status_headline(&voisu(runtime.path(), "status")),
-            "idle\n",
+            "Ready\n",
             "{failure}"
         );
         daemon.terminate();
@@ -1429,7 +1429,7 @@ cat > "$dir/clipboard"
     assert_eq!(failed.status.code(), Some(4));
     assert_eq!(
         stderr(&failed),
-        "Secret storage is unavailable; set VOISU_GROQ_API_KEY or VOISU_DEEPGRAM_API_KEY for development or headless use\n"
+        "Can't read your keys from the keyring; set VOISU_GROQ_API_KEY or VOISU_DEEPGRAM_API_KEY for development or headless use\n"
     );
     let first_pid: u32 = fs::read_to_string(commands.path().join("pw-record.pids"))
         .unwrap()
@@ -1449,7 +1449,7 @@ cat > "$dir/clipboard"
         !Path::new(&format!("/proc/{first_pid}")).exists(),
         "failed provider start must kill and reap pw-record"
     );
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
 
     if let Err(err) = fs::remove_file(commands.path().join("pw-record.ready")) {
         assert_eq!(
@@ -1604,7 +1604,7 @@ cat > /dev/null
     };
     status_thread.join().unwrap();
     assert!(status.status.success(), "{}", stderr(&status));
-    assert_eq!(status_headline(&status), "processing\n");
+    assert_eq!(status_headline(&status), "Working on your Transcript\n");
 
     let stopped = stop.join().unwrap();
     assert!(stopped.status.success(), "{}", stderr(&stopped));
@@ -1642,17 +1642,17 @@ while [ "$i" -lt 60 ]; do sleep 1; i=$((i + 1)); done
 
     let rejected = voisu(runtime.path(), "start");
     assert_eq!(rejected.status.code(), Some(4));
-    assert_eq!(stderr(&rejected), "Source Transcripts are unavailable\n");
+    assert_eq!(stderr(&rejected), "Couldn't reach Groq or Deepgram\n");
     assert!(!stderr(&rejected).contains("controlled-secret"));
     assert!(!stderr(&rejected).contains("example.invalid"));
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
     let diagnostics = daemon.terminate_and_stderr();
     assert!(!diagnostics.contains("controlled-secret"));
     assert!(!diagnostics.contains("example.invalid"));
 }
 
 #[test]
-fn production_groq_quality_failure_is_classified_through_the_public_cli() {
+fn production_groq_blank_transcript_reads_as_no_words_through_the_public_cli() {
     let runtime = TempDir::new().unwrap();
     let commands = TempDir::new().unwrap();
     write_fake_command(
@@ -1679,10 +1679,10 @@ fn production_groq_quality_failure_is_classified_through_the_public_cli() {
     wait_for_marker(commands.path(), "pw-record.ready");
     let rejected = voisu(runtime.path(), "stop");
     assert_eq!(rejected.status.code(), Some(4));
-    assert_eq!(stderr(&rejected), "Transcript failed quality validation\n");
+    assert_eq!(stderr(&rejected), "Didn't hear any words\n");
     request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     server.join().unwrap();
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
     assert!(voisu(runtime.path(), "start").status.success());
 }
 
@@ -1718,10 +1718,10 @@ fn production_groq_5xx_is_recoverable_through_the_public_cli() {
     wait_for_marker(commands.path(), "pw-record.ready");
     let rejected = voisu(runtime.path(), "stop");
     assert_eq!(rejected.status.code(), Some(4));
-    assert_eq!(stderr(&rejected), "Source Transcripts are unavailable\n");
+    assert_eq!(stderr(&rejected), "Couldn't reach Groq or Deepgram\n");
     request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     server.join().unwrap();
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
     assert!(voisu(runtime.path(), "start").status.success());
 }
 
@@ -1758,11 +1758,11 @@ fn production_slow_groq_endpoint_is_bounded_and_recoverable() {
     let started = Instant::now();
     let rejected = voisu(runtime.path(), "stop");
     assert_eq!(rejected.status.code(), Some(4));
-    assert_eq!(stderr(&rejected), "Source Transcripts are unavailable\n");
+    assert_eq!(stderr(&rejected), "Couldn't reach Groq or Deepgram\n");
     assert!(started.elapsed() < PROCESSING_RESPONSE_DEADLINE);
     request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     server.join().unwrap();
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
     assert!(voisu(runtime.path(), "start").status.success());
     let diagnostics = daemon.terminate_and_stderr();
     assert!(
@@ -1794,7 +1794,7 @@ fn production_capture_death_mid_recording_self_recovers_without_stop() {
     // lag on a contended CI core; the loop returns as soon as Idle is observed.
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
-        if status_headline(&voisu(runtime.path(), "status")) == "idle\n" {
+        if status_headline(&voisu(runtime.path(), "status")) == "Ready\n" {
             assert!(voisu(runtime.path(), "start").status.success());
             let diagnostics = daemon.terminate_and_stderr();
             // Which capture-failure diagnostic wins is a benign daemon-side race:
@@ -1912,7 +1912,7 @@ cat > "$dir/clipboard"
     );
 
     assert!(voisu(runtime.path(), "start").status.success());
-    wait_for_status(runtime.path(), "idle\n");
+    wait_for_status(runtime.path(), "Ready\n");
 
     assert!(voisu(runtime.path(), "start").status.success());
     wait_for_marker(commands.path(), "pw-record.reconnected");
@@ -1922,7 +1922,7 @@ cat > "$dir/clipboard"
         fs::read_to_string(commands.path().join("clipboard")).unwrap(),
         "Recovered microphone."
     );
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
 }
 
 #[test]
@@ -1949,10 +1949,10 @@ fn production_missing_wl_copy_is_reported_and_recoverable() {
     wait_for_marker(commands.path(), "pw-record.ready");
     let rejected = voisu(runtime.path(), "stop");
     assert_eq!(rejected.status.code(), Some(4));
-    assert_eq!(stderr(&rejected), "Transcript Delivery failed\n");
+    assert_eq!(stderr(&rejected), "Couldn't put the text in your window\n");
     request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     server.join().unwrap();
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
     assert!(voisu(runtime.path(), "start").status.success());
 }
 
@@ -2499,7 +2499,7 @@ fn production_recording_quality_failure(script_body: &str, expected: &str) {
     let stopped = voisu(runtime.path(), "stop");
     assert_eq!(stopped.status.code(), Some(4));
     assert_eq!(stderr(&stopped), format!("{expected}\n"));
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
 
     // Every rejected Recording must leave the daemon ready for the next one.
     assert!(voisu(runtime.path(), "start").status.success());
@@ -2565,7 +2565,7 @@ fn a_capture_that_dies_silently_before_stop_never_delivers_a_transcript() {
         thread::sleep(Duration::from_millis(20));
     };
     assert!(
-        message == "Recording capture failed\n" || message == "No Recording active\n",
+        message == "Couldn't record from the microphone\n" || message == "No Recording active\n",
         "a silently dead capture must fail the Recording, got: {message}"
     );
     assert!(
@@ -2583,7 +2583,7 @@ fn a_capture_that_dies_silently_before_stop_never_delivers_a_transcript() {
 fn empty_recording_is_distinct_and_recoverable_through_the_public_cli() {
     production_recording_quality_failure(
         "#!/bin/sh\ndir=$(dirname \"$0\")\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\ni=0\nwhile [ \"$i\" -lt 60 ]; do sleep 1; i=$((i + 1)); done\n",
-        "No audio was captured",
+        "No sound recorded; check your microphone",
     );
 }
 
@@ -2591,7 +2591,7 @@ fn empty_recording_is_distinct_and_recoverable_through_the_public_cli() {
 fn too_short_recording_is_distinct_and_recoverable_through_the_public_cli() {
     production_recording_quality_failure(
         "#!/bin/sh\ndir=$(dirname \"$0\")\nprintf '\\001\\000'\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\ni=0\nwhile [ \"$i\" -lt 60 ]; do sleep 1; i=$((i + 1)); done\n",
-        "Recording is too short",
+        "Too short to transcribe",
     );
 }
 
@@ -2599,7 +2599,7 @@ fn too_short_recording_is_distinct_and_recoverable_through_the_public_cli() {
 fn silent_recording_is_distinct_and_recoverable_through_the_public_cli() {
     production_recording_quality_failure(
         "#!/bin/sh\ndir=$(dirname \"$0\")\n/usr/bin/head -c 3200 /dev/zero\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\ni=0\nwhile [ \"$i\" -lt 60 ]; do sleep 1; i=$((i + 1)); done\n",
-        "Recording contains no speech",
+        "Didn't hear any words",
     );
 }
 
@@ -2619,7 +2619,7 @@ fn status_is_responsive_and_processing_is_observable_during_provider_work() {
     let mut observed = false;
     while Instant::now() < deadline {
         let status = voisu(runtime.path(), "status");
-        if status_headline(&status) == "processing\n" {
+        if status_headline(&status) == "Working on your Transcript\n" {
             observed = true;
             break;
         }
@@ -2632,7 +2632,7 @@ fn status_is_responsive_and_processing_is_observable_during_provider_work() {
 
     let stop = stop.join().unwrap();
     assert!(stop.status.success(), "{}", stderr(&stop));
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
 }
 
 #[test]
@@ -2646,14 +2646,14 @@ fn capture_finalization_failure_is_redacted_and_the_next_recording_succeeds() {
 
     let failed = voisu(runtime.path(), "stop");
     assert_eq!(failed.status.code(), Some(4));
-    assert_eq!(stderr(&failed), "Recording capture failed\n");
+    assert_eq!(stderr(&failed), "Couldn't record from the microphone\n");
     assert!(!stderr(&failed).contains("controlled-secret"));
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
 
     assert!(voisu(runtime.path(), "start").status.success());
     let recovered = voisu(runtime.path(), "stop");
     assert!(recovered.status.success(), "{}", stderr(&recovered));
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
 }
 
 #[test]
@@ -2678,7 +2678,7 @@ fn capture_pump_panic_fails_the_recording_and_the_next_recording_succeeds() {
         stderr(&restarted)
     );
     assert_eq!(failed.status.code(), Some(4));
-    assert_eq!(stderr(&failed), "Recording capture failed\n");
+    assert_eq!(stderr(&failed), "Couldn't record from the microphone\n");
 
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     let failures = history["history"][0]["provider_failures"]
@@ -2689,7 +2689,7 @@ fn capture_pump_panic_fails_the_recording_and_the_next_recording_succeeds() {
 
     let recovered = voisu(runtime.path(), "stop");
     assert!(recovered.status.success(), "{}", stderr(&recovered));
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
 }
 
 #[test]
@@ -2704,7 +2704,7 @@ fn processing_task_panic_records_aborted_unknown_outcomes_and_rebuilds_adapters(
         stderr(&failed),
         "Recording processing failed at an unknown point\n"
     );
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
 
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     let record = &history["history"][0];
@@ -2727,7 +2727,7 @@ fn processing_task_panic_records_aborted_unknown_outcomes_and_rebuilds_adapters(
     assert!(voisu(runtime.path(), "start").status.success());
     let recovered = voisu(runtime.path(), "stop");
     assert!(recovered.status.success(), "{}", stderr(&recovered));
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
 }
 
 impl Drop for Daemon {
@@ -4602,21 +4602,21 @@ fn auth_set_replaces_a_credential_without_echoing_it() {
     let runtime = TempDir::new().unwrap();
     let first = voisu_with_secret(
         runtime.path(),
-        &["auth", "set", "groq"],
+        &["key", "set", "groq"],
         &[("VOISU_TEST_SECRET_STORE", "available")],
         "controlled-secret-one",
     );
     let replacement = voisu_with_secret(
         runtime.path(),
-        &["auth", "set", "groq"],
+        &["key", "set", "groq"],
         &[("VOISU_TEST_SECRET_STORE", "available")],
         "controlled-secret-two",
     );
 
     assert!(first.status.success(), "{}", stderr(&first));
-    assert_eq!(stdout(&first), "Groq credential stored\n");
+    assert_eq!(stdout(&first), "Groq key saved\n");
     assert!(replacement.status.success(), "{}", stderr(&replacement));
-    assert_eq!(stdout(&replacement), "Groq credential stored\n");
+    assert_eq!(stdout(&replacement), "Groq key saved\n");
     let combined = format!(
         "{}{}{}{}",
         stdout(&first),
@@ -4637,7 +4637,7 @@ fn a_locked_keyring_falls_back_to_a_0600_file_with_a_loud_warning() {
     let config_home = TempDir::new().unwrap();
     let denied = voisu_with_secret(
         runtime.path(),
-        &["auth", "set", "deepgram"],
+        &["key", "set", "deepgram"],
         &[
             ("VOISU_TEST_SECRET_STORE", "denied"),
             ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap()),
@@ -4646,7 +4646,7 @@ fn a_locked_keyring_falls_back_to_a_0600_file_with_a_loud_warning() {
     );
 
     assert!(denied.status.success(), "{}", stderr(&denied));
-    assert_eq!(stdout(&denied), "Deepgram credential stored\n");
+    assert_eq!(stdout(&denied), "Deepgram key saved\n");
     let warning = stderr(&denied);
     assert!(
         warning.contains("WARNING"),
@@ -4693,7 +4693,7 @@ fn auth_set_reports_a_surviving_plaintext_copy_instead_of_claiming_migration() {
 
     let stored = voisu_with_secret(
         runtime.path(),
-        &["auth", "set", "groq"],
+        &["key", "set", "groq"],
         &[
             ("VOISU_TEST_SECRET_STORE", "available"),
             ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap()),
@@ -4750,7 +4750,7 @@ fn auth_set_succeeds_quietly_when_a_read_only_config_dir_holds_no_plaintext_copy
 
     let stored = voisu_with_secret(
         runtime.path(),
-        &["auth", "set", "groq"],
+        &["key", "set", "groq"],
         &[
             ("VOISU_TEST_SECRET_STORE", "available"),
             ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap()),
@@ -4766,7 +4766,7 @@ fn auth_set_succeeds_quietly_when_a_read_only_config_dir_holds_no_plaintext_copy
         "a prune-free keyring store must report success: {}",
         stderr(&stored)
     );
-    assert_eq!(stdout(&stored), "Groq credential stored\n");
+    assert_eq!(stdout(&stored), "Groq key saved\n");
     assert!(
         !stderr(&stored).contains("WARNING"),
         "no plaintext copy exists, so no alarm may fire: {}",
@@ -4792,7 +4792,7 @@ fn auth_set_succeeds_quietly_when_only_the_other_providers_plaintext_line_exists
 
     let stored = voisu_with_secret(
         runtime.path(),
-        &["auth", "set", "groq"],
+        &["key", "set", "groq"],
         &[
             ("VOISU_TEST_SECRET_STORE", "available"),
             ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap()),
@@ -4808,7 +4808,7 @@ fn auth_set_succeeds_quietly_when_only_the_other_providers_plaintext_line_exists
         "no Groq plaintext line exists, so the store must report success: {}",
         stderr(&stored)
     );
-    assert_eq!(stdout(&stored), "Groq credential stored\n");
+    assert_eq!(stdout(&stored), "Groq key saved\n");
     assert!(
         !stderr(&stored).contains("WARNING"),
         "another provider's line must not raise this provider's alarm: {}",
@@ -4831,7 +4831,7 @@ fn a_credential_stored_in_the_fallback_file_is_loaded_back() {
     let config = config_home.path().to_str().unwrap();
     let stored = voisu_with_secret(
         runtime.path(),
-        &["auth", "set", "groq"],
+        &["key", "set", "groq"],
         &[
             ("VOISU_TEST_SECRET_STORE", "unavailable"),
             ("XDG_CONFIG_HOME", config),
@@ -4847,7 +4847,7 @@ fn a_credential_stored_in_the_fallback_file_is_loaded_back() {
 
     let verified = voisu_with_env(
         runtime.path(),
-        &["auth", "verify", "groq"],
+        &["key", "check", "groq"],
         &[
             ("VOISU_TEST_SECRET_STORE", "unavailable"),
             ("XDG_CONFIG_HOME", config),
@@ -4855,7 +4855,7 @@ fn a_credential_stored_in_the_fallback_file_is_loaded_back() {
         ],
     );
     assert!(verified.status.success(), "{}", stderr(&verified));
-    assert_eq!(stdout(&verified), "Groq authentication verified\n");
+    assert_eq!(stdout(&verified), "Groq key works\n");
 }
 
 #[test]
@@ -4969,7 +4969,7 @@ fn auth_set_writes_exact_credential_bytes_and_isolates_secret_tool_environment()
     let credential = "credential-without-a-newline";
     let stored = voisu_with_secret(
         runtime.path(),
-        &["auth", "set", "groq"],
+        &["key", "set", "groq"],
         &[
             ("PATH", &commands.path()),
             ("VOISU_GROQ_API_KEY", "parent-groq-key"),
@@ -5002,7 +5002,7 @@ fn auth_set_bounds_a_stalled_or_missing_secret_tool_then_falls_back_without_leak
     let started = Instant::now();
     let stalled = voisu_with_secret(
         runtime.path(),
-        &["auth", "set", "groq"],
+        &["key", "set", "groq"],
         &[
             ("PATH", &commands.path()),
             ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap()),
@@ -5026,7 +5026,7 @@ fn auth_set_bounds_a_stalled_or_missing_secret_tool_then_falls_back_without_leak
     let missing_config = TempDir::new().unwrap();
     let missing = voisu_with_secret(
         runtime.path(),
-        &["auth", "set", "groq"],
+        &["key", "set", "groq"],
         &[
             ("PATH", runtime.path().to_str().unwrap()),
             ("XDG_CONFIG_HOME", missing_config.path().to_str().unwrap()),
@@ -5070,7 +5070,7 @@ fn auth_set_retries_an_activating_keyring_within_budget_then_falls_back() {
     let started = Instant::now();
     let stored = voisu_with_secret(
         runtime.path(),
-        &["auth", "set", "groq"],
+        &["key", "set", "groq"],
         &[
             ("PATH", &path),
             ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap()),
@@ -5140,7 +5140,7 @@ fn auth_verify_recovers_from_a_transient_secret_service_lookup_denial() {
     let verified = voisu_isolated(
         runtime.path(),
         config_home.path(),
-        &["auth", "verify", "groq"],
+        &["key", "check", "groq"],
         &[
             ("PATH", &path),
             ("VOISU_TEST_KEYRING_RETRY_MS", "0"),
@@ -5155,7 +5155,7 @@ fn auth_verify_recovers_from_a_transient_secret_service_lookup_denial() {
         "a transient denial must recover, not fail the activation: {}",
         stderr(&verified)
     );
-    assert_eq!(stdout(&verified), "Groq authentication verified\n");
+    assert_eq!(stdout(&verified), "Groq key works\n");
     assert!(
         started.elapsed() < Duration::from_secs(4),
         "the load retry must stay bounded"
@@ -5202,7 +5202,7 @@ fn auth_verify_surfaces_the_loud_failure_when_a_lookup_denial_persists() {
     let denied = voisu_isolated(
         runtime.path(),
         config_home.path(),
-        &["auth", "verify", "groq"],
+        &["key", "check", "groq"],
         &[("PATH", &path), ("VOISU_TEST_KEYRING_RETRY_MS", "0")],
     );
 
@@ -5259,14 +5259,14 @@ fn auth_verify_does_not_retry_a_clean_no_match_lookup() {
     let absent = voisu_isolated(
         runtime.path(),
         config_home.path(),
-        &["auth", "verify", "groq"],
+        &["key", "check", "groq"],
         &[("PATH", &path), ("VOISU_TEST_KEYRING_RETRY_MS", "0")],
     );
 
     assert_eq!(absent.status.code(), Some(4));
     assert!(
         stderr(&absent).contains(
-            "Secret storage is unavailable; set VOISU_GROQ_API_KEY or VOISU_DEEPGRAM_API_KEY"
+            "Can't read your keys from the keyring; set VOISU_GROQ_API_KEY or VOISU_DEEPGRAM_API_KEY"
         ),
         "a clean no-match must surface the env-var setup guidance: {}",
         stderr(&absent)
@@ -5294,7 +5294,7 @@ fn auth_set_bounds_a_child_that_never_drains_a_large_stdin() {
     let started = Instant::now();
     let stalled = voisu_with_secret(
         runtime.path(),
-        &["auth", "set", "groq"],
+        &["key", "set", "groq"],
         &[
             ("PATH", &commands.path()),
             ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap()),
@@ -5322,7 +5322,7 @@ fn auth_set_is_bounded_when_a_descendant_holds_the_pipes_past_child_exit() {
     let started = Instant::now();
     let held = voisu_with_secret(
         runtime.path(),
-        &["auth", "set", "groq"],
+        &["key", "set", "groq"],
         &[
             ("PATH", &commands.path()),
             ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap()),
@@ -5367,7 +5367,7 @@ fn auth_set_is_bounded_when_the_child_crashes_while_a_descendant_holds_the_pipes
     let started = Instant::now();
     let crashed = voisu_with_secret(
         runtime.path(),
-        &["auth", "set", "groq"],
+        &["key", "set", "groq"],
         &[
             ("PATH", &commands.path()),
             ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap()),
@@ -5393,12 +5393,12 @@ fn auth_set_caps_retained_diagnostics_from_a_noisy_child_without_leaking_them() 
     let started = Instant::now();
     let stored = voisu_with_secret(
         runtime.path(),
-        &["auth", "set", "groq"],
+        &["key", "set", "groq"],
         &[("PATH", &commands.path())],
         "controlled-secret",
     );
     assert!(stored.status.success(), "{}", stderr(&stored));
-    assert_eq!(stdout(&stored), "Groq credential stored\n");
+    assert_eq!(stdout(&stored), "Groq key saved\n");
     assert!(
         started.elapsed() < Duration::from_secs(4),
         "noisy stderr must be drained within the budget, elapsed {:?}",
@@ -5416,7 +5416,7 @@ fn auth_verify_checks_each_provider_without_retaining_or_printing_response_conte
     let runtime = TempDir::new().unwrap();
     let groq = voisu_with_env(
         runtime.path(),
-        &["auth", "verify", "groq"],
+        &["key", "check", "groq"],
         &[
             ("VOISU_TEST_SECRET_STORE", "denied"),
             ("VOISU_GROQ_API_KEY", "controlled-secret"),
@@ -5425,7 +5425,7 @@ fn auth_verify_checks_each_provider_without_retaining_or_printing_response_conte
     );
     let deepgram = voisu_with_env(
         runtime.path(),
-        &["auth", "verify", "deepgram"],
+        &["key", "check", "deepgram"],
         &[
             ("VOISU_TEST_SECRET_STORE", "available"),
             ("VOISU_TEST_STORED_DEEPGRAM_CREDENTIAL", "controlled-secret"),
@@ -5434,15 +5434,15 @@ fn auth_verify_checks_each_provider_without_retaining_or_printing_response_conte
     );
 
     assert!(groq.status.success(), "{}", stderr(&groq));
-    assert_eq!(stdout(&groq), "Groq authentication verified\n");
+    assert_eq!(stdout(&groq), "Groq key works\n");
     assert_eq!(deepgram.status.code(), Some(4));
     assert!(
-        stderr(&groq).contains("Cloud credential-maintenance"),
+        stderr(&groq).contains("Checking your key online"),
         "{}",
         stderr(&groq)
     );
     assert!(
-        stderr(&deepgram).contains("Cloud credential-maintenance"),
+        stderr(&deepgram).contains("Checking your key online"),
         "{}",
         stderr(&deepgram)
     );
@@ -5469,7 +5469,7 @@ fn auth_verify_requires_2xx_discards_response_and_isolates_curl_environment() {
     commands.touch("curl.redirect");
     let verified = voisu_with_env(
         runtime.path(),
-        &["auth", "verify", "groq"],
+        &["key", "check", "groq"],
         &[
             ("PATH", &commands.path()),
             ("VOISU_GROQ_API_KEY", "parent-groq-key"),
@@ -5484,7 +5484,7 @@ fn auth_verify_requires_2xx_discards_response_and_isolates_curl_environment() {
         "a redirect is not an authenticated API response"
     );
     assert!(
-        stderr(&verified).contains("Cloud credential-maintenance"),
+        stderr(&verified).contains("Checking your key online"),
         "{}",
         stderr(&verified)
     );
@@ -5513,7 +5513,7 @@ fn auth_verify_escapes_credential_before_writing_curl_configuration() {
     let credential = r#"quote"and\slash"#;
     let verified = voisu_with_env(
         runtime.path(),
-        &["auth", "verify", "groq"],
+        &["key", "check", "groq"],
         &[
             ("PATH", &commands.path()),
             ("VOISU_GROQ_API_KEY", credential),
@@ -5537,7 +5537,7 @@ fn auth_verify_bounds_stalled_curl_without_leaking_the_credential() {
     let started = Instant::now();
     let stalled = voisu_with_env(
         runtime.path(),
-        &["auth", "verify", "groq"],
+        &["key", "check", "groq"],
         &[
             ("PATH", &commands.path()),
             ("VOISU_GROQ_API_KEY", "controlled-secret"),
@@ -5562,7 +5562,7 @@ fn status_distinguishes_daemon_unavailable_from_idle() {
     let _daemon = Daemon::start(runtime.path());
     let idle = voisu(runtime.path(), "status");
     assert!(idle.status.success(), "{}", stderr(&idle));
-    assert_eq!(status_headline(&idle), "idle\n");
+    assert_eq!(status_headline(&idle), "Ready\n");
 }
 
 const OVERLAY_STATUS: &str = r#"{"version":1,"command":"overlaystatus"}"#;
@@ -5578,7 +5578,7 @@ fn overlay_status_carries_the_delivered_event_while_lifecycle_responses_do_not()
     assert!(idle.get("overlay_event").is_none());
 
     // Normal CLI Status is unchanged by the observer path.
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
     assert!(voisu(runtime.path(), "start").status.success());
 
     // The lifecycle Stop response must NOT carry the observer payload; the
@@ -5601,7 +5601,7 @@ fn overlay_status_carries_the_delivered_event_while_lifecycle_responses_do_not()
         again["overlay_event"]["id"],
         observed["overlay_event"]["id"]
     );
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
 }
 
 #[test]
@@ -5632,7 +5632,7 @@ fn overlay_status_confirms_delivery_while_the_recording_is_still_processing() {
     };
     let event = &early["overlay_event"];
     assert_eq!(event["outcome"], "delivered", "{early}");
-    assert_eq!(event["message"], "Delivered", "{early}");
+    assert_eq!(event["message"], "Pasted", "{early}");
     assert_eq!(
         event["correlation_id"], early["evidence"]["correlation_id"],
         "the early event names the Recording it confirms: {early}"
@@ -5695,7 +5695,7 @@ fn overlay_status_classifies_a_guardrail_quality_failure() {
     assert!(voisu(runtime.path(), "start").status.success());
     let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
     assert_eq!(stopped["ok"], false, "{stopped}");
-    assert_eq!(stopped["message"], "Transcript failed quality validation");
+    assert_eq!(stopped["message"], "Held back text that looked wrong");
     assert!(stopped.get("overlay_event").is_none(), "{stopped}");
 
     let observed = ipc_request(runtime.path(), OVERLAY_STATUS);
@@ -5716,7 +5716,7 @@ fn overlay_status_classifies_a_non_guardrail_capture_failure() {
     assert!(voisu(runtime.path(), "start").status.success());
     let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
     assert_eq!(stopped["ok"], false, "{stopped}");
-    assert_eq!(stopped["message"], "Recording capture failed");
+    assert_eq!(stopped["message"], "Couldn't record from the microphone");
     assert!(stopped.get("overlay_event").is_none(), "{stopped}");
 
     let observed = ipc_request(runtime.path(), OVERLAY_STATUS);
@@ -5819,7 +5819,7 @@ fn an_unknown_observer_command_is_rejected_without_disturbing_the_daemon() {
         "unknown command was not rejected: {response}"
     );
 
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
 }
 
 #[test]
@@ -5991,7 +5991,7 @@ fn concurrent_start_begins_exactly_one_recording() {
     for _ in 0..2 {
         let stop = voisu(runtime.path(), "stop");
         assert!(stop.status.success(), "{}", stderr(&stop));
-        assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+        assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
 
         let start = voisu(runtime.path(), "start");
         assert!(start.status.success(), "{}", stderr(&start));
@@ -6002,7 +6002,7 @@ fn concurrent_start_begins_exactly_one_recording() {
     }
     let stop = voisu(runtime.path(), "stop");
     assert!(stop.status.success(), "{}", stderr(&stop));
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
 }
 
 #[test]
@@ -6016,10 +6016,7 @@ fn stop_completes_recording_and_delivery_then_returns_to_idle() {
 
     let stop = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
     assert_eq!(stop["ok"], true);
-    assert_eq!(
-        stop["message"],
-        "Transcript submitted through the compositor; preserved on the clipboard"
-    );
+    assert_eq!(stop["message"], "Pasted. Also on your clipboard.");
     assert_eq!(
         stop["evidence"]["stages"],
         serde_json::json!([
@@ -6035,7 +6032,7 @@ fn stop_completes_recording_and_delivery_then_returns_to_idle() {
 
     let status = voisu(runtime.path(), "status");
     assert!(status.status.success(), "{}", stderr(&status));
-    assert_eq!(status_headline(&status), "idle\n");
+    assert_eq!(status_headline(&status), "Ready\n");
 }
 
 #[test]
@@ -6052,7 +6049,7 @@ fn unavailable_direct_delivery_reports_that_the_transcript_is_on_the_clipboard()
     assert!(stopped.status.success(), "{}", stderr(&stopped));
     assert_eq!(
         stdout(&stopped),
-        "Direct Delivery unavailable; Transcript is on the clipboard\n"
+        "Couldn't paste; text is on your clipboard (permission denied)\n"
     );
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     let record = &history["history"][0];
@@ -6067,7 +6064,7 @@ fn unavailable_direct_delivery_reports_that_the_transcript_is_on_the_clipboard()
     assert_eq!(observed["overlay_event"]["outcome"], "copied", "{observed}");
     assert_eq!(
         observed["overlay_event"]["message"],
-        "Direct Delivery unavailable; Transcript is on the clipboard",
+        "Couldn't paste; text is on your clipboard (permission denied)",
         "{observed}"
     );
 }
@@ -6088,7 +6085,7 @@ fn one_valid_source_transcript_delivers_once_when_the_other_provider_fails() {
         stopped["evidence"]["source_transcript_providers"],
         serde_json::json!(["deepgram"])
     );
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
 }
 
 #[test]
@@ -6469,7 +6466,7 @@ fn stale_correlation_after_formatting_is_refused_at_delivery() {
         stopped["message"]
             .as_str()
             .unwrap()
-            .contains("Delivery failed"),
+            .contains("Couldn't put the text in your window"),
         "{stopped}"
     );
 }
@@ -6650,7 +6647,7 @@ fn failed_recovery_reports_quality_failure_when_neither_source_is_safe() {
     let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
 
     assert_eq!(stopped["ok"], false, "{stopped}");
-    assert_eq!(stopped["message"], "Transcript failed quality validation");
+    assert_eq!(stopped["message"], "Held back text that looked wrong");
     assert_eq!(stopped["evidence"]["delivery_count"], 0);
     assert_eq!(stopped["evidence"]["reconciliation_requested"], true);
     assert_eq!(stopped["evidence"]["recovery_attempted"], true);
@@ -6987,7 +6984,7 @@ fi
     );
     assert_eq!(stopped["evidence"]["transcript_selection"], "source_groq");
     assert!(commands.path().join("reconciliation.started").exists());
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
     let pid = fs::read_to_string(commands.path().join("reconciliation.pid")).unwrap();
     assert!(
         !Path::new(&format!("/proc/{}", pid.trim())).exists(),
@@ -7080,7 +7077,7 @@ printf '{"text":"Groq wins"}'
         stopped["evidence"]["source_transcript_providers"],
         serde_json::json!(["groq"])
     );
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
     // The gated abort closes the websocket BEFORE the daemon acknowledges and
     // Idle becomes observable, so at this point the close is already on the
     // wire: only the mock's cross-thread observation lag is granted, not an
@@ -7150,7 +7147,7 @@ printf '{"text":"Groq wins"}'
         stopped["evidence"]["source_transcript_providers"],
         serde_json::json!(["groq"])
     );
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
     // The failed stream's websocket is torn down before Idle is observable,
     // not left dangling; only observation lag is granted.
     assert_marker_appears_within(
@@ -7272,11 +7269,8 @@ fn toggle_has_the_same_observable_transitions_as_start_then_stop() {
 
     let stop = voisu(runtime.path(), "toggle");
     assert!(stop.status.success(), "{}", stderr(&stop));
-    assert_eq!(
-        stdout(&stop),
-        "Transcript submitted through the compositor; preserved on the clipboard\n"
-    );
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(stdout(&stop), "Pasted. Also on your clipboard.\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
 }
 
 /// A private D-Bus session bus for one test: a real `dbus-daemon` in an
@@ -8019,7 +8013,7 @@ fn trigger_key_first_activation_starts_and_next_activation_stops_the_recording()
     wait_for_status(runtime.path(), "Recording\n");
 
     portal.activate();
-    wait_for_status(runtime.path(), "idle\n");
+    wait_for_status(runtime.path(), "Ready\n");
 
     // The Recording that the Trigger Key drove delivered exactly once.
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
@@ -8129,7 +8123,7 @@ fn concurrent_trigger_key_activations_cannot_overlap_recordings() {
         let records = history["history"].as_array().unwrap();
         if records.len() == 2
             && records.iter().all(|record| record["delivery_count"] == 1)
-            && status_headline(&voisu(runtime.path(), "status")) == "idle\n"
+            && status_headline(&voisu(runtime.path(), "status")) == "Ready\n"
         {
             return;
         }
@@ -8187,12 +8181,11 @@ fn forgotten_trigger_key_recording_is_stopped_by_the_recording_deadline() {
         );
         thread::sleep(Duration::from_millis(10));
     }
-    wait_for_status(runtime.path(), "idle\n");
+    wait_for_status(runtime.path(), "Ready\n");
 
     let diagnostics = daemon.terminate_and_stderr();
     assert!(
-        diagnostics
-            .contains("Recording 1: Delivered, but the Recording was truncated; check the end"),
+        diagnostics.contains("Recording 1: Pasted. Recording was cut off; check the end"),
         "{diagnostics}"
     );
 }
@@ -8221,7 +8214,7 @@ fn deadline_at_the_buffer_ceiling_delivers_retained_audio_as_truncated() {
         stdout(&voisu(runtime.path(), "start")),
         "Recording started\n"
     );
-    wait_for_status(runtime.path(), "idle\n");
+    wait_for_status(runtime.path(), "Ready\n");
 
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     let record = &history["history"][0];
@@ -8238,8 +8231,7 @@ fn deadline_at_the_buffer_ceiling_delivers_retained_audio_as_truncated() {
         "{observed}"
     );
     assert_eq!(
-        observed["overlay_event"]["message"],
-        "Delivered, but the Recording was truncated; check the end",
+        observed["overlay_event"]["message"], "Pasted. Recording was cut off; check the end",
         "{observed}"
     );
 
@@ -8248,8 +8240,7 @@ fn deadline_at_the_buffer_ceiling_delivers_retained_audio_as_truncated() {
     // pairs each Recording with its activation lines when diagnosing a report.
     let diagnostics = daemon.terminate_and_stderr();
     assert!(
-        diagnostics
-            .contains("Recording 1: Delivered, but the Recording was truncated; check the end"),
+        diagnostics.contains("Recording 1: Pasted. Recording was cut off; check the end"),
         "{diagnostics}"
     );
     assert!(
@@ -8281,7 +8272,7 @@ fn synthetic_pcm_past_the_buffer_cap_delivers_a_non_empty_transcript() {
         stdout(&voisu(runtime.path(), "start")),
         "Recording started\n"
     );
-    wait_for_status(runtime.path(), "idle\n");
+    wait_for_status(runtime.path(), "Ready\n");
 
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     let record = &history["history"][0];
@@ -8309,7 +8300,7 @@ fn buffer_truncation_is_diagnosed_and_warns_through_the_delivered_outcome() {
         stdout(&voisu(runtime.path(), "start")),
         "Recording started\n"
     );
-    wait_for_status(runtime.path(), "idle\n");
+    wait_for_status(runtime.path(), "Ready\n");
 
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     assert_eq!(history["history"][0]["truncated_by"], "buffer", "{history}");
@@ -8320,8 +8311,7 @@ fn buffer_truncation_is_diagnosed_and_warns_through_the_delivered_outcome() {
         "{observed}"
     );
     assert_eq!(
-        observed["overlay_event"]["message"],
-        "Delivered, but the Recording was truncated; check the end",
+        observed["overlay_event"]["message"], "Pasted. Recording was cut off; check the end",
         "{observed}"
     );
 }
@@ -8397,7 +8387,7 @@ exit 1
         );
         thread::sleep(Duration::from_millis(10));
     }
-    wait_for_status(runtime.path(), "idle\n");
+    wait_for_status(runtime.path(), "Ready\n");
 
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     let record = &history["history"][0];
@@ -8460,12 +8450,11 @@ fn self_terminating_recording_publishes_a_terminal_outcome_and_operator_line() {
         );
         thread::sleep(Duration::from_millis(10));
     }
-    wait_for_status(runtime.path(), "idle\n");
+    wait_for_status(runtime.path(), "Ready\n");
 
     let diagnostics = daemon.terminate_and_stderr();
     assert!(
-        diagnostics
-            .contains("Recording 1: Delivered, but the Recording was truncated; check the end"),
+        diagnostics.contains("Recording 1: Pasted. Recording was cut off; check the end"),
         "{diagnostics}"
     );
 }
@@ -8509,13 +8498,13 @@ fn clipboard_fallback_preserves_delivery_info_and_warns_of_truncation() {
         );
         thread::sleep(Duration::from_millis(10));
     }
-    wait_for_status(runtime.path(), "idle\n");
+    wait_for_status(runtime.path(), "Ready\n");
 
     let diagnostics = daemon.terminate_and_stderr();
     assert!(
         diagnostics.contains(
-            "Recording 1: Direct Delivery unavailable; Transcript is on the clipboard, \
-             but the Recording was truncated; check the end"
+            "Recording 1: Couldn't paste; text is on your clipboard (permission denied). \
+             Recording was cut off; check the end"
         ),
         "{diagnostics}"
     );
@@ -8547,9 +8536,9 @@ fn trigger_key_permission_denial_leaves_cli_control_usable() {
     );
     assert_eq!(
         stdout(&voisu(runtime.path(), "toggle")),
-        "Transcript submitted through the compositor; preserved on the clipboard\n"
+        "Pasted. Also on your clipboard.\n"
     );
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
 
     // The denied bind must not leak the already-created portal session: the
     // daemon closes it, observable as a real Session.Close on the mock.
@@ -8565,7 +8554,7 @@ fn trigger_key_permission_denial_leaves_cli_control_usable() {
 
     let diagnostics = daemon.terminate_and_stderr();
     assert!(
-        diagnostics.contains("Trigger Key binding is unavailable"),
+        diagnostics.contains("Couldn't set up your Trigger Key"),
         "{diagnostics}"
     );
 }
@@ -8606,9 +8595,9 @@ fn trigger_key_portal_revocation_leaves_cli_control_usable() {
     assert!(stopped.status.success(), "{}", stderr(&stopped));
     assert_eq!(
         stdout(&stopped),
-        "Direct Delivery unavailable; Transcript is on the clipboard\n"
+        "Couldn't paste; text is on your clipboard (pasting turned off by VOISU_DISABLE_DIRECT_DELIVERY)\n"
     );
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
     assert_eq!(
         fs::read_to_string(commands.path().join("clipboard")).unwrap(),
         "Portal recovery Transcript."
@@ -8636,7 +8625,7 @@ fn trigger_key_portal_revocation_leaves_cli_control_usable() {
         "{diagnostics}"
     );
     assert!(
-        diagnostics.contains("Trigger Key binding is unavailable"),
+        diagnostics.contains("Couldn't set up your Trigger Key"),
         "{diagnostics}"
     );
 }
@@ -8668,7 +8657,7 @@ fn portal_restart_clears_the_stale_binding_and_rebinds_the_trigger_key() {
     wait_for_status(runtime.path(), "Recording\n");
     wait_for_portal_capture(commands.path());
     portal.activate();
-    wait_for_status(runtime.path(), "idle\n");
+    wait_for_status(runtime.path(), "Ready\n");
     assert_eq!(
         fs::read_to_string(commands.path().join("clipboard")).unwrap(),
         "Portal recovery Transcript."
@@ -8684,7 +8673,7 @@ fn portal_restart_clears_the_stale_binding_and_rebinds_the_trigger_key() {
     assert!(stopped.status.success(), "{}", stderr(&stopped));
     assert_eq!(
         stdout(&stopped),
-        "Direct Delivery unavailable; Transcript is on the clipboard\n"
+        "Couldn't paste; text is on your clipboard (pasting turned off by VOISU_DISABLE_DIRECT_DELIVERY)\n"
     );
     assert_eq!(
         fs::read_to_string(commands.path().join("clipboard")).unwrap(),
@@ -8721,7 +8710,7 @@ fn divergent_portal_request_and_session_handles_are_honored() {
     portal.activate();
     wait_for_status(runtime.path(), "Recording\n");
     portal.activate();
-    wait_for_status(runtime.path(), "idle\n");
+    wait_for_status(runtime.path(), "Ready\n");
 }
 
 #[test]
@@ -8745,13 +8734,13 @@ fn unavailable_portal_leaves_cli_control_usable() {
     );
     assert_eq!(
         stdout(&voisu(runtime.path(), "toggle")),
-        "Transcript submitted through the compositor; preserved on the clipboard\n"
+        "Pasted. Also on your clipboard.\n"
     );
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
 
     let diagnostics = daemon.terminate_and_stderr();
     assert!(
-        diagnostics.contains("Trigger Key binding is unavailable"),
+        diagnostics.contains("Couldn't set up your Trigger Key"),
         "{diagnostics}"
     );
 }
@@ -8783,9 +8772,9 @@ fn trigger_key_binds_without_restart_once_the_portal_becomes_available() {
     );
     assert_eq!(
         stdout(&voisu(runtime.path(), "toggle")),
-        "Transcript submitted through the compositor; preserved on the clipboard\n"
+        "Pasted. Also on your clipboard.\n"
     );
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
 
     // The portal comes up: the daemon must bind the Trigger Key on its own, with
     // NO restart, and the Trigger Key must then drive Recordings.
@@ -8795,7 +8784,7 @@ fn trigger_key_binds_without_restart_once_the_portal_becomes_available() {
     portal.activate();
     wait_for_status(runtime.path(), "Recording\n");
     portal.activate();
-    wait_for_status(runtime.path(), "idle\n");
+    wait_for_status(runtime.path(), "Ready\n");
 }
 
 #[test]
@@ -8827,7 +8816,7 @@ fn trigger_key_rebinds_after_the_activation_stream_drops() {
     portal.activate();
     wait_for_status(runtime.path(), "Recording\n");
     portal.activate();
-    wait_for_status(runtime.path(), "idle\n");
+    wait_for_status(runtime.path(), "Ready\n");
 
     let diagnostics = daemon.terminate_and_stderr();
     assert!(
@@ -8865,7 +8854,7 @@ fn session_closed_rebinds_the_trigger_key_without_a_restart() {
     portal.activate();
     wait_for_status(runtime.path(), "Recording\n");
     portal.activate();
-    wait_for_status(runtime.path(), "idle\n");
+    wait_for_status(runtime.path(), "Ready\n");
 }
 
 #[test]
@@ -8891,7 +8880,7 @@ fn trigger_key_binds_after_a_transient_bind_interruption() {
     portal.activate();
     wait_for_status(runtime.path(), "Recording\n");
     portal.activate();
-    wait_for_status(runtime.path(), "idle\n");
+    wait_for_status(runtime.path(), "Ready\n");
 }
 
 #[test]
@@ -8904,7 +8893,7 @@ fn injected_xdg_runtime_dirs_are_isolated() {
     assert!(!socket_path(other_runtime.path()).exists());
     assert_eq!(
         status_headline(&voisu(active_runtime.path(), "status")),
-        "idle\n"
+        "Ready\n"
     );
 
     let unavailable = voisu(other_runtime.path(), "status");
@@ -8953,7 +8942,7 @@ fn protocol_version_mismatches_are_rejected_by_daemon_and_cli() {
     assert!(!status.status.success());
     assert_eq!(
         stderr(&status),
-        "IPC protocol mismatch: daemon uses 999, CLI uses 1\n"
+        "Voisu needs a restart to match this version: voisu service restart (service protocol 999, command protocol 1)\n"
     );
 }
 
@@ -9072,7 +9061,7 @@ fn sigterm_cleans_up_and_a_crash_leaves_a_safely_recoverable_socket() {
     Daemon::start(runtime.path()).crash();
     assert!(path.exists(), "SIGKILL should leave a stale socket fixture");
     let replacement = Daemon::start(runtime.path());
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
     drop(replacement);
 }
 
@@ -9159,7 +9148,7 @@ exec setsid sleep infinity
     }
 
     let replacement = Daemon::start(runtime.path());
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
     assert!(voisu(runtime.path(), "start").status.success());
     assert!(voisu(runtime.path(), "stop").status.success());
     replacement.terminate();
@@ -9283,7 +9272,7 @@ fn single_instance_rejection_preserves_the_live_daemon_and_cleanup_owns_one_inod
         .unwrap();
     assert!(!second.status.success());
     assert_eq!(stderr(&second), "voisu-daemon is already running\n");
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
 
     let original_inode = fs::symlink_metadata(&path).unwrap().ino();
     fs::remove_file(&path).unwrap();
@@ -9385,7 +9374,7 @@ fn live_chunks_flow_to_providers_during_the_recording_not_only_after_stop() {
         stop["evidence"]["streamed_chunk_count"].as_u64().unwrap() >= streamed_during,
         "final evidence must retain the streamed chunk count"
     );
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
 }
 
 #[test]
@@ -9404,9 +9393,9 @@ fn partial_provider_start_failure_aborts_the_capture_and_surfaces_abort_errors()
     // must abort the capture and reject with a redacted public message.
     let failed = voisu(runtime.path(), "start");
     assert_eq!(failed.status.code(), Some(4));
-    assert_eq!(stderr(&failed), "Source Transcripts are unavailable\n");
+    assert_eq!(stderr(&failed), "Couldn't reach Groq or Deepgram\n");
     assert!(!stderr(&failed).contains("controlled"));
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
 
     // The one-shot provider failure is spent, so the next Recording proves the
     // aborted resources were left in a clean, reusable state.
@@ -9441,7 +9430,7 @@ fn start_during_recovery_is_rejected_retryably_then_succeeds() {
     // recovery until the bounded abort timeout acknowledges completion.
     let failed = voisu(runtime.path(), "start");
     assert_eq!(failed.status.code(), Some(4));
-    assert_eq!(stderr(&failed), "Source Transcripts are unavailable\n");
+    assert_eq!(stderr(&failed), "Couldn't reach Groq or Deepgram\n");
 
     // During recovery the daemon is publicly idle and Start is rejected with a
     // distinct retryable message rather than deferred: no reordering against
@@ -9452,7 +9441,7 @@ fn start_during_recovery_is_rejected_retryably_then_succeeds() {
         stderr(&rejected),
         "Recording recovery in progress; retry shortly\n"
     );
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
 
     // Once the bounded abort acknowledges, the next Recording succeeds.
     let restarted = start_recording_when_recovered(runtime.path());
@@ -9529,7 +9518,7 @@ while [ "$i" -lt 600 ]; do sleep 0.1; i=$((i + 1)); done
     // the tokio task that awaits it (a detached blocking curl would keep
     // running for up to 14s, overlapping the next Recording).
     let idle_deadline = Instant::now() + Duration::from_secs(8);
-    while status_headline(&voisu(runtime.path(), "status")) != "idle\n" {
+    while status_headline(&voisu(runtime.path(), "status")) != "Ready\n" {
         assert!(
             Instant::now() < idle_deadline,
             "failed Recording must recover to idle"
@@ -9642,7 +9631,7 @@ while [ "$i" -lt 600 ]; do sleep 0.1; i=$((i + 1)); done
     // Only after the stale finalize request is provably dead does the daemon
     // return to idle and accept the next Recording.
     let idle_deadline = Instant::now() + Duration::from_secs(8);
-    while status_headline(&voisu(runtime.path(), "status")) != "idle\n" {
+    while status_headline(&voisu(runtime.path(), "status")) != "Ready\n" {
         assert!(
             Instant::now() < idle_deadline,
             "failed Recording must recover to idle"
@@ -9718,7 +9707,7 @@ printf '{"text":"unused Groq Source Transcript"}'
     // the sibling Groq test above and costs nothing on a healthy host: the poll
     // returns as soon as idle is observed.
     let idle_deadline = Instant::now() + Duration::from_secs(8);
-    while status_headline(&voisu(runtime.path(), "status")) != "idle\n" {
+    while status_headline(&voisu(runtime.path(), "status")) != "Ready\n" {
         assert!(
             Instant::now() < idle_deadline,
             "failed Recording must recover to idle"
@@ -9745,8 +9734,8 @@ fn capture_finalization_abort_failure_is_surfaced_into_diagnostics() {
 
     let failed = voisu(runtime.path(), "stop");
     assert_eq!(failed.status.code(), Some(4));
-    assert_eq!(stderr(&failed), "Recording capture failed\n");
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(stderr(&failed), "Couldn't record from the microphone\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
 
     let diagnostics = daemon.terminate_and_stderr();
     assert!(
@@ -9775,8 +9764,8 @@ fn provider_work_is_aborted_not_dropped_when_the_recording_capture_fails() {
     // observable in local diagnostics.
     let failed = voisu(runtime.path(), "stop");
     assert_eq!(failed.status.code(), Some(4));
-    assert_eq!(stderr(&failed), "Recording capture failed\n");
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(stderr(&failed), "Couldn't record from the microphone\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
 
     // The next Recording must succeed after the aborted one.
     assert!(voisu(runtime.path(), "start").status.success());
@@ -9803,8 +9792,8 @@ fn repeated_failures_never_deliver_and_the_next_recording_delivers_once() {
         assert!(voisu(runtime.path(), "start").status.success());
         let failed = voisu(runtime.path(), "stop");
         assert_eq!(failed.status.code(), Some(4));
-        assert_eq!(stderr(&failed), "Recording capture failed\n");
-        assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+        assert_eq!(stderr(&failed), "Couldn't record from the microphone\n");
+        assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
     }
 
     assert!(voisu(runtime.path(), "start").status.success());
@@ -9848,7 +9837,7 @@ fn cli_termination_during_stop_cannot_abandon_the_daemon_or_duplicate_delivery()
     let mut stop = stop.spawn().unwrap();
 
     let processing_deadline = Instant::now() + Duration::from_secs(2);
-    while status_headline(&voisu(runtime.path(), "status")) != "processing\n" {
+    while status_headline(&voisu(runtime.path(), "status")) != "Working on your Transcript\n" {
         assert!(
             Instant::now() < processing_deadline,
             "daemon never accepted Stop before CLI termination"
@@ -9858,7 +9847,7 @@ fn cli_termination_during_stop_cannot_abandon_the_daemon_or_duplicate_delivery()
     stop.kill().unwrap();
     let _ = stop.wait();
 
-    wait_for_status(runtime.path(), "idle\n");
+    wait_for_status(runtime.path(), "Ready\n");
     let history = ipc_request(runtime.path(), r#"{"version":1,"command":"history"}"#);
     let records = history["history"].as_array().unwrap();
     assert_eq!(records.len(), 1, "{history}");
@@ -10047,7 +10036,7 @@ fn a_stalled_provider_send_does_not_prevent_stop_from_completing() {
         elapsed < Duration::from_secs(5),
         "stop must not wait on a stalled provider send, elapsed {elapsed:?}"
     );
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
 }
 
 #[test]
@@ -10074,7 +10063,7 @@ fn a_stalled_partial_start_abort_keeps_the_daemon_responsive() {
     );
 
     let status_started = Instant::now();
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
     assert!(
         status_started.elapsed() < Duration::from_millis(1500),
         "status must stay responsive while the abort is stalled"
@@ -10118,7 +10107,7 @@ fn cli_reports_version_mismatch_from_the_envelope_even_for_incompatible_payloads
     assert!(!status.status.success());
     assert_eq!(
         stderr(&status),
-        "IPC protocol mismatch: daemon uses 999, CLI uses 1\n"
+        "Voisu needs a restart to match this version: voisu service restart (service protocol 999, command protocol 1)\n"
     );
 }
 
@@ -10131,7 +10120,7 @@ fn oversized_and_slow_frames_do_not_block_or_kill_the_daemon() {
     let mut slow = UnixStream::connect(&path).unwrap();
     slow.write_all(b"{\"version\":2").unwrap();
     let status_started = Instant::now();
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
     // A daemon that blocked on the slow frame would stall Status for the slow
     // connection's ~2 s read deadline, so the outer bound must stay well below
     // that while still tolerating contended-runner spawn latency.
@@ -10156,7 +10145,7 @@ fn oversized_and_slow_frames_do_not_block_or_kill_the_daemon() {
     let mut response = String::new();
     let _ = BufReader::new(oversized).read_line(&mut response);
     assert!(response.is_empty());
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
 }
 
 /// The per-test `XDG_STATE_HOME`. The diagnostics store is durable state, so
@@ -10523,7 +10512,7 @@ fn fixed_fixture_replays_through_provider_and_validation_boundaries() {
         "the selected Source Transcript becomes the final transcript: {replayed}"
     );
     // The daemon stays reusable after a replay: a real Recording still works.
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
     assert!(voisu(runtime.path(), "start").status.success());
 }
 
@@ -10714,7 +10703,7 @@ fn replay_of_a_missing_fixture_is_rejected_and_leaves_the_daemon_reusable() {
     let request = r#"{"version":1,"command":{"replay":"nonexistent.pcm"}}"#;
     let replayed = ipc_request(runtime.path(), request);
     assert_eq!(replayed["ok"], false, "{replayed}");
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
     assert!(voisu(runtime.path(), "start").status.success());
 }
 
@@ -10736,7 +10725,7 @@ fn replay_rejects_a_symlink_planted_inside_the_fixture_directory() {
         replayed["ok"], false,
         "O_NOFOLLOW must refuse the symlink: {replayed}"
     );
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
 }
 
 #[test]
@@ -10757,7 +10746,7 @@ fn replay_rejects_a_fifo_without_wedging_the_daemon() {
         replayed["ok"], false,
         "a FIFO is not a regular file: {replayed}"
     );
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
     assert!(voisu(runtime.path(), "start").status.success());
 }
 
@@ -10781,7 +10770,7 @@ fn replay_partial_provider_start_failure_aborts_the_started_stream_and_recovers(
         r#"{"version":1,"command":{"replay":"dictation.pcm"}}"#,
     );
     assert_eq!(replayed["ok"], false, "{replayed}");
-    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "idle\n");
+    assert_eq!(status_headline(&voisu(runtime.path(), "status")), "Ready\n");
     // The failure was one-shot; the daemon is fully reusable afterwards.
     let retried = ipc_request(
         runtime.path(),
@@ -10999,7 +10988,7 @@ fn a_delivered_recording_reports_its_per_stage_timings_to_the_journal() {
         .unwrap_or_else(|| panic!("a delivered Recording must log its timings: {journal}"));
     assert!(line.starts_with("Recording 1: outcome=ok"), "{line}");
     assert!(
-        journal.lines().any(|line| line == "Recording 1: delivered"),
+        journal.lines().any(|line| line == "Recording 1: pasted"),
         "the human-readable delivered line must remain separate: {journal}"
     );
     assert!(line.contains("correlation_id=rec-"), "{line}");
@@ -11322,7 +11311,7 @@ fn a_history_read_failure_after_startup_is_not_presented_as_an_empty_history() {
         response["message"]
             .as_str()
             .unwrap()
-            .contains("diagnostics are unavailable"),
+            .contains("Recording history is unavailable"),
         "the failure must name the unavailable diagnostics: {response}"
     );
 
@@ -11336,7 +11325,7 @@ fn a_history_read_failure_after_startup_is_not_presented_as_an_empty_history() {
         export["message"]
             .as_str()
             .unwrap()
-            .contains("diagnostics are unavailable"),
+            .contains("Recording history is unavailable"),
         "{export}"
     );
 }
@@ -12292,7 +12281,7 @@ fn delivery_cli_sets_gets_and_persists_paste_or_copy_while_rejecting_other_modes
 
     let initial = run(&["delivery"]);
     assert!(initial.status.success(), "{}", stderr(&initial));
-    assert_eq!(stdout(&initial), "delivery mode: paste\n");
+    assert_eq!(stdout(&initial), "Delivery: paste\n");
 
     let copy = run(&["delivery", "copy"]);
     assert!(copy.status.success(), "{}", stderr(&copy));
@@ -12302,15 +12291,15 @@ fn delivery_cli_sets_gets_and_persists_paste_or_copy_while_rejecting_other_modes
             .contains("delivery_mode = \"copy\""),
         "copy mode persists"
     );
-    assert_eq!(stdout(&run(&["delivery"])), "delivery mode: copy\n");
+    assert_eq!(stdout(&run(&["delivery"])), "Delivery: copy\n");
 
     let paste = run(&["delivery", "paste"]);
     assert!(paste.status.success(), "{}", stderr(&paste));
     assert_eq!(
         stdout(&paste),
-        "Delivery mode set to paste for new Recordings; restart the daemon to apply (voisu service restart)\n"
+        "Delivery set to paste. Restart Voisu to use it: voisu service restart\n"
     );
-    assert_eq!(stdout(&run(&["delivery"])), "delivery mode: paste\n");
+    assert_eq!(stdout(&run(&["delivery"])), "Delivery: paste\n");
 
     // Earlier releases' names load from config but are not CLI aliases.
     for old in ["type", "clipboard", "guarded", "future"] {
@@ -12390,8 +12379,7 @@ cat > "$dir/clipboard"
     let record = &history["history"][0];
     assert_eq!(record["delivery_method"], "clipboard_fallback", "{history}");
     assert_eq!(
-        record["delivery_fallback_reason"],
-        "Delivery is set to copy; Transcript is on the clipboard",
+        record["delivery_fallback_reason"], "Delivery is set to copy",
         "copy mode must skip the emulated-input adapter: {history}"
     );
 

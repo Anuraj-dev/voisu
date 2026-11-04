@@ -162,7 +162,7 @@ fn choose_engine(
 ) -> EngineChoice {
     if !interactive {
         io.writeln(&format!(
-            "Non-interactive: keeping {}; use `voisu mode local|cloud` to change.",
+            "Non-interactive: keeping {}; use `voisu engine local|cloud` to change.",
             current.as_str()
         ));
         return EngineChoice::Keep(current);
@@ -659,7 +659,7 @@ mod tests {
         assert_eq!(io.prompts, 0);
         assert!(
             io.transcript().contains(
-                "Non-interactive: keeping cloud; use `voisu mode local|cloud` to change."
+                "Non-interactive: keeping cloud; use `voisu engine local|cloud` to change."
             ),
             "{}",
             io.transcript()

@@ -802,19 +802,21 @@ impl BoundaryError {
 
     pub fn public_message(&self) -> &'static str {
         self.public_message.unwrap_or(match self.kind {
-            BoundaryKind::Capture => "Recording capture failed",
-            BoundaryKind::EmptyRecording => "No audio was captured",
-            BoundaryKind::TooShortRecording => "Recording is too short",
-            BoundaryKind::SilentRecording => "Recording contains no speech",
-            BoundaryKind::RecordingDeadline => "Recording Deadline elapsed",
-            BoundaryKind::Provider => "Source Transcripts are unavailable",
-            BoundaryKind::Validation => "Transcript failed quality validation",
-            BoundaryKind::Delivery => "Transcript Delivery failed",
+            BoundaryKind::Capture => "Couldn't record from the microphone",
+            BoundaryKind::EmptyRecording => "No sound recorded; check your microphone",
+            BoundaryKind::TooShortRecording => "Too short to transcribe",
+            BoundaryKind::SilentRecording => "Didn't hear any words",
+            BoundaryKind::RecordingDeadline => "Stopped at the time limit",
+            BoundaryKind::Provider => "Couldn't reach Groq or Deepgram",
+            BoundaryKind::Validation => "Held back text that looked wrong",
+            BoundaryKind::Delivery => "Couldn't put the text in your window",
             BoundaryKind::SecretStorage => {
-                "Secret storage is unavailable; set VOISU_GROQ_API_KEY or VOISU_DEEPGRAM_API_KEY for development or headless use"
+                "Can't read your keys from the keyring; set VOISU_GROQ_API_KEY or VOISU_DEEPGRAM_API_KEY for development or headless use"
             }
-            BoundaryKind::ProviderAuthentication => "Provider authentication failed",
-            BoundaryKind::Shortcut => "Trigger Key binding is unavailable",
+            BoundaryKind::ProviderAuthentication => {
+                "Groq or Deepgram rejected your key; run voisu setup"
+            }
+            BoundaryKind::Shortcut => "Couldn't set up your Trigger Key",
         })
     }
 

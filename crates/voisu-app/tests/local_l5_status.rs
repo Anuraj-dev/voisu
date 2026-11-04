@@ -114,13 +114,13 @@ fn stderr(output: &Output) -> String {
 fn status_exposes_pending_active_revision_capability_and_unavailable() {
     let harness = Harness::new();
     let _daemon = harness.start_daemon();
-    assert!(harness.voisu(&["mode", "local"]).status.success());
+    assert!(harness.voisu(&["engine", "local"]).status.success());
     let printed = stdout(&harness.voisu(&["status"]));
-    assert!(printed.contains("asr mode pending: local"), "{printed}");
-    assert!(printed.contains("config revision:"), "{printed}");
-    assert!(printed.contains("asr capability: asr-mode-v1"), "{printed}");
+    assert!(printed.contains("Engine: Local\n"), "{printed}");
+    assert!(!printed.contains("revision"), "{printed}");
+    assert!(!printed.contains("asr-mode-v1"), "{printed}");
     assert!(
-        printed.contains("local readiness: unavailable (Local selected; model unavailable)"),
+        printed.contains("Local model: can't load (Local selected; model unavailable)"),
         "{printed}"
     );
     let started = harness.voisu(&["start"]);
@@ -137,13 +137,15 @@ fn pending_local_does_not_make_an_active_cloud_recording_offline() {
     let harness = Harness::new();
     let _daemon = harness.start_daemon();
     assert!(harness.voisu(&["start"]).status.success());
-    assert!(harness.voisu(&["mode", "local"]).status.success());
+    assert!(harness.voisu(&["engine", "local"]).status.success());
     let printed = stdout(&harness.voisu(&["status"]));
     assert!(printed.starts_with("Recording\n"), "{printed}");
-    assert!(printed.contains("asr mode pending: local"), "{printed}");
-    assert!(printed.contains("asr mode active: cloud"), "{printed}");
     assert!(
-        printed.contains("recording path: cloud (this Recording is not offline; Local is pending)"),
+        printed.contains("Engine: Local (starts with your next Recording)"),
+        "{printed}"
+    );
+    assert!(
+        printed.contains("This Recording uses Cloud; Local starts with the next one"),
         "{printed}"
     );
     let _ = harness.voisu(&["stop"]);
@@ -152,7 +154,7 @@ fn pending_local_does_not_make_an_active_cloud_recording_offline() {
 #[test]
 fn local_doctor_skips_cloud_probes_with_explicit_skip_rows() {
     let harness = Harness::new();
-    assert!(harness.voisu(&["mode", "local"]).status.success());
+    assert!(harness.voisu(&["engine", "local"]).status.success());
     let doctor = harness
         .command(env!("CARGO_BIN_EXE_voisu"))
         .args(["doctor"])
@@ -173,7 +175,7 @@ fn local_doctor_skips_cloud_probes_with_explicit_skip_rows() {
 #[test]
 fn local_setup_does_not_prompt_for_cloud_keys() {
     let harness = Harness::new();
-    assert!(harness.voisu(&["mode", "local"]).status.success());
+    assert!(harness.voisu(&["engine", "local"]).status.success());
     fs::create_dir_all(harness.config.path().join("hypr")).unwrap();
     fs::write(
         harness.config.path().join("hypr/hyprland.lua"),
@@ -215,7 +217,7 @@ fn local_setup_does_not_prompt_for_cloud_keys() {
 #[test]
 fn setup_discovers_the_profile_before_local_prompts() {
     let harness = Harness::new();
-    assert!(harness.voisu(&["mode", "local"]).status.success());
+    assert!(harness.voisu(&["engine", "local"]).status.success());
 
     let setup = harness
         .command(env!("CARGO_BIN_EXE_voisu"))

@@ -150,12 +150,38 @@ pub enum WritingMode {
 }
 
 impl WritingMode {
-    /// The hand-authored TOML value persisted for this mode.
+    /// The word users see and type (`voisu writing clean|exact`), also the
+    /// TOML value persisted for this mode. Earlier releases stored
+    /// `smart`/`literal`; those still load.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Smart => "smart",
-            Self::Literal => "literal",
+            Self::Smart => "clean",
+            Self::Literal => "exact",
         }
+    }
+}
+
+/// The word users see and type for a Rendering Policy
+/// (`voisu layout plain|auto|sections`), also the TOML value persisted for
+/// it. [`RenderingPolicy::as_str`] stays the internal name the formatting
+/// pipeline and cloud request use; earlier releases stored that name, and it
+/// still loads.
+pub fn layout_name(policy: RenderingPolicy) -> &'static str {
+    match policy {
+        RenderingPolicy::Natural => "plain",
+        RenderingPolicy::Adaptive => "auto",
+        RenderingPolicy::Structured => "sections",
+    }
+}
+
+/// Parses a layout word typed by the user. Only the current words are
+/// accepted on the command line.
+pub fn parse_layout(value: &str) -> Option<RenderingPolicy> {
+    match value {
+        "plain" => Some(RenderingPolicy::Natural),
+        "auto" => Some(RenderingPolicy::Adaptive),
+        "sections" => Some(RenderingPolicy::Structured),
+        _ => None,
     }
 }
 
@@ -749,8 +775,12 @@ fn parse_writing_mode(contents: &str) -> WritingModeLoad {
         // Both TOML string forms are accepted so a hand-edited single-quoted
         // literal string is honored rather than fail-closing to Literal.
         return match value.trim() {
-            "\"smart\"" | "'smart'" => WritingModeLoad::Known(WritingMode::Smart),
-            "\"literal\"" | "'literal'" => WritingModeLoad::Known(WritingMode::Literal),
+            "\"clean\"" | "'clean'" | "\"smart\"" | "'smart'" => {
+                WritingModeLoad::Known(WritingMode::Smart)
+            }
+            "\"exact\"" | "'exact'" | "\"literal\"" | "'literal'" => {
+                WritingModeLoad::Known(WritingMode::Literal)
+            }
             _ => WritingModeLoad::FailClosed,
         };
     }
@@ -760,7 +790,8 @@ fn parse_writing_mode(contents: &str) -> WritingModeLoad {
 /// Parses the root-scope `rendering_policy` string. Missing key →
 /// [`RenderingPolicyLoad::Missing`]; present but unrecognised →
 /// [`RenderingPolicyLoad::FailClosed`] plus a bounded, value-free diagnostic;
-/// `natural`/`adaptive`/`structured` → Known. Tolerance and table scoping
+/// `plain`/`auto`/`sections` (or the earlier `natural`/`adaptive`/`structured`)
+/// → Known. Tolerance and table scoping
 /// mirror [`parse_writing_mode`].
 fn parse_rendering_policy(contents: &str) -> RenderingPolicyLoad {
     for line in contents.lines() {
@@ -779,18 +810,24 @@ fn parse_rendering_policy(contents: &str) -> RenderingPolicyLoad {
         }
         // Both TOML string forms are accepted so a hand-edited single-quoted
         // literal string is honored rather than fail-closing to Natural.
-        return match value.trim() {
-            "\"natural\"" | "'natural'" => RenderingPolicyLoad::Known(RenderingPolicy::Natural),
-            "\"adaptive\"" | "'adaptive'" => RenderingPolicyLoad::Known(RenderingPolicy::Adaptive),
-            "\"structured\"" | "'structured'" => {
-                RenderingPolicyLoad::Known(RenderingPolicy::Structured)
-            }
+        let value = value.trim();
+        let unquoted = value
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+            .or_else(|| {
+                value
+                    .strip_prefix('\'')
+                    .and_then(|rest| rest.strip_suffix('\''))
+            });
+        // Current layout words, or the internal names earlier releases stored.
+        return match unquoted
+            .and_then(|word| parse_layout(word).or_else(|| RenderingPolicy::parse(word)))
+        {
+            Some(policy) => RenderingPolicyLoad::Known(policy),
             // Spec §12 / DAG T0: unknown or corrupt present value fails closed
             // to Natural with one bounded diagnostic (no raw config dump).
             _ => {
-                eprintln!(
-                    "voisu: unrecognized rendering_policy in config; failing closed to natural"
-                );
+                eprintln!("voisu: unrecognized rendering_policy in config; using the plain layout");
                 RenderingPolicyLoad::FailClosed
             }
         };
@@ -809,13 +846,13 @@ fn strip_comment(line: &str) -> &str {
 const MANAGED_LINES: [&str; 3] = [
     "# Voisu daemon configuration.",
     "# ASR mode is re-read at Start/Replay; other keys may be snapshotted at daemon start.",
-    "# Managed by the `voisu deepgram`, `voisu delivery`, `voisu writing`, `voisu rendering`, and `voisu mode` commands.",
+    "# Managed by the `voisu deepgram`, `voisu delivery`, `voisu writing`, `voisu layout`, and `voisu engine` commands.",
 ];
 
 /// Managed header lines emitted by earlier releases. Stripped alongside
 /// [`MANAGED_LINES`] so upgrading an existing config never strands stale
 /// headers above the rewritten block.
-const LEGACY_MANAGED_LINES: [&str; 9] = [
+const LEGACY_MANAGED_LINES: [&str; 10] = [
     "# Whether the Deepgram Provider participates in a Recording.",
     "# Managed by `voisu deepgram on|off`; read once at daemon start.",
     // Pre-Writing-Mode managed body lines (delivery-only era).
@@ -828,6 +865,8 @@ const LEGACY_MANAGED_LINES: [&str; 9] = [
     "# Recording Provider, Delivery, Writing Mode, and Rendering Policy settings; read once at daemon start.",
     "# Managed by the `voisu deepgram`, `voisu delivery`, `voisu writing`, and `voisu rendering` commands.",
     "# Recording Provider, Delivery, Writing Mode, Rendering Policy, and ASR mode settings; read once at daemon start.",
+    // Pre-plain-words managed body line (`rendering` / `mode` command era).
+    "# Managed by the `voisu deepgram`, `voisu delivery`, `voisu writing`, `voisu rendering`, and `voisu mode` commands.",
 ];
 
 /// Persists the toggle, creating the parent `voisu` directory if needed and
@@ -1038,7 +1077,7 @@ fn render(
     if let Some(policy) = rendering_policy {
         out.push_str(&format!(
             "{RENDERING_POLICY_KEY} = \"{}\"\n",
-            policy.as_str()
+            layout_name(policy)
         ));
     }
     if let Some(mode) = asr_mode {
@@ -1423,6 +1462,15 @@ other_key = 5
             parse_writing_mode("writing_mode = \"literal\"\n"),
             WritingModeLoad::Known(WritingMode::Literal)
         );
+        // The words written since plain-words.
+        assert_eq!(
+            parse_writing_mode("writing_mode = \"clean\"\n"),
+            WritingModeLoad::Known(WritingMode::Smart)
+        );
+        assert_eq!(
+            parse_writing_mode("writing_mode = 'exact'\n"),
+            WritingModeLoad::Known(WritingMode::Literal)
+        );
         assert_eq!(
             resolve_writing_mode(parse_writing_mode("writing_mode = \"future\"\n")),
             WritingMode::Literal
@@ -1652,6 +1700,20 @@ other_key = 5
             parse_rendering_policy("rendering_policy = \"structured\"\n"),
             RenderingPolicyLoad::Known(RenderingPolicy::Structured)
         );
+        // The layout words written since plain-words load to the same policies.
+        for policy in [
+            RenderingPolicy::Natural,
+            RenderingPolicy::Adaptive,
+            RenderingPolicy::Structured,
+        ] {
+            let stored = format!("rendering_policy = '{}'\n", layout_name(policy));
+            assert_eq!(
+                parse_rendering_policy(&stored),
+                RenderingPolicyLoad::Known(policy)
+            );
+            assert_eq!(parse_layout(layout_name(policy)), Some(policy));
+        }
+        assert_eq!(parse_layout("natural"), None, "no old words on the CLI");
         // Unknown present values emit a bounded diagnostic (stderr) and still
         // resolve to Natural — diagnostic content is not asserted.
         assert_eq!(

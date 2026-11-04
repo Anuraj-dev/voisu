@@ -172,7 +172,7 @@ fn read_response(
             return Err((
                 PROTOCOL_MISMATCH_CODE,
                 format!(
-                    "IPC protocol mismatch: daemon uses {}, CLI uses {}",
+                    "Voisu needs a restart to match this version: voisu service restart (service protocol {}, command protocol {})",
                     envelope.version, PROTOCOL_VERSION
                 ),
             ));

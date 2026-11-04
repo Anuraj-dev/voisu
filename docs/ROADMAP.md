@@ -17,9 +17,9 @@ Shipped and working in the current release:
   the Trigger Key, provider streaming, and Delivery. Works without GTK.
 - **CLI** (`voisu`) — `voisu setup` guided wizard, `voisu doctor` diagnostics,
   recording control (`start`, `stop`, `toggle`, `status`, `shortcut`),
-  local diagnostics (`history`, `export`, `replay`), provider keys
-  (`auth set` / `auth verify`), behavior toggles (`deepgram on|off`,
-  `delivery`, `writing`, `rendering`), a personal pronunciation dictionary
+  local diagnostics (`history`, `export`), provider keys
+  (`key set` / `key check`), behavior toggles (`deepgram on|off`,
+  `delivery`, `writing`, `layout`), a personal pronunciation dictionary
   (`dictionary add` / `remove` / `list`), and user-service management
   (`voisu service install` / `start` / `stop` / `restart` / `status` /
   `uninstall`). See the command reference in `README.md`.
@@ -31,9 +31,9 @@ Shipped and working in the current release:
 - **Trigger Key via desktop portals** — no raw input-device or privileged
   `uinput` access on the normal path. On KDE Plasma / GNOME a system dialog
   appears once and the choice persists.
-- **Delivery modes** — direct text insertion into the focused application via
-  the RemoteDesktop portal, with clipboard preservation as the fallback
-  (`voisu delivery clipboard`).
+- **Delivery modes** — `paste` puts the Transcript on the clipboard and pastes it
+  into the focused application; `copy` only copies it. If pasting fails, the
+  Transcript stays on the clipboard.
 - **Overlay** — optional, separate on-screen status surface (GTK4) reflecting
   daemon state. Runs as its own user service; on Fedora it is a separate
   `voisu-overlay` package.
@@ -89,8 +89,8 @@ It is not a current installation failure.
     and persists with a user-chosen key. Text-insertion Delivery works via RemoteDesktop.
   - **Hyprland** — no shortcut dialog. `voisu setup` installs Caps Lock
     (`code:66`) after a default-yes prompt, or Right Alt (`code:108`) on
-    decline or conflict. **Type Delivery does not work on Hyprland**: its portal
-    implements no RemoteDesktop interface, so setup selects `clipboard`.
+    decline or conflict. Its portal implements no RemoteDesktop interface, so
+    Paste presses the paste shortcut found in the Hyprland config.
   - **Plain wlroots** portals do not implement GlobalShortcuts, so the Trigger
     Key cannot bind without `xdg-desktop-portal-hyprland`.
   - Run `voisu doctor` if the Trigger Key does not respond — it reports a portal

@@ -216,6 +216,6 @@ mod tests {
     fn screen_reader_uses_the_accessible_label() {
         let view = OverlayView::daemon_unavailable();
         assert_eq!(screen_reader_announcement(view), view.accessible_label);
-        assert!(daemon_stall_announcement().contains("cannot reach voisu-daemon"));
+        assert!(daemon_stall_announcement().contains("the Overlay can't reach it"));
     }
 }

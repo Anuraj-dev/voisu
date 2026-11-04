@@ -1508,10 +1508,7 @@ async fn contraction_fallback_refuses_when_both_sources_fail_quality_guards() {
         .await
         .expect_err("the repair path must refuse when neither source is safe");
 
-    assert_eq!(
-        error.public_message(),
-        "Transcript failed quality validation"
-    );
+    assert_eq!(error.public_message(), "Held back text that looked wrong");
     assert!(
         error
             .diagnostic()
@@ -1556,10 +1553,7 @@ async fn a_wordless_sibling_is_not_a_deliverable_contraction_fallback() {
         .await
         .expect_err("dots must not be delivered as the contraction fallback");
 
-    assert_eq!(
-        error.public_message(),
-        "Transcript failed quality validation"
-    );
+    assert_eq!(error.public_message(), "Held back text that looked wrong");
     assert!(
         error
             .diagnostic()
@@ -3662,10 +3656,7 @@ async fn a_refusal_shaped_repair_is_never_delivered() {
                 decision.transcript.0
             ),
         };
-        assert_eq!(
-            error.public_message(),
-            "Transcript failed quality validation"
-        );
+        assert_eq!(error.public_message(), "Held back text that looked wrong");
         assert!(
             error.diagnostic().contains("no Source Transcript contains")
                 || error
@@ -3853,10 +3844,7 @@ async fn failed_recovery_reports_quality_failure_when_neither_source_is_safe() {
         .await
         .unwrap_err();
 
-    assert_eq!(
-        error.public_message(),
-        "Transcript failed quality validation"
-    );
+    assert_eq!(error.public_message(), "Held back text that looked wrong");
     assert!(
         error
             .diagnostic()

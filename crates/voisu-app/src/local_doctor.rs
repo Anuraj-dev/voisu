@@ -4,9 +4,10 @@ use voisu_core::{AsrMode, AsrModeStatus, LocalReadiness, ReadinessStatus};
 
 use crate::local_status::{format_local_readiness, recording_is_offline};
 
-/// Banner for the explicitly invoked Cloud credential-maintenance command.
+/// Banner for `voisu key check`, the one command that contacts a Cloud
+/// Provider on request. Local setup and doctor never run it.
 pub const CLOUD_CREDENTIAL_MAINTENANCE: &str =
-    "Cloud credential-maintenance: explicitly invoked; never run from Local setup or doctor";
+    "Checking your key online with the provider; Local setup and doctor never do this";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DoctorCheck {
@@ -226,12 +227,12 @@ mod tests {
 
     #[test]
     fn cloud_credential_maintenance_is_named_and_not_a_doctor_action() {
-        assert!(CLOUD_CREDENTIAL_MAINTENANCE.contains("Cloud credential-maintenance"));
-        assert!(CLOUD_CREDENTIAL_MAINTENANCE.contains("never run from Local setup or doctor"));
+        assert!(CLOUD_CREDENTIAL_MAINTENANCE.contains("Checking your key online"));
+        assert!(CLOUD_CREDENTIAL_MAINTENANCE.contains("Local setup and doctor never do this"));
         assert!(!skipped_cloud_key_rows().iter().any(|row| {
             row.action
                 .as_deref()
-                .is_some_and(|action| action.contains("auth verify"))
+                .is_some_and(|action| action.contains("key check"))
         }));
     }
 }

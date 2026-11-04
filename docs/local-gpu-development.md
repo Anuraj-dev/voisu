@@ -62,11 +62,11 @@ The normal development service remains opt-in and mutually exclusive with produc
 
 ```sh
 ~/.local/bin/voisu-dev on
-voisu mode local
+voisu engine local
 ~/.local/bin/voisu-dev status
 ```
 
-Use `~/.local/bin/voisu-dev off` to return to the production service and `voisu mode cloud`. A model selection does not change production catalog selection.
+Use `~/.local/bin/voisu-dev off` to return to the production service and `voisu engine cloud`. A model selection does not change production catalog selection.
 
 ## Replay exact audio through Rust
 

@@ -38,12 +38,12 @@ use voisu_app::smart_writing::{
     final_transform_and_deliver,
 };
 use voisu_app::system::{
-    CAPTURE_FINALIZE_DEADLINE, CredentialPreparationOwner, DIAGNOSTIC_RESPONSE_DEADLINE,
-    DeepgramProvider, FedoraShortcutPortal, GrammarCapability, GroqProvider,
-    INTENT_RECONSTRUCTION_DEADLINE, MergeResultValidator, PROCESSING_RESPONSE_DEADLINE,
-    PROVIDER_COMPLETION_DEADLINE, PipeWireCapture, PortalClipboardDelivery, ProviderReaper,
-    RECONCILIATION_DEADLINE, RECOVERY_ABORT_DEADLINE, WlClipboard,
-    clipboard_backend_display_reachable,
+    CAPTURE_FINALIZE_DEADLINE, COPY_MODE_REASON, CredentialPreparationOwner,
+    DIAGNOSTIC_RESPONSE_DEADLINE, DeepgramProvider, FedoraShortcutPortal, GrammarCapability,
+    GroqProvider, INTENT_RECONSTRUCTION_DEADLINE, MergeResultValidator,
+    PROCESSING_RESPONSE_DEADLINE, PROVIDER_COMPLETION_DEADLINE, PipeWireCapture,
+    PortalClipboardDelivery, ProviderReaper, RECONCILIATION_DEADLINE, RECOVERY_ABORT_DEADLINE,
+    WlClipboard, clipboard_backend_display_reachable,
 };
 use voisu_core::{
     ActiveCapture, AsrMode, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture, BoundaryKind,
@@ -381,6 +381,7 @@ enum ActorMessage {
         id: u64,
         correlation_id: String,
         method: DeliveryMethod,
+        fallback_reason: Option<String>,
         truncated: bool,
     },
     Completed(Box<Completion>),
@@ -657,7 +658,7 @@ async fn actor_loop(
                                 );
                                 Response::rejected(
                                     Some(state_label(&state)),
-                                    "diagnostics are unavailable",
+                                    "Recording history is unavailable",
                                 )
                             }
                         },
@@ -673,16 +674,16 @@ async fn actor_loop(
                             )),
                             Ok(None) => Response::rejected(
                                 Some(state_label(&state)),
-                                "no diagnostic record for that correlation ID",
+                                "no Recording with that id; find ids with voisu history --json",
                             ),
                             Err(_) => Response::rejected(
                                 Some(state_label(&state)),
-                                "diagnostics are unavailable",
+                                "Recording history is unavailable",
                             ),
                         },
                         None => Response::rejected(
                             Some(state_label(&state)),
-                            "diagnostics are unavailable",
+                            "Recording history is unavailable",
                         ),
                     };
                     let _ = reply.send(response);
@@ -690,7 +691,7 @@ async fn actor_loop(
                 Command::Replay(_) if diagnostics.is_none() => {
                     let _ = reply.send(Response::rejected(
                         Some(state_label(&state)),
-                        "diagnostics are unavailable",
+                        "Recording history is unavailable",
                     ));
                 }
                 Command::Replay(fixture_name) if matches!(state, ActorState::Idle) => {
@@ -1555,6 +1556,7 @@ async fn actor_loop(
                 id,
                 correlation_id,
                 method,
+                fallback_reason,
                 truncated,
             } => {
                 // Same check as AuthorizeDelivery: only the Recording still
@@ -1565,7 +1567,11 @@ async fn actor_loop(
                     ActorState::Processing(evidence)
                         if evidence.recording_id == id && evidence.correlation_id == correlation_id
                 ) {
-                    let (outcome, message) = delivered_overlay_event(Some(method), truncated);
+                    let (outcome, message) = delivered_overlay_event(
+                        Some(method),
+                        fallback_reason.as_deref(),
+                        truncated,
+                    );
                     retain_overlay_event(
                         &mut next_overlay_event_id,
                         &mut last_overlay_event,
@@ -1579,6 +1585,7 @@ async fn actor_loop(
             ActorMessage::Completed(completed) => {
                 let truncated = completed.evidence.truncated_by.is_some();
                 let delivery_method = completed.evidence.delivery_method;
+                let fallback_reason = completed.evidence.delivery_fallback_reason.clone();
                 let correlation_id = completed.evidence.correlation_id.clone();
                 validator = Some(completed.validator);
                 delivery = Some(completed.delivery);
@@ -1603,21 +1610,11 @@ async fn actor_loop(
                             let response = Response::with_evidence(
                                 true,
                                 Some(DaemonState::Idle),
-                                match (delivery_method, truncated) {
-                                    (Some(DeliveryMethod::ClipboardFallback), true) => {
-                                        "Direct Delivery unavailable; Transcript is on the clipboard, \
-                                     but the Recording was truncated; check the end"
-                                    }
-                                    (Some(DeliveryMethod::ClipboardFallback), false) => {
-                                        "Direct Delivery unavailable; Transcript is on the clipboard"
-                                    }
-                                    (_, true) => {
-                                        "Delivered, but the Recording was truncated; check the end"
-                                    }
-                                    _ => {
-                                        "Transcript submitted through the compositor; preserved on the clipboard"
-                                    }
-                                },
+                                delivered_message(
+                                    delivery_method,
+                                    fallback_reason.as_deref(),
+                                    truncated,
+                                ),
                                 Some(completed.evidence),
                             );
                             // DeliveryLanded normally retained this
@@ -1627,8 +1624,11 @@ async fn actor_loop(
                                 event.correlation_id.as_deref() == Some(correlation_id.as_str())
                             });
                             if !announced {
-                                let (outcome, message) =
-                                    delivered_overlay_event(delivery_method, truncated);
+                                let (outcome, message) = delivered_overlay_event(
+                                    delivery_method,
+                                    fallback_reason.as_deref(),
+                                    truncated,
+                                );
                                 retain_overlay_event(
                                     &mut next_overlay_event_id,
                                     &mut last_overlay_event,
@@ -2029,30 +2029,53 @@ fn retain_overlay_event(
     *next_id += 1;
 }
 
+/// What `voisu stop` says once the Transcript reached the user. Copy mode copies
+/// on purpose, so only a real paste fallback explains why it could not paste.
+fn delivered_message(
+    method: Option<DeliveryMethod>,
+    fallback_reason: Option<&str>,
+    truncated: bool,
+) -> String {
+    let outcome = match (method, fallback_reason) {
+        (Some(DeliveryMethod::ClipboardFallback), Some(COPY_MODE_REASON)) => {
+            "Copied. Paste with Ctrl+V".to_owned()
+        }
+        (Some(DeliveryMethod::ClipboardFallback), Some(why)) => {
+            format!("Couldn't paste; text is on your clipboard ({why})")
+        }
+        (Some(DeliveryMethod::ClipboardFallback), None) => {
+            "Couldn't paste; text is on your clipboard".to_owned()
+        }
+        (_, _) if truncated => "Pasted".to_owned(),
+        (_, _) => "Pasted. Also on your clipboard.".to_owned(),
+    };
+    if truncated {
+        format!("{outcome}. Recording was cut off; check the end")
+    } else {
+        outcome
+    }
+}
+
 /// The Overlay event for a Recording whose Delivery succeeded: a check mark
 /// when the Transcript was pasted, a calm Copied state when it only reached the
 /// clipboard and the user still has to paste.
 fn delivered_overlay_event(
     method: Option<DeliveryMethod>,
+    fallback_reason: Option<&str>,
     truncated: bool,
 ) -> (OverlayOutcome, String) {
-    let (outcome, message) = match (method, truncated) {
-        (Some(DeliveryMethod::ClipboardFallback), true) => (
+    if method == Some(DeliveryMethod::ClipboardFallback) {
+        return (
             OverlayOutcome::Copied,
-            "Direct Delivery unavailable; Transcript is on the clipboard, \
-             but the Recording was truncated; check the end",
-        ),
-        (Some(DeliveryMethod::ClipboardFallback), false) => (
-            OverlayOutcome::Copied,
-            "Direct Delivery unavailable; Transcript is on the clipboard",
-        ),
-        (_, true) => (
-            OverlayOutcome::Delivered,
-            "Delivered, but the Recording was truncated; check the end",
-        ),
-        _ => (OverlayOutcome::Delivered, "Delivered"),
+            delivered_message(method, fallback_reason, truncated),
+        );
+    }
+    let message = if truncated {
+        delivered_message(method, fallback_reason, truncated)
+    } else {
+        "Pasted".to_owned()
     };
-    (outcome, message.to_owned())
+    (OverlayOutcome::Delivered, message)
 }
 
 /// Tells the actor this Recording's Delivery landed so the Overlay can confirm
@@ -2064,6 +2087,7 @@ async fn announce_delivery(
     id: u64,
     correlation_id: &str,
     method: DeliveryMethod,
+    fallback_reason: Option<String>,
     truncated: bool,
 ) {
     let _ = actor
@@ -2071,6 +2095,7 @@ async fn announce_delivery(
             id,
             correlation_id: correlation_id.to_owned(),
             method,
+            fallback_reason,
             truncated,
         })
         .await;
@@ -2622,6 +2647,7 @@ async fn process_recording(
                         id,
                         &correlation_id,
                         method,
+                        evidence.delivery_fallback_reason.clone(),
                         evidence.truncated_by.is_some(),
                     )
                     .await;
@@ -2841,6 +2867,7 @@ async fn process_recording(
             id,
             &correlation_id,
             delivery_outcome.method,
+            evidence.delivery_fallback_reason.clone(),
             evidence.truncated_by.is_some(),
         )
         .await;
@@ -3210,7 +3237,7 @@ fn build_delivery_adapter(
         return (
             Box::new(PortalClipboardDelivery::clipboard_only_with_reason(
                 Box::new(WlClipboard),
-                "direct Delivery disabled by VOISU_DISABLE_DIRECT_DELIVERY; Transcript remains on the clipboard",
+                "pasting turned off by VOISU_DISABLE_DIRECT_DELIVERY",
             )),
             copy_only,
         );
@@ -3219,14 +3246,14 @@ fn build_delivery_adapter(
         DeliveryMode::Copy => (
             Box::new(PortalClipboardDelivery::clipboard_only_with_reason(
                 Box::new(WlClipboard),
-                "Delivery is set to copy; Transcript is on the clipboard",
+                COPY_MODE_REASON,
             )),
             copy_only,
         ),
         DeliveryMode::Paste if voisu_app::hyprland_bindings::hyprland_press_path_available() => {
             match voisu_app::hyprland_bindings::discover_live_paste_action() {
                 Some(action) => {
-                    eprintln!("verified Hyprland Paste Action: {}", action.description);
+                    eprintln!("Paste shortcut: {}", action.description);
                     let shortcut = Some(action.shortcut.binding.clone());
                     (
                         Box::new(PortalClipboardDelivery::with_hyprland_paste(action)),
@@ -3238,9 +3265,7 @@ fn build_delivery_adapter(
                     )
                 }
                 None => {
-                    eprintln!(
-                        "no verified Hyprland Paste Action; Delivery will remain clipboard-only"
-                    );
+                    eprintln!("No paste shortcut in Hyprland config; Voisu will copy only");
                     (
                         Box::new(PortalClipboardDelivery::clipboard_only()),
                         PasteReadiness {
@@ -3821,7 +3846,7 @@ async fn shortcut_listener(actor: mpsc::Sender<ActorMessage>) {
                 // reprompt an already-made decision, so retire quietly like an
                 // explicit revocation; start, stop, and toggle stay available.
                 eprintln!(
-                    "Trigger Key binding is unavailable: {}; start, stop, and toggle remain available",
+                    "Couldn't set up your Trigger Key: {}; voisu start, stop, and toggle still work",
                     error.diagnostic()
                 );
                 let _ = actor.send(ActorMessage::ShortcutBound(None)).await;
@@ -3830,7 +3855,7 @@ async fn shortcut_listener(actor: mpsc::Sender<ActorMessage>) {
             Err(error) => {
                 if !announced_down {
                     eprintln!(
-                        "Trigger Key binding is unavailable: {}; retrying until the desktop portal is ready",
+                        "Couldn't set up your Trigger Key: {}; trying again until the desktop is ready",
                         error.diagnostic()
                     );
                     announced_down = true;

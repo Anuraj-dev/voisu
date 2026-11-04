@@ -12,17 +12,17 @@ use voisu_core::{
 
 enum CliAction {
     Daemon(Command),
-    History { json: bool },
+    History { json: bool, verbose: bool },
     Replay { path: String, json: bool },
     Doctor { verbose: bool },
     Setup,
-    AuthSet(Provider),
-    AuthVerify(Provider),
+    KeySet(Provider),
+    KeyCheck(Provider),
     SetDeepgram(bool),
     SetAsrMode(AsrMode),
     Delivery(Option<DeliveryMode>),
     Writing(Option<WritingMode>),
-    Rendering(Option<RenderingPolicy>),
+    Layout(Option<RenderingPolicy>),
     DictionaryAdd(String),
     DictionaryRemove(String),
     DictionaryList { json: bool },
@@ -40,20 +40,20 @@ fn main() -> ExitCode {
     }
     match parse_command() {
         Ok(CliAction::Daemon(command)) => daemon_command(command),
-        Ok(CliAction::History { json }) => history_command(json),
+        Ok(CliAction::History { json, verbose }) => history_command(json, verbose),
         Ok(CliAction::Replay { path, json }) => replay_command(&path, json),
         Ok(CliAction::Doctor { verbose }) => doctor(verbose),
         Ok(CliAction::Setup) => setup(),
-        Ok(CliAction::AuthSet(provider)) => match credential_from_stdin() {
-            Ok(credential) => auth_set(provider, credential),
+        Ok(CliAction::KeySet(provider)) => match credential_from_stdin() {
+            Ok(credential) => key_set(provider, credential),
             Err(error) => fail(2, error.public_message()),
         },
-        Ok(CliAction::AuthVerify(provider)) => auth_verify(provider),
+        Ok(CliAction::KeyCheck(provider)) => key_check(provider),
         Ok(CliAction::SetDeepgram(enabled)) => set_deepgram(enabled),
         Ok(CliAction::SetAsrMode(mode)) => set_asr_mode(mode),
         Ok(CliAction::Delivery(mode)) => delivery(mode),
         Ok(CliAction::Writing(mode)) => writing(mode),
-        Ok(CliAction::Rendering(policy)) => rendering(policy),
+        Ok(CliAction::Layout(policy)) => layout(policy),
         Ok(CliAction::DictionaryAdd(term)) => dictionary_add(&term),
         Ok(CliAction::DictionaryRemove(term)) => dictionary_remove(&term),
         Ok(CliAction::DictionaryList { json }) => dictionary_list(json),
@@ -155,7 +155,7 @@ fn replay_command(path: &str, json: bool) -> ExitCode {
 /// foregrounds tail latency and each Provider's outcome, paginating 20 at a time
 /// when stdout and stdin are a TTY. `--json` prints the byte-for-byte raw
 /// history response (the historic behavior) so scripts never break.
-fn history_command(json: bool) -> ExitCode {
+fn history_command(json: bool, verbose: bool) -> ExitCode {
     let response = match send_command(Command::History) {
         Ok(response) => response,
         Err(code) => return code,
@@ -181,12 +181,12 @@ fn history_command(json: bool) -> ExitCode {
         Ok(records) => records,
         Err(_) => return fail(1, "daemon returned an invalid diagnostic history"),
     };
-    render_history_pretty(&records)
+    render_history_pretty(&records, verbose)
 }
 
 /// Prints the pretty history, paginating only when stdout AND stdin are a TTY.
 /// Piped or scripted invocations print the first page without ever blocking.
-fn render_history_pretty(records: &serde_json::Value) -> ExitCode {
+fn render_history_pretty(records: &serde_json::Value, verbose: bool) -> ExitCode {
     use std::io::IsTerminal;
     use voisu_app::history_view::{
         DEFAULT_PAGE_SIZE, RenderStyle, pagination_prompt, render_history_noninteractive,
@@ -200,6 +200,7 @@ fn render_history_pretty(records: &serde_json::Value) -> ExitCode {
         now_ms: voisu_core::unix_millis_now(),
         color,
         transcript_width: 72,
+        verbose,
     };
 
     if !interactive {
@@ -548,10 +549,10 @@ fn finish_ubuntu_setup(complete_message: &str) -> ExitCode {
     }
 }
 
-fn auth_set(provider: Provider, credential: Credential) -> ExitCode {
+fn key_set(provider: Provider, credential: Credential) -> ExitCode {
     match SecretToolStore.replace(provider, credential) {
         Ok(()) => {
-            println!("{} credential stored", provider.cli_label());
+            println!("{} key saved", provider.cli_label());
             ExitCode::SUCCESS
         }
         Err(error) => fail(4, error.public_message()),
@@ -575,9 +576,8 @@ fn set_deepgram(enabled: bool) -> ExitCode {
     match voisu_app::config::set_deepgram_enabled(enabled) {
         Ok(_) => {
             println!(
-                "Deepgram {} for new Recordings; restart the daemon to apply \
-                 (voisu service restart)",
-                if enabled { "enabled" } else { "disabled" }
+                "Deepgram turned {}. Restart Voisu to use it: voisu service restart",
+                if enabled { "on" } else { "off" }
             );
             ExitCode::SUCCESS
         }
@@ -589,17 +589,13 @@ fn set_deepgram(enabled: bool) -> ExitCode {
 /// only at start, so writes apply after the next restart.
 fn delivery(mode: Option<DeliveryMode>) -> ExitCode {
     let Some(mode) = mode else {
-        println!(
-            "delivery mode: {}",
-            voisu_app::config::delivery_mode().as_str()
-        );
+        println!("Delivery: {}", voisu_app::config::delivery_mode().as_str());
         return ExitCode::SUCCESS;
     };
     match voisu_app::config::set_delivery_mode(mode) {
         Ok(_) => {
             println!(
-                "Delivery mode set to {} for new Recordings; restart the daemon to apply \
-                 (voisu service restart)",
+                "Delivery set to {}. Restart Voisu to use it: voisu service restart",
                 mode.as_str()
             );
             ExitCode::SUCCESS
@@ -608,26 +604,25 @@ fn delivery(mode: Option<DeliveryMode>) -> ExitCode {
     }
 }
 
-/// Reads or persists the Writing Mode. Smart enables Intent Reconstruction;
-/// Literal disables it. A running daemon resolves configuration only at start,
-/// so writes apply after the next restart.
+/// Reads or persists the Writing Mode. Clean (Smart) enables Intent
+/// Reconstruction; exact (Literal) disables it. A running daemon resolves this
+/// only at start, so writes apply after the next restart.
 fn writing(mode: Option<WritingMode>) -> ExitCode {
     let Some(mode) = mode else {
         let current = voisu_app::config::writing_mode();
         println!(
-            "writing mode: {} ({})",
+            "Writing: {} ({})",
             current.as_str(),
-            intent_reconstruction_status(current)
+            writing_meaning(current)
         );
         return ExitCode::SUCCESS;
     };
     match voisu_app::config::set_writing_mode(mode) {
         Ok(_) => {
             println!(
-                "Writing mode set to {} for new Recordings ({}); restart the daemon to apply \
-                 (voisu service restart)",
+                "Writing set to {} ({}). Restart Voisu to use it: voisu service restart",
                 mode.as_str(),
-                intent_reconstruction_status(mode)
+                writing_meaning(mode)
             );
             ExitCode::SUCCESS
         }
@@ -635,36 +630,46 @@ fn writing(mode: Option<WritingMode>) -> ExitCode {
     }
 }
 
-/// IR follows the persisted Writing Mode, not this CLI process's env. A
-/// daemon unit `VOISU_ENABLE_INTENT_RECONSTRUCTION` force-off still wins
-/// after restart; say so on Smart so a host drop-in is not hidden.
-fn intent_reconstruction_status(mode: WritingMode) -> &'static str {
+/// What each Writing Mode does, in the user's terms. Clean also lets Intent
+/// Reconstruction fix misheard words when Groq and Deepgram disagree (unless a
+/// daemon unit `VOISU_ENABLE_INTENT_RECONSTRUCTION` forces it off).
+fn writing_meaning(mode: WritingMode) -> &'static str {
     match mode {
-        WritingMode::Smart => "Intent Reconstruction on unless the daemon env forces it off",
-        WritingMode::Literal => "Intent Reconstruction off",
+        WritingMode::Smart => "fixes punctuation, grammar, and misheard words",
+        WritingMode::Literal => "your words as spoken",
     }
 }
 
-/// Reads or persists the Developer Prompt Rendering policy. A running daemon
-/// resolves configuration only at start, so writes apply after the next restart.
-fn rendering(policy: Option<RenderingPolicy>) -> ExitCode {
+/// Reads or persists the Layout (the Rendering Policy). The daemon reads it at
+/// each Recording start, so a change applies to the next Recording.
+fn layout(policy: Option<RenderingPolicy>) -> ExitCode {
     let Some(policy) = policy else {
+        let current = voisu_app::config::rendering_policy();
         println!(
-            "rendering policy: {}",
-            voisu_app::config::rendering_policy().as_str()
+            "Layout: {} ({})",
+            voisu_app::config::layout_name(current),
+            layout_meaning(current)
         );
         return ExitCode::SUCCESS;
     };
     match voisu_app::config::set_rendering_policy(policy) {
         Ok(_) => {
             println!(
-                "Rendering policy set to {} for new Recordings; restart the daemon to apply \
-                 (voisu service restart)",
-                policy.as_str()
+                "Layout set to {} ({}). It applies to your next Recording.",
+                voisu_app::config::layout_name(policy),
+                layout_meaning(policy)
             );
             ExitCode::SUCCESS
         }
         Err(message) => fail(4, &message),
+    }
+}
+
+fn layout_meaning(policy: RenderingPolicy) -> &'static str {
+    match policy {
+        RenderingPolicy::Natural => "punctuation only",
+        RenderingPolicy::Adaptive => "organizes text when you speak in parts",
+        RenderingPolicy::Structured => "adds section headings",
     }
 }
 
@@ -725,7 +730,7 @@ fn credential_from_stdin() -> Result<Credential, BoundaryError> {
     Credential::new(credential.trim_end().to_owned())
 }
 
-fn auth_verify(provider: Provider) -> ExitCode {
+fn key_check(provider: Provider) -> ExitCode {
     eprintln!("{}", voisu_app::local_doctor::CLOUD_CREDENTIAL_MAINTENANCE);
     let credential = match SecretToolStore.load(provider) {
         Ok(credential) => credential,
@@ -738,7 +743,7 @@ fn auth_verify(provider: Provider) -> ExitCode {
         credential,
     )) {
         Ok(()) => {
-            println!("{} authentication verified", provider.cli_label());
+            println!("{} key works", provider.cli_label());
             ExitCode::SUCCESS
         }
         Err(error) => fail(4, error.public_message()),
@@ -766,12 +771,22 @@ fn parse_command() -> Result<CliAction, String> {
         [command] if command == "toggle" => Ok(CliAction::Daemon(Command::Toggle)),
         [command] if command == "status" => Ok(CliAction::Daemon(Command::Status)),
         [command] if command == "shortcut" => Ok(CliAction::Daemon(Command::Shortcut)),
-        [command] if command == "history" => Ok(CliAction::History { json: false }),
-        [command, flag] if command == "history" && flag == "--json" => {
-            Ok(CliAction::History { json: true })
+        [command] if command == "history" => Ok(CliAction::History {
+            json: false,
+            verbose: false,
+        }),
+        [command, flag] if command == "history" && flag == "--json" => Ok(CliAction::History {
+            json: true,
+            verbose: false,
+        }),
+        [command, flag] if command == "history" && (flag == "--verbose" || flag == "-v") => {
+            Ok(CliAction::History {
+                json: false,
+                verbose: true,
+            })
         }
-        [command, correlation_id] if command == "export" => Ok(CliAction::Daemon(Command::Export(
-            ExportCorrelationId::new(correlation_id.clone()),
+        [command, recording_id] if command == "export" => Ok(CliAction::Daemon(Command::Export(
+            ExportCorrelationId::new(recording_id.clone()),
         ))),
         [command, path] if command == "replay" => Ok(CliAction::Replay {
             path: path.clone(),
@@ -794,16 +809,18 @@ fn parse_command() -> Result<CliAction, String> {
             Ok(CliAction::Help)
         }
         [command] if command == "--version" || command == "-V" => Ok(CliAction::Version),
-        [auth, set, provider] if auth == "auth" && set == "set" => {
-            Ok(CliAction::AuthSet(parse_provider(provider)?))
+        [key, set, provider] if key == "key" && set == "set" => {
+            Ok(CliAction::KeySet(parse_provider(provider)?))
         }
-        [auth, verify, provider] if auth == "auth" && verify == "verify" => {
-            Ok(CliAction::AuthVerify(parse_provider(provider)?))
+        [key, check, provider] if key == "key" && check == "check" => {
+            Ok(CliAction::KeyCheck(parse_provider(provider)?))
         }
         [command, state] if command == "deepgram" => {
             Ok(CliAction::SetDeepgram(parse_toggle(state)?))
         }
-        [command, mode] if command == "mode" => Ok(CliAction::SetAsrMode(parse_asr_mode(mode)?)),
+        [command, engine] if command == "engine" => {
+            Ok(CliAction::SetAsrMode(parse_asr_mode(engine)?))
+        }
         [command] if command == "delivery" => Ok(CliAction::Delivery(None)),
         [command, mode] if command == "delivery" => {
             Ok(CliAction::Delivery(Some(parse_delivery_mode(mode)?)))
@@ -812,9 +829,9 @@ fn parse_command() -> Result<CliAction, String> {
         [command, mode] if command == "writing" => {
             Ok(CliAction::Writing(Some(parse_writing_mode(mode)?)))
         }
-        [command] if command == "rendering" => Ok(CliAction::Rendering(None)),
-        [command, policy] if command == "rendering" => {
-            Ok(CliAction::Rendering(Some(parse_rendering_policy(policy)?)))
+        [command] if command == "layout" => Ok(CliAction::Layout(None)),
+        [command, layout] if command == "layout" => {
+            Ok(CliAction::Layout(Some(parse_layout(layout)?)))
         }
         [dictionary, action, term] if dictionary == "dictionary" && action == "add" => {
             Ok(CliAction::DictionaryAdd(term.clone()))
@@ -862,7 +879,7 @@ fn parse_service_action(value: &str) -> Result<UserServiceAction, String> {
 }
 
 fn parse_asr_mode(value: &str) -> Result<AsrMode, String> {
-    AsrMode::parse(value).ok_or_else(|| "mode must be local or cloud".to_owned())
+    AsrMode::parse(value).ok_or_else(|| "engine must be local or cloud".to_owned())
 }
 
 fn parse_toggle(value: &str) -> Result<bool, String> {
@@ -883,15 +900,15 @@ fn parse_delivery_mode(value: &str) -> Result<DeliveryMode, String> {
 
 fn parse_writing_mode(value: &str) -> Result<WritingMode, String> {
     match value {
-        "smart" => Ok(WritingMode::Smart),
-        "literal" => Ok(WritingMode::Literal),
-        _ => Err("writing mode must be smart or literal".to_owned()),
+        "clean" => Ok(WritingMode::Smart),
+        "exact" => Ok(WritingMode::Literal),
+        _ => Err("writing must be clean or exact".to_owned()),
     }
 }
 
-fn parse_rendering_policy(value: &str) -> Result<RenderingPolicy, String> {
-    RenderingPolicy::parse(value)
-        .ok_or_else(|| "rendering policy must be natural, adaptive, or structured".to_owned())
+fn parse_layout(value: &str) -> Result<RenderingPolicy, String> {
+    voisu_app::config::parse_layout(value)
+        .ok_or_else(|| "layout must be plain, auto, or sections".to_owned())
 }
 
 fn parse_provider(value: &str) -> Result<Provider, String> {
@@ -904,37 +921,37 @@ fn parse_provider(value: &str) -> Result<Provider, String> {
 
 const USAGE: &str = "\
 usage: voisu <command> [args]
-       voisu           open the interface (on a real terminal)
+       voisu                    open the interface (on a real terminal)
 
 commands:
-  setup
-  start
-  stop
-  toggle
-  status
-  shortcut
-  history [--json]
-  export <correlation-id>
-  replay [--json] <fixture-name>
-  doctor [--verbose|-v]
-  auth set <groq|deepgram>
-  auth verify <groq|deepgram>
-  deepgram <on|off>
-  mode <local|cloud>
-  delivery [paste|copy]
-  writing [smart|literal]
-  rendering [natural|adaptive|structured]
-  dictionary add <term>
-  dictionary remove <term>
-  dictionary list [--json]
+  setup                         set up Voisu step by step
+  start                         start a Recording
+  stop                          stop the Recording and deliver the text
+  toggle                        start or stop a Recording
+  status                        show what Voisu is doing
+  shortcut                      show your Trigger Key
+  history [--json|--verbose]    list recent Recordings
+  export <recording-id>         print one Recording's details for a bug report
+  doctor [--verbose|-v]         check that everything works
+  key set <groq|deepgram>       save a key (reads it from standard input)
+  key check <groq|deepgram>     check that a saved key works
+  deepgram <on|off>             use Deepgram alongside Groq
+  engine <local|cloud>          transcribe on this computer or online
+  delivery [paste|copy]         paste the text for you, or only copy it
+  writing [clean|exact]         fix grammar and misheard words, or keep your words as spoken
+  layout [plain|auto|sections]  punctuation only, organize when you speak in parts, or add headings
+  dictionary add <term>         add a word Voisu should spell your way
+  dictionary remove <term>      remove a word
+  dictionary list [--json]      list your words
   service <install|start|stop|restart|status|uninstall>
-  local remove [--yes]
-  local-dev register|select|status|replay
+                                manage the Voisu service
+  local remove [--yes]          delete the Local model
   update [--check|--dry-run] [--switch-to-bin]
+                                update Voisu
 
 options:
-  -h, --help, help
-  -V, --version";
+  -h, --help, help              show this help
+  -V, --version                 show the version";
 
 fn usage() -> &'static str {
     USAGE

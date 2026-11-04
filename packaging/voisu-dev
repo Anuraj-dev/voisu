@@ -19,7 +19,7 @@ case "${1:-}" in
         fi
         systemctl --user disable voisu.service >/dev/null 2>&1 || true
         systemctl --user enable voisu-dev.service >/dev/null 2>&1 || true
-        voisu mode local
+        voisu engine local
         ;;
     off)
         systemctl --user stop voisu-dev.service
@@ -29,7 +29,7 @@ case "${1:-}" in
         fi
         systemctl --user disable voisu-dev.service >/dev/null 2>&1 || true
         systemctl --user enable voisu.service >/dev/null 2>&1 || true
-        voisu mode cloud
+        voisu engine cloud
         ;;
     status)
         systemctl --user --no-pager --full status voisu-dev.service || true

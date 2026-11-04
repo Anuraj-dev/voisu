@@ -137,13 +137,12 @@ How you pick the Trigger Key depends on your desktop's portal:
   auto-install Left Alt and never overwrites an exact unmanaged binding. Caps
   Lock as the Trigger Key also disables lock-toggle on that key.
 
-  Type Delivery does not work on Hyprland: its portal implements no
-  RemoteDesktop interface. Setup selects clipboard Delivery, which preserves
-  the Transcript and then asks Hyprland to press a verified Paste Action
-  chord. RemoteDesktop is not used on that path:
+  Hyprland's portal implements no RemoteDesktop interface, so Paste puts the
+  Transcript on the clipboard and then asks Hyprland to press the paste
+  shortcut it found in your config:
 
   ```sh
-  voisu delivery clipboard
+  voisu delivery paste
   ```
 
 - **Cinnamon / X11 (Linux Mint, Ubuntu on X11):** X11 sessions have no portal
@@ -191,17 +190,11 @@ keeps Local selected with no model. Remove it with `voisu local remove`
   GNOME to export `WAYLAND_DISPLAY`/`DISPLAY`. If `voisu service status` still
   shows inactive or failed, run `voisu service restart` once the desktop is up,
   and check `journalctl --user -u voisu.service`.
-- **`Paste action` and `Paste backend` show SKIP.** Those checks are
-  Hyprland-only; SKIP is expected on GNOME.
-- **`Focus guard none` shows WARN.** Expected on GNOME, where Voisu cannot
-  verify which window has focus. In `type` mode (`voisu delivery type`) Delivery
-  pastes into whichever window has focus. In `guarded` mode
-  (`voisu delivery guarded`) it cannot verify focus, so it leaves the Transcript
-  on the clipboard instead of pasting.
+- **Paste goes to whichever window has focus.** On GNOME, Voisu cannot check
+  which window has focus. To paste by hand instead, run `voisu delivery copy`.
 - **The Overlay is the GNOME Shell extension `overlay@voisu.app`.**
   `voisu-overlay.service` (the GTK observer) being inactive is expected there.
-- **Direct Delivery puts the Transcript on the clipboard and asks GNOME to
-  paste it.** It goes through the RemoteDesktop portal and libei. Unless the
+- **Paste puts the Transcript on the clipboard and asks GNOME to paste it.** It goes through the RemoteDesktop portal and libei. Unless the
   compositor's input seat offers text input, Voisu submits a Ctrl+V keystroke, so
   a window that pastes with a different shortcut (a terminal using
   Ctrl+Shift+V) receives nothing; paste manually, the Transcript is on the
@@ -222,20 +215,19 @@ local to your machine.
 
 | Command | Purpose |
 | --- | --- |
-| `voisu start` / `stop` / `toggle` / `status` | Control and inspect the daemon |
+| `voisu start` / `stop` / `toggle` / `status` | Start and stop a Recording, or see what Voisu is doing |
 | `voisu shortcut` | Show the desktop-approved Trigger Key |
 | `voisu setup` | Guided wizard: Cloud or Local, Trigger Key, Delivery, provider keys or Consented Install |
-| `voisu mode [cloud\|local]` | Switch between the Cloud providers and an installed Local model |
+| `voisu engine [cloud\|local]` | Transcribe online with Cloud or on this computer with an installed Local model |
 | `voisu local remove [--yes]` | Remove a Consented Install (`--yes` required when stdin is not a terminal) |
-| `voisu auth set` / `auth verify <groq\|deepgram>` | Store or verify a provider key (key on stdin) |
+| `voisu key set` / `key check <groq\|deepgram>` | Save or check a Groq or Deepgram key (key on stdin) |
 | `voisu deepgram on` / `off` | Enable or disable Deepgram streaming |
-| `voisu delivery [type\|clipboard\|guarded]` | Show or set the Delivery mode |
-| `voisu writing [smart\|literal]` | Show or set writing mode. Smart formats and enables Intent Reconstruction; Literal keeps wording and disables it |
-| `voisu rendering [natural\|adaptive\|structured]` | Show or set the rendering policy |
+| `voisu delivery [paste\|copy]` | Paste the Transcript into your window, or only copy it |
+| `voisu writing [clean\|exact]` | `clean` fixes punctuation and formatting; `exact` keeps your words as spoken |
+| `voisu layout [plain\|auto\|sections]` | Choose how text is laid out: plain, automatic, or sections |
 | `voisu dictionary add` / `remove <term>` / `list` | Personal pronunciation dictionary |
-| `voisu history [--json]` | Recent local diagnostic history |
+| `voisu history [--json\|--verbose]` | List recent Recordings |
 | `voisu export <correlation-id>` | Redacted diagnostic export for one Recording |
-| `voisu replay <path>` | Replay a captured fixture through the pipeline |
 | `voisu doctor [--verbose]` | Host readiness diagnostics |
 | `voisu service install` / `start` / `stop` / `restart` / `status` / `uninstall` | Manage the user services |
 | `voisu update [--check\|--dry-run] [--switch-to-bin]` | Update Voisu through its package manager (Linux; see [Updating](#updating)) |

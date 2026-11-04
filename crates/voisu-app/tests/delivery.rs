@@ -523,7 +523,7 @@ async fn paste_failure_keeps_the_final_transcript_on_clipboard_and_does_not_retr
         outcome
             .fallback_reason
             .as_deref()
-            .is_some_and(|reason| reason.contains("Transcript remains on the clipboard"))
+            .is_some_and(|reason| reason.contains("compositor rejected Paste Action"))
     );
     assert_eq!(
         events.lock().unwrap().as_slice(),
@@ -553,7 +553,7 @@ async fn paste_portal_setup_is_backgrounded_and_later_delivers_the_shortcut() {
         .expect_err("setup should be pending");
     assert_eq!(
         first.diagnostic(),
-        "Paste portal permission request pending"
+        "waiting for you to allow keyboard control"
     );
     tokio::time::timeout(Duration::from_secs(1), control.started.notified())
         .await
@@ -604,7 +604,7 @@ async fn paste_delivery_returns_before_permission_finishes_and_preserves_each_tr
         first
             .fallback_reason
             .as_deref()
-            .is_some_and(|reason| reason.contains("permission request pending"))
+            .is_some_and(|reason| reason.contains("allow keyboard control"))
     );
 
     tokio::time::timeout(Duration::from_secs(1), control.started.notified())
@@ -666,7 +666,7 @@ async fn direct_delivery_opt_out_reports_its_actual_reason() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let mut delivery = PortalClipboardDelivery::clipboard_only_with_reason(
         Box::new(RecordingClipboard(Arc::clone(&events))),
-        "direct Delivery disabled by test; Transcript remains on the clipboard",
+        "pasting turned off by test",
     );
 
     let outcome = delivery
@@ -677,7 +677,7 @@ async fn direct_delivery_opt_out_reports_its_actual_reason() {
     assert_eq!(outcome.method, DeliveryMethod::ClipboardFallback);
     assert_eq!(
         outcome.fallback_reason.as_deref(),
-        Some("direct Delivery disabled by test; Transcript remains on the clipboard")
+        Some("pasting turned off by test")
     );
 }
 
@@ -696,7 +696,7 @@ async fn no_verified_paste_action_is_explicitly_clipboard_only() {
     assert_eq!(outcome.method, DeliveryMethod::ClipboardFallback);
     assert_eq!(
         outcome.fallback_reason.as_deref(),
-        Some("no verified Hyprland Paste Action; Transcript remains on the clipboard")
+        Some("no paste shortcut found in your Hyprland config")
     );
     assert_eq!(
         events.lock().unwrap().as_slice(),
@@ -819,7 +819,7 @@ async fn hyprland_active_window_query_failure_keeps_clipboard_and_does_not_retry
         first
             .fallback_reason
             .as_deref()
-            .is_some_and(|reason| reason.contains("Transcript remains on the clipboard"))
+            .is_some_and(|reason| reason.contains("active window"))
     );
     assert_eq!(
         events.lock().unwrap().as_slice(),
@@ -854,7 +854,7 @@ async fn hyprland_unusable_active_window_keeps_clipboard_without_keys() {
             outcome
                 .fallback_reason
                 .as_deref()
-                .is_some_and(|reason| reason.contains("Transcript remains on the clipboard")),
+                .is_some_and(|reason| reason.contains("window")),
             "{label}"
         );
         assert_eq!(
@@ -889,7 +889,7 @@ async fn hyprland_live_revalidation_mismatch_keeps_clipboard() {
         outcome
             .fallback_reason
             .as_deref()
-            .is_some_and(|reason| reason.contains("Transcript remains on the clipboard"))
+            .is_some_and(|reason| reason.contains("your paste shortcut changed"))
     );
     assert_eq!(
         events.lock().unwrap().as_slice(),
@@ -919,7 +919,7 @@ async fn hyprland_emitter_error_after_clipboard_write_is_clipboard_fallback() {
         outcome
             .fallback_reason
             .as_deref()
-            .is_some_and(|reason| reason.contains("Transcript remains on the clipboard"))
+            .is_some_and(|reason| reason.contains("send_key_state failed"))
     );
     assert_eq!(
         events.lock().unwrap().as_slice(),
@@ -943,7 +943,10 @@ async fn direct_delivery_is_never_attempted_when_clipboard_preservation_fails() 
         .await
         .unwrap_err();
 
-    assert_eq!(error.public_message(), "Transcript Delivery failed");
+    assert_eq!(
+        error.public_message(),
+        "Couldn't put the text in your window"
+    );
     assert!(events.lock().unwrap().is_empty());
 }
 
