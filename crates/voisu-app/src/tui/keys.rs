@@ -23,10 +23,14 @@ pub enum Context {
     AddTermPrompt,
     KeyPrompt,
     ConfirmPrompt,
+    /// Picking one value of a setting, inline under its row.
+    ChoicePrompt,
     Overlay,
     Home {
         fix: Option<&'static str>,
         checks: bool,
+        /// `r` restarts Voisu: nothing else is starting or restarting it.
+        restart: bool,
     },
     History {
         has_records: bool,
@@ -36,7 +40,7 @@ pub enum Context {
     },
     Settings {
         enter: Option<&'static str>,
-        /// A changed setting waits for a restart.
+        /// `r` restarts Voisu: nothing else is starting or restarting it.
         restart: bool,
     },
 }
@@ -178,6 +182,14 @@ fn simple(key: char, keys: &'static str, label: &'static str, action: Action) ->
     }
 }
 
+/// `r` restarts Voisu and its Overlay, whether or not a change is waiting.
+fn restart(in_footer: bool) -> Binding {
+    Binding {
+        in_footer,
+        ..simple('r', "r", "restart", Action::Restart)
+    }
+}
+
 fn close(label: &'static str) -> Binding {
     Binding {
         keys: "Esc",
@@ -216,6 +228,12 @@ pub fn bindings(context: &Context) -> Vec<Binding> {
             close("cancel"),
             interrupt(false),
         ],
+        Context::ChoicePrompt => vec![
+            moves("pick", true),
+            enter("choose", Action::Submit),
+            close("cancel"),
+            interrupt(false),
+        ],
         Context::ConfirmPrompt => vec![
             simple('y', "y", "remove", Action::ConfirmRemove),
             Binding {
@@ -236,7 +254,11 @@ pub fn bindings(context: &Context) -> Vec<Binding> {
             closing.chords.push((letter('?'), Action::Close));
             vec![closing, quit()]
         }
-        Context::Home { fix, checks } => {
+        Context::Home {
+            fix,
+            checks,
+            restart: can_restart,
+        } => {
             let mut rows = Vec::new();
             if let Some(fix) = fix {
                 rows.push(enter(*fix, Action::Activate));
@@ -250,6 +272,10 @@ pub fn bindings(context: &Context) -> Vec<Binding> {
             } else {
                 rows.push(tabs());
                 rows.push(simple('d', "d", "checks", Action::ToggleChecks));
+            }
+            if *can_restart {
+                // Five fit: a fix or the scroll hint outranks it; `?` lists it.
+                rows.push(restart(fix.is_none() && !*checks));
             }
             rows.push(help());
             rows.push(quit());
@@ -285,15 +311,16 @@ pub fn bindings(context: &Context) -> Vec<Binding> {
         }
         Context::Settings {
             enter: label,
-            restart,
+            restart: can_restart,
         } => {
-            // Five fit: the restart offer outranks the move hint, which `?` still lists.
-            let mut rows = vec![moves("move", !*restart || label.is_none())];
+            // Five fit: the row's own action outranks the move hint, which the
+            // marker already suggests and `?` still lists.
+            let mut rows = vec![moves("move", label.is_none() || !*can_restart)];
             if let Some(label) = label {
                 rows.push(enter(*label, Action::Activate));
             }
-            if *restart {
-                rows.push(simple('r', "r", "restart", Action::Restart));
+            if *can_restart {
+                rows.push(restart(true));
             }
             rows.extend([tabs(), help(), quit()]);
             rows
@@ -330,11 +357,18 @@ pub(super) fn every_context() -> Vec<Context> {
         Context::AddTermPrompt,
         Context::KeyPrompt,
         Context::ConfirmPrompt,
+        Context::ChoicePrompt,
         Context::Overlay,
     ];
     for fix in [None, Some("Run setup"), Some("Restart Voisu")] {
         for checks in [false, true] {
-            contexts.push(Context::Home { fix, checks });
+            for restart in [false, true] {
+                contexts.push(Context::Home {
+                    fix,
+                    checks,
+                    restart,
+                });
+            }
         }
     }
     for flag in [false, true] {
@@ -386,11 +420,45 @@ mod tests {
         let hints: Vec<String> = footer(&Context::Home {
             fix: None,
             checks: false,
+            restart: true,
         })
         .iter()
         .map(|hint| format!("{} {}", hint.keys, hint.label))
         .collect();
-        assert_eq!(hints, ["←→ tabs", "d checks", "? help", "q quit"]);
+        assert_eq!(
+            hints,
+            ["←→ tabs", "d checks", "r restart", "? help", "q quit"]
+        );
+    }
+
+    #[test]
+    fn r_restarts_from_home_and_settings_whenever_nothing_else_is() {
+        for enter in [None, Some("change")] {
+            let context = Context::Settings {
+                enter,
+                restart: true,
+            };
+            assert_eq!(action_for(&context, letter('r')), Some(Action::Restart));
+            assert!(
+                footer(&context).iter().any(|hint| hint.label == "restart"),
+                "{context:?}"
+            );
+        }
+        for fix in [None, Some("Restart Voisu")] {
+            for checks in [false, true] {
+                let context = Context::Home {
+                    fix,
+                    checks,
+                    restart: true,
+                };
+                assert_eq!(action_for(&context, letter('r')), Some(Action::Restart));
+            }
+        }
+        let busy = Context::Settings {
+            enter: Some("change"),
+            restart: false,
+        };
+        assert_eq!(action_for(&busy, letter('r')), None, "one at a time");
     }
 
     #[test]
@@ -427,7 +495,7 @@ mod tests {
     #[test]
     fn typing_in_a_prompt_is_never_captured_as_a_command() {
         for context in [Context::AddTermPrompt, Context::KeyPrompt] {
-            for ch in "qhjkl?acd1234".chars() {
+            for ch in "qhjklr?acd1234".chars() {
                 assert_eq!(action_for(&context, letter(ch)), None, "{context:?} {ch}");
             }
         }

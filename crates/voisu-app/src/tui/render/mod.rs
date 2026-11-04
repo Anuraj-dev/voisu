@@ -149,7 +149,7 @@ fn header_line(app: &App, look: &Look, width: usize) -> Line<'static> {
         .saturating_sub(text::width(NAME) + text::width(&state) + 1)
         .max(1);
     Pieces::new(look)
-        .add(NAME, Tone::Bold)
+        .add(NAME, Tone::Accent)
         .add(&" ".repeat(gap), Tone::Plain)
         .add(&state, tone)
         .line()
@@ -167,7 +167,7 @@ fn tab_lines(app: &App, look: &Look) -> Vec<Line<'static>> {
         }
         let title = tab.title();
         let active = *tab == app.tab;
-        names = names.add(title, if active { Tone::Bold } else { Tone::Dim });
+        names = names.add(title, if active { Tone::Accent } else { Tone::Dim });
         if active {
             rule = (column, title.len());
         }
@@ -175,7 +175,7 @@ fn tab_lines(app: &App, look: &Look) -> Vec<Line<'static>> {
     }
     let underline = Pieces::new(look)
         .add(&" ".repeat(rule.0), Tone::Plain)
-        .add(&"━".repeat(rule.1), Tone::Bold)
+        .add(&"━".repeat(rule.1), Tone::Accent)
         .line();
     vec![names.line(), underline]
 }
@@ -197,8 +197,8 @@ fn key_row(look: &Look, keys: &str, label: &str, width: usize) -> Line<'static> 
     let keys = format!("   {keys:<27}");
     let room = width.saturating_sub(text::width(&keys));
     Pieces::new(look)
-        .add(&keys, Tone::Bold)
-        .add(&text::fit(label, room), Tone::Dim)
+        .add(&keys, Tone::Accent)
+        .add(&text::fit(label, room), Tone::Plain)
         .line()
 }
 
@@ -218,6 +218,8 @@ fn notice_line(app: &App, look: &Look, width: usize) -> (Line<'static>, Option<u
                 "•".repeat(input.chars()),
                 true,
             ),
+            // A choice is drawn in the body; the toast line stays free.
+            Prompt::Choice { .. } => return toast_line(app, look, width),
             Prompt::ConfirmRemove(term) => (
                 format!("Remove \"{}\"? y/n", text::clean_line(term)),
                 String::new(),
@@ -237,6 +239,10 @@ fn notice_line(app: &App, look: &Look, width: usize) -> (Line<'static>, Option<u
             .line();
         return (line, cursor);
     }
+    toast_line(app, look, width)
+}
+
+fn toast_line(app: &App, look: &Look, width: usize) -> (Line<'static>, Option<u16>) {
     let Some(toast) = &app.toast else {
         return (Line::default(), None);
     };
@@ -287,7 +293,7 @@ fn footer_line(look: &Look, context: &Context, width: usize) -> Line<'static> {
         }
         pieces = pieces
             .add(gap, Tone::Plain)
-            .add(&shown_keys, Tone::Bold)
+            .add(&shown_keys, Tone::Accent)
             .add(" ", Tone::Plain)
             .add(&hint.label, Tone::Dim);
         used += gap.len() + cost(hint);
@@ -401,10 +407,13 @@ mod tests {
         assert_eq!(lines[7], "");
         assert!(lines[8].starts_with("   Last       "), "{}", lines[8]);
         assert_eq!(lines[9], "   Engine     Cloud");
-        assert_eq!(lines[10], "   Delivery   Clipboard");
-        assert_eq!(lines[11], "   Writing    Smart · Adaptive");
+        assert_eq!(lines[10], "   Delivery   Paste");
+        assert_eq!(lines[11], "   Writing    Clean · Auto");
         assert_eq!(lines[12], "   Health     15 passed · 1 warning");
-        assert_eq!(lines[23], " ←→ tabs   d checks   ? help   q quit");
+        assert_eq!(
+            lines[23],
+            " ←→ tabs   d checks   r restart   ? help   q quit"
+        );
     }
 
     #[test]
@@ -428,28 +437,53 @@ mod tests {
         let mut app = app_on('4');
         let lines = screen(&mut app, &UNICODE, (80, 24));
         assert_eq!(lines[5], " ▌ Engine        Cloud");
-        assert_eq!(lines[6], "   Delivery      Clipboard");
-        assert_eq!(lines[7], "   Writing       Smart");
-        assert_eq!(lines[8], "   Rendering     Adaptive");
+        assert_eq!(lines[6], "   Delivery      Paste");
+        assert_eq!(lines[7], "   Writing       Clean");
+        assert_eq!(lines[8], "   Layout        Auto");
         assert_eq!(lines[9], "   Deepgram      On");
-        assert_eq!(lines[10], "   Groq key      Valid");
-        assert_eq!(lines[11], "   Deepgram key  Unreachable");
+        assert_eq!(lines[10], "   Groq key      Works");
+        assert_eq!(lines[11], "   Deepgram key  Can't reach it");
         assert_eq!(lines[12], "   Trigger Key   Not bound");
         assert_eq!(lines[13], "   Run setup");
         assert_eq!(lines[14], "");
-        assert!(lines[15].starts_with("   Where your speech becomes text."));
+        assert_eq!(lines[15], "   Where your speech becomes text.");
+        assert_eq!(
+            lines[16],
+            "     ● Cloud  Fast and accurate. Needs internet."
+        );
+        assert_eq!(lines[17], "       Local  Private. Stays on this computer.");
     }
 
     #[test]
-    fn the_delivery_row_uses_the_specified_description() {
+    fn the_guide_explains_every_delivery_choice_before_any_is_picked() {
         let mut app = app_on('4');
         let _ = press(&mut app, KeyCode::Down, 0);
         let lines = screen(&mut app, &UNICODE, (80, 24));
-        assert_eq!(lines[6], " ▌ Delivery      Clipboard");
+        assert_eq!(lines[6], " ▌ Delivery      Paste");
+        assert_eq!(lines[15], "   How your words reach your window.");
         assert_eq!(
-            lines[15],
-            "   How your words reach the app. Clipboard copies and pastes; Type types them."
+            lines[16],
+            "     ● Paste       Puts your words into your window."
         );
+        assert!(lines[17].starts_with("       Type        Types your words"));
+        assert!(lines[18].starts_with("       Safe paste  Copies instead"));
+    }
+
+    #[test]
+    fn enter_turns_the_guide_into_the_picker_in_place() {
+        let mut app = app_on('4');
+        let _ = press(&mut app, KeyCode::Down, 0);
+        let _ = press(&mut app, KeyCode::Enter, 0);
+        let _ = press(&mut app, KeyCode::Down, 0);
+        let lines = screen(&mut app, &UNICODE, (80, 24));
+        // `●` stays on the value in effect; `▌` follows the highlight.
+        assert!(lines[16].starts_with("     ● Paste"), "{}", lines[16]);
+        assert!(lines[17].starts_with("   ▌   Type"), "{}", lines[17]);
+        assert_eq!(lines[22], "", "the toast line stays free");
+        assert_eq!(lines[23], " ↑↓ pick   ↵ choose   Esc cancel");
+        let ascii = screen(&mut app, &ASCII, (80, 24));
+        assert!(ascii[16].starts_with("     * Paste"), "{}", ascii[16]);
+        assert!(ascii[17].starts_with("   >   Type"), "{}", ascii[17]);
     }
 
     // --- Every tab at every size --------------------------------------------------
@@ -487,22 +521,46 @@ mod tests {
     }
 
     #[test]
-    fn every_settings_row_and_every_description_fit_the_minimum_size() {
+    fn every_settings_row_and_its_guide_fit_where_they_should() {
         for index in 0..SettingsRow::ALL.len() {
             let mut app = app_on('4');
             app.settings_selected = index;
-            let lines = screen(&mut app, &UNICODE, (60, 16));
-            let body = joined(&lines);
-            for row in SettingsRow::ALL {
+            let row = app.selected_setting();
+
+            // At 80x24 every row, the description and the whole guide show.
+            let body = joined(&screen(&mut app, &UNICODE, (80, 24)));
+            for other in SettingsRow::ALL {
                 assert!(
-                    body.contains(row.label()),
-                    "{index}: lost {}\n{body}",
-                    row.label()
+                    body.contains(other.label()),
+                    "{index}: lost {}",
+                    other.label()
                 );
             }
-            let description = app.selected_setting().description(None);
+            let description = row.description();
             let last_word = description.split_whitespace().last().expect("word");
             assert!(body.contains(last_word), "{index}: description cut\n{body}");
+            for choice in row.choices() {
+                assert!(
+                    body.contains(choice.label),
+                    "{index}: {}\n{body}",
+                    choice.label
+                );
+            }
+
+            // At the minimum, the selected row and its whole guide still show;
+            // the description, or else the explanation in the guide, survives.
+            let body = joined(&screen(&mut app, &UNICODE, (60, 16)));
+            assert!(body.contains(row.label()), "{index}\n{body}");
+            for choice in row.choices() {
+                assert!(
+                    body.contains(choice.label),
+                    "{index}: {}\n{body}",
+                    choice.label
+                );
+            }
+            if row.choices().is_empty() {
+                assert!(body.contains(last_word), "{index}: description cut\n{body}");
+            }
         }
     }
 
@@ -866,7 +924,12 @@ mod tests {
             assert!(
                 matches!(
                     cell.fg,
-                    Color::Reset | Color::Green | Color::Blue | Color::Yellow | Color::Red
+                    Color::Reset
+                        | Color::Green
+                        | Color::Blue
+                        | Color::Yellow
+                        | Color::Red
+                        | Color::Cyan
                 ),
                 "{:?}",
                 cell.fg

@@ -4,7 +4,10 @@ use ratatui::text::Line;
 
 use super::super::keys::{self, Action};
 use super::super::look::{Look, Tone};
-use super::super::model::{App, CheckLine, Fix, HERO_HEIGHT, Hero, ServiceVerb};
+use super::super::model::{
+    App, CheckLine, Fix, HERO_HEIGHT, Hero, ServiceVerb, delivery_label, engine_label,
+    layout_label, writing_label,
+};
 use super::super::text;
 use super::{Pieces, single};
 use voisu_core::ReadinessStatus;
@@ -132,14 +135,14 @@ fn summary_rows(app: &App, look: &Look, width: usize) -> Vec<Line<'static>> {
     rows.push(summary_row(
         look,
         "Engine",
-        &shown(app.engine().map(|mode| text::capitalized(mode.as_str()))),
+        &shown(app.engine().map(|mode| engine_label(mode).to_owned())),
         Tone::Plain,
         width,
     ));
     rows.push(summary_row(
         look,
         "Delivery",
-        &shown(settings.map(|s| text::capitalized(s.delivery.as_str()))),
+        &shown(settings.map(|s| delivery_label(s.delivery).to_owned())),
         Tone::Plain,
         width,
     ));
@@ -149,8 +152,8 @@ fn summary_rows(app: &App, look: &Look, width: usize) -> Vec<Line<'static>> {
         &shown(settings.map(|s| {
             format!(
                 "{} · {}",
-                text::capitalized(s.writing.as_str()),
-                text::capitalized(s.rendering.as_str())
+                writing_label(s.writing),
+                layout_label(s.rendering)
             )
         })),
         Tone::Plain,

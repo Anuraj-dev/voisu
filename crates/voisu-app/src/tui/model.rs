@@ -259,6 +259,89 @@ pub enum Prompt {
     AddTerm(PromptText),
     Key(Provider, PromptText),
     ConfirmRemove(String),
+    /// A setting's values, open under its row; `picked` is the highlighted one.
+    Choice {
+        row: SettingsRow,
+        picked: usize,
+    },
+}
+
+/// One value a setting can take, with one plain line about it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Choice {
+    pub label: &'static str,
+    pub line: &'static str,
+}
+
+const fn choice(label: &'static str, line: &'static str) -> Choice {
+    Choice { label, line }
+}
+
+// Every word the TUI shows for a setting's values lives in this block, so a
+// rename is one edit here. The config keeps its own TOML values.
+
+/// The order each setting's values are offered in; `SettingsRow::choices`
+/// lists them in this same order.
+const ENGINES: [AsrMode; 2] = [AsrMode::Cloud, AsrMode::Local];
+const DELIVERIES: [DeliveryMode; 2] = [DeliveryMode::Paste, DeliveryMode::Copy];
+const WRITINGS: [WritingMode; 2] = [WritingMode::Smart, WritingMode::Literal];
+const LAYOUTS: [RenderingPolicy; 3] = [
+    RenderingPolicy::Natural,
+    RenderingPolicy::Adaptive,
+    RenderingPolicy::Structured,
+];
+
+const ENGINE_CHOICES: [Choice; 2] = [
+    choice("Cloud", "Fast and accurate. Needs internet."),
+    choice("Local", "Private. Stays on this computer."),
+];
+const DELIVERY_CHOICES: [Choice; 2] = [
+    choice("Paste", "Puts your words into your window."),
+    choice("Copy", "Copies only; you press Ctrl+V."),
+];
+const WRITING_CHOICES: [Choice; 2] = [
+    choice("Clean", "Fixes punctuation, grammar and misheard words."),
+    choice("Exact", "Your words, exactly as spoken."),
+];
+const LAYOUT_CHOICES: [Choice; 3] = [
+    choice("Plain", "Punctuation only."),
+    choice("Auto", "Organizes when you speak in parts."),
+    choice("Sections", "Adds headings."),
+];
+
+pub fn engine_label(mode: AsrMode) -> &'static str {
+    ENGINE_CHOICES[position(&ENGINES, mode)].label
+}
+
+pub fn delivery_label(mode: DeliveryMode) -> &'static str {
+    DELIVERY_CHOICES[position(&DELIVERIES, mode)].label
+}
+
+pub fn writing_label(mode: WritingMode) -> &'static str {
+    WRITING_CHOICES[position(&WRITINGS, mode)].label
+}
+
+pub fn layout_label(policy: RenderingPolicy) -> &'static str {
+    LAYOUT_CHOICES[position(&LAYOUTS, policy)].label
+}
+
+/// A provider key's check result in plain words.
+fn key_word(value: &str) -> String {
+    match value {
+        "valid" => "Works".to_owned(),
+        "invalid" => "Rejected".to_owned(),
+        "rate-limited" => "Busy, try again soon".to_owned(),
+        "quota exhausted" => "Out of free use".to_owned(),
+        "unreachable" => "Can't reach it".to_owned(),
+        other => text::capitalized(other),
+    }
+}
+
+fn position<T: PartialEq>(values: &[T], value: T) -> usize {
+    values
+        .iter()
+        .position(|candidate| *candidate == value)
+        .unwrap_or(0)
 }
 
 /// One Home problem's fix: the one key rule 3 promises.
@@ -323,12 +406,23 @@ impl SettingsRow {
             SettingsRow::Engine => "Engine",
             SettingsRow::Delivery => "Delivery",
             SettingsRow::Writing => "Writing",
-            SettingsRow::Rendering => "Rendering",
+            SettingsRow::Rendering => "Layout",
             SettingsRow::Deepgram => "Deepgram",
             SettingsRow::GroqKey => "Groq key",
             SettingsRow::DeepgramKey => "Deepgram key",
             SettingsRow::TriggerKey => "Trigger Key",
             SettingsRow::RunSetup => "Run setup",
+        }
+    }
+
+    /// The values `↵` offers, or nothing for a row that is not a choice.
+    pub fn choices(self) -> &'static [Choice] {
+        match self {
+            SettingsRow::Engine => &ENGINE_CHOICES,
+            SettingsRow::Delivery => &DELIVERY_CHOICES,
+            SettingsRow::Writing => &WRITING_CHOICES,
+            SettingsRow::Rendering => &LAYOUT_CHOICES,
+            _ => &[],
         }
     }
 
@@ -343,23 +437,12 @@ impl SettingsRow {
 
     /// One plain line about what the setting does, kept short enough to fit
     /// two rows at the minimum width.
-    pub fn description(self, _delivery: Option<DeliveryMode>) -> &'static str {
+    pub fn description(self) -> &'static str {
         match self {
-            SettingsRow::Engine => {
-                "Where your speech becomes text. Cloud uses Groq and Deepgram; \
-                 Local stays on this computer."
-            }
-            SettingsRow::Delivery => {
-                "How your words reach the app. Clipboard copies and pastes; Type types them."
-            }
-            SettingsRow::Writing => {
-                "How much Voisu tidies your words. Smart formats and corrects; \
-                 Literal keeps your wording."
-            }
-            SettingsRow::Rendering => {
-                "How your Transcript is laid out: plain, organized when it \
-                 helps, or with section labels."
-            }
+            SettingsRow::Engine => "Where your speech becomes text.",
+            SettingsRow::Delivery => "How your words reach your window.",
+            SettingsRow::Writing => "How much Voisu tidies your words.",
+            SettingsRow::Rendering => "How your words are laid out.",
             SettingsRow::Deepgram => {
                 "Uses Deepgram alongside Groq for better accuracy on technical \
                  words. Off uses Groq alone."
@@ -516,6 +599,7 @@ impl App {
             Tab::Home => Context::Home {
                 fix: self.fix().map(Fix::label),
                 checks: self.checks_open,
+                restart: self.can_restart(),
             },
             Tab::History => Context::History {
                 has_records: self.history.as_ref().is_some_and(|items| !items.is_empty()),
@@ -525,7 +609,7 @@ impl App {
             },
             Tab::Settings => Context::Settings {
                 enter: self.selected_setting().enter_label(),
-                restart: !self.restart_pending.is_empty() && self.can_restart(),
+                restart: self.can_restart(),
             },
         }
     }
@@ -542,6 +626,7 @@ impl App {
                 Prompt::AddTerm(_) => Context::AddTermPrompt,
                 Prompt::Key(..) => Context::KeyPrompt,
                 Prompt::ConfirmRemove(_) => Context::ConfirmPrompt,
+                Prompt::Choice { .. } => Context::ChoicePrompt,
             }
         } else if self.overlay {
             Context::Overlay
@@ -699,15 +784,15 @@ impl App {
         let (value, tone) = match row {
             SettingsRow::Engine => self
                 .engine()
-                .map_or_else(loading, |mode| plain(text::capitalized(mode.as_str()))),
+                .map_or_else(loading, |mode| plain(engine_label(mode).to_owned())),
             SettingsRow::Delivery => self.settings.map_or_else(loading, |settings| {
-                plain(text::capitalized(settings.delivery.as_str()))
+                plain(delivery_label(settings.delivery).to_owned())
             }),
             SettingsRow::Writing => self.settings.map_or_else(loading, |settings| {
-                plain(text::capitalized(settings.writing.as_str()))
+                plain(writing_label(settings.writing).to_owned())
             }),
             SettingsRow::Rendering => self.settings.map_or_else(loading, |settings| {
-                plain(text::capitalized(settings.rendering.as_str()))
+                plain(layout_label(settings.rendering).to_owned())
             }),
             SettingsRow::Deepgram => self.settings.map_or_else(loading, |settings| {
                 plain(if settings.deepgram { "On" } else { "Off" }.to_owned())
@@ -747,10 +832,7 @@ impl App {
             ReadinessStatus::Fail => Tone::Failure,
             ReadinessStatus::Skip => Tone::Plain,
         };
-        (
-            text::capitalized(row.value.as_deref().unwrap_or("Unknown")),
-            tone,
-        )
+        (key_word(row.value.as_deref().unwrap_or("unknown")), tone)
     }
 
     /// The transcript pane's text for the selected record, wrapped to `width`.
@@ -1043,6 +1125,11 @@ impl App {
         fn moved(value: usize, by: isize, limit: usize) -> usize {
             value.saturating_add_signed(by).min(limit)
         }
+        if let Some(Prompt::Choice { row, picked }) = &mut self.prompt {
+            *picked = moved(*picked, by, row.choices().len() - 1);
+            self.dirty = true;
+            return;
+        }
         match self.tab {
             Tab::Home => {
                 let limit = self
@@ -1108,41 +1195,19 @@ impl App {
         effects.push(Effect::Job(Job::Service(verb)));
     }
 
-    /// `↵` on a settings row: the next value, wrapping. The screen moves at once
-    /// and the reload that follows the change confirms it.
+    /// `↵` on a settings row. A row with values opens them inline, so one
+    /// stray Enter never changes anything; On/Off rows flip at once.
     fn activate_setting(&mut self, effects: &mut Vec<Effect>) {
         let row = self.selected_setting();
         match row {
-            SettingsRow::Engine => {
-                let Some(current) = self.engine() else {
+            SettingsRow::Engine
+            | SettingsRow::Delivery
+            | SettingsRow::Writing
+            | SettingsRow::Rendering => {
+                let Some(picked) = self.current_choice(row) else {
                     return;
                 };
-                let (mode, local_ready) = match current {
-                    AsrMode::Cloud => (AsrMode::Local, self.daemon_says_local_ready()),
-                    AsrMode::Local => (AsrMode::Cloud, false),
-                };
-                effects.push(Effect::Job(Job::SetEngine { mode, local_ready }));
-            }
-            SettingsRow::Delivery => {
-                if let Some(settings) = &mut self.settings {
-                    settings.delivery = next_delivery(settings.delivery);
-                    effects.push(Effect::Job(Job::SetDelivery(settings.delivery)));
-                }
-            }
-            SettingsRow::Writing => {
-                if let Some(settings) = &mut self.settings {
-                    settings.writing = match settings.writing {
-                        WritingMode::Smart => WritingMode::Literal,
-                        WritingMode::Literal => WritingMode::Smart,
-                    };
-                    effects.push(Effect::Job(Job::SetWriting(settings.writing)));
-                }
-            }
-            SettingsRow::Rendering => {
-                if let Some(settings) = &mut self.settings {
-                    settings.rendering = next_rendering(settings.rendering);
-                    effects.push(Effect::Job(Job::SetRendering(settings.rendering)));
-                }
+                self.prompt = Some(Prompt::Choice { row, picked });
             }
             SettingsRow::Deepgram => {
                 if let Some(settings) = &mut self.settings {
@@ -1160,6 +1225,52 @@ impl App {
             SettingsRow::RunSetup => effects.push(Effect::RunSetup),
         }
         self.dirty = true;
+    }
+
+    /// Which of `row.choices()` is in effect now, once it is known.
+    pub fn current_choice(&self, row: SettingsRow) -> Option<usize> {
+        let settings = self.settings?;
+        Some(match row {
+            SettingsRow::Engine => position(&ENGINES, self.engine()?),
+            SettingsRow::Delivery => position(&DELIVERIES, settings.delivery),
+            SettingsRow::Writing => position(&WRITINGS, settings.writing),
+            SettingsRow::Rendering => position(&LAYOUTS, settings.rendering),
+            _ => return None,
+        })
+    }
+
+    /// `↵` in an open choice. Picking the value already in effect changes
+    /// nothing. The screen moves at once and the reload that follows confirms
+    /// it, except Engine, which waits for the worker: Local needs consent.
+    fn choose(&mut self, row: SettingsRow, picked: usize, effects: &mut Vec<Effect>) {
+        if self.current_choice(row) == Some(picked) {
+            return;
+        }
+        let daemon_says_local_ready = self.daemon_says_local_ready();
+        let Some(settings) = &mut self.settings else {
+            return;
+        };
+        let job = match row {
+            SettingsRow::Engine => {
+                let mode = ENGINES[picked];
+                let local_ready = mode == AsrMode::Local && daemon_says_local_ready;
+                Job::SetEngine { mode, local_ready }
+            }
+            SettingsRow::Delivery => {
+                settings.delivery = DELIVERIES[picked];
+                Job::SetDelivery(settings.delivery)
+            }
+            SettingsRow::Writing => {
+                settings.writing = WRITINGS[picked];
+                Job::SetWriting(settings.writing)
+            }
+            SettingsRow::Rendering => {
+                settings.rendering = LAYOUTS[picked];
+                Job::SetRendering(settings.rendering)
+            }
+            _ => return,
+        };
+        effects.push(Effect::Job(job));
     }
 
     fn daemon_says_local_ready(&self) -> bool {
@@ -1225,6 +1336,7 @@ impl App {
                     }
                 }
             }
+            Some(Prompt::Choice { row, picked }) => self.choose(row, picked, effects),
             other => self.prompt = other,
         }
         self.dirty = true;
@@ -1261,21 +1373,6 @@ pub enum CheckLine {
         value: String,
     },
     Action(String),
-}
-
-fn next_delivery(current: DeliveryMode) -> DeliveryMode {
-    match current {
-        DeliveryMode::Paste => DeliveryMode::Copy,
-        DeliveryMode::Copy => DeliveryMode::Paste,
-    }
-}
-
-fn next_rendering(current: RenderingPolicy) -> RenderingPolicy {
-    match current {
-        RenderingPolicy::Natural => RenderingPolicy::Adaptive,
-        RenderingPolicy::Adaptive => RenderingPolicy::Structured,
-        RenderingPolicy::Structured => RenderingPolicy::Natural,
-    }
 }
 
 /// The Trigger Key's display value from the daemon's `shortcut` answer.
@@ -2135,36 +2232,78 @@ mod tests {
     // --- Settings ----------------------------------------------------------------
 
     #[test]
-    fn enter_advances_each_setting_and_wraps() {
+    fn enter_opens_the_choices_and_only_a_second_enter_changes_anything() {
         let mut app = ready_app();
         app.tab = Tab::Settings;
-
         app.settings_selected = 1;
-        for expected in [DeliveryMode::Paste, DeliveryMode::Copy] {
-            let effects = press(&mut app, KeyCode::Enter, 0);
-            assert!(
-                matches!(effects.as_slice(), [Effect::Job(Job::SetDelivery(mode))] if *mode == expected)
-            );
-        }
+        app.settings.as_mut().expect("loaded").delivery = DeliveryMode::Paste;
+        let current = app.current_choice(SettingsRow::Delivery).expect("loaded");
 
-        app.settings_selected = 2;
+        assert!(press(&mut app, KeyCode::Enter, 0).is_empty());
+        assert_eq!(app.context(), Context::ChoicePrompt);
+        assert!(press(&mut app, KeyCode::Esc, 0).is_empty());
+        assert!(app.prompt.is_none(), "Esc closes the choice unchanged");
+
+        let _ = press(&mut app, KeyCode::Enter, 0);
+        assert!(
+            press(&mut app, KeyCode::Enter, 0).is_empty(),
+            "the value in effect is no change"
+        );
+        assert!(app.prompt.is_none());
+
+        let _ = press(&mut app, KeyCode::Enter, 0);
+        let _ = press(&mut app, KeyCode::Down, 0);
         let effects = press(&mut app, KeyCode::Enter, 0);
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Job(Job::SetWriting(WritingMode::Literal))]
-        ));
+        let expected = DELIVERIES[current + 1];
+        assert!(
+            matches!(effects.as_slice(), [Effect::Job(Job::SetDelivery(mode))] if *mode == expected)
+        );
+        assert_eq!(app.current_choice(SettingsRow::Delivery), Some(current + 1));
+        assert!(app.prompt.is_none());
+    }
 
+    #[test]
+    fn the_picker_stops_at_both_ends() {
+        let mut app = ready_app();
+        app.tab = Tab::Settings;
         app.settings_selected = 3;
-        let effects = press(&mut app, KeyCode::Enter, 0);
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Job(Job::SetRendering(RenderingPolicy::Structured))]
-        ));
-        let effects = press(&mut app, KeyCode::Enter, 0);
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Job(Job::SetRendering(RenderingPolicy::Natural))]
-        ));
+        let _ = press(&mut app, KeyCode::Enter, 0);
+        let picked = |app: &App| match app.prompt {
+            Some(Prompt::Choice { picked, .. }) => picked,
+            _ => panic!("the choice closed"),
+        };
+        for _ in 0..5 {
+            let _ = press(&mut app, KeyCode::Up, 0);
+        }
+        assert_eq!(picked(&app), 0);
+        for _ in 0..5 {
+            let _ = press(&mut app, KeyCode::Down, 0);
+        }
+        assert_eq!(picked(&app), LAYOUTS.len() - 1);
+    }
+
+    #[test]
+    fn writing_and_layout_send_their_own_jobs_and_deepgram_still_flips() {
+        let mut app = ready_app();
+        app.tab = Tab::Settings;
+        let pick_next = |app: &mut App, row: usize| {
+            app.settings_selected = row;
+            let _ = press(app, KeyCode::Enter, 0);
+            let _ = press(app, KeyCode::Down, 0);
+            press(app, KeyCode::Enter, 0)
+        };
+
+        let next = app.current_choice(SettingsRow::Writing).expect("loaded") + 1;
+        let effects = pick_next(&mut app, 2);
+        assert!(
+            matches!(effects.as_slice(), [Effect::Job(Job::SetWriting(mode))] if *mode == WRITINGS[next])
+        );
+
+        let next = app.current_choice(SettingsRow::Rendering).expect("loaded") + 1;
+        let effects = pick_next(&mut app, 3);
+        assert!(
+            matches!(effects.as_slice(), [Effect::Job(Job::SetRendering(policy))] if *policy == LAYOUTS[next])
+        );
 
         app.settings_selected = 4;
         let effects = press(&mut app, KeyCode::Enter, 0);
@@ -2186,7 +2325,7 @@ mod tests {
             app.context(),
             Context::Settings {
                 enter: None,
-                restart: false
+                restart: true
             }
         );
     }
@@ -2201,6 +2340,8 @@ mod tests {
                 at(0),
             );
             app.tab = Tab::Settings;
+            let _ = press(&mut app, KeyCode::Enter, 0);
+            let _ = press(&mut app, KeyCode::Down, 0);
             let effects = press(&mut app, KeyCode::Enter, 0);
             assert!(matches!(
                 effects.as_slice(),

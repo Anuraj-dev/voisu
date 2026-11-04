@@ -18,6 +18,9 @@ pub enum Tone {
     Plain,
     Dim,
     Bold,
+    /// What to look at first: the name, the open tab, keys, the highlight.
+    /// Bold everywhere; cyan too where there is colour.
+    Accent,
     Recording,
     Processing,
     Success,
@@ -93,6 +96,7 @@ impl Look {
             Tone::Plain => base,
             Tone::Dim => base.add_modifier(Modifier::DIM),
             Tone::Bold => base.add_modifier(Modifier::BOLD),
+            Tone::Accent => colored(Color::Cyan).add_modifier(Modifier::BOLD),
             Tone::Recording | Tone::Success => colored(Color::Green),
             Tone::Processing => colored(Color::Blue),
             Tone::Caution => colored(Color::Yellow),
@@ -146,6 +150,7 @@ mod tests {
             Tone::Plain,
             Tone::Dim,
             Tone::Bold,
+            Tone::Accent,
             Tone::Recording,
             Tone::Processing,
             Tone::Success,

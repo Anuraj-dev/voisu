@@ -20,7 +20,8 @@ use crate::system::{ClipboardBoundary, SecretToolStore, WlClipboard};
 
 use super::model::{
     DaemonSnapshot, HistoryItem, Job, Refresh, Reply, ServiceVerb, SettingsRow, SettingsSnapshot,
-    StatusPoll, Tone, local_switch_allowed, trigger_key_value,
+    StatusPoll, Tone, delivery_label, engine_label, layout_label, local_switch_allowed,
+    trigger_key_value, writing_label,
 };
 use super::text;
 
@@ -115,7 +116,7 @@ pub fn execute(job: Job, replies: &Sender<Reply>) {
         // which is chosen at start.
         Job::SetDelivery(mode) => send(applied_setting(
             config::set_delivery_mode(mode),
-            format!("Delivery set to {}.", text::capitalized(mode.as_str())),
+            format!("Delivery set to {}.", delivery_label(mode)),
             "Restart Voisu to apply.",
             &[
                 Refresh::Settings,
@@ -125,7 +126,7 @@ pub fn execute(job: Job, replies: &Sender<Reply>) {
         )),
         Job::SetWriting(mode) => send(applied_setting(
             config::set_writing_mode(mode),
-            format!("Writing set to {}.", text::capitalized(mode.as_str())),
+            format!("Writing set to {}.", writing_label(mode)),
             "Restart Voisu to apply it fully.",
             // The daemon builds its Intent Reconstruction check once, at start.
             &[
@@ -136,7 +137,7 @@ pub fn execute(job: Job, replies: &Sender<Reply>) {
         )),
         Job::SetRendering(policy) => send(applied_setting(
             config::set_rendering_policy(policy),
-            format!("Rendering set to {}.", text::capitalized(policy.as_str())),
+            format!("Layout set to {}.", layout_label(policy)),
             "It applies to your next Recording.",
             &[Refresh::Settings, Refresh::Doctor],
         )),
@@ -317,7 +318,7 @@ fn consented_install(status: ConsentedStatus) -> bool {
 
 /// An offline change waits for the next daemon start, and the words say so.
 fn engine_applied_text(mode: AsrMode, message: &str) -> String {
-    let name = text::capitalized(mode.as_str());
+    let name = engine_label(mode);
     if message.contains("next supported daemon start") {
         format!("Engine set to {name}. It applies when Voisu next starts.")
     } else {
