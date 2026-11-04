@@ -3,7 +3,7 @@
 //! Restoring is idempotent and callable from a panic hook, so every exit path
 //! shares one routine. The interface owns the terminal while it runs, so stderr
 //! is parked on `/dev/null`: a stray library diagnostic must not scribble over
-//! the screen. It is given back before the Setup wizard runs and on every exit.
+//! the screen. It is given back on every exit.
 
 use std::io::{self, BufWriter, Stdout, Write};
 use std::os::fd::AsRawFd;
@@ -50,8 +50,7 @@ pub fn install_signal_handlers() {
 /// crossterm reader spins forever: `read` fails with EIO, which it neither
 /// returns nor breaks on, so the loop never sees the SIGHUP and a closed window
 /// would leave a process burning a core. Only while this process owns the
-/// terminal, because a signal during the Setup wizard is the main loop's to weigh
-/// once the wizard returns.
+/// terminal: after that, leaving is already under way.
 fn watchdog() {
     let unhandled = || pending_signal().filter(|_| ACTIVE.load(Ordering::SeqCst));
     loop {
@@ -72,12 +71,6 @@ pub fn pending_signal() -> Option<i32> {
         0 => None,
         signal => Some(signal),
     }
-}
-
-/// Forgets a Ctrl-C that the Setup wizard's own terminal delivered to this
-/// process group as well: it was meant for the wizard.
-pub fn forget_interrupt() {
-    let _ = SIGNAL.compare_exchange(libc::SIGINT, 0, Ordering::Relaxed, Ordering::Relaxed);
 }
 
 /// Puts the terminal back and restores the original panic behaviour's output.
@@ -145,10 +138,4 @@ pub fn leave() {
     let _ = execute!(stdout, ratatui::crossterm::cursor::Show);
     let _ = stdout.flush();
     let _ = disable_raw_mode();
-}
-
-/// Takes the terminal back after the Setup wizard and repaints from scratch.
-pub fn reenter(screen: &mut Screen) -> io::Result<()> {
-    arm()?;
-    screen.clear()
 }

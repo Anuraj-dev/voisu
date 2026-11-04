@@ -70,6 +70,7 @@ impl Look {
                 '✕' => out.push('x'),
                 '✓' => out.push('+'),
                 '━' => out.push('='),
+                '─' => out.push('-'),
                 '│' => out.push('|'),
                 '↵' => out.push_str("Enter"),
                 '←' => out.push_str("Left"),

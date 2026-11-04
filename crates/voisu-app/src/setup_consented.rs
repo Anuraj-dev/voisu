@@ -644,9 +644,7 @@ pub fn production_local_complete_message() -> String {
 
 /// Fetches and installs only when the setup offer calls this after an explicit yes.
 pub fn production_install(consent: ConsentedConsent) -> Result<(), ConsentedError> {
-    production_install_with(consent, |total| {
-        Box::new(TerminalProgress::stdout(total))
-    })
+    production_install_with(consent, |total| Box::new(TerminalProgress::stdout(total)))
 }
 
 /// [`production_install`], reporting to whatever `progress` builds from the

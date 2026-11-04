@@ -7,14 +7,18 @@
 use std::fmt;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use voisu_core::{AsrMode, AsrModeStatus, Credential, DaemonState, Provider, ReadinessStatus};
+use voisu_core::{
+    AsrMode, AsrModeStatus, Credential, DaemonState, Provider, ProviderKeyStatus, ReadinessStatus,
+};
 
 use crate::config::{DeliveryMode, RenderingPolicy, WritingMode};
 pub use crate::doctor::DoctorFix as Fix;
 use crate::doctor::DoctorRow;
+use crate::setup_flow::SETUP_INCOMPLETE;
 
 use super::keys::{self, Action, Context};
 pub use super::look::Tone;
+use super::setup::{KEY_WORKS, Landed, Outcome, SetupAnswer, SetupEvent, SetupState};
 use super::text;
 
 /// Smallest size the interface can lay out.
@@ -158,6 +162,7 @@ pub enum Reply {
         kind: Tone,
         text: String,
     },
+    Setup(SetupEvent),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -225,8 +230,10 @@ impl fmt::Debug for Job {
 #[derive(Debug)]
 pub enum Effect {
     Job(Job),
-    /// Leave the screen, run the wizard on this terminal, come back.
-    RunSetup,
+    /// Start the one setup flow on its own thread.
+    StartSetup,
+    /// Answer the question the flow is waiting on.
+    Setup(SetupAnswer),
 }
 
 pub enum Msg {
@@ -235,7 +242,6 @@ pub enum Msg {
     Resize(u16, u16),
     Tick,
     Reply(Reply),
-    SetupReturned { completed: bool },
 }
 
 /// One-line input. Debug is redacted: this may hold an API key.
@@ -250,6 +256,36 @@ impl PromptText {
     /// The plain text, for prompts that are not masked.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// One keystroke. Returns whether the text changed.
+    pub(super) fn edit(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Backspace => {
+                self.0.pop();
+            }
+            KeyCode::Char(ch)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && !ch.is_control()
+                    && self.0.len() < PROMPT_LIMIT =>
+            {
+                self.0.push(ch);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Pasted text, trimmed, up to the first line break.
+    pub(super) fn paste(&mut self, pasted: &str) {
+        for ch in pasted.trim().chars() {
+            if ch.is_control() || self.0.len() >= PROMPT_LIMIT {
+                break;
+            }
+            self.0.push(ch);
+        }
     }
 }
 
@@ -342,12 +378,23 @@ pub fn layout_label(policy: RenderingPolicy) -> &'static str {
 /// A provider key's check result in plain words.
 fn key_word(value: &str) -> String {
     match value {
-        "valid" => "Works".to_owned(),
-        "invalid" => "Rejected".to_owned(),
-        "too many requests, try later" => "Busy, try again soon".to_owned(),
-        "out of credit" => "Out of free use".to_owned(),
-        "unreachable" => "Can't reach it".to_owned(),
+        "valid" => status_word(ProviderKeyStatus::Valid).to_owned(),
+        "invalid" => status_word(ProviderKeyStatus::InvalidKey).to_owned(),
+        "too many requests, try later" => status_word(ProviderKeyStatus::RateLimited).to_owned(),
+        "out of credit" => status_word(ProviderKeyStatus::QuotaExhausted).to_owned(),
+        "unreachable" => status_word(ProviderKeyStatus::Unreachable).to_owned(),
         other => text::capitalized(other),
+    }
+}
+
+/// A live check's result, in the same words wherever a key is shown.
+pub fn status_word(status: ProviderKeyStatus) -> &'static str {
+    match status {
+        ProviderKeyStatus::Valid => KEY_WORKS,
+        ProviderKeyStatus::InvalidKey => "Rejected",
+        ProviderKeyStatus::RateLimited => "Busy, try again soon",
+        ProviderKeyStatus::QuotaExhausted => "Out of free use",
+        ProviderKeyStatus::Unreachable => "Can't reach it",
     }
 }
 
@@ -509,6 +556,10 @@ pub struct App {
     /// Settings changed since the daemon started, which it reads only then.
     pub restart_pending: Vec<SettingsRow>,
     pub should_quit: bool,
+    /// The setup screens, over the tabs, while setup runs.
+    pub setup: Option<SetupState>,
+    /// What `voisu setup` exits with. Bare `voisu` always exits 0.
+    pub setup_exit: Option<u8>,
     failed_polls: u8,
     guard_until_mono_ms: u64,
     recording_since_mono_ms: Option<u64>,
@@ -546,6 +597,8 @@ impl App {
             fresh_daemon_on_success: false,
             restart_pending: Vec::new(),
             should_quit: false,
+            setup: None,
+            setup_exit: None,
             failed_polls: 0,
             guard_until_mono_ms: 0,
             recording_since_mono_ms: None,
@@ -635,6 +688,8 @@ impl App {
             }
         } else if self.too_small() {
             Context::TooSmall
+        } else if let Some(setup) = &self.setup {
+            setup.context()
         } else if let Some(prompt) = &self.prompt {
             match prompt {
                 Prompt::AddTerm(_) => Context::AddTermPrompt,
@@ -995,6 +1050,7 @@ impl App {
 
     fn on_reply(&mut self, reply: Reply, effects: &mut Vec<Effect>) {
         match reply {
+            Reply::Setup(event) => self.on_setup_event(event, effects),
             Reply::Status(poll) => self.on_status(poll, effects),
             Reply::SetupNeeded(needed) => {
                 self.dirty |= self.setup_needed != Some(needed);
@@ -1086,10 +1142,25 @@ impl App {
 
     fn on_key(&mut self, key: KeyEvent, effects: &mut Vec<Effect>) {
         let context = self.context();
-        if let Some(action) = keys::action_for(&context, key) {
-            self.apply(action, effects);
-        } else if matches!(context, Context::AddTermPrompt | Context::KeyPrompt) {
-            self.edit_prompt(key);
+        let on_setup = context.is_setup();
+        match keys::action_for(&context, key) {
+            Some(action) if on_setup && action != Action::Quit => {
+                if let Some(setup) = &mut self.setup {
+                    let outcome = setup.act(action);
+                    self.on_setup_outcome(outcome, effects);
+                }
+            }
+            Some(action) => self.apply(action, effects),
+            None if on_setup => {
+                if let Some(setup) = &mut self.setup {
+                    setup.type_key(key);
+                    self.dirty = true;
+                }
+            }
+            None if matches!(context, Context::AddTermPrompt | Context::KeyPrompt) => {
+                self.edit_prompt(key);
+            }
+            None => {}
         }
     }
 
@@ -1142,6 +1213,8 @@ impl App {
                 self.dirty = true;
             }
             Action::Submit => self.submit_prompt(effects),
+            // Bound only on the setup screens, which take their keys in `on_key`.
+            Action::Keep | Action::PasteClipboard => {}
             Action::ConfirmRemove => {
                 if let Some(Prompt::ConfirmRemove(term)) = self.prompt.take() {
                     self.dirty = true;
@@ -1207,7 +1280,7 @@ impl App {
     fn activate(&mut self, effects: &mut Vec<Effect>) {
         match self.tab {
             Tab::Home => match self.fix() {
-                Some(Fix::RunSetup) => effects.push(Effect::RunSetup),
+                Some(Fix::RunSetup) => self.start_setup(effects),
                 Some(Fix::StartVoisu) => self.start_service(ServiceVerb::Start, effects),
                 Some(Fix::RestartVoisu) => self.start_service(ServiceVerb::Restart, effects),
                 None => {}
@@ -1252,7 +1325,7 @@ impl App {
                 self.prompt = Some(Prompt::Key(Provider::Deepgram, PromptText::default()));
             }
             SettingsRow::TriggerKey => return,
-            SettingsRow::RunSetup => effects.push(Effect::RunSetup),
+            SettingsRow::RunSetup => self.start_setup(effects),
         }
         self.dirty = true;
     }
@@ -1333,22 +1406,9 @@ impl App {
         let (Some(Prompt::AddTerm(text)) | Some(Prompt::Key(_, text))) = &mut self.prompt else {
             return;
         };
-        match key.code {
-            KeyCode::Backspace => {
-                text.0.pop();
-            }
-            KeyCode::Char(ch)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                    && !ch.is_control()
-                    && text.0.len() < PROMPT_LIMIT =>
-            {
-                text.0.push(ch);
-            }
-            _ => return,
+        if text.edit(key) {
+            self.dirty = true;
         }
-        self.dirty = true;
     }
 
     fn submit_prompt(&mut self, effects: &mut Vec<Effect>) {
@@ -1385,20 +1445,84 @@ impl App {
     /// Bracketed paste is discarded: pasted text must never act as keystrokes.
     /// A masked key prompt is the one exception, because a key that cannot be
     /// pasted cannot realistically be entered.
-    fn on_paste(&mut self, pasted: String) {
+    fn on_paste(&mut self, pasted: String, effects: &mut Vec<Effect>) {
+        if matches!(self.context(), Context::SetupKey { .. }) {
+            let outcome = match &mut self.setup {
+                Some(setup) => setup.paste(&pasted),
+                None => return,
+            };
+            self.on_setup_outcome(outcome, effects);
+            return;
+        }
         if self.context() != Context::KeyPrompt {
             return;
         }
         let Some(Prompt::Key(_, text)) = &mut self.prompt else {
             return;
         };
-        for ch in pasted.trim().chars() {
-            if ch.is_control() || text.0.len() >= PROMPT_LIMIT {
-                break;
-            }
-            text.0.push(ch);
-        }
+        text.paste(&pasted);
         self.dirty = true;
+    }
+
+    /// Opens the setup screens over the tabs. `run` starts the flow itself.
+    fn start_setup(&mut self, effects: &mut Vec<Effect>) {
+        self.setup = Some(SetupState::starting());
+        self.prompt = None;
+        self.overlay = false;
+        self.dirty = true;
+        effects.push(Effect::StartSetup);
+    }
+
+    /// `voisu setup` opens straight on the setup screens; until the flow says
+    /// otherwise, quitting means it did not finish.
+    pub fn start_setup_from_cli(&mut self) -> Vec<Effect> {
+        self.setup_exit = Some(SETUP_INCOMPLETE);
+        let mut effects = Vec::new();
+        self.start_setup(&mut effects);
+        effects
+    }
+
+    fn on_setup_outcome(&mut self, outcome: Outcome, effects: &mut Vec<Effect>) {
+        self.dirty = true;
+        match outcome {
+            Outcome::Stay => {}
+            Outcome::Answer(answer) => effects.push(Effect::Setup(answer)),
+            Outcome::Close => {
+                let completed = self.setup.as_ref().and_then(|setup| setup.code) == Some(0);
+                self.close_setup(completed, effects);
+            }
+        }
+    }
+
+    /// Back to the tabs, with everything setup may have changed read afresh.
+    fn close_setup(&mut self, completed: bool, effects: &mut Vec<Effect>) {
+        self.setup = None;
+        if completed {
+            self.show(Tone::Success, "Setup finished.");
+        } else {
+            self.show(Tone::Caution, "Setup didn't finish.");
+        }
+        self.setup_needed = None;
+        effects.push(Effect::Job(Job::LoadSettings));
+        effects.push(Effect::Job(Job::LoadShortcut));
+        self.request_doctor(effects);
+    }
+
+    fn on_setup_event(&mut self, event: SetupEvent, effects: &mut Vec<Effect>) {
+        let Some(setup) = &mut self.setup else {
+            return;
+        };
+        self.dirty = true;
+        let landed = setup.on_event(event, self.now.mono_ms);
+        // Bare `voisu` was opened by no script, so only `voisu setup` reports.
+        if let Landed::Finished { code } | Landed::Gone { code } = landed
+            && self.setup_exit.is_some()
+        {
+            self.setup_exit = Some(code);
+        }
+        if let Landed::Gone { code } = landed {
+            self.close_setup(code == 0, effects);
+        }
     }
 }
 
@@ -1440,24 +1564,13 @@ pub fn update(app: &mut App, msg: Msg, now: Now) -> Vec<Effect> {
     let before = std::mem::replace(&mut app.now, now);
     match msg {
         Msg::Key(key) => app.on_key(key, &mut effects),
-        Msg::Paste(pasted) => app.on_paste(pasted),
+        Msg::Paste(pasted) => app.on_paste(pasted, &mut effects),
         Msg::Resize(width, height) => {
             app.size = (width, height);
             app.dirty = true;
         }
         Msg::Tick => {}
         Msg::Reply(reply) => app.on_reply(reply, &mut effects),
-        Msg::SetupReturned { completed } => {
-            if completed {
-                app.show(Tone::Success, "Setup finished.");
-            } else {
-                app.show(Tone::Caution, "Setup didn't finish.");
-            }
-            app.setup_needed = None;
-            effects.push(Effect::Job(Job::LoadSettings));
-            effects.push(Effect::Job(Job::LoadShortcut));
-            app.request_doctor(&mut effects);
-        }
     }
     if app
         .toast
@@ -2063,7 +2176,8 @@ mod tests {
             at(0),
         );
         let effects = press(&mut app, KeyCode::Enter, 0);
-        assert!(matches!(effects.as_slice(), [Effect::RunSetup]));
+        assert!(matches!(effects.as_slice(), [Effect::StartSetup]));
+        assert!(app.setup.is_some());
     }
 
     #[test]
@@ -2500,7 +2614,8 @@ mod tests {
         app.tab = Tab::Settings;
         app.settings_selected = 8;
         let effects = press(&mut app, KeyCode::Enter, 0);
-        assert!(matches!(effects.as_slice(), [Effect::RunSetup]));
+        assert!(matches!(effects.as_slice(), [Effect::StartSetup]));
+        assert!(app.setup.is_some());
     }
 
     #[test]

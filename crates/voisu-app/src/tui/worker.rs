@@ -74,7 +74,7 @@ fn poll_status(replies: &Sender<Reply>) {
     }
 }
 
-fn status_poll() -> StatusPoll {
+pub(crate) fn status_poll() -> StatusPoll {
     match send_command(Command::Status) {
         Ok(response) if response.ok => match response.state {
             Some(state) => StatusPoll::Up(DaemonSnapshot {
@@ -270,7 +270,7 @@ pub fn history_item(record: &DiagnosticRecord, now_ms: u64) -> HistoryItem {
 
 /// `None` only when no daemon answered, so the row never sticks on `Checking…`
 /// against a daemon that replied without a Trigger Key.
-fn load_shortcut() -> Option<String> {
+pub(crate) fn load_shortcut() -> Option<String> {
     match send_command(Command::Shortcut) {
         Ok(response) if response.ok => Some(trigger_key_value(&response.message)),
         Ok(_) | Err(DaemonClientError::Failed { .. }) => Some("Unknown".to_owned()),

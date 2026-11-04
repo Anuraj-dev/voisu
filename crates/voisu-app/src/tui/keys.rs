@@ -43,6 +43,39 @@ pub enum Context {
         /// `r` restarts Voisu: nothing else is starting or restarting it.
         restart: bool,
     },
+    /// A setup question with a few answers.
+    SetupChoice,
+    /// A key field on the setup keys screen. Letters are the key being typed.
+    SetupKey {
+        enter: Option<&'static str>,
+        /// A key is stored, and `→` keeps it.
+        keep: bool,
+        /// The field takes typing, so `Ctrl+V` can fill it.
+        editable: bool,
+    },
+    /// Setup is working and there is nothing to answer.
+    SetupBusy,
+    /// Setup is waiting for the desktop's own window.
+    SetupWaiting,
+    SetupInstallFailed {
+        esc: &'static str,
+    },
+    /// Setup has ended, one way or the other.
+    SetupDone,
+}
+
+impl Context {
+    pub fn is_setup(&self) -> bool {
+        matches!(
+            self,
+            Context::SetupChoice
+                | Context::SetupKey { .. }
+                | Context::SetupBusy
+                | Context::SetupWaiting
+                | Context::SetupInstallFailed { .. }
+                | Context::SetupDone
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,6 +98,10 @@ pub enum Action {
     Close,
     Submit,
     ConfirmRemove,
+    /// Keep the stored key.
+    Keep,
+    /// Read a key from the clipboard.
+    PasteClipboard,
 }
 
 /// One row of the table: how it reads, and which keys do what.
@@ -159,6 +196,14 @@ fn interrupt(in_footer: bool) -> Binding {
         label: "quit".into(),
         in_footer,
         chords: vec![(ctrl_c(), Action::Quit)],
+    }
+}
+
+/// `Ctrl-C` while setup is at work: it stops the work as well as the interface.
+fn stop() -> Binding {
+    Binding {
+        label: "stop".into(),
+        ..interrupt(true)
     }
 }
 
@@ -325,6 +370,63 @@ pub fn bindings(context: &Context) -> Vec<Binding> {
             rows.extend([tabs(), help(), quit()]);
             rows
         }
+        Context::SetupChoice => vec![
+            moves("pick", true),
+            enter("choose", Action::Submit),
+            close("leave setup"),
+            interrupt(false),
+        ],
+        Context::SetupKey {
+            enter: label,
+            keep,
+            editable,
+        } => {
+            // Arrows only: every letter here is part of a key.
+            let mut rows = vec![Binding {
+                keys: "↑↓",
+                all_keys: "↑ ↓",
+                label: "move".into(),
+                in_footer: true,
+                chords: vec![
+                    (plain(KeyCode::Up), Action::Up),
+                    (plain(KeyCode::Down), Action::Down),
+                ],
+            }];
+            if *editable {
+                rows.push(Binding {
+                    keys: "Ctrl+V",
+                    all_keys: "Ctrl+V",
+                    label: "paste".into(),
+                    // Five hints don't fit the narrowest screen, and replacing a
+                    // key is the rarer case: the key still works.
+                    in_footer: !*keep,
+                    chords: vec![(ctrl('v'), Action::PasteClipboard)],
+                });
+            }
+            if let Some(label) = label {
+                rows.push(enter(*label, Action::Submit));
+            }
+            if *keep {
+                rows.push(Binding {
+                    keys: "→",
+                    all_keys: "→",
+                    label: "keep".into(),
+                    in_footer: true,
+                    chords: vec![(plain(KeyCode::Right), Action::Keep)],
+                });
+            }
+            rows.push(close("leave setup"));
+            rows.push(interrupt(false));
+            rows
+        }
+        Context::SetupBusy => vec![stop()],
+        Context::SetupWaiting => vec![close("later"), stop()],
+        Context::SetupInstallFailed { esc } => vec![
+            enter("try again", Action::Submit),
+            close(esc),
+            interrupt(false),
+        ],
+        Context::SetupDone => vec![enter("open Voisu", Action::Submit), quit()],
     }
 }
 
@@ -359,7 +461,21 @@ pub(super) fn every_context() -> Vec<Context> {
         Context::ConfirmPrompt,
         Context::ChoicePrompt,
         Context::Overlay,
+        Context::SetupChoice,
+        Context::SetupBusy,
+        Context::SetupWaiting,
+        Context::SetupInstallFailed { esc: "use Cloud" },
+        Context::SetupDone,
     ];
+    for enter in [None, Some("check"), Some("replace"), Some("save it")] {
+        for (keep, editable) in [(false, false), (false, true), (true, true)] {
+            contexts.push(Context::SetupKey {
+                enter,
+                keep,
+                editable,
+            });
+        }
+    }
     for fix in [None, Some("Run setup"), Some("Restart Voisu")] {
         for checks in [false, true] {
             for restart in [false, true] {
@@ -494,7 +610,12 @@ mod tests {
 
     #[test]
     fn typing_in_a_prompt_is_never_captured_as_a_command() {
-        for context in [Context::AddTermPrompt, Context::KeyPrompt] {
+        let setup_key = Context::SetupKey {
+            enter: Some("check"),
+            keep: true,
+            editable: true,
+        };
+        for context in [Context::AddTermPrompt, Context::KeyPrompt, setup_key] {
             for ch in "qhjklr?acd1234".chars() {
                 assert_eq!(action_for(&context, letter(ch)), None, "{context:?} {ch}");
             }

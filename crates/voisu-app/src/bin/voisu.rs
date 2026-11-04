@@ -283,6 +283,9 @@ fn print_doctor_rows(rows: &[DoctorRow], verbose: bool) {
 /// supply the text wizard.
 fn setup() -> ExitCode {
     use std::io::IsTerminal;
+    if voisu_app::tui::should_open_setup() {
+        return voisu_app::tui::run_setup();
+    }
     // Integration tests can isolate the wizard while exercising the real CLI;
     // production never sets this seam.
     let wizard_only = std::env::var_os("VOISU_TEST_SETUP_WIZARD_ONLY").is_some();

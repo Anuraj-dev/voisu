@@ -28,6 +28,13 @@ struct Interface {
 
 impl Interface {
     fn open() -> Self {
+        let mut interface = Self::spawn(&[]);
+        // The first frame comes after the alternate screen, once the loop runs.
+        interface.wait_for_output(b"Settings");
+        interface
+    }
+
+    fn spawn(args: &[&str]) -> Self {
         let dirs = TempDir::new().unwrap();
         let runtime = dirs.path().join("runtime");
         std::fs::create_dir(&runtime).unwrap();
@@ -35,6 +42,7 @@ impl Interface {
 
         let (master, slave) = pseudo_terminal();
         let mut command = Command::new(env!("CARGO_BIN_EXE_voisu"));
+        command.args(args);
         command
             .env_clear()
             .env("TERM", "xterm-256color")
@@ -66,8 +74,6 @@ impl Interface {
             _dirs: dirs,
         };
         interface.wait_for_output(ENTER_ALTERNATE_SCREEN);
-        // The first frame comes after the alternate screen, once the loop runs.
-        interface.wait_for_output(b"Settings");
         interface
     }
 
@@ -247,36 +253,41 @@ fn quitting_with_q_restores_the_terminal_and_exits_zero() {
 
 /// Setup runs on the same terminal and comes back to a raw, working interface.
 /// With no desktop session in the environment, setup fails at once, which is
-/// enough to cover the hand-off without a real wizard.
+/// enough to cover it running inside the interface without a real desktop.
 #[test]
-fn setup_gets_the_terminal_and_hands_it_back() {
+fn setup_runs_inside_the_interface_and_comes_back_to_it() {
     let mut interface = Interface::open();
     // A fresh home is not set up, so ↵ is Run setup.
     interface.wait_for_output(b"Not set up");
     interface.type_keys(b"\r");
 
-    let failed = b"cannot determine the desktop session";
-    interface.wait_for_output(failed);
-    let handed_back = interface
-        .output
-        .windows(failed.len())
-        .position(|window| window == failed)
-        .unwrap();
-    interface.wait_for_output_after(handed_back, ENTER_ALTERNATE_SCREEN);
-    // Repainting asks where the cursor is; answer as a terminal emulator would.
-    interface.wait_for_output_after(handed_back, b"\x1b[6n");
-    interface.type_keys(b"\x1b[1;1R");
-    let before_setup = &interface.output[..handed_back];
+    interface.wait_for_output(b"Setup didn't finish");
+    let failed = interface.output.len();
     assert!(
-        before_setup
-            .windows(LEAVE_ALTERNATE_SCREEN.len())
-            .any(|window| window == LEAVE_ALTERNATE_SCREEN),
-        "setup must run after the interface leaves the screen"
+        !interface.printed(LEAVE_ALTERNATE_SCREEN),
+        "setup must not leave the screen"
     );
-    interface.wait_for_output_after(handed_back, b"Settings");
-    assert_eq!(interface.local_flags() & COOKED, 0, "raw again after setup");
+    assert_eq!(interface.local_flags() & COOKED, 0, "raw during setup");
+
+    interface.type_keys(b"\r");
+    interface.wait_for_output_after(failed, b"Settings");
+    assert_eq!(interface.local_flags() & COOKED, 0, "raw after setup");
 
     interface.type_keys(b"q");
-    assert_eq!(interface.wait_for_exit().code(), Some(0));
+    assert_eq!(
+        interface.wait_for_exit().code(),
+        Some(0),
+        "bare voisu was opened by no script"
+    );
+    assert_eq!(interface.local_flags() & COOKED, COOKED);
+}
+
+/// `voisu setup` on a terminal opens the screens and still reports how it went.
+#[test]
+fn voisu_setup_on_a_terminal_reports_how_setup_went() {
+    let mut interface = Interface::spawn(&["setup"]);
+    interface.wait_for_output(b"Setup didn't finish");
+    interface.type_keys(b"q");
+    assert_eq!(interface.wait_for_exit().code(), Some(4));
     assert_eq!(interface.local_flags() & COOKED, COOKED);
 }

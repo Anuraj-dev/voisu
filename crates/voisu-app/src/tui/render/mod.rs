@@ -8,6 +8,7 @@ mod dictionary;
 mod history;
 mod home;
 mod settings;
+mod setup;
 
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
@@ -79,6 +80,11 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, look: &Look) {
             footer_line(look, &app.context(), area.width as usize),
         ];
         frame.render_widget(Paragraph::new(lines), area);
+        return;
+    }
+
+    if let Some(state) = &app.setup {
+        setup::draw(frame, app, state, look);
         return;
     }
 
