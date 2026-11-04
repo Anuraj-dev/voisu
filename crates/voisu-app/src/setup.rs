@@ -110,7 +110,11 @@ pub struct LiveHyprlandSetupActions<'a> {
 
 impl HyprlandSetupActions for LiveHyprlandSetupActions<'_> {
     fn select_clipboard_delivery(&mut self) -> Result<(), String> {
-        // On Hyprland, Paste presses the verified paste shortcut.
+        // On Hyprland, Paste presses the verified paste shortcut. A user who
+        // chose Copy keeps it: rerunning setup must not turn chord pressing on.
+        if config::delivery_mode() == DeliveryMode::Copy {
+            return Ok(());
+        }
         config::set_delivery_mode(DeliveryMode::Paste).map(|_| ())
     }
 
@@ -1112,17 +1116,25 @@ mod tests {
     }
 
     #[test]
-    fn hyprland_setup_selects_paste_delivery() {
+    fn hyprland_setup_selects_paste_delivery_unless_the_user_chose_copy() {
         let dir = tempfile::tempdir().unwrap();
         let _lock = xdg_config_test_lock();
         let _guard = XdgConfigHomeGuard::set(dir.path());
         let mut io = FakeIo::new(vec![], vec![]);
         let mut actions = LiveHyprlandSetupActions { io: &mut io };
 
-        config::set_delivery_mode(DeliveryMode::Copy).unwrap();
-        assert_eq!(config::delivery_mode(), DeliveryMode::Copy);
         actions.select_clipboard_delivery().unwrap();
-        assert_eq!(config::delivery_mode(), DeliveryMode::Paste);
+        assert_eq!(
+            config::stored_delivery(),
+            Some(config::StoredDelivery::Mode(DeliveryMode::Paste))
+        );
+
+        config::set_delivery_mode(DeliveryMode::Copy).unwrap();
+        actions.select_clipboard_delivery().unwrap();
+        assert_eq!(
+            config::stored_delivery(),
+            Some(config::StoredDelivery::Mode(DeliveryMode::Copy))
+        );
     }
 
     #[test]
