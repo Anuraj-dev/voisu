@@ -296,12 +296,11 @@ fn delivery_row(
         }),
         (PasteBackend::Unavailable, _) => DoctorRow::new(
             LABEL,
-            ReadinessStatus::Fail,
-            "Voisu copies only until Hyprland has a paste shortcut; voisu setup adds one",
+            ReadinessStatus::Warn,
+            "add a paste shortcut to your Hyprland config, or run voisu delivery copy",
         )
-        .value("No paste shortcut found in your Hyprland config")
-        .action("voisu setup, or voisu delivery copy")
-        .fix(DoctorFix::RunSetup),
+        .value("No paste shortcut found in your Hyprland config. Your words stay on the clipboard.")
+        .action("add a paste shortcut to your Hyprland config, or run voisu delivery copy"),
         (PasteBackend::NotRequired, PasteActionState::ClipboardOnly) => DoctorRow::new(
             LABEL,
             ReadinessStatus::Warn,
@@ -684,12 +683,12 @@ mod delivery_row_tests {
         assert_eq!(
             shown(&row),
             (
-                "No paste shortcut found in your Hyprland config",
-                ReadinessStatus::Fail,
-                Some("voisu setup, or voisu delivery copy")
+                "No paste shortcut found in your Hyprland config. Your words stay on the clipboard.",
+                ReadinessStatus::Warn,
+                Some("add a paste shortcut to your Hyprland config, or run voisu delivery copy")
             )
         );
-        assert_eq!(row.fix, Some(DoctorFix::RunSetup));
+        assert_eq!(row.fix, None);
     }
 
     #[test]

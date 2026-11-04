@@ -3737,16 +3737,35 @@ fn doctor_says_how_to_fix_hyprland_paste_without_a_shortcut() {
         ],
     );
     let output = stdout(&doctor);
-    assert_eq!(doctor.status.code(), Some(4), "{output}");
+    assert_eq!(doctor.status.code(), Some(0), "{output}");
     assert!(
-        output.contains(&format!(
-            "{}    voisu setup, or voisu delivery copy\n",
-            doctor_line(
-                "Delivery",
-                "No paste shortcut found in your Hyprland config",
-                "FAIL"
-            )
+        output.contains(&doctor_line(
+            "Delivery",
+            "No paste shortcut found in your Hyprland config. Your words stay on the clipboard.",
+            "WARN"
         )),
+        "{output}"
+    );
+
+    // WARN rows stay on one line; the how-to is behind --verbose.
+    let verbose = voisu_isolated(
+        runtime.path(),
+        config_home.path(),
+        &["doctor", "--verbose"],
+        &[
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("WAYLAND_DISPLAY", "wayland-8"),
+            ("HYPRLAND_INSTANCE_SIGNATURE", "hyprland-test"),
+            ("VOISU_TEST_READINESS", "pass"),
+            ("VOISU_TEST_OVERLAY_READINESS", "ready"),
+            ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
+        ],
+    );
+    let output = stdout(&verbose);
+    assert!(
+        output.contains(
+            "    (add a paste shortcut to your Hyprland config, or run voisu delivery copy)\n"
+        ),
         "{output}"
     );
 }
