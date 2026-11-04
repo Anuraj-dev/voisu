@@ -3234,20 +3234,18 @@ fn build_delivery_adapter(
         };
         return (Box::new(ControlledDelivery), paste);
     }
-    if std::env::var_os("VOISU_DISABLE_DIRECT_DELIVERY").is_some() {
-        return (
-            Box::new(PortalClipboardDelivery::clipboard_only_with_reason(
-                Box::new(WlClipboard),
-                "pasting turned off by VOISU_DISABLE_DIRECT_DELIVERY",
-            )),
-            copy_only,
-        );
-    }
     match delivery_mode {
         DeliveryMode::Copy => (
             Box::new(PortalClipboardDelivery::clipboard_only_with_reason(
                 Box::new(WlClipboard),
                 COPY_MODE_REASON,
+            )),
+            copy_only,
+        ),
+        DeliveryMode::Paste if std::env::var_os("VOISU_DISABLE_DIRECT_DELIVERY").is_some() => (
+            Box::new(PortalClipboardDelivery::clipboard_only_with_reason(
+                Box::new(WlClipboard),
+                "pasting turned off by VOISU_DISABLE_DIRECT_DELIVERY",
             )),
             copy_only,
         ),

@@ -12392,6 +12392,15 @@ fn delivery_cli_sets_gets_and_persists_paste_or_copy_while_rejecting_other_modes
 
 #[test]
 fn copy_delivery_mode_uses_the_clipboard_only_adapter() {
+    copy_mode_says_copied(&[]);
+}
+
+#[test]
+fn copy_delivery_mode_says_copied_even_when_pasting_is_turned_off() {
+    copy_mode_says_copied(&[("VOISU_DISABLE_DIRECT_DELIVERY", "1")]);
+}
+
+fn copy_mode_says_copied(extra_environment: &[(&str, &str)]) {
     let runtime = TempDir::new().unwrap();
     let config = TempDir::new().unwrap();
     let config_dir = config.path().join("voisu");
@@ -12428,26 +12437,27 @@ cat > "$dir/clipboard"
         commands.path().display(),
         std::env::var("PATH").unwrap()
     );
-    let daemon = Daemon::start_production_with_env(
-        runtime.path(),
-        &[
-            ("PATH", &path),
-            ("XDG_CONFIG_HOME", config.path().to_str().unwrap()),
-            // Keep the production adapter selection active while keeping any
-            // portal connection hermetic. Copy mode must not touch it.
-            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/voisu-no-portal"),
-            ("VOISU_DISABLE_SHORTCUTS", "1"),
-            ("VOISU_TEST_SECRET_STORE", "unavailable"),
-            ("VOISU_GROQ_API_KEY", "controlled-secret"),
-            ("VOISU_GROQ_TRANSCRIPTION_URL", &endpoint),
-            ("VOISU_RECORDING_DEADLINE_MS", "5000"),
-        ],
-    );
+    let config_home = config.path().to_str().unwrap();
+    let mut environment = vec![
+        ("PATH", path.as_str()),
+        ("XDG_CONFIG_HOME", config_home),
+        // Keep the production adapter selection active while keeping any
+        // portal connection hermetic. Copy mode must not touch it.
+        ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/voisu-no-portal"),
+        ("VOISU_DISABLE_SHORTCUTS", "1"),
+        ("VOISU_TEST_SECRET_STORE", "unavailable"),
+        ("VOISU_GROQ_API_KEY", "controlled-secret"),
+        ("VOISU_GROQ_TRANSCRIPTION_URL", endpoint.as_str()),
+        ("VOISU_RECORDING_DEADLINE_MS", "5000"),
+    ];
+    environment.extend_from_slice(extra_environment);
+    let daemon = Daemon::start_production_with_env(runtime.path(), &environment);
 
     assert!(voisu(runtime.path(), "start").status.success());
     thread::sleep(Duration::from_millis(50));
     let stopped = voisu(runtime.path(), "stop");
     assert!(stopped.status.success(), "{}", stderr(&stopped));
+    assert_eq!(stdout(&stopped), "Copied. Paste with Ctrl+V\n");
     assert_eq!(
         fs::read_to_string(commands.path().join("clipboard")).unwrap(),
         "Clipboard-only Transcript."
