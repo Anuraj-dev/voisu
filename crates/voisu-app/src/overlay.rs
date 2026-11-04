@@ -66,7 +66,8 @@ impl OverlayView {
                 visible_label: "Pasted",
                 accessible_label: "Transcript pasted",
             },
-            OverlayOutcome::QualityFailure => Self::no_speech(),
+            OverlayOutcome::SilentRecording => Self::no_speech(),
+            OverlayOutcome::QualityFailure => Self::held_back(),
             OverlayOutcome::Copied => Self::copied(),
             _ => Self {
                 phase: OverlayPhase::Failure,
@@ -109,6 +110,16 @@ impl OverlayView {
             phase: OverlayPhase::NoSpeech,
             visible_label: "Didn't catch any speech",
             accessible_label: "Didn't hear any words; nothing was pasted",
+        }
+    }
+
+    /// A Transcript came back but failed the safety checks, so it is a Failure
+    /// with its own words, not silence.
+    pub const fn held_back() -> Self {
+        Self {
+            phase: OverlayPhase::Failure,
+            visible_label: "Held back text that looked wrong",
+            accessible_label: "Voisu held back text that looked wrong; nothing was pasted",
         }
     }
 
@@ -1457,7 +1468,7 @@ mod tests {
         // respects expiry rather than trivially going hidden.
         let mut controller = PresentationController::default();
         let now = Instant::now();
-        let stale = event(1, OverlayOutcome::QualityFailure);
+        let stale = event(1, OverlayOutcome::SilentRecording);
         let terminal = overlay_status(DaemonState::Idle, Some(stale.clone()));
         assert_eq!(
             controller.observe(&terminal, now).phase,
@@ -1549,7 +1560,8 @@ mod tests {
         );
         for (outcome, phase) in [
             (OverlayOutcome::DeliveryFailure, OverlayPhase::Failure),
-            (OverlayOutcome::QualityFailure, OverlayPhase::NoSpeech),
+            (OverlayOutcome::SilentRecording, OverlayPhase::NoSpeech),
+            (OverlayOutcome::QualityFailure, OverlayPhase::Failure),
             (OverlayOutcome::Copied, OverlayPhase::Copied),
         ] {
             let mut controller = PresentationController::default();
@@ -2422,17 +2434,27 @@ mod tests {
     }
 
     #[test]
-    fn quality_failure_maps_to_no_speech_view() {
-        let event = OverlayEvent {
-            outcome: OverlayOutcome::QualityFailure,
-            ..sample_event()
+    fn silence_maps_to_no_speech_and_held_back_text_keeps_its_own_words() {
+        let view_of = |outcome| {
+            OverlayView::from_terminal_event(&OverlayEvent {
+                outcome,
+                ..sample_event()
+            })
         };
-        let view = OverlayView::from_terminal_event(&event);
-        assert_eq!(view.phase, OverlayPhase::NoSpeech);
-        assert_eq!(view.visible_label, "Didn't catch any speech");
+        let silent = view_of(OverlayOutcome::SilentRecording);
+        assert_eq!(silent.phase, OverlayPhase::NoSpeech);
+        assert_eq!(silent.visible_label, "Didn't catch any speech");
         assert_eq!(
-            view.accessible_label,
+            silent.accessible_label,
             "Didn't hear any words; nothing was pasted"
+        );
+
+        let held_back = view_of(OverlayOutcome::QualityFailure);
+        assert_eq!(held_back.phase, OverlayPhase::Failure);
+        assert_eq!(held_back.capsule_text(), "Held back text that looked wrong");
+        assert_eq!(
+            held_back.accessible_label,
+            "Voisu held back text that looked wrong; nothing was pasted"
         );
     }
 

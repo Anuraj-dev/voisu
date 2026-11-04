@@ -2113,14 +2113,14 @@ fn daemon_instance_id() -> u64 {
 }
 
 fn overlay_outcome(error: &BoundaryError) -> OverlayOutcome {
-    if error.transcript_failure().is_some() {
-        return OverlayOutcome::QualityFailure;
-    }
     match error.kind() {
+        // Silence can carry Transcript evidence (an outro-only answer), but
+        // nothing was held back. Every other error with evidence was.
+        BoundaryKind::SilentRecording => OverlayOutcome::SilentRecording,
+        _ if error.transcript_failure().is_some() => OverlayOutcome::QualityFailure,
         BoundaryKind::Capture => OverlayOutcome::CaptureFailure,
         BoundaryKind::EmptyRecording => OverlayOutcome::EmptyRecording,
         BoundaryKind::TooShortRecording => OverlayOutcome::TooShortRecording,
-        BoundaryKind::SilentRecording => OverlayOutcome::SilentRecording,
         BoundaryKind::RecordingDeadline => OverlayOutcome::RecordingDeadline,
         BoundaryKind::Provider => OverlayOutcome::ProviderFailure,
         BoundaryKind::Delivery => OverlayOutcome::DeliveryFailure,

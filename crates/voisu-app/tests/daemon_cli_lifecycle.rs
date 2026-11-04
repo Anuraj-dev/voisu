@@ -5725,6 +5725,29 @@ fn overlay_status_classifies_a_guardrail_quality_failure() {
 }
 
 #[test]
+fn overlay_status_reports_outro_only_speech_as_silence_not_a_quality_failure() {
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("VOISU_TEST_DEEPGRAM_TRANSCRIPT", "Thank you for watching!"),
+            ("VOISU_TEST_GROQ_TRANSCRIPT", "Thank you for watching!"),
+        ],
+    );
+
+    assert!(voisu(runtime.path(), "start").status.success());
+    let stopped = ipc_request(runtime.path(), r#"{"version":1,"command":"stop"}"#);
+    assert_eq!(stopped["ok"], false, "{stopped}");
+    assert_eq!(stopped["message"], "Didn't hear any words", "{stopped}");
+
+    let observed = ipc_request(runtime.path(), OVERLAY_STATUS);
+    assert_eq!(
+        observed["overlay_event"]["outcome"], "silent_recording",
+        "{observed}"
+    );
+}
+
+#[test]
 fn overlay_status_classifies_a_non_guardrail_capture_failure() {
     let runtime = TempDir::new().unwrap();
     let _daemon = Daemon::start_with_env(
