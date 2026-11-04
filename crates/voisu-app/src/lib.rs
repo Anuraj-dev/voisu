@@ -32,6 +32,7 @@ pub mod service;
 pub mod setup;
 pub mod setup_consented;
 pub mod setup_engine;
+pub mod setup_flow;
 pub mod setup_profile;
 pub mod smart_writing;
 pub mod system;
