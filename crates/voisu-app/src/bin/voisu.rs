@@ -440,9 +440,9 @@ fn setup() -> ExitCode {
                 match run_hyprland_setup(&config, &mut actions) {
                     Ok(result) => {
                         let paste = if result.paste_verified {
-                            "verified Paste Action"
+                            "your Hyprland paste shortcut is ready"
                         } else {
-                            "clipboard-only paste fallback"
+                            "no paste shortcut found, so your words stay on the clipboard"
                         };
                         println!("{SETUP_COMPLETE_MESSAGE}");
                         println!(
