@@ -3838,6 +3838,18 @@ fn doctor_says_when_this_desktop_cannot_paste_for_voisu() {
         "{}",
         stdout(&missing)
     );
+    assert_eq!(missing.status.code(), Some(4), "{}", stdout(&missing));
+    let unknown = doctor("unknown");
+    assert!(
+        stdout(&unknown).contains(&doctor_line(
+            "Delivery",
+            "couldn't check whether this desktop allows pasting",
+            "WARN"
+        )),
+        "{}",
+        stdout(&unknown)
+    );
+    assert_eq!(unknown.status.code(), Some(0), "{}", stdout(&unknown));
     let not_allowed = doctor("not-allowed");
     assert!(
         stdout(&not_allowed).contains(&doctor_line(

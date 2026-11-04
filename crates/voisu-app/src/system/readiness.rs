@@ -759,6 +759,9 @@ fn portal_interface_available(interface: &str) -> bool {
 pub enum RemoteDesktopAccess {
     /// The portal has no RemoteDesktop interface: Voisu can only copy.
     Missing,
+    /// The portal could not be asked (no bus, no portal service, a timeout), so
+    /// nothing is known about this desktop.
+    Unknown,
     /// The interface exists, but the user has not allowed keyboard control
     /// yet; the next paste asks.
     NotAllowed,
@@ -766,23 +769,48 @@ pub enum RemoteDesktopAccess {
 }
 
 /// Probe the RemoteDesktop portal for doctor. `VOISU_TEST_REMOTE_DESKTOP`
-/// (`missing`, `not-allowed`, `allowed`) pins the answer so tests never depend
-/// on the host's portal.
+/// (`missing`, `unknown`, `not-allowed`, `allowed`) pins the answer so tests
+/// never depend on the host's portal.
 pub fn remote_desktop_access() -> RemoteDesktopAccess {
     if let Ok(value) = std::env::var("VOISU_TEST_REMOTE_DESKTOP") {
         return match value.as_str() {
             "missing" => RemoteDesktopAccess::Missing,
+            "unknown" => RemoteDesktopAccess::Unknown,
             "not-allowed" => RemoteDesktopAccess::NotAllowed,
             _ => RemoteDesktopAccess::Allowed,
         };
     }
-    if !portal_interface_available(REMOTE_DESKTOP_INTERFACE) {
-        RemoteDesktopAccess::Missing
-    } else if remote_desktop_access_remembered() {
-        RemoteDesktopAccess::Allowed
-    } else {
-        RemoteDesktopAccess::NotAllowed
+    let introspection = run_restricted_stdout(
+        "busctl",
+        &[
+            "--user",
+            "introspect",
+            PORTAL_BUS_NAME,
+            PORTAL_OBJECT_PATH,
+            "--xml-interface",
+        ],
+    );
+    let listed = introspection
+        .as_deref()
+        .and_then(|xml| std::str::from_utf8(xml).ok())
+        .and_then(remote_desktop_listed);
+    match listed {
+        None => RemoteDesktopAccess::Unknown,
+        Some(false) => RemoteDesktopAccess::Missing,
+        Some(true) if remote_desktop_access_remembered() => RemoteDesktopAccess::Allowed,
+        Some(true) => RemoteDesktopAccess::NotAllowed,
     }
+}
+
+/// Whether the portal's introspection XML lists the RemoteDesktop interface.
+/// Introspection tells "the portal answered without it" apart from a `busctl`
+/// failure without matching localized error text, and it cannot prompt. `None`
+/// for anything but a complete document, such as output cut off at the helper's
+/// stdout cap.
+fn remote_desktop_listed(xml: &str) -> Option<bool> {
+    xml.trim_end()
+        .ends_with("</node>")
+        .then(|| xml.contains(&format!("\"{REMOTE_DESKTOP_INTERFACE}\"")))
 }
 
 fn daemon_finding(response: Option<&Response>) -> ReadinessFinding {
@@ -891,4 +919,27 @@ fn readiness(
     detail: &str,
 ) -> ReadinessFinding {
     ReadinessFinding::new(capability, status, detail)
+}
+
+#[cfg(test)]
+mod remote_desktop_access_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_complete_answer_says_whether_the_interface_exists() {
+        let listing = |interface: &str| {
+            format!("<node>\n <interface name=\"{interface}\">\n </interface>\n</node>\n")
+        };
+        assert_eq!(
+            remote_desktop_listed(&listing(REMOTE_DESKTOP_INTERFACE)),
+            Some(true)
+        );
+        assert_eq!(
+            remote_desktop_listed(&listing(GLOBAL_SHORTCUTS_INTERFACE)),
+            Some(false)
+        );
+        let cut_off = listing(GLOBAL_SHORTCUTS_INTERFACE);
+        assert_eq!(remote_desktop_listed(&cut_off[..cut_off.len() - 9]), None);
+        assert_eq!(remote_desktop_listed(""), None);
+    }
 }

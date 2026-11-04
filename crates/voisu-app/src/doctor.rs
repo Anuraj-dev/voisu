@@ -343,6 +343,12 @@ fn delivery_row(
             )
             .value("This desktop doesn't let apps paste for you")
             .action("voisu delivery copy"),
+            RemoteDesktopAccess::Unknown => DoctorRow::new(
+                LABEL,
+                ReadinessStatus::Warn,
+                "the desktop portal didn't answer, so this says nothing about whether pasting works",
+            )
+            .value("couldn't check whether this desktop allows pasting"),
         },
     }
 }
@@ -803,6 +809,14 @@ mod delivery_row_tests {
                 RemoteDesktopAccess::NotAllowed,
                 (
                     "Allow keyboard control when asked",
+                    ReadinessStatus::Warn,
+                    None,
+                ),
+            ),
+            (
+                RemoteDesktopAccess::Unknown,
+                (
+                    "couldn't check whether this desktop allows pasting",
                     ReadinessStatus::Warn,
                     None,
                 ),
