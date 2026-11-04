@@ -10,12 +10,16 @@ use voisu_core::{
     resolve_session,
 };
 
-use crate::system::{FedoraReadiness, ProviderHttpClient, SecretToolStore};
+use crate::config::DeliveryMode;
+use crate::system::{
+    FedoraReadiness, ProviderHttpClient, RemoteDesktopAccess, SecretToolStore,
+    remote_desktop_access,
+};
 
 /// One rendered doctor line: `label  value  STATUS`, with an optional runnable
 /// action (shown indented only on FAIL) and reasoning (shown only under
-/// --verbose). Capability findings, the focus guard, and the provider-key
-/// checks are all reduced to this single shape so the terseness contract holds
+/// --verbose). Capability findings, Delivery, and the provider-key checks are
+/// all reduced to this single shape so the terseness contract holds
 /// for every check, not just the first group.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DoctorRow {
@@ -84,18 +88,6 @@ pub fn collect_rows() -> Vec<DoctorRow> {
             fix: None,
         })
         .collect();
-
-    // One runtime serves both the focus probe and the live per-provider key
-    // round trips, so the CLI never needs an ambient async runtime.
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .ok();
-    let focus_backend = runtime
-        .as_ref()
-        .map(|runtime| runtime.block_on(crate::focus::detect_focus_backend()))
-        .unwrap_or(crate::focus::FocusBackendKind::None);
-    rows.push(focus_guard_row(focus_backend));
 
     if ubuntu_gnome {
         use crate::ubuntu_gnome::{LiveState, TriggerState};
@@ -187,8 +179,13 @@ pub fn collect_rows() -> Vec<DoctorRow> {
                     .into_iter()
                     .map(local_doctor_row),
             );
-        } else if let Some(runtime) = runtime.as_ref() {
-            rows.extend(provider_key_rows(runtime));
+        } else if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            // The live key round trips get their own runtime, so the CLI never
+            // needs an ambient async one.
+            rows.extend(provider_key_rows(&runtime));
         }
     }
 
@@ -210,91 +207,16 @@ fn local_doctor_row(check: crate::local_doctor::DoctorCheck) -> DoctorRow {
     row
 }
 
-fn focus_guard_row(backend: crate::focus::FocusBackendKind) -> DoctorRow {
-    if backend == crate::focus::FocusBackendKind::None {
-        DoctorRow::new(
-            "Focus guard",
-            ReadinessStatus::Warn,
-            "no focus backend; guarded Delivery fails closed to the clipboard",
-        )
-        .value("none")
-    } else {
-        DoctorRow::new(
-            "Focus guard",
-            ReadinessStatus::Pass,
-            "focus backend available for guarded Delivery",
-        )
-        .value(backend.as_str())
-    }
-}
-
 fn daemon_readiness_rows(readiness: &DaemonReadiness) -> Vec<DoctorRow> {
     let mut rows = Vec::with_capacity(6);
     let daemon_session_matches = daemon_session_matches_cli(readiness);
     rows.push(daemon_session_row(readiness));
 
-    let cli_delivery = crate::config::delivery_mode().as_str();
-    let delivery_matches = readiness.delivery_mode == cli_delivery;
-    rows.push(
-        DoctorRow::new(
-            "Daemon delivery",
-            if delivery_matches {
-                ReadinessStatus::Pass
-            } else {
-                ReadinessStatus::Fail
-            },
-            if delivery_matches {
-                "daemon Delivery mode matches the current configuration"
-            } else {
-                "daemon selected Delivery before the current configuration; restart the service"
-            },
-        )
-        .value(readiness.delivery_mode.clone())
-        .action("voisu service restart")
-        .fix(DoctorFix::RestartVoisu),
-    );
-
-    rows.push(match readiness.paste_action {
-        PasteActionState::Verified => DoctorRow::new(
-            "Paste action",
-            ReadinessStatus::Pass,
-            "Hyprland Paste Action binding was verified by the daemon",
-        )
-        .value("verified"),
-        PasteActionState::ClipboardOnly => DoctorRow::new(
-            "Paste action",
-            ReadinessStatus::Warn,
-            "no verified Hyprland Paste Action; Delivery remains clipboard-only",
-        )
-        .value("clipboard-only"),
-        PasteActionState::NotRequired => DoctorRow::new(
-            "Paste action",
-            ReadinessStatus::Skip,
-            "the selected Delivery mode does not use a Hyprland Paste Action",
-        )
-        .value("not selected"),
-    });
-
-    rows.push(match readiness.paste_backend {
-        PasteBackend::Hyprland => DoctorRow::new(
-            "Paste backend",
-            ReadinessStatus::Pass,
-            "the daemon emits the verified Paste Action through Hyprland send_key_state",
-        )
-        .value("hyprland"),
-        PasteBackend::Unavailable => DoctorRow::new(
-            "Paste backend",
-            ReadinessStatus::Warn,
-            "a verified Paste Action binding exists, but the Hyprland press path cannot run",
-        )
-        .value("unavailable"),
-        PasteBackend::NotRequired => DoctorRow::new(
-            "Paste backend",
-            ReadinessStatus::Skip,
-            "the selected Delivery mode does not use the Hyprland press path",
-        )
-        .value("not required"),
-    });
+    rows.push(delivery_row(
+        readiness,
+        crate::config::delivery_mode(),
+        remote_desktop_access,
+    ));
 
     let clipboard_value = readiness
         .clipboard_backend
@@ -302,25 +224,25 @@ fn daemon_readiness_rows(readiness: &DaemonReadiness) -> Vec<DoctorRow> {
         .unwrap_or("not installed");
     rows.push(if readiness.clipboard_usable && daemon_session_matches {
         DoctorRow::new(
-            "Daemon clipboard",
+            "Service clipboard",
             ReadinessStatus::Pass,
-            "the daemon has a clipboard tool and a usable display endpoint",
+            "the Voisu service has a clipboard tool and a usable display endpoint",
         )
         .value(clipboard_value)
     } else if readiness.clipboard_backend.is_some() {
         DoctorRow::new(
-            "Daemon clipboard",
+            "Service clipboard",
             ReadinessStatus::Fail,
-            "a clipboard tool is installed, but the daemon cannot reach its display endpoint",
+            "a clipboard tool is installed, but the Voisu service cannot reach its display endpoint",
         )
         .value(clipboard_value)
         .action("voisu service restart")
         .fix(DoctorFix::RestartVoisu)
     } else {
         DoctorRow::new(
-            "Daemon clipboard",
+            "Service clipboard",
             ReadinessStatus::Fail,
-            "no clipboard backend is installed in the daemon environment",
+            "no clipboard tool is installed where the Voisu service runs",
         )
         .value(clipboard_value)
         .action("install wl-clipboard on Wayland or xclip on X11")
@@ -330,6 +252,84 @@ fn daemon_readiness_rows(readiness: &DaemonReadiness) -> Vec<DoctorRow> {
         rows.push(overlay_readiness_row());
     }
     rows
+}
+
+/// The one Delivery row: what the running Voisu service will do with a
+/// Transcript, and the fix when it cannot paste. `access` probes the
+/// RemoteDesktop portal; it runs only for Paste outside Hyprland.
+fn delivery_row(
+    readiness: &DaemonReadiness,
+    configured: DeliveryMode,
+    access: impl FnOnce() -> RemoteDesktopAccess,
+) -> DoctorRow {
+    const LABEL: &str = "Delivery";
+    if readiness.delivery_mode != configured.as_str() {
+        return DoctorRow::new(
+            LABEL,
+            ReadinessStatus::Fail,
+            format!(
+                "the Voisu service still uses {} from before the last Delivery change",
+                readiness.delivery_mode
+            ),
+        )
+        .value("Restart Voisu to use your new Delivery setting")
+        .action("voisu service restart")
+        .fix(DoctorFix::RestartVoisu);
+    }
+    if configured == DeliveryMode::Copy {
+        return DoctorRow::new(
+            LABEL,
+            ReadinessStatus::Pass,
+            "Voisu puts the Transcript on the clipboard",
+        )
+        .value("copy · you paste with Ctrl+V");
+    }
+    match (&readiness.paste_backend, &readiness.paste_action) {
+        (PasteBackend::Hyprland, _) => DoctorRow::new(
+            LABEL,
+            ReadinessStatus::Pass,
+            "Voisu presses your Hyprland paste shortcut after copying",
+        )
+        .value(match readiness.paste_shortcut.as_deref() {
+            Some(shortcut) => format!("paste · {shortcut}"),
+            None => "paste".to_owned(),
+        }),
+        (PasteBackend::Unavailable, _) => DoctorRow::new(
+            LABEL,
+            ReadinessStatus::Fail,
+            "Voisu copies only until Hyprland has a paste shortcut; voisu setup adds one",
+        )
+        .value("No paste shortcut found in your Hyprland config")
+        .action("voisu setup, or voisu delivery copy")
+        .fix(DoctorFix::RunSetup),
+        (PasteBackend::NotRequired, PasteActionState::ClipboardOnly) => DoctorRow::new(
+            LABEL,
+            ReadinessStatus::Warn,
+            "the Voisu service was started with VOISU_DISABLE_DIRECT_DELIVERY, so it copies only",
+        )
+        .value("pasting turned off by VOISU_DISABLE_DIRECT_DELIVERY"),
+        (PasteBackend::NotRequired, _) => match access() {
+            RemoteDesktopAccess::Allowed => DoctorRow::new(
+                LABEL,
+                ReadinessStatus::Pass,
+                "you allowed Voisu keyboard control through the desktop portal",
+            )
+            .value("paste"),
+            RemoteDesktopAccess::NotAllowed => DoctorRow::new(
+                LABEL,
+                ReadinessStatus::Warn,
+                "your desktop will ask once to let Voisu control the keyboard; until then Voisu copies only",
+            )
+            .value("Allow keyboard control when asked"),
+            RemoteDesktopAccess::Missing => DoctorRow::new(
+                LABEL,
+                ReadinessStatus::Fail,
+                "the desktop portal has no RemoteDesktop interface, so Voisu can only copy",
+            )
+            .value("This desktop doesn't let apps paste for you")
+            .action("voisu delivery copy"),
+        },
+    }
 }
 
 fn daemon_session_row(readiness: &DaemonReadiness) -> DoctorRow {
@@ -347,16 +347,16 @@ fn daemon_session_row(readiness: &DaemonReadiness) -> DoctorRow {
     let value = daemon_session_value(readiness, daemon_session);
     if same_endpoint {
         DoctorRow::new(
-            "Daemon session",
+            "Service session",
             ReadinessStatus::Pass,
-            "daemon session type and display endpoint match the current CLI session",
+            "the Voisu service's session type and display endpoint match this terminal's",
         )
         .value(value)
     } else {
         DoctorRow::new(
-            "Daemon session",
+            "Service session",
             ReadinessStatus::Fail,
-            "daemon session state is missing or stale compared with this CLI; restart the service",
+            "the Voisu service's session is missing or older than this terminal's; restart it",
         )
         .value(value)
         .action("voisu service restart")
@@ -529,8 +529,8 @@ fn provider_key_rows(runtime: &tokio::runtime::Runtime) -> Vec<DoctorRow> {
                 let value = match status {
                     ProviderKeyStatus::Valid => "valid",
                     ProviderKeyStatus::InvalidKey => "invalid",
-                    ProviderKeyStatus::RateLimited => "rate-limited",
-                    ProviderKeyStatus::QuotaExhausted => "quota exhausted",
+                    ProviderKeyStatus::RateLimited => "too many requests, try later",
+                    ProviderKeyStatus::QuotaExhausted => "out of credit",
                     ProviderKeyStatus::Unreachable => "unreachable",
                 };
                 let mut detail = format!("{}{}", status.headline(), location_note);
@@ -561,7 +561,7 @@ fn provider_key_rows(runtime: &tokio::runtime::Runtime) -> Vec<DoctorRow> {
                          break) and it overrides any stored key"
                     ),
                 )
-                .value("env override invalid")
+                .value(format!("{variable} is invalid"))
                 .action(format!("unset or fix {variable}"))
             }
             KeyDiagnosis::Absent => DoctorRow::new(
@@ -598,4 +598,150 @@ fn provider_key_rows(runtime: &tokio::runtime::Runtime) -> Vec<DoctorRow> {
         rows.push(row);
     }
     rows
+}
+
+#[cfg(test)]
+mod delivery_row_tests {
+    use super::*;
+
+    fn readiness(mode: &str, action: PasteActionState, backend: PasteBackend) -> DaemonReadiness {
+        DaemonReadiness {
+            session_type: Some("wayland".to_owned()),
+            wayland_display: Some("wayland-1".to_owned()),
+            x11_display: None,
+            x_authority: None,
+            hyprland_instance_signature: None,
+            delivery_mode: mode.to_owned(),
+            paste_action: action,
+            paste_backend: backend,
+            paste_shortcut: None,
+            clipboard_usable: true,
+            clipboard_backend: Some("wl-copy".to_owned()),
+        }
+    }
+
+    fn no_probe() -> RemoteDesktopAccess {
+        panic!("only Paste outside Hyprland probes the RemoteDesktop portal")
+    }
+
+    fn shown(row: &DoctorRow) -> (&str, ReadinessStatus, Option<&str>) {
+        (
+            row.value.as_deref().unwrap_or(""),
+            row.status,
+            row.action.as_deref(),
+        )
+    }
+
+    #[test]
+    fn a_service_started_before_the_last_change_asks_for_a_restart() {
+        let stale = readiness(
+            "clipboard",
+            PasteActionState::ClipboardOnly,
+            PasteBackend::NotRequired,
+        );
+        let row = delivery_row(&stale, DeliveryMode::Paste, no_probe);
+        assert_eq!(
+            shown(&row),
+            (
+                "Restart Voisu to use your new Delivery setting",
+                ReadinessStatus::Fail,
+                Some("voisu service restart")
+            )
+        );
+        assert_eq!(row.fix, Some(DoctorFix::RestartVoisu));
+    }
+
+    #[test]
+    fn copy_says_the_user_pastes() {
+        let copy = readiness(
+            "copy",
+            PasteActionState::ClipboardOnly,
+            PasteBackend::NotRequired,
+        );
+        let row = delivery_row(&copy, DeliveryMode::Copy, no_probe);
+        assert_eq!(
+            shown(&row),
+            ("copy · you paste with Ctrl+V", ReadinessStatus::Pass, None)
+        );
+    }
+
+    #[test]
+    fn hyprland_paste_names_its_shortcut_or_says_how_to_add_one() {
+        let mut verified = readiness("paste", PasteActionState::Verified, PasteBackend::Hyprland);
+        verified.paste_shortcut = Some("SUPER + V".to_owned());
+        let row = delivery_row(&verified, DeliveryMode::Paste, no_probe);
+        assert_eq!(
+            shown(&row),
+            ("paste · SUPER + V", ReadinessStatus::Pass, None)
+        );
+
+        let missing = readiness(
+            "paste",
+            PasteActionState::ClipboardOnly,
+            PasteBackend::Unavailable,
+        );
+        let row = delivery_row(&missing, DeliveryMode::Paste, no_probe);
+        assert_eq!(
+            shown(&row),
+            (
+                "No paste shortcut found in your Hyprland config",
+                ReadinessStatus::Fail,
+                Some("voisu setup, or voisu delivery copy")
+            )
+        );
+        assert_eq!(row.fix, Some(DoctorFix::RunSetup));
+    }
+
+    #[test]
+    fn the_opt_out_says_pasting_is_turned_off() {
+        let disabled = readiness(
+            "paste",
+            PasteActionState::ClipboardOnly,
+            PasteBackend::NotRequired,
+        );
+        let row = delivery_row(&disabled, DeliveryMode::Paste, no_probe);
+        assert_eq!(
+            shown(&row),
+            (
+                "pasting turned off by VOISU_DISABLE_DIRECT_DELIVERY",
+                ReadinessStatus::Warn,
+                None
+            )
+        );
+    }
+
+    #[test]
+    fn portal_paste_reports_whether_the_desktop_lets_voisu_paste() {
+        let portal = readiness(
+            "paste",
+            PasteActionState::NotRequired,
+            PasteBackend::NotRequired,
+        );
+        let cases = [
+            (
+                RemoteDesktopAccess::Allowed,
+                ("paste", ReadinessStatus::Pass, None),
+            ),
+            (
+                RemoteDesktopAccess::NotAllowed,
+                (
+                    "Allow keyboard control when asked",
+                    ReadinessStatus::Warn,
+                    None,
+                ),
+            ),
+            (
+                RemoteDesktopAccess::Missing,
+                (
+                    "This desktop doesn't let apps paste for you",
+                    ReadinessStatus::Fail,
+                    Some("voisu delivery copy"),
+                ),
+            ),
+        ];
+        for (access, expected) in cases {
+            let row = delivery_row(&portal, DeliveryMode::Paste, || access);
+            assert_eq!(shown(&row), expected, "{access:?}");
+        }
+    }
 }

@@ -249,11 +249,11 @@ fn doctor(verbose: bool) -> ExitCode {
 /// computed) so the layout is deterministic regardless of which checks ran, and
 /// followed by an explicit two-space gutter so a value that overflows its column
 /// can never touch the status ("1.0.5 (WAV fallback)  PASS", never glued).
-const DOCTOR_LABEL_WIDTH: usize = 15;
+const DOCTOR_LABEL_WIDTH: usize = 17;
 const DOCTOR_VALUE_WIDTH: usize = 20;
 
 /// Print every doctor check as one terse line. A runnable action prints on its
-/// own indented line only on FAIL; WARN and SKIP keep to one line, with any
+/// own indented line only on FAIL; WARN and OFF keep to one line, with any
 /// guidance behind --verbose.
 fn print_doctor_rows(rows: &[DoctorRow], verbose: bool) {
     for row in rows {

@@ -3288,26 +3288,25 @@ fn doctor_reports_each_fedora_capability_through_the_public_cli() {
         .arg("doctor")
         .env("XDG_RUNTIME_DIR", runtime.path())
         .env("VOISU_TEST_READINESS", "pass")
-        .env("VOISU_TEST_FOCUS_BACKEND", "hyprland")
         .env("VOISU_TEST_SKIP_DOCTOR_KEYS", "1")
         .output()
         .expect("doctor should run");
 
     assert!(doctor.status.success(), "{}", stderr(&doctor));
     // Golden: one terse line per check (`label  value  STATUS`), including the
-    // Focus guard, no reasoning paragraphs, no action lines when everything
-    // passes. `doctor_line` mirrors the production column widths (15 / 20) and
+    // Voisu service row, no reasoning paragraphs, no action lines when
+    // everything passes. `doctor_line` mirrors the production column widths
+    // (17 / 20) and
     // the two-space gutters so a layout regression is caught.
     let expected = format!(
-        "{}{}{}{}{}{}{}{}",
-        doctor_line("Session", "Wayland (KDE)", "PASS"),
-        doctor_line("PipeWire", "1.4.11 (raw)", "PASS"),
+        "{}{}{}{}{}{}{}",
+        doctor_line("Desktop", "Wayland (KDE)", "PASS"),
+        doctor_line("Audio", "1.4.11 (raw)", "PASS"),
         doctor_line("Microphone", "", "PASS"),
-        doctor_line("Portals", "", "PASS"),
+        doctor_line("Desktop portal", "", "PASS"),
         doctor_line("Clipboard", "", "PASS"),
-        doctor_line("Secret storage", "", "PASS"),
-        doctor_line("Daemon", "", "PASS"),
-        doctor_line("Focus guard", "hyprland", "PASS"),
+        doctor_line("Keyring", "", "PASS"),
+        doctor_line("Voisu service", "", "PASS"),
     );
     assert_eq!(stdout(&doctor), expected);
 }
@@ -3344,18 +3343,17 @@ fn doctor_rejects_a_daemon_started_without_wayland_display() {
             ("WAYLAND_DISPLAY", "wayland-0"),
             ("HYPRLAND_INSTANCE_SIGNATURE", ""),
             ("VOISU_TEST_READINESS", "pass"),
-            ("VOISU_TEST_FOCUS_BACKEND", "hyprland"),
             ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
         ],
     );
     let output = stdout(&doctor);
     assert_eq!(doctor.status.code(), Some(4), "{output}");
     assert!(
-        output.contains(&doctor_line("Daemon session", "Wayland / missing", "FAIL")),
+        output.contains(&doctor_line("Service session", "Wayland / missing", "FAIL")),
         "{output}"
     );
     assert!(
-        output.contains(&doctor_line("Daemon clipboard", "not installed", "FAIL")),
+        output.contains(&doctor_line("Service clipboard", "not installed", "FAIL")),
         "{output}"
     );
 }
@@ -3382,7 +3380,6 @@ fn doctor_rejects_a_daemon_with_a_stale_wayland_display() {
             ("WAYLAND_DISPLAY", "wayland-2"),
             ("HYPRLAND_INSTANCE_SIGNATURE", ""),
             ("VOISU_TEST_READINESS", "pass"),
-            ("VOISU_TEST_FOCUS_BACKEND", "hyprland"),
             ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
         ],
     );
@@ -3390,7 +3387,7 @@ fn doctor_rejects_a_daemon_with_a_stale_wayland_display() {
     assert_eq!(doctor.status.code(), Some(4), "{output}");
     assert!(
         output.contains(&doctor_line(
-            "Daemon session",
+            "Service session",
             "Wayland / wayland-1",
             "FAIL"
         )),
@@ -3422,7 +3419,6 @@ fn doctor_rejects_a_daemon_from_a_different_hyprland_instance() {
             ("HYPRLAND_INSTANCE_SIGNATURE", "new-instance"),
             ("VOISU_TEST_OVERLAY_READINESS", "ready"),
             ("VOISU_TEST_READINESS", "pass"),
-            ("VOISU_TEST_FOCUS_BACKEND", "hyprland"),
             ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
         ],
     );
@@ -3430,7 +3426,7 @@ fn doctor_rejects_a_daemon_from_a_different_hyprland_instance() {
     assert_eq!(doctor.status.code(), Some(4), "{output}");
     assert!(
         output.contains(&doctor_line(
-            "Daemon session",
+            "Service session",
             "Wayland / wayland-1",
             "FAIL"
         )),
@@ -3474,24 +3470,23 @@ fn doctor_rejects_x11_clipboard_readiness_with_stale_xauthority() {
             ("DISPLAY", ":0"),
             ("XAUTHORITY", "/run/user/1000/current-xauth"),
             ("VOISU_TEST_READINESS", "pass"),
-            ("VOISU_TEST_FOCUS_BACKEND", "none"),
             ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
         ],
     );
     let output = stdout(&doctor);
     assert_eq!(doctor.status.code(), Some(4), "{output}");
     assert!(
-        output.contains(&doctor_line("Daemon session", "X11 / :0", "FAIL")),
+        output.contains(&doctor_line("Service session", "X11 / :0", "FAIL")),
         "{output}"
     );
     assert!(
-        output.contains(&doctor_line("Daemon clipboard", "xclip", "FAIL")),
+        output.contains(&doctor_line("Service clipboard", "xclip", "FAIL")),
         "X11 clipboard readiness must follow the authenticated session: {output}"
     );
 }
 
 #[test]
-fn doctor_reports_clipboard_only_when_hyprland_paste_is_unverified() {
+fn doctor_reports_copy_delivery_as_the_user_pasting() {
     let config_home = TempDir::new().unwrap();
     let voisu_config = config_home.path().join("voisu");
     fs::create_dir_all(&voisu_config).unwrap();
@@ -3530,18 +3525,17 @@ fn doctor_reports_clipboard_only_when_hyprland_paste_is_unverified() {
             ("WAYLAND_DISPLAY", "wayland-4"),
             ("HYPRLAND_INSTANCE_SIGNATURE", ""),
             ("VOISU_TEST_READINESS", "pass"),
-            ("VOISU_TEST_FOCUS_BACKEND", "hyprland"),
             ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
         ],
     );
     let output = stdout(&doctor);
     assert!(doctor.status.success(), "{output}");
     assert!(
-        output.contains(&doctor_line("Paste action", "clipboard-only", "WARN")),
-        "{output}"
-    );
-    assert!(
-        output.contains(&doctor_line("Paste backend", "not required", "SKIP")),
+        output.contains(&doctor_line(
+            "Delivery",
+            "copy · you paste with Ctrl+V",
+            "PASS"
+        )),
         "{output}"
     );
 }
@@ -3661,6 +3655,7 @@ fn doctor_reports_hyprland_paste_backend_when_action_is_verified() {
     );
     assert_eq!(status["readiness"]["paste_action"], "verified");
     assert_eq!(status["readiness"]["paste_backend"], "hyprland");
+    assert_eq!(status["readiness"]["paste_shortcut"], "CTRL + SHIFT + P");
 
     let doctor = voisu_isolated(
         runtime.path(),
@@ -3671,7 +3666,6 @@ fn doctor_reports_hyprland_paste_backend_when_action_is_verified() {
             ("WAYLAND_DISPLAY", "wayland-8"),
             ("HYPRLAND_INSTANCE_SIGNATURE", "hyprland-test"),
             ("VOISU_TEST_READINESS", "pass"),
-            ("VOISU_TEST_FOCUS_BACKEND", "hyprland"),
             ("VOISU_TEST_OVERLAY_READINESS", "ready"),
             ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
         ],
@@ -3679,20 +3673,158 @@ fn doctor_reports_hyprland_paste_backend_when_action_is_verified() {
     let output = stdout(&doctor);
     assert!(doctor.status.success(), "{output}");
     assert!(
-        output.contains(&doctor_line("Paste action", "verified", "PASS")),
+        output.contains(&doctor_line("Delivery", "paste · CTRL + SHIFT + P", "PASS")),
         "{output}"
     );
     assert!(
-        output.contains(&doctor_line("Paste backend", "hyprland", "PASS")),
+        output.contains("Voisu presses your Hyprland paste shortcut after copying"),
         "{output}"
     );
+}
+
+#[test]
+fn doctor_says_how_to_fix_hyprland_paste_without_a_shortcut() {
+    let config_home = TempDir::new().unwrap();
+    let voisu_config = config_home.path().join("voisu");
+    fs::create_dir_all(&voisu_config).unwrap();
+    fs::write(
+        voisu_config.join("config.toml"),
+        "deepgram_enabled = false\ndelivery_mode = \"paste\"\n",
+    )
+    .unwrap();
+    fs::create_dir_all(config_home.path().join("hypr")).unwrap();
+    fs::write(config_home.path().join("hypr/hyprland.lua"), "").unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(commands.path(), "hyprctl", "printf '[]'\n");
+    write_fake_command(commands.path(), "wl-copy", "cat >/dev/null\n");
+    write_fake_command(commands.path(), "wl-paste", "exit 0\n");
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_production_with_env(
+        runtime.path(),
+        &[
+            ("PATH", &path),
+            ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap()),
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("WAYLAND_DISPLAY", "wayland-8"),
+            ("HYPRLAND_INSTANCE_SIGNATURE", "hyprland-test"),
+            ("VOISU_DISABLE_SHORTCUTS", "1"),
+            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/voisu-no-portal"),
+        ],
+    );
+
+    let status = ipc_request(
+        runtime.path(),
+        &format!(r#"{{"version":{PROTOCOL_VERSION},"command":"status"}}"#),
+    );
+    assert_eq!(status["readiness"]["paste_backend"], "unavailable");
+
+    let doctor = voisu_isolated(
+        runtime.path(),
+        config_home.path(),
+        &["doctor"],
+        &[
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("WAYLAND_DISPLAY", "wayland-8"),
+            ("HYPRLAND_INSTANCE_SIGNATURE", "hyprland-test"),
+            ("VOISU_TEST_READINESS", "pass"),
+            ("VOISU_TEST_OVERLAY_READINESS", "ready"),
+            ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
+        ],
+    );
+    let output = stdout(&doctor);
+    assert_eq!(doctor.status.code(), Some(4), "{output}");
     assert!(
-        output.contains("Hyprland Paste Action binding was verified by the daemon"),
+        output.contains(&format!(
+            "{}    voisu setup, or voisu delivery copy\n",
+            doctor_line(
+                "Delivery",
+                "No paste shortcut found in your Hyprland config",
+                "FAIL"
+            )
+        )),
         "{output}"
     );
+}
+
+#[test]
+fn doctor_says_when_this_desktop_cannot_paste_for_voisu() {
+    let config_home = TempDir::new().unwrap();
+    let voisu_config = config_home.path().join("voisu");
+    fs::create_dir_all(&voisu_config).unwrap();
+    fs::write(
+        voisu_config.join("config.toml"),
+        "delivery_mode = \"paste\"\n",
+    )
+    .unwrap();
+    let commands = TempDir::new().unwrap();
+    write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat >/dev/null\n");
+    write_fake_command(commands.path(), "wl-paste", "exit 0\n");
+    let path = format!(
+        "{}:{}",
+        commands.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let runtime = TempDir::new().unwrap();
+    let _daemon = Daemon::start_with_env(
+        runtime.path(),
+        &[
+            ("XDG_CONFIG_HOME", config_home.path().to_str().unwrap()),
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("WAYLAND_DISPLAY", "wayland-4"),
+            ("HYPRLAND_INSTANCE_SIGNATURE", ""),
+            ("PATH", &path),
+            ("VOISU_TEST_REPORT_DAEMON_READINESS", "1"),
+        ],
+    );
+    let doctor = |access: &str| {
+        voisu_isolated(
+            runtime.path(),
+            config_home.path(),
+            &["doctor"],
+            &[
+                ("XDG_SESSION_TYPE", "wayland"),
+                ("WAYLAND_DISPLAY", "wayland-4"),
+                ("HYPRLAND_INSTANCE_SIGNATURE", ""),
+                ("VOISU_TEST_READINESS", "pass"),
+                ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
+                ("VOISU_TEST_REMOTE_DESKTOP", access),
+            ],
+        )
+    };
+
+    let missing = doctor("missing");
     assert!(
-        output.contains("emits the verified Paste Action through Hyprland send_key_state"),
-        "{output}"
+        stdout(&missing).contains(&format!(
+            "{}    voisu delivery copy\n",
+            doctor_line(
+                "Delivery",
+                "This desktop doesn't let apps paste for you",
+                "FAIL"
+            )
+        )),
+        "{}",
+        stdout(&missing)
+    );
+    let not_allowed = doctor("not-allowed");
+    assert!(
+        stdout(&not_allowed).contains(&doctor_line(
+            "Delivery",
+            "Allow keyboard control when asked",
+            "WARN"
+        )),
+        "{}",
+        stdout(&not_allowed)
+    );
+    let allowed = doctor("allowed");
+    assert!(
+        stdout(&allowed).contains(&doctor_line("Delivery", "paste", "PASS")),
+        "{}",
+        stdout(&allowed)
     );
 }
 
@@ -3728,8 +3860,9 @@ fn doctor_reports_hyprland_overlay_readiness() {
             ("HYPRLAND_INSTANCE_SIGNATURE", "hyprland-test"),
             ("VOISU_TEST_OVERLAY_READINESS", "ready"),
             ("VOISU_TEST_READINESS", "pass"),
-            ("VOISU_TEST_FOCUS_BACKEND", "hyprland"),
             ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
+            // The controlled daemon models Paste as portal paste.
+            ("VOISU_TEST_REMOTE_DESKTOP", "allowed"),
         ],
     );
     let output = stdout(&doctor);
@@ -3768,7 +3901,6 @@ fn doctor_reports_the_overlay_package_install_command_when_the_unit_is_missing()
             ("WAYLAND_DISPLAY", "wayland-7"),
             ("HYPRLAND_INSTANCE_SIGNATURE", "hyprland-test"),
             ("VOISU_TEST_READINESS", "pass"),
-            ("VOISU_TEST_FOCUS_BACKEND", "hyprland"),
             ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
         ],
     );
@@ -3815,7 +3947,6 @@ fn doctor_accepts_a_recovered_daemon_session_and_reports_backend_state() {
             ("WAYLAND_DISPLAY", "wayland-3"),
             ("HYPRLAND_INSTANCE_SIGNATURE", ""),
             ("VOISU_TEST_READINESS", "pass"),
-            ("VOISU_TEST_FOCUS_BACKEND", "hyprland"),
             ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
         ],
     );
@@ -3823,15 +3954,15 @@ fn doctor_accepts_a_recovered_daemon_session_and_reports_backend_state() {
     assert_eq!(doctor.status.code(), Some(4), "{output}");
     assert!(
         output.contains(&doctor_line(
-            "Daemon session",
+            "Service session",
             "Wayland / wayland-3",
             "PASS"
         )),
         "{output}"
     );
     assert!(
-        output.contains(&doctor_line("Daemon clipboard", "wl-copy", "FAIL")),
-        "session recovery must not false-green Daemon clipboard from PATH plus display env: {output}"
+        output.contains(&doctor_line("Service clipboard", "wl-copy", "FAIL")),
+        "session recovery must not false-green Service clipboard from PATH plus display env: {output}"
     );
 }
 
@@ -3877,18 +4008,17 @@ fn doctor_rejects_daemon_clipboard_when_wl_copy_cannot_reach_the_display() {
             ("WAYLAND_DISPLAY", "wayland-9"),
             ("HYPRLAND_INSTANCE_SIGNATURE", ""),
             ("VOISU_TEST_READINESS", "pass"),
-            ("VOISU_TEST_FOCUS_BACKEND", "hyprland"),
             ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
         ],
     );
     let output = stdout(&doctor);
     assert_eq!(doctor.status.code(), Some(4), "{output}");
     assert!(
-        !output.contains(&doctor_line("Daemon clipboard", "wl-copy", "PASS")),
+        !output.contains(&doctor_line("Service clipboard", "wl-copy", "PASS")),
         "installed wl-copy without a reachable display must not PASS: {output}"
     );
     assert!(
-        output.contains(&doctor_line("Daemon clipboard", "wl-copy", "FAIL")),
+        output.contains(&doctor_line("Service clipboard", "wl-copy", "FAIL")),
         "{output}"
     );
 }
@@ -3896,7 +4026,7 @@ fn doctor_rejects_daemon_clipboard_when_wl_copy_cannot_reach_the_display() {
 /// One terse doctor line as the production formatter renders it: label padded to
 /// 15, value padded to 20, two-space gutters, then STATUS.
 fn doctor_line(label: &str, value: &str, status: &str) -> String {
-    format!("{label:<15}  {value:<20}  {status}\n")
+    format!("{label:<17}  {value:<20}  {status}\n")
 }
 
 #[test]
@@ -3909,13 +4039,16 @@ fn doctor_renders_the_service_env_warning_as_a_terse_row() {
     let _daemon = Daemon::start(runtime.path());
     let environment = [
         ("VOISU_TEST_READINESS", "service-env=warn"),
-        ("VOISU_TEST_FOCUS_BACKEND", "hyprland"),
         ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
     ];
     let doctor = voisu_with_env(runtime.path(), &["doctor"], &environment);
     assert!(doctor.status.success(), "{}", stderr(&doctor));
     assert!(
-        stdout(&doctor).contains(&doctor_line("Service env", "missing display env", "WARN")),
+        stdout(&doctor).contains(&doctor_line(
+            "Service display",
+            "can't reach your display",
+            "WARN"
+        )),
         "{}",
         stdout(&doctor)
     );
@@ -3936,7 +4069,7 @@ fn doctor_renders_the_service_env_warning_as_a_terse_row() {
 #[test]
 fn doctor_golden_covers_every_check_including_focus_and_provider_keys() {
     // The terseness contract applies to EVERY check, not just the capability
-    // group: the focus guard and both provider-key checks are the same one-line
+    // group: both provider-key checks are the same one-line
     // shape. Provider outcomes are pinned through the test auth seams, so no
     // network is touched and the whole table is deterministic.
     let runtime = TempDir::new().unwrap();
@@ -3948,7 +4081,6 @@ fn doctor_golden_covers_every_check_including_focus_and_provider_keys() {
         &["doctor"],
         &[
             ("VOISU_TEST_READINESS", "pass"),
-            ("VOISU_TEST_FOCUS_BACKEND", "hyprland"),
             ("VOISU_TEST_SECRET_STORE", "available"),
             ("VOISU_TEST_STORED_DEEPGRAM_CREDENTIAL", "deepgram-key"),
             ("VOISU_TEST_STORED_GROQ_CREDENTIAL", "groq-key"),
@@ -3959,55 +4091,18 @@ fn doctor_golden_covers_every_check_including_focus_and_provider_keys() {
 
     assert!(doctor.status.success(), "{}", stderr(&doctor));
     let expected = format!(
-        "{}{}{}{}{}{}{}{}{}{}",
-        doctor_line("Session", "Wayland (KDE)", "PASS"),
-        doctor_line("PipeWire", "1.4.11 (raw)", "PASS"),
+        "{}{}{}{}{}{}{}{}{}",
+        doctor_line("Desktop", "Wayland (KDE)", "PASS"),
+        doctor_line("Audio", "1.4.11 (raw)", "PASS"),
         doctor_line("Microphone", "", "PASS"),
-        doctor_line("Portals", "", "PASS"),
+        doctor_line("Desktop portal", "", "PASS"),
         doctor_line("Clipboard", "", "PASS"),
-        doctor_line("Secret storage", "", "PASS"),
-        doctor_line("Daemon", "", "PASS"),
-        doctor_line("Focus guard", "hyprland", "PASS"),
+        doctor_line("Keyring", "", "PASS"),
+        doctor_line("Voisu service", "", "PASS"),
         doctor_line("Deepgram key", "valid", "PASS"),
         doctor_line("Groq key", "valid", "PASS"),
     );
     assert_eq!(stdout(&doctor), expected);
-}
-
-#[test]
-fn doctor_explains_that_guarded_delivery_fails_closed_without_a_focus_backend() {
-    let runtime = TempDir::new().unwrap();
-    let doctor = voisu_with_env(
-        runtime.path(),
-        &["doctor"],
-        &[
-            ("VOISU_TEST_READINESS", "pass"),
-            ("VOISU_TEST_FOCUS_BACKEND", "none"),
-            ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
-        ],
-    );
-
-    // The focus guard is now a structured check like any other: one terse line,
-    // WARN, with the reasoning behind --verbose.
-    assert!(
-        stdout(&doctor).contains(&doctor_line("Focus guard", "none", "WARN")),
-        "{}",
-        stdout(&doctor)
-    );
-    let verbose = voisu_with_env(
-        runtime.path(),
-        &["doctor", "--verbose"],
-        &[
-            ("VOISU_TEST_READINESS", "pass"),
-            ("VOISU_TEST_FOCUS_BACKEND", "none"),
-            ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
-        ],
-    );
-    assert!(
-        stdout(&verbose).contains("guarded Delivery fails closed to the clipboard"),
-        "{}",
-        stdout(&verbose)
-    );
 }
 
 #[test]
@@ -4029,7 +4124,7 @@ fn doctor_exposes_actionable_warn_and_fail_outcomes() {
     let output = stdout(&doctor);
     // A FAIL check prints its status line and an indented action line.
     assert!(
-        output.contains(&doctor_line("PipeWire", "1.4.11 (raw)", "FAIL")),
+        output.contains(&doctor_line("Audio", "1.4.11 (raw)", "FAIL")),
         "{output}"
     );
     assert!(
@@ -4042,13 +4137,10 @@ fn doctor_exposes_actionable_warn_and_fail_outcomes() {
         "{output}"
     );
     assert!(
-        output.contains(&doctor_line("Daemon", "", "FAIL")),
+        output.contains(&doctor_line("Voisu service", "", "FAIL")),
         "{output}"
     );
-    assert!(
-        output.contains("\n    start voisu-daemon and run voisu doctor again\n"),
-        "{output}"
-    );
+    assert!(output.contains("\n    voisu service start\n"), "{output}");
 }
 
 #[test]
@@ -4062,7 +4154,6 @@ fn doctor_points_at_the_journal_when_the_service_unit_is_failed() {
         &["doctor"],
         &[
             ("VOISU_TEST_READINESS", "pass"),
-            ("VOISU_TEST_FOCUS_BACKEND", "none"),
             ("VOISU_TEST_SKIP_DOCTOR_KEYS", "1"),
             ("VOISU_TEST_SERVICE_FAILED", "failed"),
         ],
@@ -4072,7 +4163,7 @@ fn doctor_points_at_the_journal_when_the_service_unit_is_failed() {
     let output = stdout(&doctor);
     // The terse Daemon FAIL line plus the journal action on its own indented line.
     assert!(
-        output.contains(&doctor_line("Daemon", "", "FAIL")),
+        output.contains(&doctor_line("Voisu service", "", "FAIL")),
         "{output}"
     );
     assert!(
@@ -4104,7 +4195,10 @@ fn doctor_warns_when_the_portal_exposes_no_global_shortcuts() {
     // Terse: the WARN line carries no reasoning and no action line (actions are
     // reserved for FAIL).
     let out = stdout(&doctor);
-    assert!(out.contains(&doctor_line("Portals", "", "WARN")), "{out}");
+    assert!(
+        out.contains(&doctor_line("Desktop portal", "", "WARN")),
+        "{out}"
+    );
     assert!(
         !out.contains("voisu toggle"),
         "no action/reasoning on a terse WARN: {out}"
@@ -4152,7 +4246,7 @@ fn doctor_passes_portals_when_global_shortcuts_are_available() {
     );
 
     assert!(
-        stdout(&doctor).contains(&doctor_line("Portals", "", "PASS")),
+        stdout(&doctor).contains(&doctor_line("Desktop portal", "", "PASS")),
         "{}",
         stdout(&doctor)
     );
@@ -4199,7 +4293,7 @@ fn doctor_exercises_real_capabilities_instead_of_command_headings_or_socket_conn
     );
     assert!(stdout(&doctor).contains(&doctor_line("Microphone", "", "PASS")));
     assert!(stdout(&doctor).contains(&doctor_line("Clipboard", "", "PASS")));
-    assert!(stdout(&doctor).contains(&doctor_line("Daemon", "", "PASS")));
+    assert!(stdout(&doctor).contains(&doctor_line("Voisu service", "", "PASS")));
 }
 
 #[test]
@@ -4265,7 +4359,7 @@ fn doctor_reports_a_reachable_secret_service_without_a_match_as_pass() {
             .starts_with("lookup\nvoisu-doctor-probe\n")
     );
     assert!(
-        stdout(&doctor).contains(&doctor_line("Secret storage", "", "PASS")),
+        stdout(&doctor).contains(&doctor_line("Keyring", "", "PASS")),
         "{}",
         stdout(&doctor)
     );
@@ -4291,7 +4385,7 @@ fn doctor_warns_when_the_secret_service_reports_an_error() {
     );
 
     assert!(
-        stdout(&doctor).contains(&doctor_line("Secret storage", "", "WARN")),
+        stdout(&doctor).contains(&doctor_line("Keyring", "", "WARN")),
         "{}",
         stdout(&doctor)
     );
@@ -4329,7 +4423,6 @@ fn doctor_reports_valid_provider_keys_as_pass() {
         &["doctor"],
         &[
             ("VOISU_TEST_READINESS", "pass"),
-            ("VOISU_TEST_FOCUS_BACKEND", "none"),
             ("VOISU_TEST_SECRET_STORE", "available"),
             ("VOISU_TEST_STORED_DEEPGRAM_CREDENTIAL", "deepgram-key"),
             ("VOISU_TEST_STORED_GROQ_CREDENTIAL", "groq-key"),
@@ -4362,7 +4455,6 @@ fn doctor_flags_an_invalid_key_as_a_failure_naming_the_fix() {
         &["doctor"],
         &[
             ("VOISU_TEST_READINESS", "pass"),
-            ("VOISU_TEST_FOCUS_BACKEND", "none"),
             ("VOISU_DISABLE_DEEPGRAM", "1"),
             ("VOISU_TEST_SECRET_STORE", "available"),
             ("VOISU_TEST_STORED_GROQ_CREDENTIAL", "groq-key"),
@@ -4387,7 +4479,7 @@ fn doctor_flags_an_invalid_key_as_a_failure_naming_the_fix() {
         stdout(&doctor)
     );
     assert!(
-        stdout(&doctor).contains(&doctor_line("Deepgram key", "off", "SKIP")),
+        stdout(&doctor).contains(&doctor_line("Deepgram key", "off", "OFF")),
         "{}",
         stdout(&doctor)
     );
@@ -4406,7 +4498,6 @@ fn doctor_tells_a_locked_keyring_to_unlock_not_to_run_setup() {
         &["doctor"],
         &[
             ("VOISU_TEST_READINESS", "pass"),
-            ("VOISU_TEST_FOCUS_BACKEND", "none"),
             ("VOISU_DISABLE_DEEPGRAM", "1"),
             ("VOISU_TEST_SECRET_STORE", "locked"),
         ],
@@ -4440,7 +4531,6 @@ fn doctor_reports_a_bare_429_as_quota_and_a_missing_key_as_a_warning() {
         &["doctor"],
         &[
             ("VOISU_TEST_READINESS", "pass"),
-            ("VOISU_TEST_FOCUS_BACKEND", "none"),
             // Deepgram: stored key that returns a bare 429 → quota (WARN, not fail).
             // Groq: no stored key → not configured (WARN, not fail).
             ("VOISU_TEST_SECRET_STORE", "available"),
@@ -4455,7 +4545,7 @@ fn doctor_reports_a_bare_429_as_quota_and_a_missing_key_as_a_warning() {
         stderr(&doctor)
     );
     assert!(
-        stdout(&doctor).contains(&doctor_line("Deepgram key", "quota exhausted", "WARN")),
+        stdout(&doctor).contains(&doctor_line("Deepgram key", "out of credit", "WARN")),
         "{}",
         stdout(&doctor)
     );
@@ -4480,7 +4570,6 @@ fn doctor_fails_a_present_but_invalid_env_override_naming_the_variable() {
         &["doctor"],
         &[
             ("VOISU_TEST_READINESS", "pass"),
-            ("VOISU_TEST_FOCUS_BACKEND", "none"),
             ("VOISU_DISABLE_DEEPGRAM", "1"),
             // A healthy stored key that the broken override shadows at runtime.
             ("VOISU_TEST_SECRET_STORE", "available"),
@@ -9882,7 +9971,7 @@ fn doctor_daemon_probe_is_bounded_under_a_trickling_peer() {
     );
     assert_eq!(doctor.status.code(), Some(4));
     assert!(
-        stdout(&doctor).contains(&doctor_line("Daemon", "", "FAIL")),
+        stdout(&doctor).contains(&doctor_line("Voisu service", "", "FAIL")),
         "{}",
         stdout(&doctor)
     );
@@ -9928,7 +10017,7 @@ fn doctor_daemon_probe_rejects_a_flooding_peer_at_the_response_cap() {
     );
     assert_eq!(doctor.status.code(), Some(4));
     assert!(
-        stdout(&doctor).contains(&doctor_line("Daemon", "", "FAIL")),
+        stdout(&doctor).contains(&doctor_line("Voisu service", "", "FAIL")),
         "{}",
         stdout(&doctor)
     );

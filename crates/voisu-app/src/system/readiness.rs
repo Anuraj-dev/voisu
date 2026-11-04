@@ -146,7 +146,7 @@ fn service_display_env_finding() -> Option<ReadinessFinding> {
                 missing.join(" ")
             ),
         )
-        .with_value("missing display env"),
+        .with_value("can't reach your display"),
     )
 }
 
@@ -242,7 +242,7 @@ fn pipewire_finding() -> ReadinessFinding {
             "PipeWire core does not respond",
         )
         .with_value(value)
-        .with_action("start PipeWire and WirePlumber")
+        .with_action("restart audio: systemctl --user restart pipewire wireplumber")
     }
 }
 
@@ -332,7 +332,7 @@ fn controlled_readiness(value: &str, daemon_status: Option<&Response>) -> Vec<Re
                     ReadinessStatus::Warn,
                     "the systemd --user manager is missing WAYLAND_DISPLAY, XAUTHORITY, so Delivery from the daemon cannot reach or authenticate to the display; run `voisu service restart`",
                 )
-                .with_value("missing display env"),
+                .with_value("can't reach your display"),
             );
         }
     }
@@ -358,7 +358,7 @@ fn microphone_finding() -> ReadinessFinding {
             ReadinessStatus::Fail,
             "WirePlumber is unavailable",
         )
-        .with_action("start PipeWire and WirePlumber"),
+        .with_action("restart audio: systemctl --user restart pipewire wireplumber"),
     }
 }
 
@@ -727,13 +727,17 @@ fn portals_finding() -> ReadinessFinding {
     }
 }
 
-/// Whether `org.freedesktop.portal.GlobalShortcuts` is exposed on the desktop
-/// portal. Reads its `version` property: the portal answers with the interface
-/// version when it is implemented and fails when it is absent. This mirrors how
-/// the codebase already talks to the portal over the session bus (via busctl),
-/// staying in one subprocess convention rather than opening a second zbus edge
-/// just for a probe.
 fn global_shortcuts_available() -> bool {
+    portal_interface_available(GLOBAL_SHORTCUTS_INTERFACE)
+}
+
+/// Whether the desktop portal exposes `interface`. Reads its `version`
+/// property: the portal answers with the interface version when it is
+/// implemented and fails when it is absent. This mirrors how the codebase
+/// already talks to the portal over the session bus (via busctl), staying in
+/// one subprocess convention rather than opening a second zbus edge just for a
+/// probe.
+fn portal_interface_available(interface: &str) -> bool {
     run_restricted(
         "busctl",
         &[
@@ -741,13 +745,44 @@ fn global_shortcuts_available() -> bool {
             "get-property",
             PORTAL_BUS_NAME,
             PORTAL_OBJECT_PATH,
-            GLOBAL_SHORTCUTS_INTERFACE,
+            interface,
             "version",
         ],
         None,
         false,
     )
     .is_ok_and(|outcome| outcome.success)
+}
+
+/// Whether this desktop lets Voisu paste through the RemoteDesktop portal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoteDesktopAccess {
+    /// The portal has no RemoteDesktop interface: Voisu can only copy.
+    Missing,
+    /// The interface exists, but the user has not allowed keyboard control
+    /// yet; the next paste asks.
+    NotAllowed,
+    Allowed,
+}
+
+/// Probe the RemoteDesktop portal for doctor. `VOISU_TEST_REMOTE_DESKTOP`
+/// (`missing`, `not-allowed`, `allowed`) pins the answer so tests never depend
+/// on the host's portal.
+pub fn remote_desktop_access() -> RemoteDesktopAccess {
+    if let Ok(value) = std::env::var("VOISU_TEST_REMOTE_DESKTOP") {
+        return match value.as_str() {
+            "missing" => RemoteDesktopAccess::Missing,
+            "not-allowed" => RemoteDesktopAccess::NotAllowed,
+            _ => RemoteDesktopAccess::Allowed,
+        };
+    }
+    if !portal_interface_available(REMOTE_DESKTOP_INTERFACE) {
+        RemoteDesktopAccess::Missing
+    } else if remote_desktop_access_remembered() {
+        RemoteDesktopAccess::Allowed
+    } else {
+        RemoteDesktopAccess::NotAllowed
+    }
 }
 
 fn daemon_finding(response: Option<&Response>) -> ReadinessFinding {
@@ -776,7 +811,7 @@ fn daemon_finding(response: Option<&Response>) -> ReadinessFinding {
             ReadinessStatus::Fail,
             "the daemon did not answer the status handshake",
         )
-        .with_action("start voisu-daemon and run voisu doctor again")
+        .with_action("voisu service start")
     }
 }
 

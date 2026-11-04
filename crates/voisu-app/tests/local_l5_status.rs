@@ -157,13 +157,12 @@ fn local_doctor_skips_cloud_probes_with_explicit_skip_rows() {
         .command(env!("CARGO_BIN_EXE_voisu"))
         .args(["doctor"])
         .env("VOISU_TEST_READINESS", "pass")
-        .env("VOISU_TEST_FOCUS_BACKEND", "hyprland")
         .output()
         .expect("doctor");
     let printed = stdout(&doctor);
     assert!(printed.contains("Deepgram key"), "{printed}");
     assert!(printed.contains("not probed"), "{printed}");
-    assert!(printed.contains("SKIP"), "{printed}");
+    assert!(printed.contains("OFF"), "{printed}");
     assert!(printed.contains("Groq key"), "{printed}");
     assert!(
         !printed.contains("valid"),

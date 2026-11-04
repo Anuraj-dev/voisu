@@ -31,7 +31,6 @@ use voisu_app::local_recovery;
 use voisu_app::local_routing;
 use voisu_app::local_routing::LocalStopResult;
 
-use voisu_app::hyprland_bindings::VerifiedPasteAction;
 use voisu_app::journal::{escape_journal_control, recording_journal_lines};
 use voisu_app::minimal_grammar::MinimalGrammarAdapter;
 use voisu_app::smart_writing::{
@@ -212,10 +211,8 @@ async fn run() -> Result<(), String> {
     let controlled =
         std::env::var_os("VOISU_TEST_MODE").as_deref() == Some(std::ffi::OsStr::new("controlled"));
 
-    let (initial_delivery, initial_paste_action, initial_paste_backend) =
-        build_delivery_adapter(controlled, delivery_mode);
-    let daemon_readiness =
-        daemon_readiness_snapshot(delivery_mode, initial_paste_action, initial_paste_backend);
+    let (initial_delivery, initial_paste) = build_delivery_adapter(controlled, delivery_mode);
+    let daemon_readiness = daemon_readiness_snapshot(delivery_mode, initial_paste);
     let (actor_tx, actor_rx) = mpsc::channel(64);
     let levels = LevelRegistry::default();
     // The actor-owned reaper supervises capture and provider-stream cleanup.
@@ -1936,8 +1933,7 @@ fn status_response_with_feedback(
 /// interactive CLI's later environment after a compositor/session change.
 fn daemon_readiness_snapshot(
     delivery_mode: DeliveryMode,
-    paste_action: PasteActionState,
-    paste_backend: PasteBackend,
+    paste: PasteReadiness,
 ) -> Option<DaemonReadiness> {
     let controlled =
         std::env::var_os("VOISU_TEST_MODE").as_deref() == Some(std::ffi::OsStr::new("controlled"));
@@ -1988,8 +1984,9 @@ fn daemon_readiness_snapshot(
         x_authority,
         hyprland_instance_signature,
         delivery_mode: delivery_mode.as_str().to_owned(),
-        paste_action,
-        paste_backend,
+        paste_action: paste.action,
+        paste_backend: paste.backend,
+        paste_shortcut: paste.shortcut,
         clipboard_usable,
         clipboard_backend,
     })
@@ -3194,20 +3191,20 @@ fn rebuild_recording_adapters(
 fn build_delivery_adapter(
     controlled: bool,
     delivery_mode: DeliveryMode,
-) -> (Box<dyn DeliveryAdapter>, PasteActionState, PasteBackend) {
-    let copy_state = if delivery_mode == DeliveryMode::Copy {
-        PasteActionState::ClipboardOnly
-    } else {
-        PasteActionState::NotRequired
+) -> (Box<dyn DeliveryAdapter>, PasteReadiness) {
+    let copy_only = PasteReadiness {
+        action: PasteActionState::ClipboardOnly,
+        backend: PasteBackend::NotRequired,
+        shortcut: None,
     };
     if controlled {
         // The controlled adapter has no paste side effect; model the
         // configured mode without probing the live desktop.
-        return (
-            Box::new(ControlledDelivery),
-            copy_state,
-            PasteBackend::NotRequired,
-        );
+        let paste = match delivery_mode {
+            DeliveryMode::Copy => copy_only,
+            DeliveryMode::Paste => PasteReadiness::portal(),
+        };
+        return (Box::new(ControlledDelivery), paste);
     }
     if std::env::var_os("VOISU_DISABLE_DIRECT_DELIVERY").is_some() {
         return (
@@ -3215,8 +3212,7 @@ fn build_delivery_adapter(
                 Box::new(WlClipboard),
                 "direct Delivery disabled by VOISU_DISABLE_DIRECT_DELIVERY; Transcript remains on the clipboard",
             )),
-            PasteActionState::ClipboardOnly,
-            PasteBackend::NotRequired,
+            copy_only,
         );
     }
     match delivery_mode {
@@ -3225,43 +3221,60 @@ fn build_delivery_adapter(
                 Box::new(WlClipboard),
                 "Delivery is set to copy; Transcript is on the clipboard",
             )),
-            PasteActionState::ClipboardOnly,
-            PasteBackend::NotRequired,
+            copy_only,
         ),
         DeliveryMode::Paste if voisu_app::hyprland_bindings::hyprland_press_path_available() => {
-            match paste_action_selection() {
-                (paste_action, Some(action)) => {
+            match voisu_app::hyprland_bindings::discover_live_paste_action() {
+                Some(action) => {
                     eprintln!("verified Hyprland Paste Action: {}", action.description);
+                    let shortcut = Some(action.shortcut.binding.clone());
                     (
                         Box::new(PortalClipboardDelivery::with_hyprland_paste(action)),
-                        paste_action,
-                        PasteBackend::Hyprland,
+                        PasteReadiness {
+                            action: PasteActionState::Verified,
+                            backend: PasteBackend::Hyprland,
+                            shortcut,
+                        },
                     )
                 }
-                (paste_action, None) => {
+                None => {
                     eprintln!(
                         "no verified Hyprland Paste Action; Delivery will remain clipboard-only"
                     );
                     (
                         Box::new(PortalClipboardDelivery::clipboard_only()),
-                        paste_action,
-                        PasteBackend::NotRequired,
+                        PasteReadiness {
+                            backend: PasteBackend::Unavailable,
+                            ..copy_only
+                        },
                     )
                 }
             }
         }
         DeliveryMode::Paste => (
             Box::new(PortalClipboardDelivery::default()),
-            PasteActionState::NotRequired,
-            PasteBackend::NotRequired,
+            PasteReadiness::portal(),
         ),
     }
 }
 
-fn paste_action_selection() -> (PasteActionState, Option<VerifiedPasteAction>) {
-    match voisu_app::hyprland_bindings::discover_live_paste_action() {
-        Some(action) => (PasteActionState::Verified, Some(action)),
-        None => (PasteActionState::ClipboardOnly, None),
+/// What the daemon reports about its paste path, captured when it builds the
+/// Delivery adapter.
+#[derive(Clone, Debug)]
+struct PasteReadiness {
+    action: PasteActionState,
+    backend: PasteBackend,
+    shortcut: Option<String>,
+}
+
+impl PasteReadiness {
+    /// Paste through the RemoteDesktop portal, with no Hyprland shortcut.
+    fn portal() -> Self {
+        Self {
+            action: PasteActionState::NotRequired,
+            backend: PasteBackend::NotRequired,
+            shortcut: None,
+        }
     }
 }
 

@@ -508,16 +508,15 @@ pub enum PasteActionState {
     NotRequired,
 }
 
-/// How clipboard Delivery will press a verified Paste Action, if at all.
-///
-/// Distinct from [`PasteActionState`]: a binding can be verified while the
-/// Hyprland press path still cannot run.
+/// How Paste Delivery presses the paste shortcut, if at all.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PasteBackend {
     /// Paste Delivery selected the native Hyprland paste adapter.
     Hyprland,
-    /// A verified action exists (or would) but the Hyprland press path cannot run.
+    /// Paste Delivery on Hyprland found no verified paste shortcut, so it
+    /// copies only. Older daemons sent this when a verified shortcut existed but
+    /// the Hyprland press path could not run; both mean Hyprland cannot paste.
     Unavailable,
     /// Portal paste, copy, or the opt-out, with no Hyprland action.
     #[default]
@@ -546,6 +545,10 @@ pub struct DaemonReadiness {
     /// Defaulted so older daemons without this field still deserialize.
     #[serde(default)]
     pub paste_backend: PasteBackend,
+    /// The verified Hyprland paste shortcut Paste Delivery presses, shown by
+    /// doctor. Absent from older daemons and whenever no shortcut is pressed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paste_shortcut: Option<String>,
     /// The first clipboard writer available in the daemon's PATH, if any.
     /// Presence alone does not mean it can reach the daemon's display.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -939,7 +942,7 @@ impl ReadinessStatus {
             Self::Pass => "PASS",
             Self::Warn => "WARN",
             Self::Fail => "FAIL",
-            Self::Skip => "SKIP",
+            Self::Skip => "OFF",
         }
     }
 }
@@ -962,14 +965,14 @@ pub enum ReadinessCapability {
 impl ReadinessCapability {
     pub fn cli_label(self) -> &'static str {
         match self {
-            Self::Session => "Session",
-            Self::PipeWire => "PipeWire",
+            Self::Session => "Desktop",
+            Self::PipeWire => "Audio",
             Self::Microphone => "Microphone",
-            Self::Portals => "Portals",
+            Self::Portals => "Desktop portal",
             Self::Clipboard => "Clipboard",
-            Self::SecretStorage => "Secret storage",
-            Self::Daemon => "Daemon",
-            Self::ServiceEnvironment => "Service env",
+            Self::SecretStorage => "Keyring",
+            Self::Daemon => "Voisu service",
+            Self::ServiceEnvironment => "Service display",
         }
     }
 }
@@ -4491,6 +4494,7 @@ mod daemon_readiness_additivity_tests {
             .expect("a pre-paste-backend readiness payload must deserialize");
         assert_eq!(readiness.paste_action, PasteActionState::Verified);
         assert_eq!(readiness.paste_backend, PasteBackend::NotRequired);
+        assert_eq!(readiness.paste_shortcut, None);
     }
 }
 
