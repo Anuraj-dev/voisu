@@ -3,11 +3,12 @@
 //! accidentally launching the daemon or printing a usage error. Invalid
 //! arguments still fail with the usage text and exit 2.
 
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const EXPECTED_HELP: &str = "\
 usage: voisu <command> [args]
+       voisu           open the interface (on a real terminal)
 
 commands:
   setup
@@ -77,6 +78,20 @@ fn voisu_invalid_arguments_still_fail_with_usage_and_exit_two() {
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("usage: voisu"),
         "{output:?}"
+    );
+}
+
+#[test]
+fn bare_voisu_off_a_terminal_prints_usage_and_exits_two() {
+    let output = Command::new(env!("CARGO_BIN_EXE_voisu"))
+        .stdin(Stdio::null())
+        .output()
+        .expect("binary under test should run");
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr).trim_end(),
+        EXPECTED_HELP.trim_end()
     );
 }
 

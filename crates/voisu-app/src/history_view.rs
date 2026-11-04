@@ -250,7 +250,7 @@ fn render_record(index: usize, record: &Value, style: &RenderStyle) -> String {
 
 /// Renders each Provider referenced by this Recording with its outcome and
 /// timing, joined into one scannable line.
-fn render_providers(record: &Value, style: &RenderStyle) -> String {
+pub fn render_providers(record: &Value, style: &RenderStyle) -> String {
     if let Some(local) = record.get("local_asr").filter(|value| !value.is_null()) {
         return render_local_asr(local, style);
     }
@@ -398,7 +398,7 @@ fn truncation_tag(record: &Value) -> Option<String> {
 }
 
 /// The single most useful one-line reason a Recording produced no Transcript.
-fn failure_reason(record: &Value) -> Option<String> {
+pub fn failure_reason(record: &Value) -> Option<String> {
     for key in ["error", "validation_reason", "fallback_reason"] {
         if let Some(reason) = str_field(record, key)
             && !reason.is_empty()
@@ -515,7 +515,7 @@ fn millis_or_dash(value: Option<u64>) -> String {
 }
 
 /// Human-relative recency. Clamps future timestamps (clock skew) to "just now".
-fn relative_time(now_ms: u64, then_ms: u64) -> String {
+pub fn relative_time(now_ms: u64, then_ms: u64) -> String {
     let delta_ms = now_ms.saturating_sub(then_ms);
     let seconds = delta_ms / 1000;
     if seconds < 5 {

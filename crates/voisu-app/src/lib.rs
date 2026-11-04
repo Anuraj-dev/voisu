@@ -3,8 +3,10 @@ pub mod asr_mode_queue;
 pub mod audio_level;
 pub mod cloud_ownership;
 pub mod config;
+pub mod daemon_client;
 pub mod daemon_lock;
 pub mod dictionary;
+pub mod doctor;
 pub mod dpr_pipeline;
 pub mod feedback;
 pub mod focus;
@@ -33,6 +35,7 @@ pub mod setup_engine;
 pub mod setup_profile;
 pub mod smart_writing;
 pub mod system;
+pub mod tui;
 pub mod ubuntu_gnome;
 pub mod update;
 
