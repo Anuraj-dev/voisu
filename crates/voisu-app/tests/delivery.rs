@@ -763,6 +763,43 @@ async fn hyprland_omarchy_universal_emits_shift_insert_for_a_terminal_window() {
 }
 
 #[tokio::test]
+async fn hyprland_omarchy_universal_emits_the_terminal_chord_from_the_verified_action() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut action = omarchy_paste_action();
+    action.behavior = PasteBehavior::OmarchyUniversal {
+        normal: PasteShortcut {
+            binding: "CTRL + V".to_owned(),
+        },
+        terminal: PasteShortcut {
+            binding: "CTRL + SHIFT + V".to_owned(),
+        },
+    };
+    let mut delivery = hyprland_delivery(
+        Arc::clone(&events),
+        action.clone(),
+        Box::new(ScriptedWindow(Ok(
+            br#"{"address":"0x123","tags":["terminal*"]}"#.to_vec(),
+        ))),
+        Some(action),
+        None,
+    );
+
+    delivery
+        .deliver(Transcript("terminal transcript".to_owned()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        [
+            "clipboard:terminal transcript",
+            "send_key_state:CTRL + SHIFT:V:down",
+            "send_key_state:CTRL + SHIFT:V:up",
+        ]
+    );
+}
+
+#[tokio::test]
 async fn hyprland_omarchy_universal_emits_ctrl_v_for_a_non_terminal_window() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let action = omarchy_paste_action();

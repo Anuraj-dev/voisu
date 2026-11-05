@@ -690,21 +690,17 @@ pub fn discover_paste_action(
                 continue;
             }
 
-            if dispatcher == "__lua" && is_omarchy_universal_paste(candidate, source_text) {
+            if dispatcher == "__lua"
+                && let Some((normal, terminal)) =
+                    omarchy_universal_paste_chords(candidate, source_text)
+            {
                 return Some(VerifiedPasteAction {
                     shortcut: PasteShortcut {
                         binding: candidate.key.trim().to_owned(),
                     },
                     description: candidate.description.clone(),
                     live_binding_identity,
-                    behavior: PasteBehavior::OmarchyUniversal {
-                        normal: PasteShortcut {
-                            binding: "CTRL + V".to_owned(),
-                        },
-                        terminal: PasteShortcut {
-                            binding: "SHIFT + Insert".to_owned(),
-                        },
-                    },
+                    behavior: PasteBehavior::OmarchyUniversal { normal, terminal },
                 });
             }
 
@@ -939,27 +935,31 @@ fn is_string_literal_command(binding: &LuaBinding) -> bool {
     binding.command != "<Lua dispatcher>" && binding.dispatcher.is_none()
 }
 
-fn is_omarchy_universal_paste(binding: &LuaBinding, source: &str) -> bool {
+/// The normal and terminal chords of a verified Omarchy helper binding. The
+/// helper bodies must match exactly, but the chords come from the binding's own
+/// arguments: Voisu presses what the user's Super+V presses, and Omarchy can
+/// change those keys between releases (4.5 moved terminals from Shift+Insert to
+/// Ctrl+Shift+V).
+fn omarchy_universal_paste_chords(
+    binding: &LuaBinding,
+    source: &str,
+) -> Option<(PasteShortcut, PasteShortcut)> {
     if binding.command != "<Lua dispatcher>"
         || binding.dispatcher.as_deref() != Some("universal_clipboard_shortcut")
         || binding.description != "Universal paste"
         || !binding.key.contains('+')
-        || !binding
-            .dispatcher_arguments
-            .as_ref()
-            .is_some_and(|arguments| {
-                arguments
-                    .iter()
-                    .map(String::as_str)
-                    .eq(["CTRL", "V", "SHIFT", "Insert"])
-            })
     {
-        return false;
+        return None;
     }
-    let Ok(tokens) = lex_lua(source) else {
-        return false;
+    let [normal_mods, normal_key, terminal_mods, terminal_key] =
+        binding.dispatcher_arguments.as_deref()?
+    else {
+        return None;
     };
-    function_body_matches(
+    let normal = helper_chord(normal_mods, normal_key)?;
+    let terminal = helper_chord(terminal_mods, terminal_key)?;
+    let tokens = lex_lua(source).ok()?;
+    (function_body_matches(
         &tokens,
         "universal_clipboard_shortcut",
         &[
@@ -1005,7 +1005,26 @@ for _, tag in ipairs(window.tags or {}) do
 end
 return false
 "#,
-    )
+    ))
+    .then_some((normal, terminal))
+}
+
+/// Joins helper arguments such as `("CTRL SHIFT", "V")` into a chord. Refuses a
+/// chord with no modifier and anything the emitter could not press safely; it
+/// does not judge whether the chord pastes, which the user's binding decides.
+fn helper_chord(mods: &str, key: &str) -> Option<PasteShortcut> {
+    let key = key.trim();
+    // Checked here because an empty key would turn the last modifier into the key.
+    if !is_safe_lua_token(key) {
+        return None;
+    }
+    let mods = mods
+        .split(|c: char| c == '+' || c.is_whitespace())
+        .filter(|modifier| !modifier.is_empty())
+        .collect::<Vec<_>>();
+    let binding = format!("{} + {}", mods.join(" + "), key);
+    let (sanitized_mods, _) = sanitized_send_key_tokens(&binding)?;
+    (!sanitized_mods.is_empty()).then_some(PasteShortcut { binding })
 }
 
 fn function_body_matches(
@@ -3860,20 +3879,52 @@ o.bind("SUPER + V", "Universal paste", universal_clipboard_shortcut("CTRL", "V",
     }
 
     #[test]
-    fn omarchy_helper_requires_the_known_shortcut_arguments() {
-        let source = OMARCHY_PASTE_SOURCE.replace(
-            "universal_clipboard_shortcut(\"CTRL\", \"V\", \"SHIFT\", \"Insert\")",
-            "universal_clipboard_shortcut(\"CTRL\", \"V\", \"ALT\", \"Insert\")",
+    fn omarchy_helper_chords_come_from_the_binding_arguments() {
+        // Omarchy 4.5 moved terminals from Shift+Insert to Ctrl+Shift+V.
+        let omarchy_4_5 = OMARCHY_PASTE_SOURCE.replace(
+            r#"universal_clipboard_shortcut("CTRL", "V", "SHIFT", "Insert")"#,
+            r#"universal_clipboard_shortcut("CTRL", "V", "CTRL SHIFT", "V")"#,
         );
-        let live = serde_json::json!([{
-            "key": "V",
-            "modmask": 64,
-            "description": "Universal paste",
-            "dispatcher": "__lua",
-            "arg": "91"
-        }]);
 
-        assert!(discover_paste_action(&[&source], &live).is_none());
+        let action = discover_paste_action(&[&omarchy_4_5], &universal_paste_live("V", 64))
+            .expect("Omarchy 4.5 helper should be verified");
+
+        assert_eq!(
+            action.behavior,
+            PasteBehavior::OmarchyUniversal {
+                normal: PasteShortcut {
+                    binding: "CTRL + V".to_owned()
+                },
+                terminal: PasteShortcut {
+                    binding: "CTRL + SHIFT + V".to_owned()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn omarchy_helper_rejects_arguments_it_cannot_press_safely() {
+        for arguments in [
+            // No modifier.
+            r#""CTRL", "V", "", "V""#,
+            // Nothing to press.
+            r#""CTRL", "V", "CTRL SHIFT", """#,
+            // Paste emission has no Caps keycode.
+            r#""CTRL", "V", "CAPS", "V""#,
+            // Not plain tokens, so never interpolated into the Lua snippet.
+            r#""CTRL", "V", "CTRL;SHIFT", "V""#,
+            r#""CTRL", "V", "CTRL SHIFT", "code:55""#,
+            // The helper takes exactly four arguments.
+            r#""CTRL", "V", "CTRL SHIFT""#,
+        ] {
+            let source =
+                OMARCHY_PASTE_SOURCE.replace(r#""CTRL", "V", "SHIFT", "Insert""#, arguments);
+
+            assert!(
+                discover_paste_action(&[&source], &universal_paste_live("V", 64)).is_none(),
+                "{arguments} should stay unverified"
+            );
+        }
     }
 
     #[test]
