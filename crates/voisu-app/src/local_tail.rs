@@ -127,12 +127,12 @@ pub fn decide_transcript(
             let sanitized = voisu_core::sanitize_source_transcript_text(trimmed);
             if sanitized.trim().is_empty() {
                 return Ok(TerminalDecision::NoText {
-                    reason: "hallucinated suffix".to_owned(),
+                    reason: "no words heard".to_owned(),
                 });
             }
             if is_whole_silence_phrase(&sanitized) {
                 return Ok(TerminalDecision::NoText {
-                    reason: "silence hallucination".to_owned(),
+                    reason: "no words heard".to_owned(),
                 });
             }
             let replaced = apply_local_dictionary(&sanitized, user_terms);
@@ -332,7 +332,7 @@ mod tests {
             "Thank you. Thanks for watching.",
             "Please like and subscribe",
         ] {
-            assert_eq!(decide(text, &[]), no_text("hallucinated suffix"), "{text}");
+            assert_eq!(decide(text, &[]), no_text("no words heard"), "{text}");
         }
     }
 
@@ -353,11 +353,7 @@ mod tests {
             "Bye-bye!",
             "Thank   you ...",
         ] {
-            assert_eq!(
-                decide(text, &[]),
-                no_text("silence hallucination"),
-                "{text:?}"
-            );
+            assert_eq!(decide(text, &[]), no_text("no words heard"), "{text:?}");
         }
     }
 

@@ -253,7 +253,7 @@ fn read_revision_at(state_dir: &Path) -> Result<u64, AdmissionError> {
         Ok(contents) => contents
             .trim()
             .parse()
-            .map_err(|_| AdmissionError::Blocked("config revision is unreadable".to_owned())),
+            .map_err(|_| AdmissionError::Blocked("can't read Voisu's saved engine state; run voisu engine local or voisu engine cloud".to_owned())),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(0),
         Err(error) => Err(AdmissionError::Access(format!(
             "cannot read config revision: {error}"
@@ -321,14 +321,14 @@ pub fn load_mode(config_path: &Path, state_dir: &Path) -> Result<(AsrMode, u64),
         Ok(contents) => match parse_asr_mode_document(&contents)? {
             Some(mode) => Ok((mode, revision)),
             None if marker => Err(AdmissionError::Blocked(
-                "ASR mode is missing after an explicit selection; admission blocked".to_owned(),
+                "your engine choice is missing from the Voisu config file; run voisu engine local or voisu engine cloud".to_owned(),
             )),
             None => Ok((AsrMode::Cloud, revision)),
         },
         Err(error) if error.kind() == ErrorKind::NotFound => {
             if marker {
                 Err(AdmissionError::Blocked(
-                    "ASR mode config is missing after an explicit selection; admission blocked"
+                    "the Voisu config file holding your engine choice is gone; run voisu engine local or voisu engine cloud"
                         .to_owned(),
                 ))
             } else {
@@ -336,7 +336,7 @@ pub fn load_mode(config_path: &Path, state_dir: &Path) -> Result<(AsrMode, u64),
             }
         }
         Err(error) => Err(AdmissionError::Access(format!(
-            "cannot read ASR mode config {}: {error}",
+            "can't read your Voisu config file {}: {error}",
             config_path.display()
         ))),
     }
@@ -360,20 +360,20 @@ fn parse_asr_mode_document(contents: &str) -> Result<Option<AsrMode>, AdmissionE
         }
         let Some((key, value)) = line.split_once('=') else {
             return Err(AdmissionError::Blocked(
-                "malformed TOML in daemon config; admission blocked".to_owned(),
+                "your Voisu config file has a line Voisu can't read; fix or remove it".to_owned(),
             ));
         };
         let key = key.trim();
         if key.is_empty() {
             return Err(AdmissionError::Blocked(
-                "malformed TOML in daemon config; admission blocked".to_owned(),
+                "your Voisu config file has a line Voisu can't read; fix or remove it".to_owned(),
             ));
         }
         // Escapes are not decoded; treating them as a missing key would default
         // to Cloud and route an explicit Local file through capture.
         if key.contains('\\') {
             return Err(AdmissionError::Blocked(
-                "unsupported TOML key syntax in daemon config; admission blocked".to_owned(),
+                "your Voisu config file has a line Voisu can't read; fix or remove it".to_owned(),
             ));
         }
         let seen_key = if is_asr_mode_key(key) {
@@ -383,7 +383,7 @@ fn parse_asr_mode_document(contents: &str) -> Result<Option<AsrMode>, AdmissionE
         };
         if !seen.insert(seen_key.to_owned()) {
             return Err(AdmissionError::Blocked(format!(
-                "duplicate root key {key} in daemon config; admission blocked"
+                "your Voisu config file sets {key} twice; remove one"
             )));
         }
         if !is_asr_mode_key(key) {
@@ -395,7 +395,7 @@ fn parse_asr_mode_document(contents: &str) -> Result<Option<AsrMode>, AdmissionE
             "\"local\"" | "'local'" => AsrMode::Local,
             _ => {
                 return Err(AdmissionError::Blocked(
-                    "unknown asr_mode in daemon config; admission blocked".to_owned(),
+                    "your Voisu config file has an unknown asr_mode; run voisu engine local or voisu engine cloud".to_owned(),
                 ));
             }
         });
@@ -477,7 +477,7 @@ pub fn status_report_at(
     let Some(state_dir) = state_dir else {
         return blocked_status(
             active,
-            "cannot resolve Voisu state directory; admission blocked",
+            "can't find Voisu's state folder; set HOME or XDG_STATE_HOME",
         );
     };
     match load_mode(config_path, state_dir) {
@@ -606,7 +606,10 @@ pub fn set_asr_mode_response(
                 daemon_state,
                 crate::local_packaging::annotate_mode_message(
                     commit.mode,
-                    format!("ASR mode set to {}", commit.mode.as_str()),
+                    format!(
+                        "Engine set to {} for your next Recording",
+                        engine_name(commit.mode)
+                    ),
                 ),
             );
             attach_status(&mut response, active);
@@ -623,6 +626,26 @@ pub fn set_asr_mode_response(
         }
     }
 }
+
+/// The engine name users see: `voisu engine local|cloud` prints `Local` or
+/// `Cloud`. `AsrMode::as_str` stays the stored and typed value.
+pub fn engine_name(mode: AsrMode) -> &'static str {
+    match mode {
+        AsrMode::Local => "Local",
+        AsrMode::Cloud => "Cloud",
+    }
+}
+
+/// What the CLI says when no daemon answered, so the Engine waits for a start.
+/// The TUI reads [`ENGINE_WAITS_FOR_START`] out of this to word its own toast.
+pub(crate) fn engine_saved_for_next_start(mode: AsrMode) -> String {
+    format!(
+        "Engine set to {}; {ENGINE_WAITS_FOR_START}",
+        engine_name(mode)
+    )
+}
+
+pub(crate) const ENGINE_WAITS_FOR_START: &str = "it applies when Voisu next starts";
 
 pub fn apply_cli_mode(mode: AsrMode) -> Result<String, CliModeError> {
     match try_connect_daemon() {
@@ -649,7 +672,7 @@ fn set_mode_over_ipc(stream: UnixStream, mode: AsrMode) -> Result<String, CliMod
     {
         return Err(CliModeError::new(
             3,
-            "daemon does not support ASR mode; upgrade and restart the daemon",
+            "this Voisu service is too old to switch engines; restart it: voisu service restart",
         ));
     }
     let response = send_request(
@@ -675,10 +698,7 @@ fn set_mode_offline(mode: AsrMode) -> Result<String, CliModeError> {
                     .map_err(|error| CliModeError::new(4, error.message().to_owned()))?;
                 Ok(crate::local_packaging::annotate_mode_message(
                     commit.mode,
-                    format!(
-                        "ASR mode set to {}; it applies at the next supported daemon start",
-                        commit.mode.as_str()
-                    ),
+                    engine_saved_for_next_start(commit.mode),
                 ))
             }
         },
@@ -686,7 +706,7 @@ fn set_mode_offline(mode: AsrMode) -> Result<String, CliModeError> {
             Ok(stream) => set_mode_over_ipc(stream, mode),
             Err(_) => Err(CliModeError::new(
                 3,
-                "daemon lock is held but IPC is unavailable; mode left untouched",
+                "Voisu is starting or stopping; engine not changed. Try again in a moment",
             )),
         },
     }
@@ -805,24 +825,32 @@ fn send_request(mut stream: UnixStream, command: Command) -> Result<Response, Cl
     if serde_json::to_writer(&mut stream, &request).is_err() || stream.write_all(b"\n").is_err() {
         return Err(CliModeError::new(
             3,
-            "ASR mode result is unknown; the daemon did not acknowledge the change",
+            "Voisu didn't confirm the engine change; check with voisu status",
         ));
     }
     let mut reader = BufReader::new(stream);
     let frame = read_frame(&mut reader).map_err(|message| CliModeError::new(3, message))?;
-    let envelope: VersionEnvelope = serde_json::from_str(&frame)
-        .map_err(|_| CliModeError::new(3, "daemon returned an invalid ASR mode response"))?;
+    let envelope: VersionEnvelope = serde_json::from_str(&frame).map_err(|_| {
+        CliModeError::new(
+            3,
+            "Voisu sent an answer this command can't read; restart Voisu: voisu service restart",
+        )
+    })?;
     if envelope.version != PROTOCOL_VERSION {
         return Err(CliModeError::new(
             3,
             format!(
-                "IPC protocol mismatch: daemon uses {}, CLI uses {PROTOCOL_VERSION}",
+                "Voisu needs a restart to match this version: voisu service restart (service protocol {}, command protocol {PROTOCOL_VERSION})",
                 envelope.version
             ),
         ));
     }
-    serde_json::from_str(&frame)
-        .map_err(|_| CliModeError::new(3, "daemon returned an invalid ASR mode response"))
+    serde_json::from_str(&frame).map_err(|_| {
+        CliModeError::new(
+            3,
+            "Voisu sent an answer this command can't read; restart Voisu: voisu service restart",
+        )
+    })
 }
 
 fn read_frame(stream: &mut BufReader<UnixStream>) -> Result<String, String> {
@@ -833,7 +861,7 @@ fn read_frame(stream: &mut BufReader<UnixStream>) -> Result<String, String> {
             .checked_sub(started.elapsed())
             .filter(|remaining| !remaining.is_zero())
             .ok_or_else(|| {
-                "ASR mode result is unknown; the daemon did not acknowledge the change".to_owned()
+                "Voisu didn't confirm the engine change; check with voisu status".to_owned()
             })?;
         stream
             .get_ref()
@@ -842,8 +870,7 @@ fn read_frame(stream: &mut BufReader<UnixStream>) -> Result<String, String> {
         match stream.fill_buf() {
             Ok([]) => {
                 return Err(
-                    "ASR mode result is unknown; the daemon did not acknowledge the change"
-                        .to_owned(),
+                    "Voisu didn't confirm the engine change; check with voisu status".to_owned(),
                 );
             }
             Ok(available) => {
@@ -856,20 +883,18 @@ fn read_frame(stream: &mut BufReader<UnixStream>) -> Result<String, String> {
                 }
                 if frame_end.is_some() {
                     return String::from_utf8(response)
-                        .map_err(|_| "daemon returned an invalid ASR mode response".to_owned());
+                        .map_err(|_| "Voisu sent an answer this command can't read; restart Voisu: voisu service restart".to_owned());
                 }
             }
             Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
                 return Err(
-                    "ASR mode result is unknown; the daemon did not acknowledge the change"
-                        .to_owned(),
+                    "Voisu didn't confirm the engine change; check with voisu status".to_owned(),
                 );
             }
             Err(error) if error.kind() == ErrorKind::Interrupted => {}
             Err(_) => {
                 return Err(
-                    "ASR mode result is unknown; the daemon did not acknowledge the change"
-                        .to_owned(),
+                    "Voisu didn't confirm the engine change; check with voisu status".to_owned(),
                 );
             }
         }
@@ -918,7 +943,7 @@ mod tests {
         durable_replace(&mode_initialized_path(&state), b"initialized\n").unwrap();
         let error = load_mode(&config, &state).unwrap_err();
         assert!(
-            !error.message().to_ascii_lowercase().contains("cloud"),
+            error.message().contains("engine choice"),
             "{}",
             error.message()
         );
@@ -959,7 +984,7 @@ mod tests {
         let error = load_mode(&config, &state).unwrap_err();
         assert!(matches!(error, AdmissionError::Blocked(_)));
         assert!(
-            error.message().contains("unsupported TOML key syntax"),
+            error.message().contains("a line Voisu can't read"),
             "{}",
             error.message()
         );
@@ -974,27 +999,31 @@ mod tests {
     fn unknown_mode_never_becomes_cloud() {
         let contents = "asr_mode = \"hybrid\"\n";
         let error = parse_asr_mode_document(contents).unwrap_err();
-        assert!(error.message().contains("unknown asr_mode"));
+        assert!(
+            error.message().contains("unknown asr_mode"),
+            "{}",
+            error.message()
+        );
     }
 
     #[test]
     fn duplicate_root_keys_block_admission() {
         let contents = "asr_mode = \"local\"\nasr_mode = \"cloud\"\n";
         let error = parse_asr_mode_document(contents).unwrap_err();
-        assert!(error.message().contains("duplicate"));
+        assert!(error.message().contains("twice"));
     }
 
     #[test]
     fn quoted_and_bare_asr_mode_keys_are_duplicates() {
         let contents = "\"asr_mode\" = \"local\"\nasr_mode = \"cloud\"\n";
         let error = parse_asr_mode_document(contents).unwrap_err();
-        assert!(error.message().contains("duplicate"));
+        assert!(error.message().contains("twice"));
     }
 
     #[test]
     fn malformed_toml_blocks_admission() {
         let error = parse_asr_mode_document("not toml\n").unwrap_err();
-        assert!(error.message().contains("malformed"));
+        assert!(error.message().contains("a line Voisu can't read"));
     }
 
     #[test]

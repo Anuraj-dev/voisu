@@ -81,10 +81,10 @@ Secret Service and are not written to the unit or command line:
 
 ```sh
 voisu doctor
-printf '%s\n' "$GROQ_API_KEY" | voisu auth set groq
-printf '%s\n' "$DEEPGRAM_API_KEY" | voisu auth set deepgram
-voisu auth verify groq
-voisu auth verify deepgram
+printf '%s\n' "$GROQ_API_KEY" | voisu key set groq
+printf '%s\n' "$DEEPGRAM_API_KEY" | voisu key set deepgram
+voisu key check groq
+voisu key check deepgram
 voisu service install
 voisu service start                 # immediate daemon start; login start is enabled
 voisu service status

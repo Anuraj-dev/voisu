@@ -115,7 +115,7 @@ Voisu currently defaults to `type`. Type Delivery requires a RemoteDesktop porta
 Equivalent command:
 
 ```bash
-voisu delivery clipboard
+voisu delivery paste
 ```
 
 ### P1: `voisu doctor` can report a false green

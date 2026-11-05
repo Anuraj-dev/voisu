@@ -508,18 +508,17 @@ pub enum PasteActionState {
     NotRequired,
 }
 
-/// How clipboard Delivery will press a verified Paste Action, if at all.
-///
-/// Distinct from [`PasteActionState`]: a binding can be verified while the
-/// Hyprland press path still cannot run.
+/// How Paste Delivery presses the paste shortcut, if at all.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PasteBackend {
-    /// Clipboard Delivery selected the native Hyprland paste adapter.
+    /// Paste Delivery selected the native Hyprland paste adapter.
     Hyprland,
-    /// A verified action exists (or would) but the Hyprland press path cannot run.
+    /// Paste Delivery on Hyprland found no verified paste shortcut, so it
+    /// copies only. Older daemons sent this when a verified shortcut existed but
+    /// the Hyprland press path could not run; both mean Hyprland cannot paste.
     Unavailable,
-    /// Type, guarded, opt-out, or clipboard-only with no action.
+    /// Portal paste, copy, or the opt-out, with no Hyprland action.
     #[default]
     NotRequired,
 }
@@ -546,6 +545,10 @@ pub struct DaemonReadiness {
     /// Defaulted so older daemons without this field still deserialize.
     #[serde(default)]
     pub paste_backend: PasteBackend,
+    /// The verified Hyprland paste shortcut Paste Delivery presses, shown by
+    /// doctor. Absent from older daemons and whenever no shortcut is pressed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paste_shortcut: Option<String>,
     /// The first clipboard writer available in the daemon's PATH, if any.
     /// Presence alone does not mean it can reach the daemon's display.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -799,19 +802,21 @@ impl BoundaryError {
 
     pub fn public_message(&self) -> &'static str {
         self.public_message.unwrap_or(match self.kind {
-            BoundaryKind::Capture => "Recording capture failed",
-            BoundaryKind::EmptyRecording => "No audio was captured",
-            BoundaryKind::TooShortRecording => "Recording is too short",
-            BoundaryKind::SilentRecording => "Recording contains no speech",
-            BoundaryKind::RecordingDeadline => "Recording Deadline elapsed",
-            BoundaryKind::Provider => "Source Transcripts are unavailable",
-            BoundaryKind::Validation => "Transcript failed quality validation",
-            BoundaryKind::Delivery => "Transcript Delivery failed",
+            BoundaryKind::Capture => "Couldn't record from the microphone",
+            BoundaryKind::EmptyRecording => "No sound recorded; check your microphone",
+            BoundaryKind::TooShortRecording => "Too short to transcribe",
+            BoundaryKind::SilentRecording => "Didn't hear any words",
+            BoundaryKind::RecordingDeadline => "Stopped at the time limit",
+            BoundaryKind::Provider => "Groq or Deepgram couldn't give us text",
+            BoundaryKind::Validation => "Held back text that looked wrong",
+            BoundaryKind::Delivery => "Couldn't put the text in your window",
             BoundaryKind::SecretStorage => {
-                "Secret storage is unavailable; set VOISU_GROQ_API_KEY or VOISU_DEEPGRAM_API_KEY for development or headless use"
+                "Can't read your keys from the keyring; set VOISU_GROQ_API_KEY or VOISU_DEEPGRAM_API_KEY for development or headless use"
             }
-            BoundaryKind::ProviderAuthentication => "Provider authentication failed",
-            BoundaryKind::Shortcut => "Trigger Key binding is unavailable",
+            BoundaryKind::ProviderAuthentication => {
+                "Groq or Deepgram rejected your key; run voisu setup"
+            }
+            BoundaryKind::Shortcut => "Couldn't set up your Trigger Key",
         })
     }
 
@@ -939,7 +944,7 @@ impl ReadinessStatus {
             Self::Pass => "PASS",
             Self::Warn => "WARN",
             Self::Fail => "FAIL",
-            Self::Skip => "SKIP",
+            Self::Skip => "OFF",
         }
     }
 }
@@ -962,14 +967,14 @@ pub enum ReadinessCapability {
 impl ReadinessCapability {
     pub fn cli_label(self) -> &'static str {
         match self {
-            Self::Session => "Session",
-            Self::PipeWire => "PipeWire",
+            Self::Session => "Desktop",
+            Self::PipeWire => "Audio",
             Self::Microphone => "Microphone",
-            Self::Portals => "Portals",
+            Self::Portals => "Desktop portal",
             Self::Clipboard => "Clipboard",
-            Self::SecretStorage => "Secret storage",
-            Self::Daemon => "Daemon",
-            Self::ServiceEnvironment => "Service env",
+            Self::SecretStorage => "Keyring",
+            Self::Daemon => "Voisu service",
+            Self::ServiceEnvironment => "Service display",
         }
     }
 }
@@ -1785,23 +1790,25 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
         let sanitized_sources = sources.clone();
         sources.retain(|source| !source.text.is_empty());
         if sources.is_empty() {
+            // Nothing but ASR outro filler is silence, not a quality failure:
+            // report it like a local-engine no-words Recording.
             let validation_reason =
-                "hallucinated suffix; no Source Transcript remains after stripping ASR outros"
-                    .to_owned();
-            return Err(
-                BoundaryError::new(BoundaryKind::Validation, validation_reason.clone())
-                    .with_transcript_failure(TranscriptFailureEvidence {
-                        validation_reason,
-                        fallback_reason: Some("hallucinated suffix".to_owned()),
-                        reconciliation_requested: false,
-                        recovery_attempted: false,
-                        source_selection_diagnostic: source_selection_diagnostic(
-                            &sanitized_sources,
-                            None,
-                            None,
-                        ),
-                    }),
-            );
+                "didn't hear any words (removed filler like \"thanks for watching\")".to_owned();
+            return Err(BoundaryError::new(
+                BoundaryKind::SilentRecording,
+                validation_reason.clone(),
+            )
+            .with_transcript_failure(TranscriptFailureEvidence {
+                validation_reason,
+                fallback_reason: Some("no words heard".to_owned()),
+                reconciliation_requested: false,
+                recovery_attempted: false,
+                source_selection_diagnostic: source_selection_diagnostic(
+                    &sanitized_sources,
+                    None,
+                    None,
+                ),
+            }));
         }
         sources.sort_by_key(|source| source.provider);
         if let (Some(deepgram), Some(groq)) = (
@@ -4481,7 +4488,7 @@ mod daemon_readiness_additivity_tests {
             "session_type": "wayland",
             "wayland_display": "wayland-0",
             "x11_display": null,
-            "delivery_mode": "clipboard",
+            "delivery_mode": "copy",
             "paste_action": "verified",
             "clipboard_usable": true
         }"#;
@@ -4489,6 +4496,7 @@ mod daemon_readiness_additivity_tests {
             .expect("a pre-paste-backend readiness payload must deserialize");
         assert_eq!(readiness.paste_action, PasteActionState::Verified);
         assert_eq!(readiness.paste_backend, PasteBackend::NotRequired);
+        assert_eq!(readiness.paste_shortcut, None);
     }
 }
 

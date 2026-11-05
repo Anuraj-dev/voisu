@@ -140,11 +140,11 @@ fn clean_install_ships_no_production_weights_and_defaults_cloud() {
     assert!(status.status.success(), "{}", stdout(&status));
     let printed = stdout(&status);
     assert!(
-        printed.contains("asr mode pending:") || printed.contains("idle"),
+        printed.contains("Engine:") || printed.contains("Ready"),
         "{printed}"
     );
     assert!(
-        printed.contains("local readiness:") || printed.contains("idle"),
+        printed.contains("Local model:") || printed.contains("Ready"),
         "{printed}"
     );
     assert!(
@@ -168,7 +168,7 @@ fn clean_install_ships_no_production_weights_and_defaults_cloud() {
 #[test]
 fn offline_local_selection_survives_daemon_restart() {
     let harness = Harness::new();
-    let set = harness.voisu(&["mode", "local"]);
+    let set = harness.voisu(&["engine", "local"]);
     assert!(set.status.success(), "{}", stdout(&set));
     let first = harness.start_daemon();
     drop(first);
@@ -176,7 +176,7 @@ fn offline_local_selection_survives_daemon_restart() {
     let status = harness.voisu(&["status"]);
     assert!(status.status.success());
     let printed = stdout(&status);
-    assert!(printed.contains("local"), "{printed}");
+    assert!(printed.contains("Engine: Local"), "{printed}");
     let config = fs::read_to_string(harness.config_file()).unwrap();
     assert!(config.contains("asr_mode = \"local\""), "{config}");
 }
@@ -184,9 +184,9 @@ fn offline_local_selection_survives_daemon_restart() {
 #[test]
 fn upgrade_preserves_private_settings_and_receipts() {
     let harness = Harness::new();
-    assert!(harness.voisu(&["mode", "local"]).status.success());
+    assert!(harness.voisu(&["engine", "local"]).status.success());
     assert!(harness.voisu(&["deepgram", "off"]).status.success());
-    assert!(harness.voisu(&["writing", "literal"]).status.success());
+    assert!(harness.voisu(&["writing", "exact"]).status.success());
     assert!(
         harness
             .voisu(&["dictionary", "add", "raja"])
@@ -209,7 +209,7 @@ fn upgrade_preserves_private_settings_and_receipts() {
     let config = fs::read_to_string(harness.config_file()).unwrap();
     assert!(config.contains("asr_mode = \"local\""), "{config}");
     assert!(config.contains("deepgram_enabled = false"), "{config}");
-    assert!(config.contains("writing_mode = \"literal\""), "{config}");
+    assert!(config.contains("writing_mode = \"exact\""), "{config}");
     let dict = harness.config.path().join("voisu").join("dictionary.txt");
     assert!(fs::read_to_string(&dict).unwrap().contains("raja"));
     assert_eq!(store.load_active().unwrap().unwrap().artifact_id, "kept");
@@ -228,11 +228,11 @@ fn cloud_switch_is_opt_out_not_a_model_repair() {
         encode_receipt(&retained),
     )
     .unwrap();
-    let cloud = harness.voisu(&["mode", "cloud"]);
+    let cloud = harness.voisu(&["engine", "cloud"]);
     assert!(cloud.status.success(), "{}", stdout(&cloud));
     let printed = stdout(&cloud);
-    assert!(printed.contains("opt-out"), "{printed}");
-    assert!(printed.contains("not a Local repair"), "{printed}");
+    assert!(printed.contains("sends your audio online"), "{printed}");
+    assert!(printed.contains("doesn't fix the Local model"), "{printed}");
     assert_eq!(store.load_active().unwrap().unwrap().artifact_id, "broken");
 }
 
@@ -406,5 +406,5 @@ fn daemon_and_cli_stay_call_sites() {
         !cli.contains("local_packaging"),
         "packaging contracts stay out of voisu.rs"
     );
-    assert!(cli.contains("mode <local|cloud>"));
+    assert!(cli.contains("engine <local|cloud>"));
 }

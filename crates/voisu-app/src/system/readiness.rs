@@ -146,7 +146,7 @@ fn service_display_env_finding() -> Option<ReadinessFinding> {
                 missing.join(" ")
             ),
         )
-        .with_value("missing display env"),
+        .with_value("can't reach your display"),
     )
 }
 
@@ -242,7 +242,7 @@ fn pipewire_finding() -> ReadinessFinding {
             "PipeWire core does not respond",
         )
         .with_value(value)
-        .with_action("start PipeWire and WirePlumber")
+        .with_action("restart audio: systemctl --user restart pipewire wireplumber")
     }
 }
 
@@ -332,7 +332,7 @@ fn controlled_readiness(value: &str, daemon_status: Option<&Response>) -> Vec<Re
                     ReadinessStatus::Warn,
                     "the systemd --user manager is missing WAYLAND_DISPLAY, XAUTHORITY, so Delivery from the daemon cannot reach or authenticate to the display; run `voisu service restart`",
                 )
-                .with_value("missing display env"),
+                .with_value("can't reach your display"),
             );
         }
     }
@@ -358,7 +358,7 @@ fn microphone_finding() -> ReadinessFinding {
             ReadinessStatus::Fail,
             "WirePlumber is unavailable",
         )
-        .with_action("start PipeWire and WirePlumber"),
+        .with_action("restart audio: systemctl --user restart pipewire wireplumber"),
     }
 }
 
@@ -628,7 +628,7 @@ fn clipboard_empty_selection(stderr: &str) -> bool {
 /// specifically; an installed xclip cannot make a missing or broken
 /// wl-clipboard backend usable.
 pub fn verify_clipboard_delivery() -> Result<(), String> {
-    // Hyprland's Clipboard, Type, and Guarded adapters all preserve through
+    // On Hyprland, both the Paste and Copy adapters preserve through
     // WlClipboard. Do not use the doctor's Unknown-session fallback here:
     // xclip being installed cannot satisfy a missing wl-copy/wl-paste pair.
     let finding = clipboard_finding_for_backend(ClipboardTool::WlClipboard);
@@ -727,13 +727,17 @@ fn portals_finding() -> ReadinessFinding {
     }
 }
 
-/// Whether `org.freedesktop.portal.GlobalShortcuts` is exposed on the desktop
-/// portal. Reads its `version` property: the portal answers with the interface
-/// version when it is implemented and fails when it is absent. This mirrors how
-/// the codebase already talks to the portal over the session bus (via busctl),
-/// staying in one subprocess convention rather than opening a second zbus edge
-/// just for a probe.
 fn global_shortcuts_available() -> bool {
+    portal_interface_available(GLOBAL_SHORTCUTS_INTERFACE)
+}
+
+/// Whether the desktop portal exposes `interface`. Reads its `version`
+/// property: the portal answers with the interface version when it is
+/// implemented and fails when it is absent. This mirrors how the codebase
+/// already talks to the portal over the session bus (via busctl), staying in
+/// one subprocess convention rather than opening a second zbus edge just for a
+/// probe.
+fn portal_interface_available(interface: &str) -> bool {
     run_restricted(
         "busctl",
         &[
@@ -741,13 +745,72 @@ fn global_shortcuts_available() -> bool {
             "get-property",
             PORTAL_BUS_NAME,
             PORTAL_OBJECT_PATH,
-            GLOBAL_SHORTCUTS_INTERFACE,
+            interface,
             "version",
         ],
         None,
         false,
     )
     .is_ok_and(|outcome| outcome.success)
+}
+
+/// Whether this desktop lets Voisu paste through the RemoteDesktop portal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoteDesktopAccess {
+    /// The portal has no RemoteDesktop interface: Voisu can only copy.
+    Missing,
+    /// The portal could not be asked (no bus, no portal service, a timeout), so
+    /// nothing is known about this desktop.
+    Unknown,
+    /// The interface exists, but the user has not allowed keyboard control
+    /// yet; the next paste asks.
+    NotAllowed,
+    Allowed,
+}
+
+/// Probe the RemoteDesktop portal for doctor. `VOISU_TEST_REMOTE_DESKTOP`
+/// (`missing`, `unknown`, `not-allowed`, `allowed`) pins the answer so tests
+/// never depend on the host's portal.
+pub fn remote_desktop_access() -> RemoteDesktopAccess {
+    if let Ok(value) = std::env::var("VOISU_TEST_REMOTE_DESKTOP") {
+        return match value.as_str() {
+            "missing" => RemoteDesktopAccess::Missing,
+            "unknown" => RemoteDesktopAccess::Unknown,
+            "not-allowed" => RemoteDesktopAccess::NotAllowed,
+            _ => RemoteDesktopAccess::Allowed,
+        };
+    }
+    let introspection = run_restricted_stdout(
+        "busctl",
+        &[
+            "--user",
+            "introspect",
+            PORTAL_BUS_NAME,
+            PORTAL_OBJECT_PATH,
+            "--xml-interface",
+        ],
+    );
+    let listed = introspection
+        .as_deref()
+        .and_then(|xml| std::str::from_utf8(xml).ok())
+        .and_then(remote_desktop_listed);
+    match listed {
+        None => RemoteDesktopAccess::Unknown,
+        Some(false) => RemoteDesktopAccess::Missing,
+        Some(true) if remote_desktop_access_remembered() => RemoteDesktopAccess::Allowed,
+        Some(true) => RemoteDesktopAccess::NotAllowed,
+    }
+}
+
+/// Whether the portal's introspection XML lists the RemoteDesktop interface.
+/// Introspection tells "the portal answered without it" apart from a `busctl`
+/// failure without matching localized error text, and it cannot prompt. `None`
+/// for anything but a complete document, such as output cut off at the helper's
+/// stdout cap.
+fn remote_desktop_listed(xml: &str) -> Option<bool> {
+    xml.trim_end()
+        .ends_with("</node>")
+        .then(|| xml.contains(&format!("\"{REMOTE_DESKTOP_INTERFACE}\"")))
 }
 
 fn daemon_finding(response: Option<&Response>) -> ReadinessFinding {
@@ -776,7 +839,7 @@ fn daemon_finding(response: Option<&Response>) -> ReadinessFinding {
             ReadinessStatus::Fail,
             "the daemon did not answer the status handshake",
         )
-        .with_action("start voisu-daemon and run voisu doctor again")
+        .with_action("voisu service start")
     }
 }
 
@@ -856,4 +919,27 @@ fn readiness(
     detail: &str,
 ) -> ReadinessFinding {
     ReadinessFinding::new(capability, status, detail)
+}
+
+#[cfg(test)]
+mod remote_desktop_access_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_complete_answer_says_whether_the_interface_exists() {
+        let listing = |interface: &str| {
+            format!("<node>\n <interface name=\"{interface}\">\n </interface>\n</node>\n")
+        };
+        assert_eq!(
+            remote_desktop_listed(&listing(REMOTE_DESKTOP_INTERFACE)),
+            Some(true)
+        );
+        assert_eq!(
+            remote_desktop_listed(&listing(GLOBAL_SHORTCUTS_INTERFACE)),
+            Some(false)
+        );
+        let cut_off = listing(GLOBAL_SHORTCUTS_INTERFACE);
+        assert_eq!(remote_desktop_listed(&cut_off[..cut_off.len() - 9]), None);
+        assert_eq!(remote_desktop_listed(""), None);
+    }
 }

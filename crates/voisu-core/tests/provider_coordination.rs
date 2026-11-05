@@ -547,7 +547,10 @@ fn boundary_errors_separate_redacted_public_text_from_local_diagnostics() {
         BoundaryKind::Provider,
         "authorization=Bearer controlled-secret",
     );
-    assert_eq!(error.public_message(), "Source Transcripts are unavailable");
+    assert_eq!(
+        error.public_message(),
+        "Groq or Deepgram couldn't give us text"
+    );
     assert_eq!(error.diagnostic(), "authorization=Bearer controlled-secret");
     assert!(!error.public_message().contains("controlled-secret"));
 }

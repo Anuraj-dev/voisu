@@ -328,11 +328,11 @@ mod tests {
 
     #[test]
     fn cloud_annotation_is_opt_out_not_repair() {
-        let message = annotate_mode_message(AsrMode::Cloud, "ASR mode set to cloud".into());
-        assert!(message.contains("opt-out"));
-        assert!(message.contains("not a Local repair"));
-        let local = annotate_mode_message(AsrMode::Local, "ASR mode set to local".into());
-        assert_eq!(local, "ASR mode set to local");
+        let message = annotate_mode_message(AsrMode::Cloud, "Engine set to Cloud".into());
+        assert!(message.contains("sends your audio online"));
+        assert!(message.contains("doesn't fix the Local model"));
+        let local = annotate_mode_message(AsrMode::Local, "Engine set to Local".into());
+        assert_eq!(local, "Engine set to Local");
         assert!(!repair_from_cloud_switch());
         assert!(repair_from_setup(true));
         assert!(!repair_from_setup(false));

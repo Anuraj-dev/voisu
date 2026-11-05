@@ -138,7 +138,7 @@ fn ipc(path: &Path, frame: &str) -> serde_json::Value {
 fn local_without_ready_worker_still_refuses_before_capture() {
     let harness = Harness::new();
     let _daemon = harness.start_daemon(false);
-    let set = harness.voisu(&["mode", "local"]);
+    let set = harness.voisu(&["engine", "local"]);
     assert!(set.status.success(), "{}", stderr(&set));
     let started = harness.voisu(&["start"]);
     assert_eq!(started.status.code(), Some(4), "{started:?}");
@@ -156,7 +156,7 @@ fn local_test_env_seam_is_ignored_in_production_binary() {
     // Local stays unavailable and Start is refused before capture.
     let harness = Harness::new();
     let _daemon = harness.start_daemon(true);
-    let set = harness.voisu(&["mode", "local"]);
+    let set = harness.voisu(&["engine", "local"]);
     assert!(set.status.success(), "{}", stderr(&set));
     let status = ipc(&harness.socket(), r#"{"version":1,"command":"status"}"#);
     assert_eq!(status["asr_mode"]["pending"], "local");
@@ -190,11 +190,11 @@ fn local_test_env_seam_is_ignored_in_production_binary() {
 fn cloud_start_still_works_after_local_mode_round_trip() {
     let harness = Harness::new();
     let _daemon = harness.start_daemon(false);
-    assert!(harness.voisu(&["mode", "local"]).status.success());
-    assert!(harness.voisu(&["mode", "cloud"]).status.success());
+    assert!(harness.voisu(&["engine", "local"]).status.success());
+    assert!(harness.voisu(&["engine", "cloud"]).status.success());
     let started = harness.voisu(&["start"]);
     assert!(started.status.success(), "{}", stderr(&started));
     let printed = stdout(&harness.voisu(&["status"]));
-    assert!(printed.contains("asr mode active: cloud"), "{printed}");
+    assert!(printed.contains("Engine: Cloud\n"), "{printed}");
     let _ = harness.voisu(&["stop"]);
 }

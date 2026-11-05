@@ -41,6 +41,8 @@ pub struct RenderStyle {
     pub color: bool,
     /// Maximum displayed Transcript width in characters before truncation.
     pub transcript_width: usize,
+    /// Also show the settle time, which only helps when chasing latency.
+    pub verbose: bool,
 }
 
 impl RenderStyle {
@@ -51,6 +53,7 @@ impl RenderStyle {
             now_ms,
             color: false,
             transcript_width: DEFAULT_TRANSCRIPT_WIDTH,
+            verbose: false,
         }
     }
 }
@@ -78,7 +81,7 @@ pub fn render_page(records: &Value, start: usize, page_size: usize, style: &Rend
     let all = records.as_array().unwrap_or(&empty);
     if all.is_empty() {
         return Page {
-            body: "No Recordings in local history.\n".to_owned(),
+            body: "No Recordings yet.\n".to_owned(),
             shown: 0,
             remaining: 0,
         };
@@ -166,7 +169,7 @@ fn render_record(index: usize, record: &Value, style: &RenderStyle) -> String {
     // dictation); the best tail it supports is `release_to_text_ms −
     // capture_finalized_ms`. A reversed pair (release earlier than capture) is
     // an invalid record; `checked_sub` renders it as `—` rather than
-    // fabricating a plausible "tail 0ms".
+    // fabricating a plausible "ready in 0.0s".
     let legacy_tail = match (capture_finalized, release) {
         (Some(capture), Some(release)) => release.checked_sub(capture),
         _ => None,
@@ -180,23 +183,29 @@ fn render_record(index: usize, record: &Value, style: &RenderStyle) -> String {
         || stop_to_finalized.is_some()
         || recording_duration.is_some();
 
-    // Header: recency and the latency that matters.
+    // Header: recency, how long the text took after you stopped, and how long
+    // you spoke. Settle (stop → final words) only matters when chasing latency.
     let mut header = format!(
-        "{} {}  ·  tail {}",
+        "{} {}  ·  ready in {}",
         style.paint(&format!("{index}."), Ansi::Bold),
         style.paint(&when, Ansi::Dim),
-        style.paint(&millis_or_dash(tail), Ansi::CyanBold),
+        style.paint(&seconds_or_dash(tail), Ansi::CyanBold),
     );
     if schema_2 {
         header.push_str(&format!(
-            "  ·  settle {}  ·  speech {}",
-            style.paint(&millis_or_dash(stop_to_finalized), Ansi::Dim),
-            style.paint(&millis_or_dash(recording_duration), Ansi::Dim),
+            "  ·  spoke {}",
+            style.paint(&seconds_or_dash(recording_duration), Ansi::Dim),
         ));
-    } else {
+        if style.verbose {
+            header.push_str(&format!(
+                "  ·  settle {}",
+                style.paint(&seconds_or_dash(stop_to_finalized), Ansi::Dim),
+            ));
+        }
+    } else if style.verbose {
         header.push_str(&format!(
             "  ·  release {}",
-            style.paint(&millis_or_dash(release), Ansi::Dim),
+            style.paint(&seconds_or_dash(release), Ansi::Dim),
         ));
     }
     lines.push_str(&header);
@@ -233,8 +242,8 @@ fn render_record(index: usize, record: &Value, style: &RenderStyle) -> String {
         _ => {
             let reason = failure_reason(record);
             let status = match reason {
-                Some(reason) => format!("no Transcript delivered — {reason}"),
-                None => "no Transcript delivered".to_owned(),
+                Some(reason) => format!("No text — {reason}"),
+                None => "No text".to_owned(),
             };
             lines.push_str(&format!("   {}\n", style.paint(&status, Ansi::Red)));
         }
@@ -250,7 +259,7 @@ fn render_record(index: usize, record: &Value, style: &RenderStyle) -> String {
 
 /// Renders each Provider referenced by this Recording with its outcome and
 /// timing, joined into one scannable line.
-fn render_providers(record: &Value, style: &RenderStyle) -> String {
+pub fn render_providers(record: &Value, style: &RenderStyle) -> String {
     if let Some(local) = record.get("local_asr").filter(|value| !value.is_null()) {
         return render_local_asr(local, style);
     }
@@ -277,7 +286,7 @@ fn render_providers(record: &Value, style: &RenderStyle) -> String {
     providers.sort();
 
     if providers.is_empty() {
-        return style.paint("no Provider results", Ansi::Dim);
+        return style.paint("no engine results", Ansi::Dim);
     }
 
     let rendered: Vec<String> = providers
@@ -339,7 +348,7 @@ fn render_one_provider(
                 style.paint("not started", Ansi::Yellow),
             );
         }
-        let mut outcome = format!("failed ({})", stage_human(stage));
+        let mut outcome = failure_outcome(stage);
         if !diagnostic.is_empty() {
             outcome.push_str(": ");
             outcome.push_str(&truncate_inline(diagnostic, 48));
@@ -378,8 +387,8 @@ fn delivery_tag(record: &Value) -> Option<String> {
     let method = str_field(record, "delivery_method");
     let count = u64_field(record, "delivery_count").unwrap_or(0);
     match method {
-        Some("clipboard_fallback") => Some("(clipboard fallback)".to_owned()),
-        _ if count == 0 => Some("(not delivered)".to_owned()),
+        Some("clipboard_fallback") => Some("(copied only, paste it)".to_owned()),
+        _ if count == 0 => Some("(not pasted)".to_owned()),
         _ => None,
     }
 }
@@ -391,14 +400,14 @@ fn delivery_tag(record: &Value) -> Option<String> {
 /// failed is exactly the case worth spotting.
 fn truncation_tag(record: &Value) -> Option<String> {
     match str_field(record, "truncated_by")? {
-        "buffer" => Some("(truncated: bounded buffer)".to_owned()),
-        "recording_deadline" => Some("(truncated: Recording Deadline)".to_owned()),
-        _ => Some("(truncated)".to_owned()),
+        "buffer" => Some("(cut off: too long)".to_owned()),
+        "recording_deadline" => Some("(cut off: time limit)".to_owned()),
+        _ => Some("(cut off)".to_owned()),
     }
 }
 
 /// The single most useful one-line reason a Recording produced no Transcript.
-fn failure_reason(record: &Value) -> Option<String> {
+pub fn failure_reason(record: &Value) -> Option<String> {
     for key in ["error", "validation_reason", "fallback_reason"] {
         if let Some(reason) = str_field(record, key)
             && !reason.is_empty()
@@ -411,24 +420,23 @@ fn failure_reason(record: &Value) -> Option<String> {
 
 fn selection_label(selection: Option<&str>) -> &'static str {
     match selection {
-        Some("complementary") => "Complementary (merged)",
+        Some("complementary") => "Groq + Deepgram combined",
         Some("near_identical_groq") => "Groq",
         Some("source_groq") => "Groq",
         Some("source_deepgram") => "Deepgram",
-        Some("reconciled") => "Reconciled (merged)",
-        Some("repaired") => "Repaired (merged)",
+        Some("reconciled") => "Groq + Deepgram combined",
+        Some("repaired") => "Groq + Deepgram combined, fixed",
         _ => "delivered",
     }
 }
 
-fn stage_human(stage: &str) -> &str {
+fn failure_outcome(stage: &str) -> String {
     match stage {
-        "not_started" => "not started",
-        "streaming" => "streaming",
-        "completion" => "completion",
-        "provider_deadline" => "missed deadline",
-        "aborted" => "aborted",
-        other => other,
+        "streaming" => "failed while listening".to_owned(),
+        "completion" => "failed at the end".to_owned(),
+        "provider_deadline" => "too slow".to_owned(),
+        "aborted" => "stopped".to_owned(),
+        other => format!("failed ({other})"),
     }
 }
 
@@ -447,12 +455,7 @@ fn render_local_asr(local: &Value, style: &RenderStyle) -> String {
             Some(ms) => style.paint(&format!("ok {ms}ms"), Ansi::Green),
             None => style.paint("ok", Ansi::Green),
         },
-        "no_text" => {
-            let detail = reason
-                .map(|text| format!("no text ({text})"))
-                .unwrap_or_else(|| "no text".to_owned());
-            style.paint(&detail, Ansi::Yellow)
-        }
+        "no_text" => style.paint("no words heard", Ansi::Yellow),
         "error" => {
             let detail = reason
                 .map(|text| format!("failed: {text}"))
@@ -507,15 +510,15 @@ fn provider_display_name(provider: &str) -> String {
     }
 }
 
-fn millis_or_dash(value: Option<u64>) -> String {
+fn seconds_or_dash(value: Option<u64>) -> String {
     match value {
-        Some(ms) => format!("{ms}ms"),
+        Some(ms) => format!("{:.1}s", ms as f64 / 1000.0),
         None => "—".to_owned(),
     }
 }
 
 /// Human-relative recency. Clamps future timestamps (clock skew) to "just now".
-fn relative_time(now_ms: u64, then_ms: u64) -> String {
+pub fn relative_time(now_ms: u64, then_ms: u64) -> String {
     let delta_ms = now_ms.saturating_sub(then_ms);
     let seconds = delta_ms / 1000;
     if seconds < 5 {
@@ -642,8 +645,20 @@ mod tests {
             "delivery_count": 1,
             "delivery_method": "compositor_submitted"
         }));
-        assert!(out.contains("tail 212ms"), "{out}");
-        assert!(out.contains("release 1832ms"), "{out}");
+        assert!(out.contains("ready in 0.2s"), "{out}");
+        // The start-anchored release is a latency-chasing detail.
+        assert!(!out.contains("release"), "{out}");
+        let verbose = render_page(
+            &json!([{"capture_finalized_ms": 1620, "release_to_text_ms": 1832}]),
+            0,
+            DEFAULT_PAGE_SIZE,
+            &RenderStyle {
+                verbose: true,
+                ..plain()
+            },
+        )
+        .body;
+        assert!(verbose.contains("release 1.8s"), "{verbose}");
         assert!(out.contains("2m ago"), "{out}");
         assert!(out.contains("Groq: \"Render the full record\""), "{out}");
         assert!(out.contains("Deepgram ok 1620ms"), "{out}");
@@ -670,10 +685,31 @@ mod tests {
         }));
         // Tail is the truthful stop-anchored value, and the start-anchored
         // release (1832 ms, inflated by the whole dictation) is not shown.
-        assert!(out.contains("tail 402ms"), "{out}");
-        assert!(out.contains("settle 212ms"), "{out}");
-        assert!(out.contains("speech 1620ms"), "{out}");
+        assert!(out.contains("ready in 0.4s  ·  spoke 1.6s"), "{out}");
+        assert!(!out.contains("settle"), "{out}");
         assert!(!out.contains("release"), "{out}");
+    }
+
+    #[test]
+    fn verbose_history_adds_the_settle_time() {
+        let record = json!([{
+            "recorded_at_unix_ms": NOW - 120_000,
+            "final_transcript": "Honest timings",
+            "telemetry_schema": 2,
+            "recording_duration_ms": 1620,
+            "stop_to_finalized_ms": 212,
+            "stop_to_delivered_ms": 402,
+            "delivery_count": 1
+        }]);
+        let style = RenderStyle {
+            verbose: true,
+            ..plain()
+        };
+        let out = render_page(&record, 0, DEFAULT_PAGE_SIZE, &style).body;
+        assert!(
+            out.contains("ready in 0.4s  ·  spoke 1.6s  ·  settle 0.2s"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -688,10 +724,7 @@ mod tests {
             "delivery_method": "compositor_submitted",
             "truncated_by": "recording_deadline"
         }));
-        assert!(
-            deadline.contains("(truncated: Recording Deadline)"),
-            "{deadline}"
-        );
+        assert!(deadline.contains("(cut off: time limit)"), "{deadline}");
 
         let buffer = render_one(json!({
             "recorded_at_unix_ms": NOW - 1000,
@@ -703,7 +736,7 @@ mod tests {
             "delivery_method": "compositor_submitted",
             "truncated_by": "buffer"
         }));
-        assert!(buffer.contains("(truncated: bounded buffer)"), "{buffer}");
+        assert!(buffer.contains("(cut off: too long)"), "{buffer}");
 
         // An untruncated Recording of the same shape must stay unmarked, so the
         // tag distinguishes a capped dictation from a merely short one.
@@ -716,7 +749,7 @@ mod tests {
             "delivery_count": 1,
             "delivery_method": "compositor_submitted"
         }));
-        assert!(!complete.contains("truncated"), "{complete}");
+        assert!(!complete.contains("cut off"), "{complete}");
     }
 
     #[test]
@@ -729,8 +762,7 @@ mod tests {
             "source_transcripts": [{"provider": "groq", "text": "legacy record"}],
             "delivery_count": 1
         }));
-        assert!(out.contains("tail —"), "{out}");
-        assert!(out.contains("release —"), "{out}");
+        assert!(out.contains("ready in —"), "{out}");
         // A Source Transcript without a stored timing still reads as ok.
         assert!(out.contains("Groq ok"), "{out}");
         assert!(!out.contains("panic"), "{out}");
@@ -769,15 +801,12 @@ mod tests {
                  "diagnostic": "Provider Deadline elapsed"}
             ]
         }));
+        assert!(out.contains("No text — quality validation failed"), "{out}");
         assert!(
-            out.contains("no Transcript delivered — quality validation failed"),
+            out.contains("Deepgram failed at the end: upstream returned HTTP 503"),
             "{out}"
         );
-        assert!(
-            out.contains("Deepgram failed (completion): upstream returned HTTP 503"),
-            "{out}"
-        );
-        assert!(out.contains("Groq failed (missed deadline)"), "{out}");
+        assert!(out.contains("Groq too slow"), "{out}");
         // No JSON blob leaked into the failure view.
         assert!(!out.contains('{'), "{out}");
     }
@@ -790,7 +819,7 @@ mod tests {
             "error": "Recording Deadline elapsed"
         }));
         assert!(
-            out.contains("no Transcript delivered — Recording Deadline elapsed"),
+            out.contains("No text — Recording Deadline elapsed"),
             "{out}"
         );
     }
@@ -806,15 +835,15 @@ mod tests {
             "release_to_text_ms": 20
         }));
         assert!(out.contains('…'), "{out}");
-        assert!(out.contains("Reconciled (merged)"), "{out}");
+        assert!(out.contains("Groq + Deepgram combined"), "{out}");
         // The displayed transcript line stays within the width bound.
         let line = out
             .lines()
-            .find(|line| line.contains("Reconciled"))
+            .find(|line| line.contains("combined"))
             .expect("selection line present");
         assert!(
             line.chars().count()
-                <= 3 + "Reconciled (merged): ".len() + DEFAULT_TRANSCRIPT_WIDTH + 2,
+                <= 3 + "Groq + Deepgram combined: ".len() + DEFAULT_TRANSCRIPT_WIDTH + 2,
             "{line}"
         );
     }
@@ -873,7 +902,7 @@ mod tests {
     #[test]
     fn empty_history_states_it_plainly() {
         let out = render_history_noninteractive(&json!([]), DEFAULT_PAGE_SIZE, &plain());
-        assert_eq!(out, "No Recordings in local history.\n");
+        assert_eq!(out, "No Recordings yet.\n");
     }
 
     #[test]
@@ -912,6 +941,7 @@ mod tests {
             now_ms: NOW,
             color: true,
             transcript_width: DEFAULT_TRANSCRIPT_WIDTH,
+            verbose: false,
         };
         let colored = render_page(&json!([record]), 0, 20, &colored_style).body;
         assert!(colored.contains('\x1b'), "{colored}");
@@ -981,7 +1011,7 @@ mod tests {
     #[test]
     fn reversed_tail_ordering_renders_a_dash_not_a_false_zero() {
         // release_to_text_ms < capture_finalized_ms is an invalid record; it
-        // must not read as a plausible "tail 0ms".
+        // must not read as a plausible "ready in 0.0s".
         let out = render_one(json!({
             "recorded_at_unix_ms": NOW,
             "final_transcript": "reversed timings",
@@ -989,10 +1019,8 @@ mod tests {
             "capture_finalized_ms": 1832,
             "release_to_text_ms": 1620
         }));
-        assert!(out.contains("tail —"), "{out}");
-        assert!(!out.contains("tail 0ms"), "{out}");
-        // The release value is still surfaced as recorded.
-        assert!(out.contains("release 1620ms"), "{out}");
+        assert!(out.contains("ready in —"), "{out}");
+        assert!(!out.contains("ready in 0.0s"), "{out}");
     }
 
     #[test]
@@ -1021,8 +1049,23 @@ mod tests {
         assert!(out.contains("transformers"), "{out}");
         assert!(out.contains("ram 2.0GiB"), "{out}");
         assert!(out.contains("gpu 850MiB"), "{out}");
-        assert!(!out.contains("no Provider results"), "{out}");
+        assert!(!out.contains("no engine results"), "{out}");
         assert!(!out.contains("Deepgram"), "{out}");
         assert!(!out.contains("Groq"), "{out}");
+    }
+
+    #[test]
+    fn local_no_text_reads_as_no_words_heard() {
+        let out = render_one(json!({
+            "recorded_at_unix_ms": NOW - 1000,
+            "final_transcript": null,
+            "local_asr": {
+                "model_id": "qwen3-asr-0.6b",
+                "outcome": "no_text",
+                "reason": "silence hallucination"
+            }
+        }));
+        assert!(out.contains("qwen3-asr-0.6b no words heard"), "{out}");
+        assert!(!out.contains("hallucination"), "{out}");
     }
 }

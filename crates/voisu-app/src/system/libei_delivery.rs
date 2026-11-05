@@ -4,7 +4,7 @@
 
 use super::*;
 
-const REMOTE_DESKTOP_INTERFACE: &str = "org.freedesktop.portal.RemoteDesktop";
+pub(super) const REMOTE_DESKTOP_INTERFACE: &str = "org.freedesktop.portal.RemoteDesktop";
 
 const KEYBOARD_DEVICE: u32 = 1;
 
@@ -43,6 +43,12 @@ fn restore_token_file(explicit: Option<&Path>) -> Option<PathBuf> {
         Some(path) => path.is_absolute().then(|| path.to_path_buf()),
         None => restore_token_path(),
     }
+}
+
+/// Whether the user already allowed keyboard control: the portal handed back a
+/// restore token, so the next paste will not ask again.
+pub(super) fn remote_desktop_access_remembered() -> bool {
+    restore_token_path().is_some_and(|path| private_restore_token_file(&path).is_some())
 }
 
 fn private_restore_token_file(path: &Path) -> Option<File> {

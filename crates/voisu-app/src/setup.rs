@@ -81,6 +81,26 @@ pub trait HyprlandSetupActions {
     }
 }
 
+/// Installs the Trigger Key in the live Hyprland config. `prefer_caps_lock`
+/// decides from what is bound today; an `Err` from it installs nothing.
+pub fn install_live_trigger(
+    config: &Path,
+    prefer_caps_lock: &mut dyn FnMut(&TriggerOccupancy) -> Result<bool, String>,
+) -> Result<TriggerKey, String> {
+    let files = LocalBindingFileSystem;
+    let source = files
+        .read_to_string(config)
+        .map_err(|error| format!("cannot read {}: {error}", config.display()))?
+        .unwrap_or_default();
+    let occupancy = inspect_trigger_occupancy(config, &source, &files)
+        .map_err(|detail| TriggerBindingError::Unparseable { detail }.to_string())?;
+    let prefer_caps_lock = prefer_caps_lock(&occupancy)?;
+    let mut hyprland = LiveHyprlandController;
+    install_trigger_binding(config, &files, &mut hyprland, prefer_caps_lock)
+        .map(|report| report.key)
+        .map_err(|error| error.to_string())
+}
+
 /// Runs the Hyprland setup steps in their dependency order. Every mutating
 /// step is behind an injected seam so the ordering and failure boundaries are
 /// testable without a compositor, systemd user manager, or daemon process.
@@ -110,8 +130,12 @@ pub struct LiveHyprlandSetupActions<'a> {
 
 impl HyprlandSetupActions for LiveHyprlandSetupActions<'_> {
     fn select_clipboard_delivery(&mut self) -> Result<(), String> {
-        // Type Delivery is unusable on Hyprland. Reruns rewrite type/guarded.
-        config::set_delivery_mode(DeliveryMode::Clipboard).map(|_| ())
+        // On Hyprland, Paste presses the verified paste shortcut. A user who
+        // chose Copy keeps it: rerunning setup must not turn chord pressing on.
+        if config::delivery_mode() == DeliveryMode::Copy {
+            return Ok(());
+        }
+        config::set_delivery_mode(DeliveryMode::Paste).map(|_| ())
     }
 
     fn install_services(&mut self) -> Result<(), String> {
@@ -119,18 +143,9 @@ impl HyprlandSetupActions for LiveHyprlandSetupActions<'_> {
     }
 
     fn install_trigger_binding(&mut self, config: &Path) -> Result<TriggerKey, String> {
-        let files = LocalBindingFileSystem;
-        let source = files
-            .read_to_string(config)
-            .map_err(|error| format!("cannot read {}: {error}", config.display()))?
-            .unwrap_or_default();
-        let occupancy = inspect_trigger_occupancy(config, &source, &files)
-            .map_err(|detail| TriggerBindingError::Unparseable { detail }.to_string())?;
-        let prefer_caps_lock = caps_lock_trigger_preferred(&occupancy, self.io)?;
-        let mut hyprland = LiveHyprlandController;
-        install_trigger_binding(config, &files, &mut hyprland, prefer_caps_lock)
-            .map(|report| report.key)
-            .map_err(|error| error.to_string())
+        install_live_trigger(config, &mut |occupancy| {
+            caps_lock_trigger_preferred(occupancy, self.io)
+        })
     }
 
     fn discover_paste_action(&mut self) -> Option<VerifiedPasteAction> {
@@ -1112,19 +1127,25 @@ mod tests {
     }
 
     #[test]
-    fn hyprland_setup_overwrites_type_and_guarded_delivery_with_clipboard() {
+    fn hyprland_setup_selects_paste_delivery_unless_the_user_chose_copy() {
         let dir = tempfile::tempdir().unwrap();
         let _lock = xdg_config_test_lock();
         let _guard = XdgConfigHomeGuard::set(dir.path());
         let mut io = FakeIo::new(vec![], vec![]);
         let mut actions = LiveHyprlandSetupActions { io: &mut io };
 
-        for existing in [DeliveryMode::Type, DeliveryMode::Guarded] {
-            config::set_delivery_mode(existing).unwrap();
-            assert_eq!(config::delivery_mode(), existing);
-            actions.select_clipboard_delivery().unwrap();
-            assert_eq!(config::delivery_mode(), DeliveryMode::Clipboard);
-        }
+        actions.select_clipboard_delivery().unwrap();
+        assert_eq!(
+            config::stored_delivery(),
+            Some(config::StoredDelivery::Mode(DeliveryMode::Paste))
+        );
+
+        config::set_delivery_mode(DeliveryMode::Copy).unwrap();
+        actions.select_clipboard_delivery().unwrap();
+        assert_eq!(
+            config::stored_delivery(),
+            Some(config::StoredDelivery::Mode(DeliveryMode::Copy))
+        );
     }
 
     #[test]

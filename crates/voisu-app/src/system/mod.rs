@@ -995,7 +995,7 @@ mod tests {
             .expect_err("a stale cached action must fail closed");
         assert_eq!(
             error.diagnostic(),
-            "verified Paste Action is no longer active"
+            "your paste shortcut changed in your Hyprland config"
         );
     }
 

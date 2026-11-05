@@ -27,12 +27,10 @@ use voisu_app::dpr_pipeline::{
     DprCloudCapability, DprPipelineClockOrigin, DprTransformInput, SystemDprPipelineClock,
     dpr_pipeline_clock_origin, dpr_protected_tokens, dpr_source_context, dpr_transform_and_deliver,
 };
-use voisu_app::focus::SharedFocusProbe;
 use voisu_app::local_recovery;
 use voisu_app::local_routing;
 use voisu_app::local_routing::LocalStopResult;
 
-use voisu_app::hyprland_bindings::VerifiedPasteAction;
 use voisu_app::journal::{escape_journal_control, recording_journal_lines};
 use voisu_app::minimal_grammar::MinimalGrammarAdapter;
 use voisu_app::smart_writing::{
@@ -40,9 +38,9 @@ use voisu_app::smart_writing::{
     final_transform_and_deliver,
 };
 use voisu_app::system::{
-    CAPTURE_FINALIZE_DEADLINE, CredentialPreparationOwner, DIAGNOSTIC_RESPONSE_DEADLINE,
-    DeepgramProvider, DesktopNotifier, FedoraShortcutPortal, GrammarCapability, GroqProvider,
-    GuardedDelivery, INTENT_RECONSTRUCTION_DEADLINE, MergeResultValidator,
+    CAPTURE_FINALIZE_DEADLINE, COPY_MODE_REASON, CredentialPreparationOwner,
+    DIAGNOSTIC_RESPONSE_DEADLINE, DeepgramProvider, FedoraShortcutPortal, GrammarCapability,
+    GroqProvider, INTENT_RECONSTRUCTION_DEADLINE, MergeResultValidator,
     PROCESSING_RESPONSE_DEADLINE, PROVIDER_COMPLETION_DEADLINE, PipeWireCapture,
     PortalClipboardDelivery, ProviderReaper, RECONCILIATION_DEADLINE, RECOVERY_ABORT_DEADLINE,
     WlClipboard, clipboard_backend_display_reachable,
@@ -212,21 +210,9 @@ async fn run() -> Result<(), String> {
     let delivery_mode = voisu_app::config::delivery_mode();
     let controlled =
         std::env::var_os("VOISU_TEST_MODE").as_deref() == Some(std::ffi::OsStr::new("controlled"));
-    let focus_probe = if delivery_mode == DeliveryMode::Guarded
-        && !controlled
-        && std::env::var_os("VOISU_DISABLE_DIRECT_DELIVERY").is_none()
-    {
-        let (backend, probe) = voisu_app::focus::initialize_focus_probe(parent).await;
-        eprintln!("focus guard backend: {}", backend.as_str());
-        Some(probe)
-    } else {
-        None
-    };
 
-    let (initial_delivery, initial_paste_action, initial_paste_backend) =
-        build_delivery_adapter(controlled, delivery_mode, focus_probe.clone());
-    let daemon_readiness =
-        daemon_readiness_snapshot(delivery_mode, initial_paste_action, initial_paste_backend);
+    let (initial_delivery, initial_paste) = build_delivery_adapter(controlled, delivery_mode);
+    let daemon_readiness = daemon_readiness_snapshot(delivery_mode, initial_paste);
     let (actor_tx, actor_rx) = mpsc::channel(64);
     let levels = LevelRegistry::default();
     // The actor-owned reaper supervises capture and provider-stream cleanup.
@@ -239,7 +225,6 @@ async fn run() -> Result<(), String> {
         diagnostics,
         reaper.clone(),
         delivery_mode,
-        focus_probe,
         levels.clone(),
         daemon_readiness,
         initial_delivery,
@@ -396,6 +381,7 @@ enum ActorMessage {
         id: u64,
         correlation_id: String,
         method: DeliveryMethod,
+        fallback_reason: Option<String>,
         truncated: bool,
     },
     Completed(Box<Completion>),
@@ -546,7 +532,6 @@ async fn actor_loop(
     diagnostics: Option<Arc<DiagnosticStore>>,
     reaper: ProviderReaper,
     delivery_mode: DeliveryMode,
-    focus_probe: Option<SharedFocusProbe>,
     levels: LevelRegistry,
     daemon_readiness: Option<DaemonReadiness>,
     initial_delivery: Box<dyn DeliveryAdapter>,
@@ -581,8 +566,8 @@ async fn actor_loop(
     // adapter is a no-network stand-in so `begin_recording` never opens a Deepgram
     // stream and the completion barrier waits on Groq alone.
     let deepgram_enabled = voisu_app::config::deepgram_enabled();
-    // Delivery mode and any guarded focus probe were resolved once before the
-    // actor started. A running daemon keeps those choices until its next restart.
+    // Delivery mode was resolved once before the actor started. A running
+    // daemon keeps that choice until its next restart.
     // Production adapters are built only at a Recording or replay boundary,
     // after resolving that operation's dictionary snapshot below. Controlled
     // adapters keep their existing one-shot failure seams across retries.
@@ -673,7 +658,7 @@ async fn actor_loop(
                                 );
                                 Response::rejected(
                                     Some(state_label(&state)),
-                                    "diagnostics are unavailable",
+                                    "Recording history is unavailable",
                                 )
                             }
                         },
@@ -689,16 +674,16 @@ async fn actor_loop(
                             )),
                             Ok(None) => Response::rejected(
                                 Some(state_label(&state)),
-                                "no diagnostic record for that correlation ID",
+                                "no Recording with that id; find ids with voisu history --json",
                             ),
                             Err(_) => Response::rejected(
                                 Some(state_label(&state)),
-                                "diagnostics are unavailable",
+                                "Recording history is unavailable",
                             ),
                         },
                         None => Response::rejected(
                             Some(state_label(&state)),
-                            "diagnostics are unavailable",
+                            "Recording history is unavailable",
                         ),
                     };
                     let _ = reply.send(response);
@@ -706,7 +691,7 @@ async fn actor_loop(
                 Command::Replay(_) if diagnostics.is_none() => {
                     let _ = reply.send(Response::rejected(
                         Some(state_label(&state)),
-                        "diagnostics are unavailable",
+                        "Recording history is unavailable",
                     ));
                 }
                 Command::Replay(fixture_name) if matches!(state, ActorState::Idle) => {
@@ -788,7 +773,6 @@ async fn actor_loop(
                                 controlled,
                                 deepgram_enabled,
                                 delivery_mode,
-                                focus_probe.clone(),
                                 configured_providers.clone(),
                                 Some(reply),
                                 false,
@@ -1545,7 +1529,6 @@ async fn actor_loop(
                         controlled,
                         deepgram_enabled,
                         delivery_mode,
-                        focus_probe.clone(),
                         configured_providers.clone(),
                         None,
                         true,
@@ -1573,6 +1556,7 @@ async fn actor_loop(
                 id,
                 correlation_id,
                 method,
+                fallback_reason,
                 truncated,
             } => {
                 // Same check as AuthorizeDelivery: only the Recording still
@@ -1583,7 +1567,11 @@ async fn actor_loop(
                     ActorState::Processing(evidence)
                         if evidence.recording_id == id && evidence.correlation_id == correlation_id
                 ) {
-                    let (outcome, message) = delivered_overlay_event(Some(method), truncated);
+                    let (outcome, message) = delivered_overlay_event(
+                        Some(method),
+                        fallback_reason.as_deref(),
+                        truncated,
+                    );
                     retain_overlay_event(
                         &mut next_overlay_event_id,
                         &mut last_overlay_event,
@@ -1597,6 +1585,7 @@ async fn actor_loop(
             ActorMessage::Completed(completed) => {
                 let truncated = completed.evidence.truncated_by.is_some();
                 let delivery_method = completed.evidence.delivery_method;
+                let fallback_reason = completed.evidence.delivery_fallback_reason.clone();
                 let correlation_id = completed.evidence.correlation_id.clone();
                 validator = Some(completed.validator);
                 delivery = Some(completed.delivery);
@@ -1621,21 +1610,11 @@ async fn actor_loop(
                             let response = Response::with_evidence(
                                 true,
                                 Some(DaemonState::Idle),
-                                match (delivery_method, truncated) {
-                                    (Some(DeliveryMethod::ClipboardFallback), true) => {
-                                        "Direct Delivery unavailable; Transcript is on the clipboard, \
-                                     but the Recording was truncated; check the end"
-                                    }
-                                    (Some(DeliveryMethod::ClipboardFallback), false) => {
-                                        "Direct Delivery unavailable; Transcript is on the clipboard"
-                                    }
-                                    (_, true) => {
-                                        "Delivered, but the Recording was truncated; check the end"
-                                    }
-                                    _ => {
-                                        "Transcript submitted through the compositor; preserved on the clipboard"
-                                    }
-                                },
+                                delivered_message(
+                                    delivery_method,
+                                    fallback_reason.as_deref(),
+                                    truncated,
+                                ),
                                 Some(completed.evidence),
                             );
                             // DeliveryLanded normally retained this
@@ -1645,8 +1624,11 @@ async fn actor_loop(
                                 event.correlation_id.as_deref() == Some(correlation_id.as_str())
                             });
                             if !announced {
-                                let (outcome, message) =
-                                    delivered_overlay_event(delivery_method, truncated);
+                                let (outcome, message) = delivered_overlay_event(
+                                    delivery_method,
+                                    fallback_reason.as_deref(),
+                                    truncated,
+                                );
                                 retain_overlay_event(
                                     &mut next_overlay_event_id,
                                     &mut last_overlay_event,
@@ -1725,7 +1707,6 @@ async fn actor_loop(
                             controlled,
                             deepgram_enabled,
                             delivery_mode,
-                            focus_probe.clone(),
                             configured_providers.clone(),
                             None,
                             false,
@@ -1776,7 +1757,6 @@ fn spawn_recording_processing(
     controlled: bool,
     deepgram_enabled: bool,
     delivery_mode: DeliveryMode,
-    focus_probe: Option<SharedFocusProbe>,
     configured_providers: Vec<Provider>,
     reply: Option<oneshot::Sender<Response>>,
     publish_terminal_outcome: bool,
@@ -1825,7 +1805,6 @@ fn spawn_recording_processing(
         controlled,
         deepgram_enabled,
         delivery_mode,
-        focus_probe,
         configured_providers,
         panic_evidence,
         reply,
@@ -1954,8 +1933,7 @@ fn status_response_with_feedback(
 /// interactive CLI's later environment after a compositor/session change.
 fn daemon_readiness_snapshot(
     delivery_mode: DeliveryMode,
-    paste_action: PasteActionState,
-    paste_backend: PasteBackend,
+    paste: PasteReadiness,
 ) -> Option<DaemonReadiness> {
     let controlled =
         std::env::var_os("VOISU_TEST_MODE").as_deref() == Some(std::ffi::OsStr::new("controlled"));
@@ -2006,8 +1984,9 @@ fn daemon_readiness_snapshot(
         x_authority,
         hyprland_instance_signature,
         delivery_mode: delivery_mode.as_str().to_owned(),
-        paste_action,
-        paste_backend,
+        paste_action: paste.action,
+        paste_backend: paste.backend,
+        paste_shortcut: paste.shortcut,
         clipboard_usable,
         clipboard_backend,
     })
@@ -2050,30 +2029,53 @@ fn retain_overlay_event(
     *next_id += 1;
 }
 
+/// What `voisu stop` says once the Transcript reached the user. Copy mode copies
+/// on purpose, so only a real paste fallback explains why it could not paste.
+fn delivered_message(
+    method: Option<DeliveryMethod>,
+    fallback_reason: Option<&str>,
+    truncated: bool,
+) -> String {
+    let outcome = match (method, fallback_reason) {
+        (Some(DeliveryMethod::ClipboardFallback), Some(COPY_MODE_REASON)) => {
+            "Copied. Paste with Ctrl+V".to_owned()
+        }
+        (Some(DeliveryMethod::ClipboardFallback), Some(why)) => {
+            format!("Couldn't paste; text is on your clipboard ({why})")
+        }
+        (Some(DeliveryMethod::ClipboardFallback), None) => {
+            "Couldn't paste; text is on your clipboard".to_owned()
+        }
+        (_, _) if truncated => "Pasted".to_owned(),
+        (_, _) => "Pasted. Also on your clipboard.".to_owned(),
+    };
+    if truncated {
+        format!("{outcome}. Recording was cut off; check the end")
+    } else {
+        outcome
+    }
+}
+
 /// The Overlay event for a Recording whose Delivery succeeded: a check mark
 /// when the Transcript was pasted, a calm Copied state when it only reached the
 /// clipboard and the user still has to paste.
 fn delivered_overlay_event(
     method: Option<DeliveryMethod>,
+    fallback_reason: Option<&str>,
     truncated: bool,
 ) -> (OverlayOutcome, String) {
-    let (outcome, message) = match (method, truncated) {
-        (Some(DeliveryMethod::ClipboardFallback), true) => (
+    if method == Some(DeliveryMethod::ClipboardFallback) {
+        return (
             OverlayOutcome::Copied,
-            "Direct Delivery unavailable; Transcript is on the clipboard, \
-             but the Recording was truncated; check the end",
-        ),
-        (Some(DeliveryMethod::ClipboardFallback), false) => (
-            OverlayOutcome::Copied,
-            "Direct Delivery unavailable; Transcript is on the clipboard",
-        ),
-        (_, true) => (
-            OverlayOutcome::Delivered,
-            "Delivered, but the Recording was truncated; check the end",
-        ),
-        _ => (OverlayOutcome::Delivered, "Delivered"),
+            delivered_message(method, fallback_reason, truncated),
+        );
+    }
+    let message = if truncated {
+        delivered_message(method, fallback_reason, truncated)
+    } else {
+        "Pasted".to_owned()
     };
-    (outcome, message.to_owned())
+    (OverlayOutcome::Delivered, message)
 }
 
 /// Tells the actor this Recording's Delivery landed so the Overlay can confirm
@@ -2085,6 +2087,7 @@ async fn announce_delivery(
     id: u64,
     correlation_id: &str,
     method: DeliveryMethod,
+    fallback_reason: Option<String>,
     truncated: bool,
 ) {
     let _ = actor
@@ -2092,6 +2095,7 @@ async fn announce_delivery(
             id,
             correlation_id: correlation_id.to_owned(),
             method,
+            fallback_reason,
             truncated,
         })
         .await;
@@ -2109,14 +2113,14 @@ fn daemon_instance_id() -> u64 {
 }
 
 fn overlay_outcome(error: &BoundaryError) -> OverlayOutcome {
-    if error.transcript_failure().is_some() {
-        return OverlayOutcome::QualityFailure;
-    }
     match error.kind() {
+        // Silence can carry Transcript evidence (an outro-only answer), but
+        // nothing was held back. Every other error with evidence was.
+        BoundaryKind::SilentRecording => OverlayOutcome::SilentRecording,
+        _ if error.transcript_failure().is_some() => OverlayOutcome::QualityFailure,
         BoundaryKind::Capture => OverlayOutcome::CaptureFailure,
         BoundaryKind::EmptyRecording => OverlayOutcome::EmptyRecording,
         BoundaryKind::TooShortRecording => OverlayOutcome::TooShortRecording,
-        BoundaryKind::SilentRecording => OverlayOutcome::SilentRecording,
         BoundaryKind::RecordingDeadline => OverlayOutcome::RecordingDeadline,
         BoundaryKind::Provider => OverlayOutcome::ProviderFailure,
         BoundaryKind::Delivery => OverlayOutcome::DeliveryFailure,
@@ -2643,6 +2647,7 @@ async fn process_recording(
                         id,
                         &correlation_id,
                         method,
+                        evidence.delivery_fallback_reason.clone(),
                         evidence.truncated_by.is_some(),
                     )
                     .await;
@@ -2653,10 +2658,10 @@ async fn process_recording(
                     local_asr = local_routing::current_local_asr_error(error.message().as_str());
                     local_routing::mark_recovery_failed(&rec_id, recovery);
                     local_routing::abandon_live(&rec_id);
-                    return Err(BoundaryError::new(
-                        BoundaryKind::Validation,
-                        error.message(),
-                    ));
+                    return Err(
+                        BoundaryError::new(BoundaryKind::Validation, error.message())
+                            .with_public_message("The Local engine failed"),
+                    );
                 }
             }
         }
@@ -2708,7 +2713,11 @@ async fn process_recording(
                 } else {
                     evidence.validation_reason = Some(error.diagnostic().to_owned());
                 }
-                return Err(error);
+                return Err(silence_needs_every_provider(
+                    error,
+                    &provider_failures,
+                    deepgram_enabled,
+                ));
             }
         };
         // Eligibility and deterministic fallback selection are complete before
@@ -2862,6 +2871,7 @@ async fn process_recording(
             id,
             &correlation_id,
             delivery_outcome.method,
+            evidence.delivery_fallback_reason.clone(),
             evidence.truncated_by.is_some(),
         )
         .await;
@@ -3064,7 +3074,8 @@ async fn complete_with_grammar_capability(
             return Err(BoundaryError::new(
                 BoundaryKind::Validation,
                 "provider or grammar credential preparation panicked",
-            ));
+            )
+            .with_public_message("Couldn't read your keys"));
         }
     };
     let credential = CredentialGateEvidence {
@@ -3083,7 +3094,6 @@ async fn supervise_recording(
     controlled: bool,
     deepgram_enabled: bool,
     delivery_mode: DeliveryMode,
-    focus_probe: Option<SharedFocusProbe>,
     configured_providers: Vec<Provider>,
     panic_evidence: LifecycleEvidence,
     reply: Option<oneshot::Sender<Response>>,
@@ -3138,7 +3148,7 @@ async fn supervise_recording(
                 ));
             }
             let (validator, delivery) =
-                rebuild_recording_adapters(controlled, delivery_mode, focus_probe.clone(), &reaper);
+                rebuild_recording_adapters(controlled, delivery_mode, &reaper);
             RecordingResult {
                 result: Err(error),
                 evidence: panic_evidence,
@@ -3183,7 +3193,6 @@ fn log_best_effort(message: std::fmt::Arguments<'_>) {
 fn rebuild_recording_adapters(
     controlled: bool,
     delivery_mode: DeliveryMode,
-    focus_probe: Option<SharedFocusProbe>,
     reaper: &ProviderReaper,
 ) -> (Box<dyn TranscriptValidator>, Box<dyn DeliveryAdapter>) {
     let intent_reconstruction = voisu_app::config::intent_reconstruction_enabled();
@@ -3199,7 +3208,7 @@ fn rebuild_recording_adapters(
             } else {
                 Box::new(MergeResultValidator::new(reaper.clone()))
             },
-            build_delivery_adapter(false, delivery_mode, focus_probe).0,
+            build_delivery_adapter(false, delivery_mode).0,
         )
     }
 }
@@ -3207,106 +3216,112 @@ fn rebuild_recording_adapters(
 /// Builds the Delivery adapter from the daemon-start mode. The environment
 /// override is an emergency opt-out and deliberately wins over persisted
 /// configuration, matching the Deepgram toggle's precedence shape.
+///
+/// `Paste` presses the user's own paste shortcut on Hyprland (whose portal
+/// offers no keyboard control) and uses the RemoteDesktop portal everywhere
+/// else. `Copy` only puts the Transcript on the clipboard.
 fn build_delivery_adapter(
     controlled: bool,
     delivery_mode: DeliveryMode,
-    focus_probe: Option<SharedFocusProbe>,
-) -> (Box<dyn DeliveryAdapter>, PasteActionState, PasteBackend) {
+) -> (Box<dyn DeliveryAdapter>, PasteReadiness) {
+    let copy_only = PasteReadiness {
+        action: PasteActionState::ClipboardOnly,
+        backend: PasteBackend::NotRequired,
+        shortcut: None,
+    };
     if controlled {
-        (
-            Box::new(ControlledDelivery),
-            if delivery_mode == DeliveryMode::Clipboard {
-                // The controlled adapter has no paste side effect; model the
-                // configured clipboard mode without probing the live desktop.
-                PasteActionState::ClipboardOnly
-            } else {
-                PasteActionState::NotRequired
-            },
-            PasteBackend::NotRequired,
-        )
-    } else if std::env::var_os("VOISU_DISABLE_DIRECT_DELIVERY").is_some() {
-        (
+        // The controlled adapter has no paste side effect; model the
+        // configured mode without probing the live desktop.
+        let paste = match delivery_mode {
+            DeliveryMode::Copy => copy_only,
+            DeliveryMode::Paste => PasteReadiness::portal(),
+        };
+        return (Box::new(ControlledDelivery), paste);
+    }
+    match delivery_mode {
+        DeliveryMode::Copy => (
             Box::new(PortalClipboardDelivery::clipboard_only_with_reason(
                 Box::new(WlClipboard),
-                "direct Delivery disabled by VOISU_DISABLE_DIRECT_DELIVERY; Transcript remains on the clipboard",
+                COPY_MODE_REASON,
             )),
-            if delivery_mode == DeliveryMode::Clipboard {
-                PasteActionState::ClipboardOnly
-            } else {
-                PasteActionState::NotRequired
-            },
-            PasteBackend::NotRequired,
-        )
-    } else {
-        match delivery_mode {
-            DeliveryMode::Type => (
-                Box::new(PortalClipboardDelivery::default()),
-                PasteActionState::NotRequired,
-                PasteBackend::NotRequired,
-            ),
-            DeliveryMode::Clipboard => {
-                let (paste_action, verified) = paste_action_selection();
-                match (
-                    verified,
-                    voisu_app::hyprland_bindings::hyprland_press_path_available(),
-                ) {
-                    (Some(action), true) => {
-                        eprintln!("verified Hyprland Paste Action: {}", action.description);
-                        (
-                            Box::new(PortalClipboardDelivery::with_hyprland_paste(action)),
-                            paste_action,
-                            PasteBackend::Hyprland,
-                        )
-                    }
-                    (Some(action), false) => {
-                        eprintln!(
-                            "verified Hyprland Paste Action {}; press path unavailable; Delivery will remain clipboard-only",
-                            action.description
-                        );
-                        (
-                            Box::new(PortalClipboardDelivery::clipboard_only()),
-                            paste_action,
-                            PasteBackend::Unavailable,
-                        )
-                    }
-                    (None, _) => {
-                        eprintln!(
-                            "no verified Hyprland Paste Action; Delivery will remain clipboard-only"
-                        );
-                        (
-                            Box::new(PortalClipboardDelivery::clipboard_only()),
-                            paste_action,
-                            PasteBackend::NotRequired,
-                        )
-                    }
+            copy_only,
+        ),
+        DeliveryMode::Paste if std::env::var_os("VOISU_DISABLE_DIRECT_DELIVERY").is_some() => (
+            Box::new(PortalClipboardDelivery::clipboard_only_with_reason(
+                Box::new(WlClipboard),
+                "pasting turned off by VOISU_DISABLE_DIRECT_DELIVERY",
+            )),
+            copy_only,
+        ),
+        DeliveryMode::Paste if voisu_app::hyprland_bindings::hyprland_press_path_available() => {
+            match voisu_app::hyprland_bindings::discover_live_paste_action() {
+                Some(action) => {
+                    eprintln!("Paste shortcut: {}", action.description);
+                    let shortcut = Some(action.shortcut.binding.clone());
+                    (
+                        Box::new(PortalClipboardDelivery::with_hyprland_paste(action)),
+                        PasteReadiness {
+                            action: PasteActionState::Verified,
+                            backend: PasteBackend::Hyprland,
+                            shortcut,
+                        },
+                    )
+                }
+                None => {
+                    eprintln!("No paste shortcut in Hyprland config; Voisu will copy only");
+                    (
+                        Box::new(PortalClipboardDelivery::clipboard_only()),
+                        PasteReadiness {
+                            backend: PasteBackend::Unavailable,
+                            ..copy_only
+                        },
+                    )
                 }
             }
-            DeliveryMode::Guarded => {
-                let focus = focus_probe.unwrap_or_else(|| {
-                    Arc::new(tokio::sync::Mutex::new(Box::new(
-                        voisu_app::focus::NullFocusProbe,
-                    )))
-                });
-                (
-                    Box::new(GuardedDelivery::with_boundaries(
-                        focus,
-                        Box::new(PortalClipboardDelivery::default()),
-                        Box::new(PortalClipboardDelivery::clipboard_only()),
-                        Box::new(DesktopNotifier),
-                    )),
-                    PasteActionState::NotRequired,
-                    PasteBackend::NotRequired,
-                )
-            }
+        }
+        DeliveryMode::Paste => (
+            Box::new(PortalClipboardDelivery::default()),
+            PasteReadiness::portal(),
+        ),
+    }
+}
+
+/// What the daemon reports about its paste path, captured when it builds the
+/// Delivery adapter.
+#[derive(Clone, Debug)]
+struct PasteReadiness {
+    action: PasteActionState,
+    backend: PasteBackend,
+    shortcut: Option<String>,
+}
+
+impl PasteReadiness {
+    /// Paste through the RemoteDesktop portal, with no Hyprland shortcut.
+    fn portal() -> Self {
+        Self {
+            action: PasteActionState::NotRequired,
+            backend: PasteBackend::NotRequired,
+            shortcut: None,
         }
     }
 }
 
-fn paste_action_selection() -> (PasteActionState, Option<VerifiedPasteAction>) {
-    match voisu_app::hyprland_bindings::discover_live_paste_action() {
-        Some(action) => (PasteActionState::Verified, Some(action)),
-        None => (PasteActionState::ClipboardOnly, None),
+/// Silence is a claim about the speaker, so it holds only when every Provider
+/// that ran answered: a failed one might have heard what the other missed. A
+/// Deepgram the user turned off has no say. Everything the silence error knew
+/// is already in the Recording's evidence.
+fn silence_needs_every_provider(
+    error: BoundaryError,
+    provider_failures: &[ProviderFailure],
+    deepgram_enabled: bool,
+) -> BoundaryError {
+    let a_provider_failed = provider_failures
+        .iter()
+        .any(|failure| failure.provider != Provider::Deepgram || deepgram_enabled);
+    if error.kind() == BoundaryKind::SilentRecording && a_provider_failed {
+        return BoundaryError::new(BoundaryKind::Provider, error.diagnostic());
     }
+    error
 }
 
 /// Enforces the no-silent-absence invariant: every configured provider must end
@@ -3852,7 +3867,7 @@ async fn shortcut_listener(actor: mpsc::Sender<ActorMessage>) {
                 // reprompt an already-made decision, so retire quietly like an
                 // explicit revocation; start, stop, and toggle stay available.
                 eprintln!(
-                    "Trigger Key binding is unavailable: {}; start, stop, and toggle remain available",
+                    "Couldn't set up your Trigger Key: {}; voisu start, stop, and toggle still work",
                     error.diagnostic()
                 );
                 let _ = actor.send(ActorMessage::ShortcutBound(None)).await;
@@ -3861,7 +3876,7 @@ async fn shortcut_listener(actor: mpsc::Sender<ActorMessage>) {
             Err(error) => {
                 if !announced_down {
                     eprintln!(
-                        "Trigger Key binding is unavailable: {}; retrying until the desktop portal is ready",
+                        "Couldn't set up your Trigger Key: {}; trying again until the desktop is ready",
                         error.diagnostic()
                     );
                     announced_down = true;
@@ -4834,8 +4849,7 @@ mod tests {
             processing,
             true,
             true,
-            DeliveryMode::Type,
-            None,
+            DeliveryMode::Paste,
             vec![Provider::Groq],
             evidence,
             None,

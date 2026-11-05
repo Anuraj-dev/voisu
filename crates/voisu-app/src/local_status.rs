@@ -2,63 +2,60 @@
 //!
 //! Reads `AsrModeStatus` only. Does not load models or check Cloud keys.
 
-use voisu_core::{ASR_MODE_V1, AsrMode, AsrModeStatus, LocalReadiness};
+use voisu_core::{AsrMode, AsrModeStatus, LocalReadiness};
 
-/// Historic first line, then pending/active/revision/readiness/capability.
+use crate::asr_mode::engine_name;
+
+/// The state line, then the engine, the Local model, and any problem.
 pub fn write_cli_status(message: &str, asr: Option<&AsrModeStatus>) {
     print!("{}", format_cli_status(message, asr));
+}
+
+/// The daemon reports its state with stable wire labels; people read these.
+fn state_line(message: &str) -> &str {
+    match message {
+        "idle" => "Ready",
+        "processing" => "Working on your Transcript",
+        other => other,
+    }
 }
 
 #[must_use]
 pub fn format_cli_status(message: &str, asr: Option<&AsrModeStatus>) -> String {
     let mut out = String::new();
-    out.push_str(message);
+    out.push_str(state_line(message));
     out.push('\n');
     let Some(asr) = asr else {
         return out;
     };
-    match asr.pending {
-        Some(mode) => {
-            out.push_str("asr mode pending: ");
-            out.push_str(mode.as_str());
-            out.push('\n');
+    out.push_str("Engine: ");
+    match (asr.pending, asr.active) {
+        (Some(pending), Some(active)) if pending != active => {
+            out.push_str(engine_name(pending));
+            out.push_str(" (starts with your next Recording)");
         }
-        None => out.push_str("asr mode pending: unknown\n"),
+        (Some(pending), _) => out.push_str(engine_name(pending)),
+        (None, _) => out.push_str("unknown"),
     }
-    if let Some(active) = asr.active {
-        out.push_str("asr mode active: ");
-        out.push_str(active.as_str());
-        out.push('\n');
-    }
-    match asr.revision {
-        Some(revision) => {
-            out.push_str("config revision: ");
-            out.push_str(&revision.to_string());
-            out.push('\n');
-        }
-        None => out.push_str("config revision: unknown\n"),
-    }
-    out.push_str("local readiness: ");
+    out.push('\n');
+    out.push_str("Local model: ");
     out.push_str(&format_local_readiness(&asr.local_readiness));
     out.push('\n');
     if let Some(identity) = model_identity(&asr.local_readiness) {
-        out.push_str("model identity: ");
+        out.push_str("Model: ");
         out.push_str(identity);
         out.push('\n');
     }
     if let Some(error) = &asr.admission_error {
-        out.push_str("asr admission: ");
+        out.push_str("Can't switch engine: ");
         out.push_str(error);
         out.push('\n');
     }
     if let Some(retention) = &asr.audio_retention {
-        out.push_str("audio retention: ");
+        out.push_str("Saved audio: ");
         out.push_str(retention);
         out.push('\n');
     }
-    out.push_str("asr capability: ");
-    out.push_str(ASR_MODE_V1);
-    out.push('\n');
     if let Some(line) = recording_path_line(asr) {
         out.push_str(&line);
         out.push('\n');
@@ -69,8 +66,8 @@ pub fn format_cli_status(message: &str, asr: Option<&AsrModeStatus>) -> String {
 #[must_use]
 pub fn format_local_readiness(readiness: &LocalReadiness) -> String {
     match readiness {
-        LocalReadiness::Absent => "absent".to_owned(),
-        LocalReadiness::Verifying => "verifying".to_owned(),
+        LocalReadiness::Absent => "not installed".to_owned(),
+        LocalReadiness::Verifying => "checking".to_owned(),
         LocalReadiness::Loading => "loading".to_owned(),
         LocalReadiness::Ready {
             model_identity: None,
@@ -79,8 +76,8 @@ pub fn format_local_readiness(readiness: &LocalReadiness) -> String {
             model_identity: Some(identity),
         } => format!("ready ({identity})"),
         LocalReadiness::Busy => "busy".to_owned(),
-        LocalReadiness::Stopping => "stopping".to_owned(),
-        LocalReadiness::Unavailable { error } => format!("unavailable ({error})"),
+        LocalReadiness::Stopping => "shutting down".to_owned(),
+        LocalReadiness::Unavailable { error } => format!("can't load ({error})"),
     }
 }
 
@@ -118,15 +115,10 @@ fn recording_path_line(asr: &AsrModeStatus) -> Option<String> {
     if pending == active {
         return None;
     }
-    if active == AsrMode::Cloud && pending == AsrMode::Local {
-        return Some(
-            "recording path: cloud (this Recording is not offline; Local is pending)".to_owned(),
-        );
-    }
     Some(format!(
-        "recording path: {} (pending {})",
-        active.as_str(),
-        pending.as_str()
+        "This Recording uses {}; {} starts with the next one",
+        engine_name(active),
+        engine_name(pending)
     ))
 }
 
@@ -170,18 +162,18 @@ mod tests {
         let ready_text = format_cli_status("idle", Some(&ready));
         assert!(
             unavailable_text
-                .contains("local readiness: unavailable (Local selected; model unavailable)"),
+                .contains("Local model: can't load (Local selected; model unavailable)"),
             "{unavailable_text}"
         );
         assert!(local_selected_model_unavailable(&unavailable));
         assert!(!local_ready(&unavailable));
-        assert!(ready_text.contains("local readiness: ready (l3-health-fixture)"));
-        assert!(ready_text.contains("model identity: l3-health-fixture"));
+        assert!(ready_text.contains("Local model: ready (l3-health-fixture)"));
+        assert!(ready_text.contains("Model: l3-health-fixture"));
         assert!(local_ready(&ready));
         assert!(!local_selected_model_unavailable(&ready));
-        assert!(unavailable_text.contains("asr capability: asr-mode-v1"));
-        assert!(unavailable_text.contains("config revision: 7"));
-        assert!(unavailable_text.contains("asr mode pending: local"));
+        assert!(unavailable_text.starts_with("Ready\nEngine: Local\n"));
+        assert!(!unavailable_text.contains("asr-mode-v1"));
+        assert!(!unavailable_text.contains("revision"));
     }
 
     #[test]
@@ -195,12 +187,12 @@ mod tests {
         );
         assert!(!recording_is_offline(&asr));
         let text = format_cli_status("Recording", Some(&asr));
-        assert!(text.contains("asr mode pending: local"), "{text}");
-        assert!(text.contains("asr mode active: cloud"), "{text}");
         assert!(
-            text.contains(
-                "recording path: cloud (this Recording is not offline; Local is pending)"
-            ),
+            text.contains("Engine: Local (starts with your next Recording)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("This Recording uses Cloud; Local starts with the next one"),
             "{text}"
         );
     }
@@ -208,8 +200,18 @@ mod tests {
     #[test]
     fn missing_structured_status_does_not_infer_cloud() {
         let text = format_cli_status("idle", None);
-        assert_eq!(text, "idle\n");
-        assert!(!text.contains("cloud"));
+        assert_eq!(text, "Ready\n");
+        assert!(!text.to_lowercase().contains("cloud"));
         assert!(!text.contains("asr-mode-v1"));
+    }
+
+    #[test]
+    fn wire_state_labels_read_as_plain_words() {
+        assert_eq!(format_cli_status("idle", None), "Ready\n");
+        assert_eq!(
+            format_cli_status("processing", None),
+            "Working on your Transcript\n"
+        );
+        assert_eq!(format_cli_status("Recording", None), "Recording\n");
     }
 }

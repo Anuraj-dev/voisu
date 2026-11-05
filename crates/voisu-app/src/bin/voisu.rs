@@ -1,55 +1,28 @@
-use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
+use std::io::{Read, Write};
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
 
-use voisu_app::config::{DeliveryMode, RenderingPolicy, WritingMode};
+use voisu_app::config::{DeliveryMode, RenderingPolicy, StoredDelivery, WritingMode};
+use voisu_app::doctor::DoctorRow;
 use voisu_app::service::{UserServiceAction, manage_user_service};
-use voisu_app::system::{
-    DIAGNOSTIC_RESPONSE_DEADLINE, FedoraReadiness, ProviderHttpClient, SecretToolStore,
-};
+use voisu_app::system::{ProviderHttpClient, SecretToolStore};
 use voisu_core::{
-    AsrMode, BoundaryError, BoundaryFuture, BoundaryKind, Command, Credential, DaemonReadiness,
-    ExportCorrelationId, KeyDiagnosis, KeyLocation, PROTOCOL_VERSION, PasteActionState,
-    PasteBackend, Provider, ProviderAuthenticator, ProviderKeyStatus, ReadinessStatus,
-    ReplayFixturePath, Request, Response, SecretStore, SessionKind, VersionEnvelope,
-    provider_free_tier_hint, resolve_session, socket_path,
+    AsrMode, BoundaryError, BoundaryFuture, BoundaryKind, Command, Credential, ExportCorrelationId,
+    Provider, ProviderAuthenticator, ReadinessStatus, ReplayFixturePath, Response, SecretStore,
 };
-
-/// The most response the CLI will buffer — per transport frame, and in total
-/// across the pages of one diagnostic payload.
-///
-/// Derived from the retention policy rather than picked: every retained record
-/// can hold two Source Transcripts and one final Transcript at the stored-text
-/// clamp, so the retained transcript budget is `DEFAULT_MAX_RECORDS * 3 *
-/// MAX_STORED_TEXT`. This allows a fourth clamp's worth per record for JSON
-/// escaping and the record's fixed fields, plus a flat four mebibytes of slack
-/// for provider-failure diagnostics, which the store does not clamp. Paging
-/// removed the previous bound rather than raising it, leaving the CLI's memory
-/// use answerable only to the 15 s diagnostic deadline — which on a local Unix
-/// socket permits gigabytes.
-const MAX_RESPONSE_BYTES: usize =
-    voisu_core::DEFAULT_MAX_RECORDS * 4 * voisu_core::MAX_STORED_TEXT + 4 * 1024 * 1024;
-const IO_DEADLINE: Duration = Duration::from_secs(2);
-#[derive(Clone, Copy)]
-enum DiagnosticResponseKind {
-    History,
-    Export,
-}
 
 enum CliAction {
     Daemon(Command),
-    History { json: bool },
+    History { json: bool, verbose: bool },
     Replay { path: String, json: bool },
     Doctor { verbose: bool },
     Setup,
-    AuthSet(Provider),
-    AuthVerify(Provider),
+    KeySet(Provider),
+    KeyCheck(Provider),
     SetDeepgram(bool),
     SetAsrMode(AsrMode),
     Delivery(Option<DeliveryMode>),
     Writing(Option<WritingMode>),
-    Rendering(Option<RenderingPolicy>),
+    Layout(Option<RenderingPolicy>),
     DictionaryAdd(String),
     DictionaryRemove(String),
     DictionaryList { json: bool },
@@ -62,22 +35,25 @@ enum CliAction {
 }
 
 fn main() -> ExitCode {
+    if voisu_app::tui::should_open() {
+        return voisu_app::tui::run();
+    }
     match parse_command() {
         Ok(CliAction::Daemon(command)) => daemon_command(command),
-        Ok(CliAction::History { json }) => history_command(json),
+        Ok(CliAction::History { json, verbose }) => history_command(json, verbose),
         Ok(CliAction::Replay { path, json }) => replay_command(&path, json),
         Ok(CliAction::Doctor { verbose }) => doctor(verbose),
         Ok(CliAction::Setup) => setup(),
-        Ok(CliAction::AuthSet(provider)) => match credential_from_stdin() {
-            Ok(credential) => auth_set(provider, credential),
+        Ok(CliAction::KeySet(provider)) => match credential_from_stdin() {
+            Ok(credential) => key_set(provider, credential),
             Err(error) => fail(2, error.public_message()),
         },
-        Ok(CliAction::AuthVerify(provider)) => auth_verify(provider),
+        Ok(CliAction::KeyCheck(provider)) => key_check(provider),
         Ok(CliAction::SetDeepgram(enabled)) => set_deepgram(enabled),
         Ok(CliAction::SetAsrMode(mode)) => set_asr_mode(mode),
         Ok(CliAction::Delivery(mode)) => delivery(mode),
         Ok(CliAction::Writing(mode)) => writing(mode),
-        Ok(CliAction::Rendering(policy)) => rendering(policy),
+        Ok(CliAction::Layout(policy)) => layout(policy),
         Ok(CliAction::DictionaryAdd(term)) => dictionary_add(&term),
         Ok(CliAction::DictionaryRemove(term)) => dictionary_remove(&term),
         Ok(CliAction::DictionaryList { json }) => dictionary_list(json),
@@ -106,56 +82,15 @@ fn main() -> ExitCode {
 /// Sends one command to the daemon and returns the typed response, or an
 /// `ExitCode` (already reported to the user) when the round-trip fails.
 fn send_command(command: Command) -> Result<Response, ExitCode> {
-    let path = match socket_path() {
-        Ok(path) => path,
-        Err(message) => return Err(fail(2, &message)),
-    };
-    let mut stream = match UnixStream::connect(path) {
-        Ok(stream) => stream,
-        Err(_) => {
-            println!("daemon unavailable");
-            return Err(ExitCode::from(3));
-        }
-    };
-
-    if stream.set_write_timeout(Some(IO_DEADLINE)).is_err() {
-        return Err(fail(1, "failed to configure daemon connection deadline"));
-    }
-
-    // A replay drives the same provider/validation boundaries as Stop, so it
-    // shares the longer processing budget. `history` and `export` read the
-    // bounded diagnostic store instead, which has its own budget.
-    let response_deadline = match &command {
-        Command::Stop | Command::Toggle | Command::Replay(_) => {
-            voisu_app::asr_mode::processing_response_deadline()
-        }
-        Command::History | Command::Export(_) => DIAGNOSTIC_RESPONSE_DEADLINE,
-        _ => IO_DEADLINE,
-    };
-    let diagnostic_kind = match &command {
-        Command::History => Some(DiagnosticResponseKind::History),
-        Command::Export(_) => Some(DiagnosticResponseKind::Export),
-        _ => None,
-    };
-    // Only a diagnostic command can outgrow one frame, and only this CLI can
-    // reassemble pages, so paging is asked for per request rather than assumed.
-    // A daemon that predates paging ignores the field and answers in one frame,
-    // which `read_response` still accepts.
-    let request = if diagnostic_kind.is_some() {
-        Request::paged(command)
-    } else {
-        Request::new(command)
-    };
-    if serde_json::to_writer(&mut stream, &request).is_err() || stream.write_all(b"\n").is_err() {
-        return Err(fail(1, "failed to send command to daemon"));
-    }
-    match read_response(
-        &mut BufReader::new(stream),
-        response_deadline,
-        diagnostic_kind,
-    ) {
+    use voisu_app::daemon_client::DaemonClientError;
+    match voisu_app::daemon_client::send_command(command) {
         Ok(response) => Ok(response),
-        Err((code, message)) => Err(fail(code, &message)),
+        Err(DaemonClientError::Socket(message)) => Err(fail(2, &message)),
+        Err(DaemonClientError::Unavailable) => {
+            println!("daemon unavailable");
+            Err(ExitCode::from(3))
+        }
+        Err(DaemonClientError::Failed { code, message }) => Err(fail(code, &message)),
     }
 }
 
@@ -220,7 +155,7 @@ fn replay_command(path: &str, json: bool) -> ExitCode {
 /// foregrounds tail latency and each Provider's outcome, paginating 20 at a time
 /// when stdout and stdin are a TTY. `--json` prints the byte-for-byte raw
 /// history response (the historic behavior) so scripts never break.
-fn history_command(json: bool) -> ExitCode {
+fn history_command(json: bool, verbose: bool) -> ExitCode {
     let response = match send_command(Command::History) {
         Ok(response) => response,
         Err(code) => return code,
@@ -246,12 +181,12 @@ fn history_command(json: bool) -> ExitCode {
         Ok(records) => records,
         Err(_) => return fail(1, "daemon returned an invalid diagnostic history"),
     };
-    render_history_pretty(&records)
+    render_history_pretty(&records, verbose)
 }
 
 /// Prints the pretty history, paginating only when stdout AND stdin are a TTY.
 /// Piped or scripted invocations print the first page without ever blocking.
-fn render_history_pretty(records: &serde_json::Value) -> ExitCode {
+fn render_history_pretty(records: &serde_json::Value, verbose: bool) -> ExitCode {
     use std::io::IsTerminal;
     use voisu_app::history_view::{
         DEFAULT_PAGE_SIZE, RenderStyle, pagination_prompt, render_history_noninteractive,
@@ -265,6 +200,7 @@ fn render_history_pretty(records: &serde_json::Value) -> ExitCode {
         now_ms: voisu_core::unix_millis_now(),
         color,
         transcript_width: 72,
+        verbose,
     };
 
     if !interactive {
@@ -299,165 +235,8 @@ fn render_history_pretty(records: &serde_json::Value) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// One rendered doctor line: `label  value  STATUS`, with an optional runnable
-/// action (shown indented only on FAIL) and reasoning (shown only under
-/// --verbose). Capability findings, the focus guard, and the provider-key
-/// checks are all reduced to this single shape so the terseness contract holds
-/// for every check, not just the first group.
-struct DoctorRow {
-    label: String,
-    value: Option<String>,
-    status: ReadinessStatus,
-    action: Option<String>,
-    detail: String,
-}
-
-impl DoctorRow {
-    fn new(label: impl Into<String>, status: ReadinessStatus, detail: impl Into<String>) -> Self {
-        Self {
-            label: label.into(),
-            value: None,
-            status,
-            action: None,
-            detail: detail.into(),
-        }
-    }
-
-    fn value(mut self, value: impl Into<String>) -> Self {
-        self.value = Some(value.into());
-        self
-    }
-
-    fn action(mut self, action: impl Into<String>) -> Self {
-        self.action = Some(action.into());
-        self
-    }
-}
-
 fn doctor(verbose: bool) -> ExitCode {
-    use voisu_app::setup_profile::{TriggerIntegration, live_setup_facts, trigger_integration};
-
-    let trigger_integration = trigger_integration(&live_setup_facts());
-    let ubuntu_gnome = trigger_integration == TriggerIntegration::GnomeShellExtension;
-    let mut inspector = FedoraReadiness::default();
-    let mut rows: Vec<DoctorRow> = inspector
-        .inspect_with_global_shortcuts(!ubuntu_gnome)
-        .into_iter()
-        .map(|finding| DoctorRow {
-            label: finding.capability.cli_label().to_owned(),
-            value: finding.value,
-            status: finding.status,
-            action: finding.action,
-            detail: finding.detail,
-        })
-        .collect();
-
-    // One runtime serves both the focus probe and the live per-provider key
-    // round trips, so the CLI never needs an ambient async runtime.
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .ok();
-    let focus_backend = runtime
-        .as_ref()
-        .map(|runtime| runtime.block_on(voisu_app::focus::detect_focus_backend()))
-        .unwrap_or(voisu_app::focus::FocusBackendKind::None);
-    rows.push(focus_guard_row(focus_backend));
-
-    if ubuntu_gnome {
-        use voisu_app::ubuntu_gnome::{LiveState, TriggerState};
-        let state = voisu_app::ubuntu_gnome::doctor_state();
-        rows.push(match state.overlay {
-            LiveState::Active => DoctorRow::new(
-                "Overlay",
-                ReadinessStatus::Pass,
-                "Ubuntu native GNOME Shell Overlay is active",
-            )
-            .value("active"),
-            LiveState::RestartRequired => DoctorRow::new(
-                "Overlay",
-                ReadinessStatus::Warn,
-                "GNOME persisted the native Overlay but needs a logout/login or reboot to load it",
-            )
-            .value("restart required"),
-            LiveState::Unavailable => DoctorRow::new(
-                "Overlay",
-                ReadinessStatus::Fail,
-                state
-                    .detail
-                    .as_deref()
-                    .unwrap_or("Ubuntu native GNOME Shell Overlay is missing, disabled, or broken"),
-            )
-            .value("unavailable")
-            .action("run `voisu setup`"),
-        });
-        rows.push(match state.trigger {
-            TriggerState::Active => DoctorRow::new(
-                "Trigger Key",
-                ReadinessStatus::Pass,
-                "GNOME accepted the extension-owned Trigger Key",
-            )
-            .value(state.trigger_key.as_deref().unwrap_or("configured")),
-            TriggerState::RestartRequired => DoctorRow::new(
-                "Trigger Key",
-                ReadinessStatus::Warn,
-                "Trigger Key will be attempted when GNOME loads the extension",
-            )
-            .value(format!(
-                "{} / restart required",
-                state.trigger_key.as_deref().unwrap_or("configured")
-            )),
-            TriggerState::NotInstalled => DoctorRow::new(
-                "Trigger Key",
-                ReadinessStatus::Warn,
-                "GNOME could not install the configured Trigger Key",
-            )
-            .value(format!(
-                "{} / not installed",
-                state.trigger_key.as_deref().unwrap_or("configured")
-            ))
-            .action("use `voisu toggle`"),
-        });
-    }
-
-    // The CLI's own probes remain useful, but they cannot prove that the
-    // already-running service inherited the same display endpoint. Newer
-    // daemons add an additive readiness payload on the handshake already used
-    // for the Daemon row; old daemons simply retain the historic doctor table.
-    if let Some(readiness) = inspector
-        .daemon_status()
-        .and_then(|response| response.readiness.as_ref())
-    {
-        rows.extend(daemon_readiness_rows(readiness));
-    }
-
-    if let Some(asr) = inspector
-        .daemon_status()
-        .and_then(|response| response.asr_mode.as_ref())
-    {
-        rows.extend(
-            voisu_app::local_doctor::rows_from_status(asr)
-                .into_iter()
-                .map(local_doctor_row),
-        );
-    }
-
-    // The live key checks reach the network; a test that pins other doctor
-    // output opts out with VOISU_TEST_SKIP_DOCTOR_KEYS and covers the key
-    // classification through dedicated seams instead. Local doctor skips Cloud
-    // probes with explicit SKIP rows rather than hiding them.
-    if std::env::var_os("VOISU_TEST_SKIP_DOCTOR_KEYS").is_none() {
-        if voisu_app::local_doctor::skip_cloud_probes() {
-            rows.extend(
-                voisu_app::local_doctor::skipped_cloud_key_rows()
-                    .into_iter()
-                    .map(local_doctor_row),
-            );
-        } else if let Some(runtime) = runtime.as_ref() {
-            rows.extend(provider_key_rows(runtime));
-        }
-    }
-
+    let rows = voisu_app::doctor::collect_rows();
     let has_failure = rows.iter().any(|row| row.status == ReadinessStatus::Fail);
     print_doctor_rows(&rows, verbose);
     if has_failure {
@@ -471,23 +250,12 @@ fn doctor(verbose: bool) -> ExitCode {
 /// computed) so the layout is deterministic regardless of which checks ran, and
 /// followed by an explicit two-space gutter so a value that overflows its column
 /// can never touch the status ("1.0.5 (WAV fallback)  PASS", never glued).
-const DOCTOR_LABEL_WIDTH: usize = 15;
+const DOCTOR_LABEL_WIDTH: usize = 17;
 const DOCTOR_VALUE_WIDTH: usize = 20;
 
 /// Print every doctor check as one terse line. A runnable action prints on its
-/// own indented line only on FAIL; WARN and SKIP keep to one line, with any
+/// own indented line only on FAIL; WARN and OFF keep to one line, with any
 /// guidance behind --verbose.
-fn local_doctor_row(check: voisu_app::local_doctor::DoctorCheck) -> DoctorRow {
-    let mut row = DoctorRow::new(check.label, check.status, check.detail);
-    if !check.value.is_empty() {
-        row = row.value(check.value);
-    }
-    if let Some(action) = check.action {
-        row = row.action(action);
-    }
-    row
-}
-
 fn print_doctor_rows(rows: &[DoctorRow], verbose: bool) {
     for row in rows {
         let value = row.value.as_deref().unwrap_or("");
@@ -510,588 +278,22 @@ fn print_doctor_rows(rows: &[DoctorRow], verbose: bool) {
     }
 }
 
-fn focus_guard_row(backend: voisu_app::focus::FocusBackendKind) -> DoctorRow {
-    if backend == voisu_app::focus::FocusBackendKind::None {
-        DoctorRow::new(
-            "Focus guard",
-            ReadinessStatus::Warn,
-            "no focus backend; guarded Delivery fails closed to the clipboard",
-        )
-        .value("none")
-    } else {
-        DoctorRow::new(
-            "Focus guard",
-            ReadinessStatus::Pass,
-            "focus backend available for guarded Delivery",
-        )
-        .value(backend.as_str())
-    }
-}
-
-fn daemon_readiness_rows(readiness: &DaemonReadiness) -> Vec<DoctorRow> {
-    let mut rows = Vec::with_capacity(6);
-    let daemon_session_matches = daemon_session_matches_cli(readiness);
-    rows.push(daemon_session_row(readiness));
-
-    let cli_delivery = voisu_app::config::delivery_mode().as_str();
-    let delivery_matches = readiness.delivery_mode == cli_delivery;
-    rows.push(
-        DoctorRow::new(
-            "Daemon delivery",
-            if delivery_matches {
-                ReadinessStatus::Pass
-            } else {
-                ReadinessStatus::Fail
-            },
-            if delivery_matches {
-                "daemon Delivery mode matches the current configuration"
-            } else {
-                "daemon selected Delivery before the current configuration; restart the service"
-            },
-        )
-        .value(readiness.delivery_mode.clone())
-        .action("voisu service restart"),
-    );
-
-    rows.push(match readiness.paste_action {
-        PasteActionState::Verified => DoctorRow::new(
-            "Paste action",
-            ReadinessStatus::Pass,
-            "Hyprland Paste Action binding was verified by the daemon",
-        )
-        .value("verified"),
-        PasteActionState::ClipboardOnly => DoctorRow::new(
-            "Paste action",
-            ReadinessStatus::Warn,
-            "no verified Hyprland Paste Action; Delivery remains clipboard-only",
-        )
-        .value("clipboard-only"),
-        PasteActionState::NotRequired => DoctorRow::new(
-            "Paste action",
-            ReadinessStatus::Skip,
-            "the selected Delivery mode does not use a Hyprland Paste Action",
-        )
-        .value("not selected"),
-    });
-
-    rows.push(match readiness.paste_backend {
-        PasteBackend::Hyprland => DoctorRow::new(
-            "Paste backend",
-            ReadinessStatus::Pass,
-            "the daemon emits the verified Paste Action through Hyprland send_key_state",
-        )
-        .value("hyprland"),
-        PasteBackend::Unavailable => DoctorRow::new(
-            "Paste backend",
-            ReadinessStatus::Warn,
-            "a verified Paste Action binding exists, but the Hyprland press path cannot run",
-        )
-        .value("unavailable"),
-        PasteBackend::NotRequired => DoctorRow::new(
-            "Paste backend",
-            ReadinessStatus::Skip,
-            "the selected Delivery mode does not use the Hyprland press path",
-        )
-        .value("not required"),
-    });
-
-    let clipboard_value = readiness
-        .clipboard_backend
-        .as_deref()
-        .unwrap_or("not installed");
-    rows.push(if readiness.clipboard_usable && daemon_session_matches {
-        DoctorRow::new(
-            "Daemon clipboard",
-            ReadinessStatus::Pass,
-            "the daemon has a clipboard tool and a usable display endpoint",
-        )
-        .value(clipboard_value)
-    } else if readiness.clipboard_backend.is_some() {
-        DoctorRow::new(
-            "Daemon clipboard",
-            ReadinessStatus::Fail,
-            "a clipboard tool is installed, but the daemon cannot reach its display endpoint",
-        )
-        .value(clipboard_value)
-        .action("voisu service restart")
-    } else {
-        DoctorRow::new(
-            "Daemon clipboard",
-            ReadinessStatus::Fail,
-            "no clipboard backend is installed in the daemon environment",
-        )
-        .value(clipboard_value)
-        .action("install wl-clipboard on Wayland or xclip on X11")
-    });
-
-    if is_hyprland_session() {
-        rows.push(overlay_readiness_row());
-    }
-    rows
-}
-
-fn daemon_session_row(readiness: &DaemonReadiness) -> DoctorRow {
-    let daemon_resolution = resolve_session(
-        readiness.wayland_display.as_deref(),
-        readiness.x11_display.as_deref(),
-        readiness.session_type.as_deref(),
-    );
-    let daemon_session = match readiness.session_type.as_deref() {
-        Some(value) if value.eq_ignore_ascii_case("wayland") => SessionKind::Wayland,
-        Some(value) if value.eq_ignore_ascii_case("x11") => SessionKind::X11,
-        _ => daemon_resolution.session,
-    };
-    let same_endpoint = daemon_session_matches_cli(readiness);
-    let value = daemon_session_value(readiness, daemon_session);
-    if same_endpoint {
-        DoctorRow::new(
-            "Daemon session",
-            ReadinessStatus::Pass,
-            "daemon session type and display endpoint match the current CLI session",
-        )
-        .value(value)
-    } else {
-        DoctorRow::new(
-            "Daemon session",
-            ReadinessStatus::Fail,
-            "daemon session state is missing or stale compared with this CLI; restart the service",
-        )
-        .value(value)
-        .action("voisu service restart")
-    }
-}
-
-fn daemon_session_matches_cli(readiness: &DaemonReadiness) -> bool {
-    let cli_wayland = std::env::var("WAYLAND_DISPLAY").ok();
-    let cli_x11 = std::env::var("DISPLAY").ok();
-    let cli_type = std::env::var("XDG_SESSION_TYPE").ok();
-    let cli_resolution = resolve_session(
-        cli_wayland.as_deref(),
-        cli_x11.as_deref(),
-        cli_type.as_deref(),
-    );
-    let daemon_resolution = resolve_session(
-        readiness.wayland_display.as_deref(),
-        readiness.x11_display.as_deref(),
-        readiness.session_type.as_deref(),
-    );
-    let daemon_session = match readiness.session_type.as_deref() {
-        Some(value) if value.eq_ignore_ascii_case("wayland") => SessionKind::Wayland,
-        Some(value) if value.eq_ignore_ascii_case("x11") => SessionKind::X11,
-        _ => daemon_resolution.session,
-    };
-    match cli_resolution.session {
-        SessionKind::Wayland => {
-            daemon_session == SessionKind::Wayland
-                && cli_wayland.as_deref() == readiness.wayland_display.as_deref()
-                && same_optional_identity(
-                    std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok().as_deref(),
-                    readiness.hyprland_instance_signature.as_deref(),
-                )
-        }
-        SessionKind::X11 => {
-            daemon_session == SessionKind::X11
-                && cli_x11.as_deref() == readiness.x11_display.as_deref()
-                && same_optional_identity(
-                    std::env::var("XAUTHORITY").ok().as_deref(),
-                    readiness.x_authority.as_deref(),
-                )
-        }
-        SessionKind::Unknown => false,
-    }
-}
-
-fn same_optional_identity(current: Option<&str>, daemon: Option<&str>) -> bool {
-    current.map(str::trim).filter(|value| !value.is_empty())
-        == daemon.map(str::trim).filter(|value| !value.is_empty())
-}
-
-fn daemon_session_value(readiness: &DaemonReadiness, session: SessionKind) -> String {
-    let label = match session {
-        SessionKind::Wayland => "Wayland",
-        SessionKind::X11 => "X11",
-        SessionKind::Unknown => "unknown",
-    };
-    let display = match session {
-        SessionKind::Wayland => readiness.wayland_display.as_deref(),
-        SessionKind::X11 => readiness.x11_display.as_deref(),
-        SessionKind::Unknown => None,
-    }
-    .filter(|value| !value.trim().is_empty())
-    .unwrap_or("missing");
-    format!("{label} / {display}")
-}
-
-fn is_hyprland_session() -> bool {
-    std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some_and(|value| !value.is_empty())
-        && resolve_session(
-            std::env::var("WAYLAND_DISPLAY").ok().as_deref(),
-            std::env::var("DISPLAY").ok().as_deref(),
-            std::env::var("XDG_SESSION_TYPE").ok().as_deref(),
-        )
-        .session
-            == SessionKind::Wayland
-}
-
-fn overlay_readiness_row() -> DoctorRow {
-    if let Ok(value) = std::env::var("VOISU_TEST_OVERLAY_READINESS") {
-        return match value.as_str() {
-            "ready" => DoctorRow::new(
-                "Overlay",
-                ReadinessStatus::Pass,
-                "Hyprland Overlay is enabled and active",
-            )
-            .value("active"),
-            "enabled" => DoctorRow::new(
-                "Overlay",
-                ReadinessStatus::Fail,
-                "Hyprland Overlay is enabled but not active",
-            )
-            .value("stopped")
-            .action("voisu service start"),
-            _ => DoctorRow::new(
-                "Overlay",
-                ReadinessStatus::Fail,
-                "Hyprland Overlay is not enabled",
-            )
-            .value("disabled")
-            .action("voisu service install"),
-        };
-    }
-
-    match voisu_app::service::hyprland_overlay_readiness() {
-        Ok(readiness) if readiness.enabled && readiness.active => DoctorRow::new(
-            "Overlay",
-            ReadinessStatus::Pass,
-            "Hyprland Overlay is enabled and active",
-        )
-        .value("active"),
-        Ok(readiness) if readiness.enabled => DoctorRow::new(
-            "Overlay",
-            ReadinessStatus::Fail,
-            "Hyprland Overlay is enabled but not active",
-        )
-        .value("stopped")
-        .action("voisu service start"),
-        Ok(_) => DoctorRow::new(
-            "Overlay",
-            ReadinessStatus::Fail,
-            "Hyprland Overlay is not enabled",
-        )
-        .value("disabled")
-        .action("voisu service install"),
-        Err(detail) => DoctorRow::new("Overlay", ReadinessStatus::Fail, detail)
-            .value("unknown")
-            .action(voisu_app::service::hyprland_overlay_install_command()),
-    }
-}
-
-/// Live per-provider key round trips as structured rows. A wrong key (401/403)
-/// is a hard failure naming the fix; a missing key, quota, throttle, or
-/// unreachable provider is a warning, since none of those is a definitively bad
-/// key; a disabled provider is skipped.
-fn provider_key_rows(runtime: &tokio::runtime::Runtime) -> Vec<DoctorRow> {
-    let mut rows = Vec::new();
-    let deepgram_enabled = voisu_app::config::deepgram_enabled();
-    for provider in [Provider::Deepgram, Provider::Groq] {
-        let label = format!("{} key", provider.cli_label());
-        if provider == Provider::Deepgram && !deepgram_enabled {
-            rows.push(
-                DoctorRow::new(
-                    label,
-                    ReadinessStatus::Skip,
-                    "Deepgram is off; run `voisu deepgram on` to enable",
-                )
-                .value("off"),
-            );
-            continue;
-        }
-        let row = match SecretToolStore.diagnose(provider) {
-            KeyDiagnosis::Found {
-                location,
-                credential,
-            } => {
-                let status = runtime.block_on(ProviderHttpClient.check(provider, credential));
-                let location_note = match location {
-                    KeyLocation::PlaintextFile => {
-                        " — stored in the plaintext fallback file; run `voisu setup` to migrate it into your keyring"
-                    }
-                    KeyLocation::EnvOverride => {
-                        " — provided by the environment override, which wins over any stored key"
-                    }
-                    KeyLocation::Keyring => "",
-                };
-                let value = match status {
-                    ProviderKeyStatus::Valid => "valid",
-                    ProviderKeyStatus::InvalidKey => "invalid",
-                    ProviderKeyStatus::RateLimited => "rate-limited",
-                    ProviderKeyStatus::QuotaExhausted => "quota exhausted",
-                    ProviderKeyStatus::Unreachable => "unreachable",
-                };
-                let mut detail = format!("{}{}", status.headline(), location_note);
-                let mut row = DoctorRow::new(label, status.readiness(), String::new()).value(value);
-                match status {
-                    ProviderKeyStatus::InvalidKey => {
-                        detail = format!("{detail}; {}", provider_free_tier_hint(provider));
-                        row = row.action("run `voisu setup`");
-                    }
-                    ProviderKeyStatus::QuotaExhausted => {
-                        detail = format!("{detail}; {}", provider_free_tier_hint(provider));
-                    }
-                    _ => {}
-                }
-                row.detail = detail;
-                row
-            }
-            // A present env override always wins at runtime, so a malformed one
-            // shadows every stored key and breaks dictation: a hard failure
-            // naming the variable, never a PASS on the shadowed key.
-            KeyDiagnosis::EnvOverrideInvalid => {
-                let variable = provider.environment_variable();
-                DoctorRow::new(
-                    label,
-                    ReadinessStatus::Fail,
-                    format!(
-                        "{variable} is set but is not a usable key (empty or contains a line \
-                         break) and it overrides any stored key"
-                    ),
-                )
-                .value("env override invalid")
-                .action(format!("unset or fix {variable}"))
-            }
-            KeyDiagnosis::Absent => DoctorRow::new(
-                label,
-                ReadinessStatus::Warn,
-                format!(
-                    "not configured — run `voisu setup`; {}",
-                    provider_free_tier_hint(provider)
-                ),
-            )
-            .value("not configured"),
-            // The keyring could not be consulted: steer the user at the real fix
-            // (unlock / start / install) rather than telling them to write a
-            // plaintext key they may not need to.
-            KeyDiagnosis::Locked => DoctorRow::new(
-                label,
-                ReadinessStatus::Warn,
-                "keyring locked — unlock it, or run `voisu setup` to store a key",
-            )
-            .value("keyring locked"),
-            KeyDiagnosis::Unavailable => DoctorRow::new(
-                label,
-                ReadinessStatus::Warn,
-                "no desktop keyring available — run `voisu setup` to store a key",
-            )
-            .value("no keyring"),
-            KeyDiagnosis::ToolMissing => DoctorRow::new(
-                label,
-                ReadinessStatus::Warn,
-                "secret-tool is not installed — install libsecret-tools, or run `voisu setup`",
-            )
-            .value("secret-tool missing"),
-        };
-        rows.push(row);
-    }
-    rows
-}
-
 /// `voisu setup` — the interactive, re-runnable wizard that validates each key
-/// live before storing it. All logic lives in the injectable `voisu_app::setup`
-/// core; here we supply the real terminal, keyring, and live validator.
+/// live before storing it. The flow lives in `voisu_app::setup_flow`; here we
+/// supply the text wizard.
 fn setup() -> ExitCode {
     use std::io::IsTerminal;
-    use voisu_app::setup::{
-        LiveHyprlandSetupActions, LiveKeyValidator, ProviderOutcome, SETUP_COMPLETE_MESSAGE,
-        StdioWizard, run_consented_local_setup, run_hyprland_setup, run_setup,
-    };
-    use voisu_app::setup_consented::{
-        ConsentedInstallStep, SystemCommandRunner, ask_cloud_after_local,
-        developer_pilot_manifest_exists, probe_hardware, production_cloud_declined_marker,
-        production_consented_status, production_install, production_restart_daemon,
-        run_catalog_repair_if_needed, run_consented_install_step,
-    };
-    use voisu_app::setup_engine::{
-        ConsentedStatus, EngineChoice, consent_confirms_local_switch, run_engine_screen,
-    };
-    use voisu_app::setup_profile::{
-        HyprlandConfig, SetupProfile, discover_setup_profile, live_setup_facts,
-    };
-
+    if voisu_app::tui::should_open_setup() {
+        return voisu_app::tui::run_setup();
+    }
     // Integration tests can isolate the wizard while exercising the real CLI;
     // production never sets this seam.
     let wizard_only = std::env::var_os("VOISU_TEST_SETUP_WIZARD_ONLY").is_some();
-    let mut wizard = StdioWizard;
-    let discovery = match discover_setup_profile(&live_setup_facts()) {
-        Ok(discovery) => discovery,
-        Err(error) => return fail(4, &error.message()),
-    };
-    println!("Detected {} Setup Profile.", discovery.profile.as_str());
-    let current = if voisu_app::local_setup::is_local_mode() {
-        AsrMode::Local
-    } else {
-        AsrMode::Cloud
-    };
-    let hardware = probe_hardware(&SystemCommandRunner);
-    let mut secrets = SecretToolStore;
-    let deepgram = secrets.diagnose(Provider::Deepgram);
-    let groq = secrets.diagnose(Provider::Groq);
-    let consented = production_consented_status();
-    let interactive = std::io::stdin().is_terminal();
-    let choice = run_engine_screen(
-        &mut wizard,
-        current,
-        &hardware,
-        &deepgram,
-        &groq,
-        interactive,
-        developer_pilot_manifest_exists,
-        consented.clone(),
-    );
-    // The engine screen skipped its own switch warning because the consent
-    // prompt below confirms the switch; declining it must keep Cloud.
-    let consent_confirms_switch = choice == EngineChoice::Switch(AsrMode::Local)
-        && consent_confirms_local_switch(&hardware, &consented);
-    match choice {
-        EngineChoice::Keep(_) => {}
-        EngineChoice::Switch(mode) => match voisu_app::asr_mode::apply_cli_mode(mode) {
-            Ok(message) => println!("{message}"),
-            Err(error) => return fail(4, &error.message),
-        },
-    }
-    // Decided once: the optional Cloud key prompts below must not move a
-    // Local setup onto the Cloud-only completion path.
-    let mut local = voisu_app::local_setup::is_local_mode();
-    if local {
-        // Consented Install offer first; the Bakeoff-catalog repair flow
-        // after this stays evidence-gated and never offers a second download.
-        let installed = matches!(consented, ConsentedStatus::Installed { .. });
-        let now_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_secs())
-            .unwrap_or(0);
-        match run_consented_install_step(
-            &mut wizard,
-            &hardware,
-            interactive,
-            installed,
-            now_unix,
-            production_install,
-            production_restart_daemon,
-        ) {
-            ConsentedInstallStep::Failed => return ExitCode::from(4),
-            ConsentedInstallStep::Declined if consent_confirms_switch => {
-                if let Err(error) = voisu_app::asr_mode::apply_cli_mode(AsrMode::Cloud) {
-                    return fail(4, &error.message);
-                }
-                println!("Local was not installed; keeping Cloud.");
-                local = false;
-            }
-            step => {
-                if let Err(error) = run_catalog_repair_if_needed(
-                    &mut wizard,
-                    step,
-                    installed,
-                    run_consented_local_setup,
-                ) {
-                    return fail(4, &error);
-                }
-            }
-        }
-    }
-    if local {
-        // A first-time Local user without Cloud keys is asked once; No keeps
-        // `asr_mode = "local"`, skips every key prompt, and is remembered.
-        let declined_marker = production_cloud_declined_marker();
-        if ask_cloud_after_local(
-            &mut wizard,
-            interactive,
-            &deepgram,
-            &groq,
-            declined_marker.as_deref(),
-        ) {
-            run_setup(&mut wizard, &mut SecretToolStore, &mut LiveKeyValidator);
-        }
-        if wizard_only {
-            println!("{}", local_complete_message());
-            return ExitCode::SUCCESS;
-        }
-    }
-    let hyprland_config = discovery.hyprland_config;
-    if hyprland_config.is_some()
-        && !wizard_only
-        && let Err(error) = voisu_app::service::hyprland_overlay_preflight()
-    {
-        return fail(4, &error);
-    }
-    if local {
-        if let Some(HyprlandConfig::CurrentLua(config)) = hyprland_config {
-            let mut actions = LiveHyprlandSetupActions { io: &mut wizard };
-            if let Err(error) = run_hyprland_setup(&config, &mut actions) {
-                return fail(
-                    4,
-                    &format!(
-                        "Hyprland setup incomplete: {error}; recovery: run `voisu setup` after fixing this step"
-                    ),
-                );
-            }
-        }
-        if discovery.profile == SetupProfile::UbuntuWayland {
-            return finish_ubuntu_setup(&local_complete_message());
-        }
-        println!("{}", local_complete_message());
-        return ExitCode::SUCCESS;
-    }
-    let outcome = run_setup(&mut wizard, &mut SecretToolStore, &mut LiveKeyValidator);
-    // A run that stored/kept no usable key (every provider skipped or its store
-    // failed) did not accomplish setup's job, so it must not report success.
-    let usable = |outcome: ProviderOutcome| {
-        matches!(
-            outcome,
-            ProviderOutcome::Stored | ProviderOutcome::Kept | ProviderOutcome::StoredUnverified
-        )
-    };
-    if usable(outcome.deepgram) || usable(outcome.groq) {
-        if !wizard_only {
-            if let Some(HyprlandConfig::CurrentLua(config)) = hyprland_config {
-                let mut actions = LiveHyprlandSetupActions { io: &mut wizard };
-                match run_hyprland_setup(&config, &mut actions) {
-                    Ok(result) => {
-                        let paste = if result.paste_verified {
-                            "verified Paste Action"
-                        } else {
-                            "clipboard-only paste fallback"
-                        };
-                        println!("{SETUP_COMPLETE_MESSAGE}");
-                        println!(
-                            "Voisu is configured. Press {} to test; {paste}.",
-                            result.trigger_key.label
-                        );
-                        ExitCode::SUCCESS
-                    }
-                    Err(error) => fail(
-                        4,
-                        &format!(
-                            "Hyprland setup incomplete: {error}; recovery: run `voisu setup` after fixing this step"
-                        ),
-                    ),
-                }
-            } else if discovery.profile == SetupProfile::UbuntuWayland {
-                finish_ubuntu_setup(SETUP_COMPLETE_MESSAGE)
-            } else {
-                println!("{SETUP_COMPLETE_MESSAGE}");
-                ExitCode::SUCCESS
-            }
-        } else {
-            println!("{SETUP_COMPLETE_MESSAGE}");
-            ExitCode::SUCCESS
-        }
-    } else {
-        ExitCode::from(4)
-    }
-}
-
-fn local_complete_message() -> String {
-    voisu_app::setup_consented::production_local_complete_message()
+    ExitCode::from(voisu_app::setup_flow::run(
+        &mut voisu_app::setup_flow::TextSetup,
+        std::io::stdin().is_terminal(),
+        wizard_only,
+    ))
 }
 
 fn local_remove(yes: bool) -> ExitCode {
@@ -1120,56 +322,10 @@ fn local_remove(yes: bool) -> ExitCode {
     }
 }
 
-fn finish_ubuntu_setup(complete_message: &str) -> ExitCode {
-    use voisu_app::ubuntu_gnome::{LiveState, TriggerState};
-    match voisu_app::ubuntu_gnome::setup() {
-        Ok(result) => {
-            println!("{complete_message}");
-            match result.overlay {
-                LiveState::Active => println!("Overlay: active (native GNOME capsule)."),
-                LiveState::RestartRequired => {
-                    println!("Overlay: enabled; restart required (log out and back in, or reboot).")
-                }
-                LiveState::Unavailable => println!("Overlay: unavailable."),
-            }
-            match result.trigger {
-                TriggerState::Active => println!(
-                    "Trigger Key: {}.",
-                    result.trigger_key.as_deref().unwrap_or("configured")
-                ),
-                TriggerState::RestartRequired => {
-                    println!(
-                        "Trigger Key: {}; restart required before GNOME can install it.",
-                        result.trigger_key.as_deref().unwrap_or("configured")
-                    )
-                }
-                TriggerState::NotInstalled => {
-                    println!(
-                        "Trigger Key: not installed; configured binding {}; use `voisu toggle`.",
-                        result.trigger_key.as_deref().unwrap_or("configured")
-                    )
-                }
-            }
-            if result.daemon_restart_required {
-                println!("Daemon: enabled; restart required before it can start.");
-            } else {
-                println!("Daemon: enabled and active.");
-            }
-            ExitCode::SUCCESS
-        }
-        Err(error) => fail(
-            4,
-            &format!(
-                "Ubuntu setup incomplete: {error}; recovery: run `voisu setup` after fixing this step"
-            ),
-        ),
-    }
-}
-
-fn auth_set(provider: Provider, credential: Credential) -> ExitCode {
+fn key_set(provider: Provider, credential: Credential) -> ExitCode {
     match SecretToolStore.replace(provider, credential) {
         Ok(()) => {
-            println!("{} credential stored", provider.cli_label());
+            println!("{} key saved", provider.cli_label());
             ExitCode::SUCCESS
         }
         Err(error) => fail(4, error.public_message()),
@@ -1193,9 +349,8 @@ fn set_deepgram(enabled: bool) -> ExitCode {
     match voisu_app::config::set_deepgram_enabled(enabled) {
         Ok(_) => {
             println!(
-                "Deepgram {} for new Recordings; restart the daemon to apply \
-                 (voisu service restart)",
-                if enabled { "enabled" } else { "disabled" }
+                "Deepgram turned {}. Restart Voisu to use it: voisu service restart",
+                if enabled { "on" } else { "off" }
             );
             ExitCode::SUCCESS
         }
@@ -1205,19 +360,25 @@ fn set_deepgram(enabled: bool) -> ExitCode {
 
 /// Reads or persists the Delivery mode. A running daemon resolves configuration
 /// only at start, so writes apply after the next restart.
+///
+/// A legacy `clipboard` means different things in different sessions, and this
+/// shell may not be in the service's session, so it reports what the value
+/// does instead of resolving it here.
 fn delivery(mode: Option<DeliveryMode>) -> ExitCode {
     let Some(mode) = mode else {
-        println!(
-            "delivery mode: {}",
-            voisu_app::config::delivery_mode().as_str()
-        );
+        if voisu_app::config::stored_delivery() == Some(StoredDelivery::LegacyClipboard) {
+            println!(
+                "Delivery: paste if Hyprland has a paste shortcut, otherwise copy (saved by an older Voisu). Choose one: voisu delivery paste or voisu delivery copy"
+            );
+        } else {
+            println!("Delivery: {}", voisu_app::config::delivery_mode().as_str());
+        }
         return ExitCode::SUCCESS;
     };
     match voisu_app::config::set_delivery_mode(mode) {
         Ok(_) => {
             println!(
-                "Delivery mode set to {} for new Recordings; restart the daemon to apply \
-                 (voisu service restart)",
+                "Delivery set to {}. Restart Voisu to use it: voisu service restart",
                 mode.as_str()
             );
             ExitCode::SUCCESS
@@ -1226,26 +387,25 @@ fn delivery(mode: Option<DeliveryMode>) -> ExitCode {
     }
 }
 
-/// Reads or persists the Writing Mode. Smart enables Intent Reconstruction;
-/// Literal disables it. A running daemon resolves configuration only at start,
-/// so writes apply after the next restart.
+/// Reads or persists the Writing Mode. Clean (Smart) enables Intent
+/// Reconstruction; exact (Literal) disables it. A running daemon resolves this
+/// only at start, so writes apply after the next restart.
 fn writing(mode: Option<WritingMode>) -> ExitCode {
     let Some(mode) = mode else {
         let current = voisu_app::config::writing_mode();
         println!(
-            "writing mode: {} ({})",
+            "Writing: {} ({})",
             current.as_str(),
-            intent_reconstruction_status(current)
+            writing_meaning(current)
         );
         return ExitCode::SUCCESS;
     };
     match voisu_app::config::set_writing_mode(mode) {
         Ok(_) => {
             println!(
-                "Writing mode set to {} for new Recordings ({}); restart the daemon to apply \
-                 (voisu service restart)",
+                "Writing set to {} ({}). Restart Voisu to use it: voisu service restart",
                 mode.as_str(),
-                intent_reconstruction_status(mode)
+                writing_meaning(mode)
             );
             ExitCode::SUCCESS
         }
@@ -1253,36 +413,46 @@ fn writing(mode: Option<WritingMode>) -> ExitCode {
     }
 }
 
-/// IR follows the persisted Writing Mode, not this CLI process's env. A
-/// daemon unit `VOISU_ENABLE_INTENT_RECONSTRUCTION` force-off still wins
-/// after restart; say so on Smart so a host drop-in is not hidden.
-fn intent_reconstruction_status(mode: WritingMode) -> &'static str {
+/// What each Writing Mode does, in the user's terms. Clean also lets Intent
+/// Reconstruction fix misheard words when Groq and Deepgram disagree (unless a
+/// daemon unit `VOISU_ENABLE_INTENT_RECONSTRUCTION` forces it off).
+fn writing_meaning(mode: WritingMode) -> &'static str {
     match mode {
-        WritingMode::Smart => "Intent Reconstruction on unless the daemon env forces it off",
-        WritingMode::Literal => "Intent Reconstruction off",
+        WritingMode::Smart => "fixes punctuation, grammar, and misheard words",
+        WritingMode::Literal => "your words as spoken",
     }
 }
 
-/// Reads or persists the Developer Prompt Rendering policy. A running daemon
-/// resolves configuration only at start, so writes apply after the next restart.
-fn rendering(policy: Option<RenderingPolicy>) -> ExitCode {
+/// Reads or persists the Layout (the Rendering Policy). The daemon reads it at
+/// each Recording start, so a change applies to the next Recording.
+fn layout(policy: Option<RenderingPolicy>) -> ExitCode {
     let Some(policy) = policy else {
+        let current = voisu_app::config::rendering_policy();
         println!(
-            "rendering policy: {}",
-            voisu_app::config::rendering_policy().as_str()
+            "Layout: {} ({})",
+            voisu_app::config::layout_name(current),
+            layout_meaning(current)
         );
         return ExitCode::SUCCESS;
     };
     match voisu_app::config::set_rendering_policy(policy) {
         Ok(_) => {
             println!(
-                "Rendering policy set to {} for new Recordings; restart the daemon to apply \
-                 (voisu service restart)",
-                policy.as_str()
+                "Layout set to {} ({}). It applies to your next Recording.",
+                voisu_app::config::layout_name(policy),
+                layout_meaning(policy)
             );
             ExitCode::SUCCESS
         }
         Err(message) => fail(4, &message),
+    }
+}
+
+fn layout_meaning(policy: RenderingPolicy) -> &'static str {
+    match policy {
+        RenderingPolicy::Natural => "punctuation only",
+        RenderingPolicy::Adaptive => "organizes text when you speak in parts",
+        RenderingPolicy::Structured => "adds section headings",
     }
 }
 
@@ -1343,7 +513,7 @@ fn credential_from_stdin() -> Result<Credential, BoundaryError> {
     Credential::new(credential.trim_end().to_owned())
 }
 
-fn auth_verify(provider: Provider) -> ExitCode {
+fn key_check(provider: Provider) -> ExitCode {
     eprintln!("{}", voisu_app::local_doctor::CLOUD_CREDENTIAL_MAINTENANCE);
     let credential = match SecretToolStore.load(provider) {
         Ok(credential) => credential,
@@ -1356,7 +526,7 @@ fn auth_verify(provider: Provider) -> ExitCode {
         credential,
     )) {
         Ok(()) => {
-            println!("{} authentication verified", provider.cli_label());
+            println!("{} key works", provider.cli_label());
             ExitCode::SUCCESS
         }
         Err(error) => fail(4, error.public_message()),
@@ -1376,132 +546,6 @@ fn block_on<T>(future: BoundaryFuture<'_, T>) -> Result<T, BoundaryError> {
         .block_on(future)
 }
 
-fn read_response_frame(
-    stream: &mut BufReader<UnixStream>,
-    deadline: Duration,
-    budget: usize,
-) -> Result<String, String> {
-    let started = Instant::now();
-    let mut response = Vec::new();
-    loop {
-        let remaining = deadline
-            .checked_sub(started.elapsed())
-            .filter(|remaining| !remaining.is_zero())
-            .ok_or_else(|| "daemon response deadline elapsed".to_owned())?;
-        stream
-            .get_ref()
-            .set_read_timeout(Some(remaining))
-            .map_err(|_| "failed to configure daemon connection deadline".to_owned())?;
-        match stream.fill_buf() {
-            Ok([]) => return Err("daemon response frame is incomplete".to_owned()),
-            Ok(available) => {
-                let frame_end = available.iter().position(|byte| *byte == b'\n');
-                let consumed = frame_end.map_or(available.len(), |position| position + 1);
-                response.extend_from_slice(&available[..consumed]);
-                stream.consume(consumed);
-                // Checked against what has been buffered SO FAR, so an oversized
-                // frame is refused while it streams rather than after the CLI
-                // has already allocated all of it.
-                if response.len() > budget {
-                    return Err("daemon response frame is too large".to_owned());
-                }
-                if frame_end.is_some() {
-                    return String::from_utf8(response)
-                        .map_err(|_| "daemon returned an invalid response".to_owned());
-                }
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                return Err("daemon response deadline elapsed".to_owned());
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => return Err("failed to read daemon response".to_owned()),
-        }
-    }
-}
-
-fn read_response(
-    stream: &mut BufReader<UnixStream>,
-    deadline: Duration,
-    diagnostic_kind: Option<DiagnosticResponseKind>,
-) -> Result<Response, (u8, String)> {
-    let started = Instant::now();
-    let mut payload = String::new();
-    let mut expected_sequence = 0;
-    loop {
-        let remaining = deadline
-            .checked_sub(started.elapsed())
-            .filter(|remaining| !remaining.is_zero())
-            .ok_or_else(|| (1, "daemon response deadline elapsed".to_owned()))?;
-        // The remaining budget, not a fresh one per frame: a paged payload is
-        // one logical response, so the ceiling has to bound the accumulation
-        // across pages, not just each page in isolation.
-        let budget = MAX_RESPONSE_BYTES.saturating_sub(payload.len());
-        let frame =
-            read_response_frame(stream, remaining, budget).map_err(|message| (1, message))?;
-        let envelope: VersionEnvelope = serde_json::from_str(&frame)
-            .map_err(|_| (1, "daemon returned an invalid response".to_owned()))?;
-        if envelope.version != PROTOCOL_VERSION {
-            return Err((
-                5,
-                format!(
-                    "IPC protocol mismatch: daemon uses {}, CLI uses {}",
-                    envelope.version, PROTOCOL_VERSION
-                ),
-            ));
-        }
-        let mut response: Response = serde_json::from_str(&frame)
-            .map_err(|_| (1, "daemon returned an invalid response".to_owned()))?;
-        let Some(page) = response.diagnostic_page.take() else {
-            if expected_sequence == 0 {
-                return Ok(response);
-            }
-            return Err((
-                1,
-                "daemon returned an incomplete diagnostic response".to_owned(),
-            ));
-        };
-        let Some(kind) = diagnostic_kind else {
-            return Err((
-                1,
-                "daemon returned an unexpected diagnostic page".to_owned(),
-            ));
-        };
-        if page.sequence != expected_sequence {
-            return Err((
-                1,
-                "daemon returned diagnostic pages out of order".to_owned(),
-            ));
-        }
-        expected_sequence += 1;
-        payload.push_str(&page.payload);
-        if !page.last {
-            continue;
-        }
-        match kind {
-            DiagnosticResponseKind::History => {
-                response.history = Some(serde_json::from_str(&payload).map_err(|_| {
-                    (
-                        1,
-                        "daemon returned an invalid diagnostic history".to_owned(),
-                    )
-                })?);
-            }
-            DiagnosticResponseKind::Export => {
-                response.export =
-                    Some(serde_json::from_str(&payload).map_err(|_| {
-                        (1, "daemon returned an invalid diagnostic export".to_owned())
-                    })?);
-            }
-        }
-        return Ok(response);
-    }
-}
-
 fn parse_command() -> Result<CliAction, String> {
     let arguments: Vec<_> = std::env::args().skip(1).collect();
     match arguments.as_slice() {
@@ -1510,12 +554,22 @@ fn parse_command() -> Result<CliAction, String> {
         [command] if command == "toggle" => Ok(CliAction::Daemon(Command::Toggle)),
         [command] if command == "status" => Ok(CliAction::Daemon(Command::Status)),
         [command] if command == "shortcut" => Ok(CliAction::Daemon(Command::Shortcut)),
-        [command] if command == "history" => Ok(CliAction::History { json: false }),
-        [command, flag] if command == "history" && flag == "--json" => {
-            Ok(CliAction::History { json: true })
+        [command] if command == "history" => Ok(CliAction::History {
+            json: false,
+            verbose: false,
+        }),
+        [command, flag] if command == "history" && flag == "--json" => Ok(CliAction::History {
+            json: true,
+            verbose: false,
+        }),
+        [command, flag] if command == "history" && (flag == "--verbose" || flag == "-v") => {
+            Ok(CliAction::History {
+                json: false,
+                verbose: true,
+            })
         }
-        [command, correlation_id] if command == "export" => Ok(CliAction::Daemon(Command::Export(
-            ExportCorrelationId::new(correlation_id.clone()),
+        [command, recording_id] if command == "export" => Ok(CliAction::Daemon(Command::Export(
+            ExportCorrelationId::new(recording_id.clone()),
         ))),
         [command, path] if command == "replay" => Ok(CliAction::Replay {
             path: path.clone(),
@@ -1538,16 +592,18 @@ fn parse_command() -> Result<CliAction, String> {
             Ok(CliAction::Help)
         }
         [command] if command == "--version" || command == "-V" => Ok(CliAction::Version),
-        [auth, set, provider] if auth == "auth" && set == "set" => {
-            Ok(CliAction::AuthSet(parse_provider(provider)?))
+        [key, set, provider] if key == "key" && set == "set" => {
+            Ok(CliAction::KeySet(parse_provider(provider)?))
         }
-        [auth, verify, provider] if auth == "auth" && verify == "verify" => {
-            Ok(CliAction::AuthVerify(parse_provider(provider)?))
+        [key, check, provider] if key == "key" && check == "check" => {
+            Ok(CliAction::KeyCheck(parse_provider(provider)?))
         }
         [command, state] if command == "deepgram" => {
             Ok(CliAction::SetDeepgram(parse_toggle(state)?))
         }
-        [command, mode] if command == "mode" => Ok(CliAction::SetAsrMode(parse_asr_mode(mode)?)),
+        [command, engine] if command == "engine" => {
+            Ok(CliAction::SetAsrMode(parse_asr_mode(engine)?))
+        }
         [command] if command == "delivery" => Ok(CliAction::Delivery(None)),
         [command, mode] if command == "delivery" => {
             Ok(CliAction::Delivery(Some(parse_delivery_mode(mode)?)))
@@ -1556,9 +612,9 @@ fn parse_command() -> Result<CliAction, String> {
         [command, mode] if command == "writing" => {
             Ok(CliAction::Writing(Some(parse_writing_mode(mode)?)))
         }
-        [command] if command == "rendering" => Ok(CliAction::Rendering(None)),
-        [command, policy] if command == "rendering" => {
-            Ok(CliAction::Rendering(Some(parse_rendering_policy(policy)?)))
+        [command] if command == "layout" => Ok(CliAction::Layout(None)),
+        [command, layout] if command == "layout" => {
+            Ok(CliAction::Layout(Some(parse_layout(layout)?)))
         }
         [dictionary, action, term] if dictionary == "dictionary" && action == "add" => {
             Ok(CliAction::DictionaryAdd(term.clone()))
@@ -1606,7 +662,7 @@ fn parse_service_action(value: &str) -> Result<UserServiceAction, String> {
 }
 
 fn parse_asr_mode(value: &str) -> Result<AsrMode, String> {
-    AsrMode::parse(value).ok_or_else(|| "mode must be local or cloud".to_owned())
+    AsrMode::parse(value).ok_or_else(|| "engine must be local or cloud".to_owned())
 }
 
 fn parse_toggle(value: &str) -> Result<bool, String> {
@@ -1619,24 +675,23 @@ fn parse_toggle(value: &str) -> Result<bool, String> {
 
 fn parse_delivery_mode(value: &str) -> Result<DeliveryMode, String> {
     match value {
-        "type" => Ok(DeliveryMode::Type),
-        "clipboard" => Ok(DeliveryMode::Clipboard),
-        "guarded" => Ok(DeliveryMode::Guarded),
-        _ => Err("delivery mode must be type, clipboard, or guarded".to_owned()),
+        "paste" => Ok(DeliveryMode::Paste),
+        "copy" => Ok(DeliveryMode::Copy),
+        _ => Err("delivery must be paste or copy".to_owned()),
     }
 }
 
 fn parse_writing_mode(value: &str) -> Result<WritingMode, String> {
     match value {
-        "smart" => Ok(WritingMode::Smart),
-        "literal" => Ok(WritingMode::Literal),
-        _ => Err("writing mode must be smart or literal".to_owned()),
+        "clean" => Ok(WritingMode::Smart),
+        "exact" => Ok(WritingMode::Literal),
+        _ => Err("writing must be clean or exact".to_owned()),
     }
 }
 
-fn parse_rendering_policy(value: &str) -> Result<RenderingPolicy, String> {
-    RenderingPolicy::parse(value)
-        .ok_or_else(|| "rendering policy must be natural, adaptive, or structured".to_owned())
+fn parse_layout(value: &str) -> Result<RenderingPolicy, String> {
+    voisu_app::config::parse_layout(value)
+        .ok_or_else(|| "layout must be plain, auto, or sections".to_owned())
 }
 
 fn parse_provider(value: &str) -> Result<Provider, String> {
@@ -1649,36 +704,37 @@ fn parse_provider(value: &str) -> Result<Provider, String> {
 
 const USAGE: &str = "\
 usage: voisu <command> [args]
+       voisu                    open the interface (on a real terminal)
 
 commands:
-  setup
-  start
-  stop
-  toggle
-  status
-  shortcut
-  history [--json]
-  export <correlation-id>
-  replay [--json] <fixture-name>
-  doctor [--verbose|-v]
-  auth set <groq|deepgram>
-  auth verify <groq|deepgram>
-  deepgram <on|off>
-  mode <local|cloud>
-  delivery [type|clipboard|guarded]
-  writing [smart|literal]
-  rendering [natural|adaptive|structured]
-  dictionary add <term>
-  dictionary remove <term>
-  dictionary list [--json]
+  setup                         set up Voisu step by step
+  start                         start a Recording
+  stop                          stop the Recording and deliver the text
+  toggle                        start or stop a Recording
+  status                        show what Voisu is doing
+  shortcut                      show your Trigger Key
+  history [--json|--verbose]    list recent Recordings
+  export <recording-id>         print one Recording's details for a bug report
+  doctor [--verbose|-v]         check that everything works
+  key set <groq|deepgram>       save a key (reads it from standard input)
+  key check <groq|deepgram>     check that a saved key works
+  deepgram <on|off>             use Deepgram alongside Groq
+  engine <local|cloud>          transcribe on this computer or online
+  delivery [paste|copy]         paste the text for you, or only copy it
+  writing [clean|exact]         fix grammar and misheard words, or keep your words as spoken
+  layout [plain|auto|sections]  punctuation only, organize when you speak in parts, or add headings
+  dictionary add <term>         add a word Voisu should spell your way
+  dictionary remove <term>      remove a word
+  dictionary list [--json]      list your words
   service <install|start|stop|restart|status|uninstall>
-  local remove [--yes]
-  local-dev register|select|status|replay
+                                manage the Voisu service
+  local remove [--yes]          delete the Local model
   update [--check|--dry-run] [--switch-to-bin]
+                                update Voisu
 
 options:
-  -h, --help, help
-  -V, --version";
+  -h, --help, help              show this help
+  -V, --version                 show the version";
 
 fn usage() -> &'static str {
     USAGE

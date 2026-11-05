@@ -35,7 +35,7 @@ const INSTALL_DURATION_HINT: &str = "This can take several minutes.";
 const INSTALL_SUCCESS: &str = "Installed distil-large-v3.5-int8 (Consented Install).";
 const DAEMON_RESTARTED: &str = "Restarted the Voisu daemon; Local dictation is ready.";
 const CLOUD_PROMPT: &str = "Also set up Cloud?";
-const CLOUD_SKIPPED: &str = "Cloud skipped; setup will not ask again. To add Cloud later, run `voisu setup` and choose Cloud, or `voisu auth set groq`.";
+const CLOUD_SKIPPED: &str = "Cloud skipped; setup will not ask again. To add Cloud later, run `voisu setup` and choose Cloud, or `voisu key set groq`.";
 /// State file that remembers a No to the Cloud prompt. It lives in the state
 /// directory, not the user config: it records what setup already asked, not a
 /// setting the user tunes.
@@ -43,7 +43,7 @@ pub const CLOUD_DECLINED_MARKER: &str = "setup-cloud-declined";
 const BUILDING_RUNTIME: &str = "Building runtime…";
 const CHECKING_GPU: &str = "Checking GPU…";
 const INSTALL_RETRY: &str =
-    "Run `voisu setup` to retry or `voisu mode cloud` to dictate with Cloud.";
+    "Run `voisu setup` to retry or `voisu engine cloud` to dictate with Cloud.";
 const REMOVE_CONFIRM: &str = "Remove the installed Consented model?";
 const REMOVE_USAGE: &str = "usage: voisu local remove [--yes]";
 pub const REMOVE_REQUIRES_YES: &str = "Non-interactive `voisu local remove` requires `--yes`.";
@@ -515,7 +515,7 @@ pub fn local_complete_message(verified_consented: bool, development_pilot: bool)
     if verified_consented || development_pilot {
         SETUP_COMPLETE_MESSAGE.to_owned()
     } else {
-        format!("{LOCAL_UNAVAILABLE}\nRun `voisu mode cloud` to dictate with Cloud.")
+        format!("{LOCAL_UNAVAILABLE}\nRun `voisu engine cloud` to dictate with Cloud.")
     }
 }
 
@@ -644,6 +644,15 @@ pub fn production_local_complete_message() -> String {
 
 /// Fetches and installs only when the setup offer calls this after an explicit yes.
 pub fn production_install(consent: ConsentedConsent) -> Result<(), ConsentedError> {
+    production_install_with(consent, |total| Box::new(TerminalProgress::stdout(total)))
+}
+
+/// [`production_install`], reporting to whatever `progress` builds from the
+/// entry's total download size.
+pub fn production_install_with(
+    consent: ConsentedConsent,
+    progress: impl FnOnce(u64) -> Box<dyn InstallProgress>,
+) -> Result<(), ConsentedError> {
     let models =
         models_dir_from_state(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
             .map_err(ConsentedError::Store)?;
@@ -660,7 +669,7 @@ pub fn production_install(consent: ConsentedConsent) -> Result<(), ConsentedErro
         .ok_or(ConsentedError::Consent)?;
     let health = ConsentedWorkerHealth::for_entry(state, entry);
     let maintenance = SetupMaintenance::default();
-    let progress = TerminalProgress::stdout(entry.total_download_bytes);
+    let progress = progress(entry.total_download_bytes);
     crate::local_model::install_consented_install(ConsentedInstallRequest {
         store: &store,
         consent,
@@ -670,7 +679,7 @@ pub fn production_install(consent: ConsentedConsent) -> Result<(), ConsentedErro
         maintenance: &maintenance,
         io: InstallIo::default(),
         clock: InstallClock::default(),
-        progress: &progress,
+        progress: &*progress,
     })
     .map(|_| ())
 }
@@ -1520,7 +1529,7 @@ mod tests {
         assert_eq!(local_complete_message(false, true), SETUP_COMPLETE_MESSAGE);
         assert_eq!(
             local_complete_message(false, false),
-            format!("{LOCAL_UNAVAILABLE}\nRun `voisu mode cloud` to dictate with Cloud.")
+            format!("{LOCAL_UNAVAILABLE}\nRun `voisu engine cloud` to dictate with Cloud.")
         );
     }
 

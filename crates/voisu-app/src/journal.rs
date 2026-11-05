@@ -22,15 +22,11 @@
 //! deprecated `release_to_text_ms` (measured from recording start), so latency
 //! percentiles computed over them are comparable across dictation lengths.
 
-use voisu_core::{LifecycleEvidence, Provider};
+use voisu_core::{DeliveryMethod, LifecycleEvidence, Provider};
 
 /// Rendered in place of any value the Recording did not measure. A key is never
 /// dropped: a parser that splits on `key=value` sees a stable key set.
 pub const ABSENT: &str = "-";
-
-/// The fixed message of a successful Recording's journal line. The failure path
-/// carries the boundary diagnostic here instead.
-pub const DELIVERED_MESSAGE: &str = "delivered";
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct RecordingJournalLines {
@@ -46,7 +42,12 @@ pub fn recording_journal_lines(
 ) -> RecordingJournalLines {
     let (message, outcome) = match diagnostic {
         Some(diagnostic) => (diagnostic, "error"),
-        None => (DELIVERED_MESSAGE, "ok"),
+        // A successful Recording says what reached the user. The failure path
+        // carries the boundary diagnostic here instead.
+        None => match evidence.delivery_method {
+            Some(DeliveryMethod::ClipboardFallback) => ("copied", "ok"),
+            _ => ("pasted", "ok"),
+        },
     };
     RecordingJournalLines {
         human: format!(
@@ -237,7 +238,7 @@ mod tests {
     #[test]
     fn a_delivered_recording_renders_human_and_structured_lines() {
         let lines = recording_journal_lines(7, &evidence(), None);
-        assert_eq!(lines.human, "Recording 7: delivered");
+        assert_eq!(lines.human, "Recording 7: pasted");
         assert_eq!(
             lines.structured,
             "Recording 7: outcome=ok correlation_id=rec-4242-7-1700000000000 \

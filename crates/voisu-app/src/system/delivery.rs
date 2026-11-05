@@ -173,6 +173,12 @@ pub struct PortalClipboardDelivery {
     background_setup: bool,
 }
 
+/// Why a Transcript is on the clipboard when Delivery is set to copy. The daemon
+/// matches on this to say "Copied" rather than explain a failed paste.
+pub const COPY_MODE_REASON: &str = "Delivery is set to copy";
+
+const NO_PASTE_SHORTCUT_REASON: &str = "no paste shortcut found in your Hyprland config";
+
 const REMOTE_DESKTOP_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
 /// A paste session is separate from the normal text Delivery session. The
@@ -272,7 +278,7 @@ impl PasteBoundary for PortalPasteAction {
             if expected != requested {
                 return Err(BoundaryError::new(
                     BoundaryKind::Delivery,
-                    "verified Paste Action changed during Delivery",
+                    "your paste shortcut changed in your Hyprland config",
                 ));
             }
             if let Some(reason) = self.terminal_failure.clone() {
@@ -288,20 +294,23 @@ impl PasteBoundary for PortalPasteAction {
                 if live_action.as_ref() != Some(&requested) {
                     return Err(BoundaryError::new(
                         BoundaryKind::Delivery,
-                        "verified Paste Action is no longer active",
+                        "your paste shortcut changed in your Hyprland config",
                     ));
                 }
             }
             if self.session.is_none() {
                 self.begin_paste_setup();
                 let setup = self.setup.take().ok_or_else(|| {
-                    BoundaryError::new(BoundaryKind::Delivery, "Paste portal unavailable")
+                    BoundaryError::new(
+                        BoundaryKind::Delivery,
+                        "this desktop doesn't let apps paste for you",
+                    )
                 })?;
                 if !setup.is_finished() {
                     self.setup = Some(setup);
                     return Err(BoundaryError::new(
                         BoundaryKind::Delivery,
-                        "Paste portal permission request pending",
+                        "waiting for you to allow keyboard control",
                     ));
                 }
                 match setup.await {
@@ -315,7 +324,7 @@ impl PasteBoundary for PortalPasteAction {
                         return Err(error);
                     }
                     Err(_) => {
-                        let reason = "Paste portal setup unavailable".to_owned();
+                        let reason = "this desktop doesn't let apps paste for you".to_owned();
                         self.terminal_failure = Some(reason.clone());
                         return Err(BoundaryError::new(BoundaryKind::Delivery, reason));
                     }
@@ -374,7 +383,10 @@ impl HyprlandKeyEmitter for HyprctlKeyEmitter {
         run_restricted_stdout("hyprctl", &["eval", &lua])
             .map(|_| ())
             .ok_or_else(|| {
-                BoundaryError::new(BoundaryKind::Delivery, "Hyprland send_key_state failed")
+                BoundaryError::new(
+                    BoundaryKind::Delivery,
+                    "Hyprland didn't press your paste shortcut",
+                )
             })
     }
 }
@@ -383,8 +395,12 @@ struct HyprctlActiveWindow;
 
 impl HyprlandActiveWindow for HyprctlActiveWindow {
     fn active_window_json(&mut self) -> Result<Vec<u8>, BoundaryError> {
-        run_restricted_stdout("hyprctl", &["activewindow", "-j"])
-            .ok_or_else(|| BoundaryError::new(BoundaryKind::Delivery, "active window unavailable"))
+        run_restricted_stdout("hyprctl", &["activewindow", "-j"]).ok_or_else(|| {
+            BoundaryError::new(
+                BoundaryKind::Delivery,
+                "couldn't check which window has focus",
+            )
+        })
     }
 }
 
@@ -396,8 +412,12 @@ fn send_key_state_lua(mods: &str, key: &str, down: bool) -> String {
 }
 
 fn classify_hyprland_active_window(payload: &[u8]) -> Result<bool, BoundaryError> {
-    let window: serde_json::Value = serde_json::from_slice(payload)
-        .map_err(|_| BoundaryError::new(BoundaryKind::Delivery, "active window unavailable"))?;
+    let window: serde_json::Value = serde_json::from_slice(payload).map_err(|_| {
+        BoundaryError::new(
+            BoundaryKind::Delivery,
+            "couldn't check which window has focus",
+        )
+    })?;
     let address = window
         .get("address")
         .and_then(serde_json::Value::as_str)
@@ -464,7 +484,10 @@ impl HyprlandPasteAction {
         })
         .await
         .map_err(|_| {
-            BoundaryError::new(BoundaryKind::Delivery, "Hyprland send_key_state failed")
+            BoundaryError::new(
+                BoundaryKind::Delivery,
+                "Hyprland didn't press your paste shortcut",
+            )
         })?;
         if let Err(error) = down {
             self.emitter = emitter;
@@ -524,7 +547,7 @@ impl HyprlandPasteAction {
                 pending.pending = false;
                 Err(BoundaryError::new(
                     BoundaryKind::Delivery,
-                    "Hyprland send_key_state failed",
+                    "Hyprland didn't press your paste shortcut",
                 ))
             }
         }
@@ -537,7 +560,12 @@ impl HyprlandPasteAction {
             (window, result)
         })
         .await
-        .map_err(|_| BoundaryError::new(BoundaryKind::Delivery, "active window unavailable"))?;
+        .map_err(|_| {
+            BoundaryError::new(
+                BoundaryKind::Delivery,
+                "couldn't check which window has focus",
+            )
+        })?;
         self.window = window;
         result
     }
@@ -551,7 +579,7 @@ impl PasteBoundary for HyprlandPasteAction {
             if expected != requested {
                 return Err(BoundaryError::new(
                     BoundaryKind::Delivery,
-                    "verified Paste Action changed during Delivery",
+                    "your paste shortcut changed in your Hyprland config",
                 ));
             }
             if let Some(verifier) = self.live_action_verifier.clone() {
@@ -562,7 +590,7 @@ impl PasteBoundary for HyprlandPasteAction {
                 if live_action.as_ref() != Some(&requested) {
                     return Err(BoundaryError::new(
                         BoundaryKind::Delivery,
-                        "verified Paste Action is no longer active",
+                        "your paste shortcut changed in your Hyprland config",
                     ));
                 }
             }
@@ -583,7 +611,7 @@ impl PasteBoundary for HyprlandPasteAction {
                 .ok_or_else(|| {
                     BoundaryError::new(
                         BoundaryKind::Delivery,
-                        "verified Paste Action shortcut cannot be emitted safely",
+                        "your paste shortcut can't be pressed safely",
                     )
                 })?;
             self.emit_chord(&mods, &key).await
@@ -602,8 +630,7 @@ impl PortalClipboardDelivery {
             paste: None,
             paste_action: None,
             direct_enabled: true,
-            clipboard_fallback_reason:
-                "no verified Hyprland Paste Action; Transcript remains on the clipboard".to_owned(),
+            clipboard_fallback_reason: NO_PASTE_SHORTCUT_REASON.to_owned(),
             session: None,
             setup: None,
             setup_failure: None,
@@ -630,10 +657,7 @@ impl PortalClipboardDelivery {
     }
 
     pub fn clipboard_only_with_boundary(clipboard: Box<dyn ClipboardBoundary>) -> Self {
-        Self::clipboard_only_with_reason(
-            clipboard,
-            "no verified Hyprland Paste Action; Transcript remains on the clipboard",
-        )
+        Self::clipboard_only_with_reason(clipboard, NO_PASTE_SHORTCUT_REASON)
     }
 
     pub fn clipboard_only_with_reason(
@@ -674,10 +698,9 @@ impl DeliveryAdapter for PortalClipboardDelivery {
                 match paste.invoke(&action).await {
                     Ok(()) => return Ok(DeliveryOutcome::compositor_submitted()),
                     Err(error) => {
-                        return Ok(DeliveryOutcome::clipboard_fallback(format!(
-                            "Paste Action failed; Transcript remains on the clipboard: {}",
-                            error.diagnostic()
-                        )));
+                        return Ok(DeliveryOutcome::clipboard_fallback(
+                            error.diagnostic().to_owned(),
+                        ));
                     }
                 }
             }
@@ -718,14 +741,14 @@ impl DeliveryAdapter for PortalClipboardDelivery {
                             }
                             Err(_) => {
                                 return Ok(DeliveryOutcome::clipboard_fallback(
-                                    "RemoteDesktop setup unavailable",
+                                    "this desktop doesn't let apps paste for you",
                                 ));
                             }
                         }
                     } else {
                         self.setup = Some(setup);
                         return Ok(DeliveryOutcome::clipboard_fallback(
-                            "RemoteDesktop permission request pending",
+                            "waiting for you to allow keyboard control",
                         ));
                     }
                 } else {
@@ -1172,8 +1195,7 @@ impl Default for PortalClipboardDelivery {
             paste: None,
             paste_action: None,
             direct_enabled: true,
-            clipboard_fallback_reason:
-                "no verified Hyprland Paste Action; Transcript remains on the clipboard".to_owned(),
+            clipboard_fallback_reason: NO_PASTE_SHORTCUT_REASON.to_owned(),
             session: None,
             setup: Some(spawn_remote_desktop_setup()),
             setup_failure: None,

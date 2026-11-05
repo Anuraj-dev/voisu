@@ -1145,18 +1145,19 @@ fn all_three_policies_persist_via_cli() {
             .output()
             .expect("run voisu CLI")
     };
-    for policy in ["natural", "adaptive", "structured"] {
-        let set = run(&["rendering", policy]);
+    for policy in ["plain", "auto", "sections"] {
+        let set = run(&["layout", policy]);
         assert!(
             set.status.success(),
             "set {policy}: {}",
             String::from_utf8_lossy(&set.stderr)
         );
-        let query = run(&["rendering"]);
+        let query = run(&["layout"]);
         assert!(query.status.success(), "query {policy}");
-        assert_eq!(
-            String::from_utf8_lossy(&query.stdout).trim(),
-            format!("rendering policy: {policy}")
+        let shown = String::from_utf8_lossy(&query.stdout);
+        assert!(
+            shown.starts_with(&format!("Layout: {policy} (")),
+            "query {policy}: {shown}"
         );
     }
 }

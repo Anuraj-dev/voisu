@@ -133,7 +133,7 @@ fn ipc(path: &Path, frame: &str) -> serde_json::Value {
 #[test]
 fn invalid_mode_argument_exits_two() {
     let harness = Harness::new();
-    let output = harness.voisu(&["mode", "hybrid"]);
+    let output = harness.voisu(&["engine", "hybrid"]);
     assert_eq!(output.status.code(), Some(2), "{output:?}");
     assert!(stderr(&output).contains("local or cloud"), "{output:?}");
     assert!(!harness.config_file().exists());
@@ -143,9 +143,9 @@ fn invalid_mode_argument_exits_two() {
 fn matching_cli_and_daemon_set_cloud_and_keep_local_unavailable() {
     let harness = Harness::new();
     let _daemon = harness.start_daemon();
-    let set = harness.voisu(&["mode", "cloud"]);
+    let set = harness.voisu(&["engine", "cloud"]);
     assert!(set.status.success(), "{}", stderr(&set));
-    assert!(stdout(&set).contains("cloud"), "{}", stdout(&set));
+    assert!(stdout(&set).contains("Cloud"), "{}", stdout(&set));
 
     let status = ipc(&harness.socket(), r#"{"version":1,"command":"status"}"#);
     assert!(
@@ -165,9 +165,8 @@ fn matching_cli_and_daemon_set_cloud_and_keep_local_unavailable() {
     assert!(printed.status.success(), "{}", stderr(&printed));
     let printed = stdout(&printed);
     assert!(printed.starts_with("Recording\n"), "{printed}");
-    assert!(printed.contains("asr mode pending: cloud"), "{printed}");
-    assert!(printed.contains("asr mode active: cloud"), "{printed}");
-    assert!(printed.contains("local readiness: absent"), "{printed}");
+    assert!(printed.contains("Engine: Cloud\n"), "{printed}");
+    assert!(printed.contains("Local model: not installed"), "{printed}");
     let _ = harness.voisu(&["stop"]);
 }
 
@@ -175,7 +174,7 @@ fn matching_cli_and_daemon_set_cloud_and_keep_local_unavailable() {
 fn local_mode_refuses_start_before_capture() {
     let harness = Harness::new();
     let _daemon = harness.start_daemon();
-    let set = harness.voisu(&["mode", "local"]);
+    let set = harness.voisu(&["engine", "local"]);
     assert!(set.status.success(), "{}", stderr(&set));
 
     let status = ipc(&harness.socket(), r#"{"version":1,"command":"status"}"#);
@@ -201,9 +200,9 @@ fn local_mode_refuses_start_before_capture() {
     );
     let printed = harness.voisu(&["status"]);
     let printed = stdout(&printed);
-    assert!(printed.contains("asr mode pending: local"), "{printed}");
+    assert!(printed.contains("Engine: Local\n"), "{printed}");
     assert!(
-        printed.contains("local readiness: unavailable (Local selected; model unavailable)"),
+        printed.contains("Local model: can't load (Local selected; model unavailable)"),
         "{printed}"
     );
 }
@@ -253,7 +252,7 @@ fn stop_is_answered_while_start_admission_waits_on_config_lock() {
 fn local_mode_refuses_replay_before_capture() {
     let harness = Harness::new();
     let _daemon = harness.start_daemon();
-    assert!(harness.voisu(&["mode", "local"]).status.success());
+    assert!(harness.voisu(&["engine", "local"]).status.success());
     let replayed = harness.voisu(&["replay", "missing.wav"]);
     assert_eq!(replayed.status.code(), Some(4), "{replayed:?}");
     assert!(
@@ -268,7 +267,7 @@ fn mode_change_during_recording_keeps_active_cloud_and_pending_local() {
     let harness = Harness::new();
     let _daemon = harness.start_daemon();
     assert!(harness.voisu(&["start"]).status.success());
-    let set = harness.voisu(&["mode", "local"]);
+    let set = harness.voisu(&["engine", "local"]);
     assert!(set.status.success(), "{}", stderr(&set));
     let status = ipc(&harness.socket(), r#"{"version":1,"command":"status"}"#);
     assert_eq!(status["state"], "recording");
@@ -276,8 +275,10 @@ fn mode_change_during_recording_keeps_active_cloud_and_pending_local() {
     assert_eq!(status["asr_mode"]["active"], "cloud");
     let printed = stdout(&harness.voisu(&["status"]));
     assert!(printed.starts_with("Recording\n"), "{printed}");
-    assert!(printed.contains("asr mode pending: local"), "{printed}");
-    assert!(printed.contains("asr mode active: cloud"), "{printed}");
+    assert!(
+        printed.contains("Engine: Local (starts with your next Recording)"),
+        "{printed}"
+    );
     let _ = harness.voisu(&["stop"]);
 }
 
@@ -307,11 +308,11 @@ fn new_cli_old_daemon_is_unsupported_and_leaves_config_untouched() {
         stream.write_all(b"\n").unwrap();
     });
 
-    let output = harness.voisu(&["mode", "local"]);
+    let output = harness.voisu(&["engine", "local"]);
     server.join().unwrap();
     assert_eq!(output.status.code(), Some(3), "{output:?}");
     assert!(
-        stderr(&output).contains("does not support ASR mode"),
+        stderr(&output).contains("too old to switch engines"),
         "{}",
         stderr(&output)
     );
@@ -331,10 +332,10 @@ fn old_client_status_on_new_daemon_stays_readable() {
 #[test]
 fn offline_mode_persists_when_the_lifetime_lock_is_free() {
     let harness = Harness::new();
-    let output = harness.voisu(&["mode", "local"]);
+    let output = harness.voisu(&["engine", "local"]);
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(
-        stdout(&output).contains("next supported daemon start"),
+        stdout(&output).contains("when Voisu next starts"),
         "{}",
         stdout(&output)
     );
@@ -368,7 +369,7 @@ fn held_lock_without_socket_does_not_persist_mode() {
             0
         );
     }
-    let output = harness.voisu(&["mode", "local"]);
+    let output = harness.voisu(&["engine", "local"]);
     assert_eq!(output.status.code(), Some(3), "{output:?}");
     assert!(!harness.config_file().exists());
     drop(lock);
@@ -377,7 +378,7 @@ fn held_lock_without_socket_does_not_persist_mode() {
 #[test]
 fn deleting_mode_after_explicit_local_never_admits_cloud() {
     let harness = Harness::new();
-    assert!(harness.voisu(&["mode", "local"]).status.success());
+    assert!(harness.voisu(&["engine", "local"]).status.success());
     fs::remove_file(harness.config_file()).unwrap();
     let _daemon = harness.start_daemon();
     let started = harness.voisu(&["start"]);

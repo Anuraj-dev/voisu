@@ -119,8 +119,8 @@ mod product_unavailable_tests {
             "L3 keeps catalog/installer out of voisu.rs"
         );
         assert!(
-            cli.contains("mode <local|cloud>"),
-            "L1 mode command remains the CLI call site"
+            cli.contains("engine <local|cloud>"),
+            "L1 engine command remains the CLI call site"
         );
     }
 }

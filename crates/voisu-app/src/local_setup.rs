@@ -146,9 +146,7 @@ pub fn run_with(
     actions: &mut dyn LocalSetupActions,
 ) -> Result<LocalSetupOutcome, String> {
     io.writeln("Voisu Local Setup: model status and retained-model repair.");
-    io.writeln(
-        "Cloud credential-maintenance is `voisu auth verify` and is never run from Local setup.",
-    );
+    io.writeln("To check your Cloud keys online, run `voisu key check`; Local setup never does.");
     io.writeln("Production model downloads are evidence-gated. Nothing is auto-downloaded.");
     io.writeln("");
     match pilot_candidate(&shipped_catalog()) {
@@ -410,7 +408,7 @@ mod tests {
         assert!(actions.installed_consent.is_none());
         assert!(!actions.restored);
         let transcript = io.transcript();
-        assert!(transcript.contains("never run from Local setup"));
+        assert!(transcript.contains("Local setup never does"));
         assert!(transcript.contains("Nothing is auto-downloaded"));
         assert!(transcript.contains("Pilot Candidate"));
         assert!(transcript.contains("unmeasured candidate"));
@@ -545,7 +543,7 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(error, NO_PRODUCTION_DOWNLOAD);
-        assert!(CLOUD_CREDENTIAL_MAINTENANCE.contains("Cloud credential-maintenance"));
+        assert!(CLOUD_CREDENTIAL_MAINTENANCE.contains("Checking your key online"));
     }
 
     #[test]
