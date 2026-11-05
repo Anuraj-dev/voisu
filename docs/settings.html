@@ -118,20 +118,30 @@
 </table>
 </div>
 
+<h2 id="linux-interface">Linux: the <code>voisu</code> interface</h2>
+<p>Run <code>voisu</code> in a terminal to open Voisu's interface. It works with the keyboard: <kbd>←</kbd>&nbsp;<kbd>→</kbd> switch tabs, <kbd>↑</kbd>&nbsp;<kbd>↓</kbd> move, <kbd>Enter</kbd> acts, <kbd>?</kbd> lists every key, <kbd>q</kbd> quits.</p>
+<ul>
+  <li><strong>Home</strong> shows whether Voisu is ready to dictate. If something is wrong, it names the problem and the one key that fixes it. <kbd>d</kbd> shows every check.</li>
+  <li><strong>Settings</strong> changes Engine, Delivery, Writing, Layout, Deepgram and your keys, with a short guide to each choice. When a change needs Voisu to restart, it offers the restart.</li>
+  <li><strong>Dictionary</strong> holds names and terms Voisu should spell your way.</li>
+  <li><strong>History</strong> lists recent Recordings. <kbd>c</kbd> copies one.</li>
+</ul>
+<p>If Voisu isn't set up yet, <code>voisu</code> opens straight on setup. <code>voisu setup</code> opens the same screens any time.</p>
+
 <h2 id="linux">Linux commands</h2>
-<p>Run <code>voisu setup</code> again any time to redo the guided setup. Individual settings:</p>
+<p>Every setting is also a command, for scripts and agents. Run <code>voisu setup</code> again any time to redo the guided setup. Individual settings:</p>
 <div class="table-scroll">
 <table>
   <thead><tr><th>Command</th><th>What it does</th></tr></thead>
   <tbody>
     <tr><td data-label="Command"><code>voisu shortcut</code></td><td data-label="What it does">Shows the Trigger Key your desktop approved.</td></tr>
-    <tr><td data-label="Command"><code>voisu delivery [type|clipboard|guarded]</code></td><td data-label="What it does">Shows or sets the Delivery mode. See <a href="using.html#delivery">Where the text goes</a>.</td></tr>
-    <tr><td data-label="Command"><code>voisu writing [smart|literal]</code></td><td data-label="What it does"><code>smart</code> tidies and formats what you said. <code>literal</code> keeps your wording as spoken.</td></tr>
-    <tr><td data-label="Command"><code>voisu rendering [natural|adaptive|structured]</code></td><td data-label="What it does">How much layout Voisu adds. <code>natural</code> keeps prose; <code>adaptive</code> may lay out lists and sections when your speech calls for it; <code>structured</code> always tries to.</td></tr>
+    <tr><td data-label="Command"><code>voisu delivery [paste|copy]</code></td><td data-label="What it does">Paste the text for you, or only copy it. See <a href="using.html#delivery">Where the text goes</a>.</td></tr>
+    <tr><td data-label="Command"><code>voisu writing [clean|exact]</code></td><td data-label="What it does"><code>clean</code> fixes grammar and misheard words. <code>exact</code> keeps your words as spoken.</td></tr>
+    <tr><td data-label="Command"><code>voisu layout [plain|auto|sections]</code></td><td data-label="What it does">How much layout Voisu adds. <code>plain</code> adds punctuation only; <code>auto</code> organizes your text when you speak in parts; <code>sections</code> adds headings.</td></tr>
     <tr><td data-label="Command"><code>voisu deepgram [on|off]</code></td><td data-label="What it does">Turns Deepgram streaming on or off.</td></tr>
-    <tr><td data-label="Command"><code>voisu mode [cloud|local]</code></td><td data-label="What it does">Switches between the cloud providers and a local model you've installed.</td></tr>
+    <tr><td data-label="Command"><code>voisu engine [cloud|local]</code></td><td data-label="What it does">Transcribe online with Cloud, or on this computer with a Local model you've installed.</td></tr>
     <tr><td data-label="Command"><code>voisu dictionary add &lt;term&gt;</code></td><td data-label="What it does">Adds a name or term to your personal dictionary. <code>remove</code> and <code>list</code> manage it.</td></tr>
-    <tr><td data-label="Command"><code>voisu auth set &lt;groq|deepgram&gt;</code></td><td data-label="What it does">Stores a provider key, read from standard input. <code>auth verify</code> checks it.</td></tr>
+    <tr><td data-label="Command"><code>voisu key set &lt;groq|deepgram&gt;</code></td><td data-label="What it does">Saves a provider key, read from standard input. <code>key check</code> checks it.</td></tr>
   </tbody>
 </table>
 </div>

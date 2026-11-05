@@ -122,18 +122,17 @@
 
 <h2 id="delivery">Where the text goes</h2>
 <p><strong>Windows.</strong> Voisu pastes into the window that had focus when you <em>started</em> the Recording, even if you clicked somewhere else while talking. It then puts your previous clipboard back. Terminals get the paste shortcut they expect: <kbd>Ctrl</kbd>&nbsp;<kbd>Shift</kbd>&nbsp;<kbd>V</kbd> for Windows Terminal, Alacritty and WezTerm, <kbd>Shift</kbd>&nbsp;<kbd>Insert</kbd> for the classic console, PuTTY, Git Bash and ConEmu. Voisu's paste is kept out of Windows clipboard history (<kbd>Win</kbd>&nbsp;<kbd>V</kbd>).</p>
-<p><strong>Linux.</strong> How the Transcript arrives depends on the Delivery mode, which <code>voisu setup</code> picks for your desktop:</p>
+<p><strong>Linux.</strong> Voisu always puts the Transcript on the clipboard first. The Delivery setting decides what happens next:</p>
 <div class="table-scroll">
 <table>
-  <thead><tr><th>Mode</th><th>Behaviour</th></tr></thead>
+  <thead><tr><th>Delivery</th><th>Behaviour</th></tr></thead>
   <tbody>
-    <tr><td data-label="Mode"><code>type</code></td><td data-label="Behaviour">Puts the Transcript on the clipboard and pastes it into the focused window through the desktop's RemoteDesktop portal.</td></tr>
-    <tr><td data-label="Mode"><code>clipboard</code></td><td data-label="Behaviour">Used on Hyprland: puts the Transcript on the clipboard, then asks Hyprland to press a verified paste shortcut.</td></tr>
-    <tr><td data-label="Mode"><code>guarded</code></td><td data-label="Behaviour">Pastes only when Voisu can confirm which window has focus. Where it can't (GNOME), the Transcript stays on the clipboard for you to paste.</td></tr>
+    <tr><td data-label="Delivery"><code>paste</code></td><td data-label="Behaviour">The default. Voisu pastes into the window you're typing in. On Hyprland it presses your paste shortcut; on KDE Plasma and GNOME it goes through the desktop's RemoteDesktop permission, which your desktop asks for once.</td></tr>
+    <tr><td data-label="Delivery"><code>copy</code></td><td data-label="Behaviour">Voisu only copies. You paste with <kbd>Ctrl</kbd>&nbsp;<kbd>V</kbd> wherever you like.</td></tr>
   </tbody>
 </table>
 </div>
-<p>Change it with <code>voisu delivery type</code>, <code>voisu delivery clipboard</code> or <code>voisu delivery guarded</code>.</p>
+<p>Change it in the <strong>Settings</strong> tab of <code>voisu</code>, or with <code>voisu delivery paste</code> or <code>voisu delivery copy</code>. Settings saved by older versions (<code>type</code>, <code>clipboard</code>, <code>guarded</code>) keep working.</p>
 <p>On Windows, turn off <strong>Paste automatically</strong> in <a href="settings.html#windows">Settings</a> to have Voisu only put the Transcript on your clipboard, without pressing any keys for you.</p>
 
 <h2 id="last">Your last Transcript</h2>

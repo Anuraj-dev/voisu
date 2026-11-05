@@ -9,7 +9,7 @@ Install Voisu on the user's computer, start it, and hand over to the user at the
 ## Rules for the agent
 
 1. **Never ask for API keys in the chat.** Do not request, accept, read, print, log, or store the user's Deepgram or Groq keys. Do not pass them as command arguments, environment variables or files. The user types them into Voisu's own prompt: `voisu setup` in their own terminal on Linux, or the Voisu settings window on Windows. If the user pastes a key into the chat anyway, don't use it. Tell them to revoke it in the provider's console and create a new one.
-2. **Don't run `voisu setup` yourself.** It is an interactive wizard that needs a real terminal for masked key entry. Ask the user to run it in a terminal window of their own, not through you.
+2. **Don't run `voisu setup` yourself.** It opens full-screen setup screens that need a real terminal for hidden key entry. Ask the user to run it in a terminal window of their own, not through you.
 3. **Show before you run.** Before each `sudo` command, show it and say why it's needed. If `sudo` can't prompt for a password in your shell, ask the user to run that exact command in their own terminal, then carry on.
 4. **Stop at every "HUMAN" step.** Tell the user exactly what to do, wait until they say it's done, then verify.
 5. **Use only the commands in this file.** Don't edit desktop config files by hand, install other key remappers, or give Voisu root or `uinput` access. Voisu never needs them.
@@ -123,7 +123,7 @@ voisu doctor
 ```
 
 - `voisu shortcut` shows the Trigger Key the desktop approved.
-- `voisu doctor` checks the daemon, portals, Delivery, clipboard and keys, and says what to do about anything that fails. Use `voisu doctor --verbose` for the reasoning behind each check. On GNOME, *Paste action* and *Paste backend* show SKIP and *Focus guard* shows WARN; that is expected.
+- `voisu doctor` checks the daemon, portals, Delivery, clipboard and keys, and says what to do about anything that fails. Use `voisu doctor --verbose` for the reasoning behind each check. The non-interactive commands (`voisu status`, `voisu shortcut`, `voisu delivery`, `voisu engine`, `voisu history --verbose`) and `journalctl --user -u voisu.service` are safe for you to run when diagnosing a problem. Bare `voisu` opens a full-screen interface meant for the user; don't run it yourself.
 - If the service isn't active, run `voisu service install` and then `voisu service start`. If it still fails, read `journalctl --user -u voisu.service`.
 
 **HUMAN: first Recording.** Ask the user to click into a text field, press the Trigger Key, say a sentence, and press it again. The Transcript should appear at the cursor. Ask them to confirm.

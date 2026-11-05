@@ -78,7 +78,7 @@
 <p class="lead">Most problems are one of a handful of things: the paste couldn't land, the desktop hasn't granted a permission, or a key or microphone isn't set up. Start with the message the capsule showed you.</p>
 
 <div class="callout tip">
-  <p><strong>On Linux, run <code>voisu doctor</code> first.</strong> It checks the daemon, the shortcut and RemoteDesktop portals, the clipboard and your keys, and tells you what to do about anything that fails. <code>voisu doctor --verbose</code> shows the reasoning behind each check.</p>
+  <p><strong>On Linux, open <code>voisu</code> or run <code>voisu doctor</code> first.</strong> It checks the daemon, the shortcut and RemoteDesktop portals, the clipboard and your keys, and tells you what to do about anything that fails. <code>voisu doctor --verbose</code> shows the reasoning behind each check.</p>
 </div>
 
 <nav class="toc" aria-label="On this page">
@@ -113,7 +113,7 @@
 <p>On Wayland, Voisu asks the desktop for permission through portals instead of reading your keyboard directly. It never needs root or <code>uinput</code> access.</p>
 <ul>
   <li><strong>Global Shortcuts</strong> gives Voisu its Trigger Key.</li>
-  <li><strong>Remote Desktop</strong> lets Voisu press paste for you in <code>type</code> mode. Your desktop asks once and Voisu remembers the grant.</li>
+  <li><strong>Remote Desktop</strong> lets Voisu press paste for you when Delivery is <code>paste</code>. Your desktop asks once and Voisu remembers the grant.</li>
 </ul>
 <p>If you refused the Remote Desktop prompt, or want to be asked again, reset the grant Voisu saved:</p>
 <div class="code"><pre><span class="p">$ </span>rm ~/.local/state/voisu/remote-desktop.restore-token
@@ -151,7 +151,7 @@
 </div>
 <p>Use <strong>Test paste (in 3 s)</strong> in the tray to check one app on its own: click into it within three seconds and watch whether the sample text appears.</p>
 <p><strong>Linux terminals.</strong> On GNOME, Voisu pastes by sending <kbd>Ctrl</kbd>&nbsp;<kbd>V</kbd>. A terminal that pastes with <kbd>Ctrl</kbd>&nbsp;<kbd>Shift</kbd>&nbsp;<kbd>V</kbd> receives nothing, but the Transcript is on the clipboard, so paste it yourself.</p>
-<p><strong>Linux, GNOME in <code>guarded</code> mode.</strong> GNOME doesn't let Voisu confirm which window has focus, so guarded Delivery leaves the Transcript on the clipboard on purpose. Switch with <code>voisu delivery type</code> if you'd rather it paste into whatever has focus.</p>
+<p><strong>Linux, GNOME.</strong> GNOME doesn't let Voisu check which window has focus, so <code>paste</code> lands in whatever window has focus when you stop. To paste by hand instead, switch with <code>voisu delivery copy</code>.</p>
 
 <h2 id="admin">Admin windows (Windows)</h2>
 <p>Windows doesn't let an ordinary app type into a window running as administrator, such as an elevated terminal, Task Manager or an installer. It drops the keystrokes silently, so Voisu checks first and shows <em>Can't type into an admin window</em> instead of pretending it worked.</p>
