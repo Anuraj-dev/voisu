@@ -65,11 +65,10 @@ enum Position {
     /// interjection ("you to be honest" and "tell by the way he talks" stay).
     ClauseStart,
     /// A `ClauseStart` that must end its clause or precede one of these words
-    /// ("I don't know what to do" is `idk`, "I don't know him" stays).
+    /// ("I don't know what to do" is `idk`, "I don't know him" stays, and with
+    /// no words, "not going to lie, it works" is `ngl`, "not going to lie down"
+    /// stays).
     ClauseStartBefore(&'static [&'static str]),
-    /// A `ClauseStart` not followed by one of these words ("not going to lie
-    /// down" stays).
-    ClauseStartNotBefore(&'static [&'static str]),
     /// A clause of its own ("never mind the cost" and "it's no problem" stay).
     WholeClause,
     /// About the speaker: it absorbs one of these subjects at clause start
@@ -78,13 +77,15 @@ enum Position {
     /// continue someone else's clause ("he left and will be right back" stays).
     Subject(&'static [&'static [&'static str]]),
     /// A `Subject` that must stand alone when it has no subject ("on my way
-    /// home, I saw a dog" stays).
+    /// home, I saw a dog" and "laughing out loud is good for you" stay).
     SubjectOrAlone(&'static [&'static [&'static str]]),
-    /// The speaker leaving, which must open the sentence and finish the thought
-    /// ("last year, I got to go" and "I got to go, and it was great" stay).
-    /// `bare` allows the phrase with no subject.
+    /// The speaker leaving, which must open the sentence and end it ("last
+    /// year, I got to go" and "I have to go, right?" stay). `bare` allows the
+    /// phrase with no subject. `may_continue` allows a comma after it, for a
+    /// form with no "had the chance to" reading ("gotta go, bye").
     Leaving {
         bare: bool,
+        may_continue: bool,
     },
 }
 
@@ -97,11 +98,6 @@ const AFTER_IDK: &[&str] = &[
     "what", "where", "when", "who", "why", "how", "if", "whether", "which", "about", "but",
     "though",
 ];
-const AFTER_LITERAL_LIE: &[&str] = &[
-    "down", "to", "about", "there", "here", "around", "back", "on", "in", "still", "low", "flat",
-];
-/// After a comma these carry the sentence on, so the phrase was not a goodbye.
-const CONTINUATIONS: [&str; 6] = ["and", "which", "but", "because", "so", "though"];
 
 /// Spoken phrases (lowercase words) and their abbreviations. Closed: add a
 /// phrase only through the spec. Matching prefers the longest phrase.
@@ -124,12 +120,12 @@ const PHRASES: &[(&[&str], &str, Position)] = &[
     (
         &["not", "gonna", "lie"],
         "ngl",
-        Position::ClauseStartNotBefore(AFTER_LITERAL_LIE),
+        Position::ClauseStartBefore(&[]),
     ),
     (
         &["not", "going", "to", "lie"],
         "ngl",
-        Position::ClauseStartNotBefore(AFTER_LITERAL_LIE),
+        Position::ClauseStartBefore(&[]),
     ),
     (&["in", "my", "opinion"], "imo", Position::ClauseStart),
     (
@@ -160,32 +156,49 @@ const PHRASES: &[(&[&str], &str, Position)] = &[
         "ttyl",
         Position::Subject(I_WILL),
     ),
-    (&["shaking", "my", "head"], "smh", Position::Subject(I_AM)),
+    (
+        &["shaking", "my", "head"],
+        "smh",
+        Position::SubjectOrAlone(I_AM),
+    ),
     (
         &["laughing", "out", "loud"],
         "lol",
-        Position::Subject(I_AM_OR_WAS),
+        Position::SubjectOrAlone(I_AM_OR_WAS),
     ),
     (
         &["laughing", "my", "ass", "off"],
         "lmao",
-        Position::Subject(I_AM_OR_WAS),
+        Position::SubjectOrAlone(I_AM_OR_WAS),
     ),
     (
         &["rolling", "on", "the", "floor", "laughing"],
         "rofl",
-        Position::Subject(I_AM_OR_WAS),
+        Position::SubjectOrAlone(I_AM_OR_WAS),
     ),
     (
         &["got", "to", "go"],
         "g2g",
-        Position::Leaving { bare: true },
+        Position::Leaving {
+            bare: true,
+            may_continue: false,
+        },
     ),
-    (&["gotta", "go"], "g2g", Position::Leaving { bare: true }),
+    (
+        &["gotta", "go"],
+        "g2g",
+        Position::Leaving {
+            bare: true,
+            may_continue: true,
+        },
+    ),
     (
         &["have", "to", "go"],
         "g2g",
-        Position::Leaving { bare: false },
+        Position::Leaving {
+            bare: false,
+            may_continue: false,
+        },
     ),
 ];
 
@@ -196,9 +209,6 @@ const DISCOURSE_LEADS: [&str; 8] = ["and", "but", "so", "well", "oh", "hey", "ok
 /// ("sorry, I got to go"). Mid-sentence they mark nothing ("I'm sorry for your
 /// information being leaked").
 const SENTENCE_OPENERS: [&str; 3] = ["sorry", "anyway", "alright"];
-
-/// Marks that end a sentence-like unit before the next token.
-const SENTENCE_MARKS: [char; 5] = ['.', '!', '?', ';', ':'];
 
 /// Punctuation that may trail a phrase's last word. It is ignored for
 /// matching and kept after the abbreviation.
@@ -336,9 +346,6 @@ impl<'a> Words<'_, 'a> {
             Position::ClauseStartBefore(words) => (leads_clause()
                 && (self.ends_clause(last) || self.next_word_in(last, words)))
             .then_some(0),
-            Position::ClauseStartNotBefore(words) => {
-                (self.starts_clause(i) && !self.next_word_in(last, words)).then_some(0)
-            }
             // "Never mind I found it" without a comma stays unchanged, so a
             // discourse lead does not count here.
             Position::WholeClause => {
@@ -350,10 +357,12 @@ impl<'a> Words<'_, 'a> {
             Position::SubjectOrAlone(subjects) => self
                 .subject_before(i, floor, subjects, false)
                 .or_else(|| (self.opens_sentence(i) && self.ends_thought(last)).then_some(0)),
-            Position::Leaving { bare } => {
-                let finishes = self.ends_clause(last)
-                    && !self.tokens[last].2.ends_with('?')
-                    && !self.next_word_in(last, &CONTINUATIONS);
+            Position::Leaving { bare, may_continue } => {
+                let finishes = if may_continue {
+                    self.ends_clause(last) && !self.tokens[last].2.ends_with('?')
+                } else {
+                    self.ends_thought(last)
+                };
                 if !finishes {
                     return None;
                 }
@@ -420,11 +429,11 @@ impl<'a> Words<'_, 'a> {
     }
 
     fn after_sentence_mark(&self, i: usize) -> bool {
-        i == 0
-            || self.tokens[i - 1]
-                .2
-                .trim_end_matches(CLOSERS)
-                .ends_with(SENTENCE_MARKS)
+        if i == 0 {
+            return true;
+        }
+        let token = self.tokens[i - 1].2;
+        ends_sentence(token, i - 1) || token.trim_end_matches(CLOSERS).ends_with([';', ':'])
     }
 
     /// Whether a one-word clause and a comma lead into token `i` ("thanks, talk
@@ -873,7 +882,19 @@ mod tests {
             "not going to lie down yet"
         );
         assert_eq!(informal("Not gonna lie to you."), "not gonna lie to you");
-        assert_eq!(informal("Not gonna lie I love it."), "ngl i love it");
+        assert_eq!(
+            informal("Not gonna lie I love it."),
+            "not gonna lie i love it"
+        );
+        assert_eq!(
+            informal("Not going to lie anymore."),
+            "not going to lie anymore"
+        );
+        assert_eq!(
+            informal("Not going to lie under oath."),
+            "not going to lie under oath"
+        );
+        assert_eq!(informal("Not gonna lie."), "ngl");
         assert_eq!(informal("I don't know him."), "i don't know him");
         assert_eq!(informal("I don't know John."), "i don't know John");
         assert_eq!(
@@ -883,6 +904,73 @@ mod tests {
         assert_eq!(informal("I don't know, maybe."), "idk, maybe");
         assert_eq!(informal("I don't know if it works."), "idk if it works");
         assert_eq!(informal("Sorry I don't know."), "sorry idk");
+    }
+
+    #[test]
+    fn a_goodbye_must_end_the_sentence() {
+        for (input, expected) in [
+            ("I have to go?", "i have to go?"),
+            ("I have to go, right?", "i have to go, right?"),
+            ("I have to go, don't I?", "i have to go, don't i?"),
+            (
+                "I have to go, unless it rains.",
+                "i have to go, unless it rains",
+            ),
+            (
+                "I got to go, thanks to my dad.",
+                "i got to go, thanks to my dad",
+            ),
+            ("I have to go. But I'll call you.", "g2g. but i'll call you"),
+            ("Gotta go. So talk to you later.", "g2g. so ttyl"),
+        ] {
+            assert_eq!(informal(input), expected, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn bare_laughing_phrases_must_stand_alone() {
+        for (input, expected) in [
+            (
+                "Laughing out loud is good for you.",
+                "laughing out loud is good for you",
+            ),
+            (
+                "Laughing out loud, she walked in.",
+                "laughing out loud, she walked in",
+            ),
+            (
+                "She, laughing out loud, walked in.",
+                "she, laughing out loud, walked in",
+            ),
+            (
+                "Rolling on the floor laughing is not normal.",
+                "rolling on the floor laughing is not normal",
+            ),
+            ("Shaking my head, she left.", "shaking my head, she left"),
+            ("Laughing out loud.", "lol"),
+            ("I was laughing out loud at it.", "lol at it"),
+        ] {
+            assert_eq!(informal(input), expected, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn an_abbreviation_stop_does_not_open_a_sentence() {
+        assert_eq!(
+            informal("The Dr. will be right back."),
+            "the Dr. will be right back"
+        );
+        assert_eq!(
+            informal("Acme Inc. will talk to you later."),
+            "acme Inc. will talk to you later"
+        );
+        assert_eq!(informal("Wait. Will be right back."), "wait. brb");
+    }
+
+    #[test]
+    fn a_question_about_letting_me_know_stays_as_words() {
+        assert_eq!(informal("Did you let me know?"), "did you let me know?");
+        assert_eq!(informal("On my way?"), "on my way?");
     }
 
     #[test]
@@ -919,7 +1007,13 @@ mod tests {
             informal("We got to go, and it was great."),
             "we got to go, and it was great"
         );
-        assert_eq!(informal("I got to go, bye."), "g2g, bye");
+        assert_eq!(informal("I got to go, bye."), "i got to go, bye");
+        assert_eq!(informal("Gotta go, bye."), "g2g, bye");
+        assert_eq!(
+            informal("Gotta go, but I'll call you later."),
+            "g2g, but i'll call you later"
+        );
+        assert_eq!(informal("Gotta go?"), "gotta go?");
         assert_eq!(informal("Sorry I got to go."), "sorry g2g");
         assert_eq!(informal("I've got to go."), "g2g");
         assert_eq!(informal("Gotta go."), "g2g");
