@@ -129,22 +129,26 @@ never trigger an action.
 
 ### Setting up from a script or an agent
 
-Every setting the interface changes is also a plain command, so a script or a
-coding agent can set Voisu up end to end without the interface. Keys are read
-from standard input, never from the command line:
+Every setting the interface changes is also a plain command, so a script can
+set Voisu up end to end. Keys are read from standard input, never from the
+command line:
 
 ```sh
-printf %s "$GROQ_API_KEY" | voisu key set groq
-printf %s "$DEEPGRAM_API_KEY" | voisu key set deepgram
+voisu key set groq       # paste the key, then Ctrl+D
+voisu key set deepgram
 voisu engine cloud
 voisu delivery paste
 voisu service install
-voisu doctor            # every check, with the fix for anything that fails
+voisu doctor             # every check, with the fix for anything that fails
 ```
 
-`voisu setup` without a terminal runs the step-by-step text version. When
-something goes wrong, `voisu doctor --verbose`, `voisu history --verbose` and
+A coding agent can install Voisu, change settings and check it with these
+commands; the [agent install guide](https://anuraj-dev.github.io/voisu/agent-install.md)
+walks it through each desktop. Your API keys never go through the agent: you
+type them into `voisu` in a terminal of your own. When something goes wrong,
+`voisu doctor --verbose`, `voisu history --verbose` and
 `journalctl --user -u voisu.service` give an agent what it needs to diagnose it.
+`voisu setup` without a terminal runs the step-by-step text version.
 
 ### Updating
 
