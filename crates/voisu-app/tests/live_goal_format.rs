@@ -16,8 +16,8 @@ use voisu_app::dpr_pipeline::{
 use voisu_app::system::SecretToolStore;
 use voisu_core::{
     BoundaryFuture, CompositionDecision, DeliveryAdapter, DeliveryOutcome, IntentObservation,
-    LocalBaselineOptions, Provider, ProviderState, RenderingPolicy, SourceTranscript, Transcript,
-    leftover_admits_format_cloud, organize_local_baseline, route_intent,
+    LocalBaselineOptions, Provider, ProviderState, RenderingPolicy, SourceTranscript, Tone,
+    Transcript, leftover_admits_format_cloud, organize_local_baseline, route_intent,
 };
 
 const LIVE_GOAL_FORMAT_ENV: &str = "VOISU_LIVE_GOAL_FORMAT";
@@ -241,6 +241,7 @@ async fn live_goal_format_sends_leftover_notes_through_production_path() {
                 cloud,
                 clock: &clock,
                 small_edit_contract: true,
+                tone: Tone::Formal,
             },
             &mut delivery,
         )

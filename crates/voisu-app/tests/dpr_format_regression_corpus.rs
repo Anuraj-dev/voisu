@@ -15,7 +15,7 @@ use voisu_app::dpr_pipeline::{
 use voisu_core::{
     BoundaryFuture, CompositionDecision, Credential, DeliveryAdapter, DeliveryOutcome,
     FormatEditCandidate, IntentObservation, LocalBaselineOptions, Provider, ProviderState,
-    RenderingPolicy, SourceTranscript, SurfaceHint, Transcript, organize_local_baseline,
+    RenderingPolicy, SourceTranscript, SurfaceHint, Tone, Transcript, organize_local_baseline,
     parse_format_edit_candidate_json, route_intent, sanitize_source_transcripts,
     text_sha256_fingerprint,
 };
@@ -942,6 +942,7 @@ async fn run_trial(fixture: &Fixture) -> Trial {
                 },
                 clock: &clock,
                 small_edit_contract: true,
+                tone: Tone::Formal,
             },
             &mut delivery,
         )
@@ -978,6 +979,7 @@ async fn run_trial(fixture: &Fixture) -> Trial {
                 cloud: DprCloudCapability::Unavailable,
                 clock: &clock,
                 small_edit_contract: true,
+                tone: Tone::Formal,
             },
             &mut delivery,
         )

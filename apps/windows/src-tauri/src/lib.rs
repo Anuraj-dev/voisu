@@ -30,7 +30,7 @@ use tauri::{AppHandle, Emitter, Manager, RunEvent, WindowEvent};
 use tauri_plugin_autostart::ManagerExt as _;
 use tauri_plugin_opener::OpenerExt as _;
 use voisu_cloud::ProviderHttpClient;
-use voisu_core::{Provider, SecretStore};
+use voisu_core::{Provider, SecretStore, Tone};
 
 #[cfg(windows)]
 use platform::hotkey::{is_dead_key, key_label};
@@ -104,6 +104,7 @@ struct UiState {
     auto_paste: bool,
     overlay_size: OverlaySize,
     boost_words: Vec<String>,
+    tone: Tone,
     trigger: UiTrigger,
     /// The only Trigger Keys the window offers, the default first.
     trigger_presets: Vec<UiPreset>,
@@ -189,6 +190,7 @@ fn get_state(app: AppHandle) -> UiState {
         auto_paste: settings.auto_paste,
         overlay_size: settings.overlay_size,
         boost_words: settings.boost_words,
+        tone: settings.tone,
         trigger: UiTrigger::of(settings.hotkey),
         trigger_presets: ui_presets(),
     }
@@ -252,6 +254,13 @@ fn set_boost_words(app: AppHandle, words: Vec<String>) -> Vec<String> {
     let words = vocabulary::normalize(words);
     tracing::info!(count = words.len(), "boost words saved");
     update_settings(&app, |settings| settings.boost_words = words).boost_words
+}
+
+/// Read as each Recording starts, so it applies from the next one.
+#[tauri::command]
+fn set_tone(app: AppHandle, tone: Tone) -> Tone {
+    tracing::info!(tone = tone.as_str(), "tone");
+    update_settings(&app, |settings| settings.tone = tone).tone
 }
 
 #[derive(Serialize)]
@@ -428,6 +437,7 @@ pub fn run() {
             set_auto_paste,
             set_overlay_size,
             set_boost_words,
+            set_tone,
             set_trigger_key,
             open_key_page,
             engine::last_transcript

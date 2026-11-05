@@ -20,7 +20,7 @@ use voisu_app::asr_mode;
 use voisu_app::asr_mode_queue::AsrModeQueue;
 use voisu_app::audio_level::{LevelRegistry, LevelRing};
 use voisu_app::cloud_ownership;
-use voisu_app::config::{DeliveryMode, RenderingPolicy, WritingMode};
+use voisu_app::config::{DeliveryMode, RenderingPolicy, Tone, WritingMode};
 use voisu_app::daemon_lock::SingleInstance;
 use voisu_app::dpr_cloud::DprCloudClient;
 use voisu_app::dpr_pipeline::{
@@ -426,6 +426,7 @@ struct StartupCompletion {
     level_ring: Arc<LevelRing>,
     writing_mode: WritingMode,
     rendering_policy: RenderingPolicy,
+    tone: Tone,
     asr_mode: AsrMode,
     dictionary_terms: Vec<String>,
     languages: ResolvedRecordingLanguages,
@@ -459,6 +460,7 @@ struct ActiveRecording {
     deadline_clock: DeadlineClock,
     writing_mode: WritingMode,
     rendering_policy: RenderingPolicy,
+    tone: Tone,
     asr_mode: AsrMode,
     dictionary_terms: Vec<String>,
     languages: ResolvedRecordingLanguages,
@@ -1039,6 +1041,7 @@ async fn actor_loop(
                             voisu_app::dictionary::whisper_prompt_for_terms(&session_terms);
                         let writing_mode = voisu_app::config::writing_mode();
                         let rendering_policy = voisu_app::config::rendering_policy();
+                        let tone = voisu_app::config::tone();
                         // One language resolution per Recording boundary: the same
                         // value is declared for every active provider (so
                         // EnglishEligibility reads exactly what the requests send)
@@ -1139,6 +1142,7 @@ async fn actor_loop(
                                     level_ring,
                                     writing_mode,
                                     rendering_policy,
+                                    tone,
                                     asr_mode: admitted_mode,
                                     dictionary_terms: smart_dictionary_terms,
                                     languages,
@@ -1159,6 +1163,7 @@ async fn actor_loop(
                     level_ring,
                     writing_mode,
                     rendering_policy,
+                    tone,
                     asr_mode: started_asr_mode,
                     dictionary_terms,
                     languages,
@@ -1356,6 +1361,7 @@ async fn actor_loop(
                                 deadline_clock,
                                 writing_mode,
                                 rendering_policy,
+                                tone,
                                 asr_mode: started_asr_mode,
                                 dictionary_terms,
                                 languages,
@@ -2500,6 +2506,7 @@ async fn process_recording(
         deadline_clock: _,
         writing_mode,
         rendering_policy,
+        tone,
         asr_mode,
         dictionary_terms,
         languages,
@@ -2621,6 +2628,7 @@ async fn process_recording(
                     text,
                     local_asr: asr,
                 }) => {
+                    let text = voisu_core::apply_tone(&text, tone);
                     local_asr = Some(asr);
                     evidence.stages.push(LifecycleStage::ValidationCompleted);
                     let finalized_at = Instant::now();
@@ -2822,6 +2830,7 @@ async fn process_recording(
                     cloud,
                     clock: &clock,
                     small_edit_contract,
+                    tone,
                 },
                 &mut authorized_delivery,
             )
@@ -2848,6 +2857,7 @@ async fn process_recording(
                     dictionary_terms: &dictionary_refs,
                     protected_names: &[],
                     credential: credential_evidence,
+                    tone,
                 },
                 &mut authorized_delivery,
             )

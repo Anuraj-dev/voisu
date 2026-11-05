@@ -12,9 +12,9 @@ use voisu_core::{
     CloudOutcome, CloudRequest, ComposeInput, ComposeSource, CompositionDecision, Credential,
     DeliveryAdapter, DeliveryFlags, DeliveryOutcome, DprDiagnostic, FormatEditSafety,
     IntentObservation, LocalBaselineOptions, ProcessHint, ProviderState, RenderingPolicy,
-    RoutingDecision, SourceSelection, SurfaceHint, TimingHint, Transcript, apply_format_edits_with,
-    compose_structured_candidate, leftover_admits_format_cloud, organize_local_baseline,
-    text_sha256_fingerprint,
+    RoutingDecision, SourceSelection, SurfaceHint, TimingHint, Tone, Transcript,
+    apply_format_edits_with, apply_tone, compose_structured_candidate,
+    leftover_admits_format_cloud, organize_local_baseline, text_sha256_fingerprint,
 };
 
 use crate::dpr_cloud::{
@@ -131,6 +131,9 @@ pub struct DprTransformInput<'a> {
     /// Request the small-edit formatting contract instead of #139 derivation.
     /// Production leaves this false until the Qwen formatter flag is on.
     pub small_edit_contract: bool,
+    /// Tone snapshotted at Recording start, applied to the final text just
+    /// before Delivery. Formal leaves it byte-identical.
+    pub tone: Tone,
 }
 
 pub struct DprTransformCompletion {
@@ -394,6 +397,7 @@ pub async fn dpr_transform_and_deliver(
     if let Some(summary) = span_summary.as_ref() {
         diagnostic.record_span_adjudication(summary);
     }
+    let rendered = apply_tone(&rendered, input.tone);
     diagnostic.delivery_emitted(input.clock.elapsed(), delivery_flags);
     let delivery = delivery.deliver(Transcript(rendered.clone())).await;
     DprTransformCompletion {
@@ -896,6 +900,7 @@ mod tests {
                 },
                 clock: &clock,
                 small_edit_contract: false,
+                tone: Tone::Formal,
             },
             &mut delivery,
         )
@@ -995,6 +1000,7 @@ mod tests {
                 },
                 clock: &clock,
                 small_edit_contract: false,
+                tone: Tone::Formal,
             },
             &mut delivery,
         )
@@ -1091,6 +1097,7 @@ mod tests {
                 },
                 clock: &clock,
                 small_edit_contract: false,
+                tone: Tone::Formal,
             },
             &mut delivery,
         )
@@ -1185,6 +1192,7 @@ mod tests {
                 },
                 clock: &clock,
                 small_edit_contract: false,
+                tone: Tone::Formal,
             },
             &mut delivery,
         )
@@ -1273,6 +1281,7 @@ mod tests {
                 },
                 clock: &clock,
                 small_edit_contract: false,
+                tone: Tone::Formal,
             },
             &mut delivery,
         )
@@ -1353,6 +1362,7 @@ mod tests {
                 },
                 clock: &clock,
                 small_edit_contract: false,
+                tone: Tone::Formal,
             },
             &mut delivery,
         )
@@ -1444,6 +1454,7 @@ mod tests {
                     },
                     clock: &clock,
                     small_edit_contract: false,
+                    tone: Tone::Formal,
                 },
                 &mut delivery,
             )
@@ -1497,6 +1508,7 @@ mod tests {
                 },
                 clock: &clock,
                 small_edit_contract: false,
+                tone: Tone::Formal,
             },
             &mut delivery,
         )
@@ -1544,6 +1556,7 @@ mod tests {
                 cloud: DprCloudCapability::Unavailable,
                 clock: &clock,
                 small_edit_contract: false,
+                tone: Tone::Formal,
             },
             &mut delivery,
         )
@@ -1647,6 +1660,7 @@ mod tests {
                 },
                 clock,
                 small_edit_contract: true,
+                tone: Tone::Formal,
             },
             delivery,
         )
@@ -1702,6 +1716,7 @@ mod tests {
                 },
                 clock: &clock,
                 small_edit_contract: true,
+                tone: Tone::Formal,
             },
             &mut delivery,
         )
@@ -1767,6 +1782,7 @@ mod tests {
                 },
                 clock: &clock,
                 small_edit_contract: true,
+                tone: Tone::Formal,
             },
             &mut delivery,
         )
@@ -1831,6 +1847,7 @@ mod tests {
                 },
                 clock: &clock,
                 small_edit_contract: true,
+                tone: Tone::Formal,
             },
             &mut delivery,
         )
@@ -2004,6 +2021,7 @@ mod tests {
                 },
                 clock: &clock,
                 small_edit_contract: true,
+                tone: Tone::Formal,
             },
             &mut delivery,
         )
@@ -2105,6 +2123,7 @@ mod tests {
                 },
                 clock: &clock,
                 small_edit_contract: true,
+                tone: Tone::Formal,
             },
             &mut delivery,
         )
@@ -2170,6 +2189,7 @@ mod tests {
                 },
                 clock: &clock,
                 small_edit_contract: false,
+                tone: Tone::Formal,
             },
             &mut delivery,
         )
@@ -2232,6 +2252,7 @@ mod tests {
                 },
                 clock: &clock,
                 small_edit_contract: true,
+                tone: Tone::Formal,
             },
             &mut delivery,
         )
@@ -2304,6 +2325,7 @@ mod tests {
                 },
                 clock: &clock,
                 small_edit_contract: true,
+                tone: Tone::Formal,
             },
             &mut delivery,
         )
@@ -2322,6 +2344,13 @@ mod tests {
     }
 
     async fn deliver_local_spoken_marks(source: &str) -> DprTransformCompletion {
+        deliver_local_with_tone(source, Tone::Formal).await.0
+    }
+
+    async fn deliver_local_with_tone(
+        source: &str,
+        tone: Tone,
+    ) -> (DprTransformCompletion, Vec<String>) {
         let sources = [ComposeSource {
             provider: SttProvider::ProviderA,
             available: true,
@@ -2338,7 +2367,7 @@ mod tests {
             initiated_ms: None,
         };
         let clock = FixedClock(Duration::ZERO);
-        dpr_transform_and_deliver(
+        let completion = dpr_transform_and_deliver(
             DprTransformInput {
                 selected_source: source,
                 sources: &sources,
@@ -2353,10 +2382,34 @@ mod tests {
                 cloud: DprCloudCapability::Unavailable,
                 clock: &clock,
                 small_edit_contract: false,
+                tone,
             },
             &mut delivery,
         )
-        .await
+        .await;
+        let delivered = delivery.rendered.lock().expect("delivery lock").clone();
+        (completion, delivered)
+    }
+
+    #[tokio::test]
+    async fn informal_tone_applies_to_the_delivered_dpr_text() {
+        let source = "by the way the build passed. talk to you later";
+        let (formal, formal_delivered) = deliver_local_with_tone(source, Tone::Formal).await;
+        let (informal, informal_delivered) = deliver_local_with_tone(source, Tone::Informal).await;
+
+        assert_eq!(formal_delivered, std::slice::from_ref(&formal.rendered));
+        assert_eq!(informal_delivered, std::slice::from_ref(&informal.rendered));
+        assert!(formal.rendered.ends_with('.'), "{}", formal.rendered);
+        assert_eq!(
+            informal.rendered,
+            voisu_core::apply_tone(&formal.rendered, Tone::Informal)
+        );
+        assert!(
+            informal.rendered.starts_with("BTW"),
+            "{}",
+            informal.rendered
+        );
+        assert!(informal.rendered.ends_with("TTYL"), "{}", informal.rendered);
     }
 
     #[tokio::test]
@@ -2495,6 +2548,7 @@ mod tests {
                 },
                 clock: &clock,
                 small_edit_contract,
+                tone: Tone::Formal,
             },
             &mut delivery,
         )
@@ -2653,6 +2707,7 @@ mod tests {
                 },
                 clock: &clock,
                 small_edit_contract: true,
+                tone: Tone::Formal,
             },
             &mut delivery,
         )
@@ -2725,6 +2780,7 @@ mod tests {
                 },
                 clock: &clock,
                 small_edit_contract: true,
+                tone: Tone::Formal,
             },
             &mut delivery,
         )
@@ -2795,6 +2851,7 @@ mod tests {
                 },
                 clock: &clock,
                 small_edit_contract: true,
+                tone: Tone::Formal,
             },
             &mut delivery,
         )
@@ -2866,6 +2923,7 @@ mod tests {
                 },
                 clock: &clock,
                 small_edit_contract: true,
+                tone: Tone::Formal,
             },
             &mut delivery,
         )
@@ -2958,6 +3016,7 @@ mod tests {
                     cloud: DprCloudCapability::Unavailable,
                     clock: &FixedClock(Duration::ZERO),
                     small_edit_contract: false,
+                    tone: Tone::Formal,
                 },
                 &mut delivery,
             )

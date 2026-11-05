@@ -10,8 +10,8 @@ use voisu_core::{
     BoundaryError, DeliveryAdapter, DeliveryOutcome, EnglishEligibilityOutcome,
     FORMATTER_CONTRACT_ID, FormatOptions, GrammarErrorCode, GrammarOutcome, GrammarSafetyOptions,
     LOCAL_FORMATTER_WORK_DEADLINE, MAX_VALIDATED_TRANSCRIPT_UTF8_BYTES, SmartWritingDiagnostic,
-    SmartWritingEditEvidence, SmartWritingMode, SmartWritingOutcome, SmartWritingReasonCode,
-    Transcript, WritingMode as CoreWritingMode, apply_grammar_candidate_json,
+    SmartWritingEditEvidence, SmartWritingMode, SmartWritingOutcome, SmartWritingReasonCode, Tone,
+    Transcript, WritingMode as CoreWritingMode, apply_grammar_candidate_json, apply_tone,
     format_validated_for_grammar, format_validated_with, parse_formatting_commands,
 };
 
@@ -88,6 +88,9 @@ pub struct FinalTransformInput<'a> {
     pub dictionary_terms: &'a [&'a str],
     pub protected_names: &'a [&'a str],
     pub credential: CredentialGateEvidence,
+    /// Tone snapshotted at Recording start, applied to the final text just
+    /// before Delivery. Formal leaves it byte-identical.
+    pub tone: Tone,
 }
 
 pub struct FinalTransformCompletion {
@@ -321,6 +324,7 @@ pub async fn final_transform_and_deliver(
 
     // Candidate is frozen here. Delivery is the sole side effect and is called
     // exactly once even when candidate work fell back.
+    let selected = apply_tone(&selected, input.tone);
     let delivery_future = delivery.deliver(Transcript(selected.clone()));
     // This metric ends when Delivery is initiated, not after clipboard/libei
     // I/O. The explicit reserve is for entering Delivery before the one-second
@@ -511,6 +515,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn informal_tone_applies_to_delivered_text_in_clean_and_exact() {
+        for mode in [WritingMode::Smart, WritingMode::Literal] {
+            let mut rendered = Vec::new();
+            for tone in [Tone::Formal, Tone::Informal] {
+                let (mut delivery, calls, delivered) = delivery();
+                let completion = final_transform_and_deliver(
+                    FinalTransformInput {
+                        validated_transcript: "by the way it works. talk to you later.",
+                        writing_mode: mode,
+                        languages: &english(),
+                        grammar: GrammarGateCapability::Unavailable,
+                        dictionary_terms: &[],
+                        protected_names: &[],
+                        credential: CredentialGateEvidence::default(),
+                        tone,
+                    },
+                    &mut delivery,
+                )
+                .await;
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    delivered.lock().expect("delivered").as_slice(),
+                    std::slice::from_ref(&completion.rendered)
+                );
+                rendered.push(completion.rendered);
+            }
+            let [formal, informal] = rendered.as_slice() else {
+                unreachable!()
+            };
+            assert!(formal.ends_with("later."), "{mode:?}: {formal}");
+            assert_eq!(*informal, voisu_core::apply_tone(formal, Tone::Informal));
+            assert_eq!(informal, "BTW it works. TTYL", "{mode:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn literal_commands_format_and_deliver_once_without_grammar() {
         let (mut delivery, calls, delivered) = delivery();
         let completion = final_transform_and_deliver(
@@ -522,6 +562,7 @@ mod tests {
                 dictionary_terms: &[],
                 protected_names: &[],
                 credential: CredentialGateEvidence::default(),
+                tone: Tone::Formal,
             },
             &mut delivery,
         )
@@ -571,6 +612,7 @@ mod tests {
                 dictionary_terms: &[],
                 protected_names: &[],
                 credential: CredentialGateEvidence::default(),
+                tone: Tone::Formal,
             },
             &mut delivery,
         )
@@ -609,6 +651,7 @@ mod tests {
                 dictionary_terms: &[],
                 protected_names: &[],
                 credential: CredentialGateEvidence::default(),
+                tone: Tone::Formal,
             },
             &mut delivery,
         )
@@ -656,6 +699,7 @@ mod tests {
                     dictionary_terms: &[],
                     protected_names: &[],
                     credential: CredentialGateEvidence::default(),
+                    tone: Tone::Formal,
                 },
                 &mut delivery,
             )
@@ -727,6 +771,7 @@ mod tests {
                 dictionary_terms: &[],
                 protected_names: &[],
                 credential: CredentialGateEvidence::default(),
+                tone: Tone::Formal,
             },
             &mut delivery,
         ));
@@ -768,6 +813,7 @@ mod tests {
                     dictionary_terms: &[],
                     protected_names: &[],
                     credential: CredentialGateEvidence::default(),
+                    tone: Tone::Formal,
                 },
                 &mut delivery,
             )
@@ -801,6 +847,7 @@ mod tests {
                 dictionary_terms: &[],
                 protected_names: &[],
                 credential: CredentialGateEvidence::default(),
+                tone: Tone::Formal,
             },
             &mut delivery,
         )

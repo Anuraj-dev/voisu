@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 use std::process::ExitCode;
 
-use voisu_app::config::{DeliveryMode, RenderingPolicy, StoredDelivery, WritingMode};
+use voisu_app::config::{DeliveryMode, RenderingPolicy, StoredDelivery, Tone, WritingMode};
 use voisu_app::doctor::DoctorRow;
 use voisu_app::service::{UserServiceAction, manage_user_service};
 use voisu_app::system::{ProviderHttpClient, SecretToolStore};
@@ -23,6 +23,7 @@ enum CliAction {
     Delivery(Option<DeliveryMode>),
     Writing(Option<WritingMode>),
     Layout(Option<RenderingPolicy>),
+    Tone(Option<Tone>),
     DictionaryAdd(String),
     DictionaryRemove(String),
     DictionaryList { json: bool },
@@ -54,6 +55,7 @@ fn main() -> ExitCode {
         Ok(CliAction::Delivery(mode)) => delivery(mode),
         Ok(CliAction::Writing(mode)) => writing(mode),
         Ok(CliAction::Layout(policy)) => layout(policy),
+        Ok(CliAction::Tone(tone)) => tone_command(tone),
         Ok(CliAction::DictionaryAdd(term)) => dictionary_add(&term),
         Ok(CliAction::DictionaryRemove(term)) => dictionary_remove(&term),
         Ok(CliAction::DictionaryList { json }) => dictionary_list(json),
@@ -456,6 +458,34 @@ fn layout_meaning(policy: RenderingPolicy) -> &'static str {
     }
 }
 
+/// Reads or persists the Tone. The daemon reads it at each Recording start,
+/// so a change applies to the next Recording.
+fn tone_command(tone: Option<Tone>) -> ExitCode {
+    let Some(tone) = tone else {
+        let current = voisu_app::config::tone();
+        println!("Tone: {} ({})", current.as_str(), tone_meaning(current));
+        return ExitCode::SUCCESS;
+    };
+    match voisu_app::config::set_tone(tone) {
+        Ok(_) => {
+            println!(
+                "Tone set to {} ({}). It applies to your next Recording.",
+                tone.as_str(),
+                tone_meaning(tone)
+            );
+            ExitCode::SUCCESS
+        }
+        Err(message) => fail(4, &message),
+    }
+}
+
+fn tone_meaning(tone: Tone) -> &'static str {
+    match tone {
+        Tone::Formal => "full words and a final full stop",
+        Tone::Informal => "chat abbreviations like BTW, no final full stop",
+    }
+}
+
 fn dictionary_add(term: &str) -> ExitCode {
     match voisu_app::dictionary::add_user_term(term) {
         Ok(true) => {
@@ -616,6 +646,8 @@ fn parse_command() -> Result<CliAction, String> {
         [command, layout] if command == "layout" => {
             Ok(CliAction::Layout(Some(parse_layout(layout)?)))
         }
+        [command] if command == "tone" => Ok(CliAction::Tone(None)),
+        [command, tone] if command == "tone" => Ok(CliAction::Tone(Some(parse_tone(tone)?))),
         [dictionary, action, term] if dictionary == "dictionary" && action == "add" => {
             Ok(CliAction::DictionaryAdd(term.clone()))
         }
@@ -694,6 +726,10 @@ fn parse_layout(value: &str) -> Result<RenderingPolicy, String> {
         .ok_or_else(|| "layout must be plain, auto, or sections".to_owned())
 }
 
+fn parse_tone(value: &str) -> Result<Tone, String> {
+    Tone::parse(value).ok_or_else(|| "tone must be formal or informal".to_owned())
+}
+
 fn parse_provider(value: &str) -> Result<Provider, String> {
     match value {
         "groq" => Ok(Provider::Groq),
@@ -723,6 +759,7 @@ commands:
   delivery [paste|copy]         paste the text for you, or only copy it
   writing [clean|exact]         fix grammar and misheard words, or keep your words as spoken
   layout [plain|auto|sections]  punctuation only, organize when you speak in parts, or add headings
+  tone [formal|informal]        full words, or chat abbreviations like BTW with no final full stop
   dictionary add <term>         add a word Voisu should spell your way
   dictionary remove <term>      remove a word
   dictionary list [--json]      list your words
