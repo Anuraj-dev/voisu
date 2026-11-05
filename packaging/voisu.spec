@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.69.2
+Version:        0.70.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -167,6 +167,9 @@ install -D -m 0644 packaging/icons/voisu.svg %{buildroot}%{_datadir}/icons/hicol
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Thu Nov 05 2026 Voisu maintainers <voisu@example.invalid> - 0.70.0-1
+- Set up and check Voisu from one terminal interface (#301)
+
 * Tue Nov 03 2026 Voisu maintainers <voisu@example.invalid> - 0.69.2-1
 - fix(overlay): show the check mark the moment the paste lands (#300)
 
