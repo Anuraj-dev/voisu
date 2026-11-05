@@ -1,0 +1,29 @@
+name: PR title
+
+# A squash merge uses the PR title as the commit subject, and version-bump.yml
+# reads that subject's type to pick the release bump. A title without a type
+# makes the bump skip silently, so check it before merge.
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions: {}
+
+jobs:
+  title:
+    name: PR title gate (Conventional Commit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Check the title has a Conventional Commit type
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          if printf '%s' "$TITLE" | grep -qE '^(feat|fix|perf|refactor|docs|chore|test|ci|style|build|revert)(\([^)]+\))?!?: .+'; then
+            echo "ok: $TITLE"
+            exit 0
+          fi
+          echo "::error::PR title needs a Conventional Commit type, e.g. 'feat(tui): ...' or 'fix(daemon): ...'."
+          echo "The squash commit takes this title; feat bumps minor, fix/perf bump patch, other types don't release."
+          echo "Got: $TITLE"
+          exit 1

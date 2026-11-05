@@ -14,7 +14,7 @@
 _copr_srpm/
 
 # Private agent-workflow overlay (own git repo: Anuraj-dev/voisu-internal)
-/internal/
+/internal
 /CLAUDE.md
 /AGENTS.md
 

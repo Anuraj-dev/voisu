@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Gives a new linked worktree the main checkout's private agent files.
+#
+# AGENTS.md, CLAUDE.md and internal/ are gitignored (internal/ is its own
+# private repo), so `git worktree add` leaves them out and an agent working in
+# the worktree starts without the project rules or STATE.md. This links them
+# back. Git runs it after every checkout; it only acts on a fresh worktree
+# (previous HEAD is all zeros). `tools/dev link` runs it by hand.
+#
+# Install for every worktree of this clone: tools/dev setup
+set -u
+
+[ "${1:-}" = 0000000000000000000000000000000000000000 ] || exit 0
+
+common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || exit 0
+main=$(dirname "$common") # the common dir is <main checkout>/.git
+here=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+[ "$here" != "$main" ] || exit 0
+
+for name in internal AGENTS.md CLAUDE.md; do
+	[ -e "$main/$name" ] || continue
+	if [ -e "$here/$name" ] || [ -L "$here/$name" ]; then
+		continue
+	fi
+	ln -s "$main/$name" "$here/$name" && echo "linked $name from $main"
+done
+exit 0

@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Developer and agent helper. Run from anywhere inside a Voisu checkout.
+#
+#   tools/dev check          the CI gates that catch most mistakes, locally:
+#                            fmt, clippy (default + overlay), rustdoc, lib tests
+#   tools/dev check --full   the above plus the whole test suite (slow; CI runs it anyway)
+#   tools/dev setup          install the git hook that links private agent files
+#                            into every new worktree
+#   tools/dev link           link them into the current worktree now
+set -euo pipefail
+
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+
+# Some sandboxed shells can't use rustup's cargo proxy; fall back to the
+# toolchain's own binaries.
+if ! cargo --version >/dev/null 2>&1; then
+	PATH="$HOME/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin:$PATH"
+fi
+
+step() {
+	printf '\n== %s\n' "$*"
+	"$@"
+}
+
+check() {
+	local full=${1:-}
+	# Same commands as .github/workflows/ci.yml, in cheapest-first order.
+	step cargo fmt --all -- --check
+	step cargo fmt --manifest-path tools/transcript-quality/Cargo.toml -- --check
+	step cargo clippy --workspace --all-targets --locked -- -D warnings
+	step cargo clippy --workspace --all-targets --features overlay --locked -- -D warnings
+	step cargo clippy --manifest-path tools/transcript-quality/Cargo.toml --all-targets --locked -- -D warnings
+	step env RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked
+	if [ "$full" = --full ]; then
+		step cargo test --workspace --locked
+		step cargo test --manifest-path tools/transcript-quality/Cargo.toml --locked
+	else
+		step cargo test --workspace --lib --locked
+	fi
+	printf '\nall checks passed\n'
+}
+
+case "${1:-}" in
+check) check "${2:-}" ;;
+setup)
+	hooks=$(git rev-parse --path-format=absolute --git-common-dir)/hooks
+	install -m 755 tools/git-hooks/post-checkout "$hooks/post-checkout"
+	echo "installed $hooks/post-checkout"
+	;;
+link) bash tools/git-hooks/post-checkout 0000000000000000000000000000000000000000 ;;
+*)
+	sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
+	exit 2
+	;;
+esac
