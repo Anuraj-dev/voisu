@@ -6,7 +6,7 @@ use super::super::keys::{self, Action};
 use super::super::look::{Look, Tone};
 use super::super::model::{
     App, CHECK_ACTION_COLUMN, CHECK_VALUE_COLUMN, CheckLine, Fix, HERO_HEIGHT, Hero, ServiceVerb,
-    delivery_value, engine_label, layout_label, writing_label,
+    delivery_value, engine_label, layout_label, tone_label, writing_label,
 };
 use super::super::text;
 use super::{Pieces, single};
@@ -151,9 +151,10 @@ fn summary_rows(app: &App, look: &Look, width: usize) -> Vec<Line<'static>> {
         "Writing",
         &shown(settings.map(|s| {
             format!(
-                "{} · {}",
+                "{} · {} · {}",
                 writing_label(s.writing),
-                layout_label(s.rendering)
+                layout_label(s.rendering),
+                tone_label(s.tone)
             )
         })),
         Tone::Plain,

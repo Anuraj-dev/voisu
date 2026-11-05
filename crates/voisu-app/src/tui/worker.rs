@@ -20,7 +20,7 @@ use crate::system::{ClipboardBoundary, SecretToolStore, WlClipboard};
 
 use super::model::{
     DaemonSnapshot, HistoryItem, Job, Refresh, Reply, ServiceVerb, SettingsRow, SettingsSnapshot,
-    StatusPoll, Tone, delivery_label, engine_label, layout_label, local_switch_allowed,
+    StatusPoll, Tone, delivery_label, engine_label, layout_label, local_switch_allowed, tone_label,
     trigger_key_value, writing_label,
 };
 use super::text;
@@ -111,9 +111,9 @@ pub fn execute(job: Job, replies: &Sender<Reply>) {
         Job::LoadHistory => send(Reply::History(load_history())),
         Job::LoadDictionary => send(Reply::Dictionary(crate::dictionary::user_terms())),
         Job::LoadShortcut => send(Reply::Shortcut(load_shortcut())),
-        // The daemon reads Delivery and Deepgram once at start, Layout per
-        // Recording, and Writing per Recording except Intent Reconstruction,
-        // which is chosen at start.
+        // The daemon reads Delivery and Deepgram once at start, Layout and Tone
+        // per Recording, and Writing per Recording except Intent
+        // Reconstruction, which is chosen at start.
         Job::SetDelivery(mode) => send(applied_setting(
             config::set_delivery_mode(mode),
             format!("Delivery set to {}.", delivery_label(mode)),
@@ -138,6 +138,12 @@ pub fn execute(job: Job, replies: &Sender<Reply>) {
         Job::SetRendering(policy) => send(applied_setting(
             config::set_rendering_policy(policy),
             format!("Layout set to {}.", layout_label(policy)),
+            "It applies to your next Recording.",
+            &[Refresh::Settings, Refresh::Doctor],
+        )),
+        Job::SetTone(tone) => send(applied_setting(
+            config::set_tone(tone),
+            format!("Tone set to {}.", tone_label(tone)),
             "It applies to your next Recording.",
             &[Refresh::Settings, Refresh::Doctor],
         )),
@@ -199,6 +205,7 @@ fn load_settings() -> SettingsSnapshot {
         legacy_delivery,
         writing: config::writing_mode(),
         rendering: config::rendering_policy(),
+        tone: config::tone(),
         deepgram: config::deepgram_enabled(),
     }
 }

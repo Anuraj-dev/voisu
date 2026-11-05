@@ -112,8 +112,8 @@ It is keyboard-only: `←` `→` (or `1`–`4`) switch tabs, `↑` `↓` move, `
 - **Home** shows the one thing that matters right now: ready to dictate, or the
   problem and the single key that fixes it (start Voisu, restart it, run setup).
   `d` shows every check `voisu doctor` runs.
-- **Settings** changes Engine, Delivery, Writing, Layout, Deepgram and your
-  keys, explains each choice beside it, and offers a restart when the running
+- **Settings** changes Engine, Delivery, Writing, Layout, Tone, Deepgram and
+  your keys, explains each choice beside it, and offers a restart when the running
   service needs one to pick up a change.
 - **Dictionary** holds the words Voisu should spell your way; `a` adds, `d`
   removes.
