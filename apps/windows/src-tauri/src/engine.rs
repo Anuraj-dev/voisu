@@ -25,8 +25,8 @@ use voisu_core::{
     ActiveCapture, AudioCapture, BoundaryError, BoundaryFuture, BoundaryKind, CancelRegistry,
     CaptureLimit, Credential, DEFAULT_RENDERING_POLICY, EnglishEligibilityOutcome,
     PreparedTranscriptDecision, Provider, ProviderCoordinator, ProviderStreams,
-    ResolvedRecordingLanguages, SecretStore, SourceTranscript, TranscriptProvider,
-    TranscriptValidator, sanitize_source_transcripts,
+    ResolvedRecordingLanguages, SecretStore, SourceTranscript, Tone, TranscriptProvider,
+    TranscriptValidator, apply_tone, sanitize_source_transcripts,
 };
 
 use crate::gesture::Action;
@@ -155,6 +155,8 @@ enum Captured {
         /// The boost words this Recording's providers started with, so
         /// reconcile sees the same list.
         vocabulary: Vec<String>,
+        /// The Tone as this Recording started.
+        tone: Tone,
     },
     /// Cancelled (`None`) or failed: release the mic and provider streams.
     Abort {
@@ -221,7 +223,9 @@ impl Engine {
                 return Captured::Done;
             }
         };
-        let vocabulary = vocabulary::normalize(&self.settings().boost_words);
+        let settings = self.settings();
+        let vocabulary = vocabulary::normalize(&settings.boost_words);
+        let tone = settings.tone;
         let streams = match self.start_providers(id, &vocabulary) {
             Ok(streams) => streams,
             Err(error) => {
@@ -238,6 +242,7 @@ impl Engine {
                 limit,
                 target,
                 vocabulary,
+                tone,
             },
             Outcome::Cancel => {
                 tracing::info!(id, "Recording cancelled");
@@ -258,7 +263,7 @@ impl Engine {
     /// The processing phase: a Transcript from a stopped Recording, or the
     /// teardown of a cancelled or failed one.
     async fn settle(&self, id: u64, captured: Captured) {
-        let (mut capture, providers, limit, target, vocabulary) = match captured {
+        let (mut capture, providers, limit, target, vocabulary, tone) = match captured {
             Captured::Done => return,
             Captured::Abort {
                 capture,
@@ -277,7 +282,8 @@ impl Engine {
                 limit,
                 target,
                 vocabulary,
-            } => (capture, providers, limit, target, vocabulary),
+                tone,
+            } => (capture, providers, limit, target, vocabulary, tone),
         };
         self.emit_state(Phase::Processing, None);
         let audio = match capture.finish().await {
@@ -293,6 +299,7 @@ impl Engine {
         };
         match self.decide(providers, audio, vocabulary).await {
             Ok(text) => {
+                let text = apply_tone(&text, tone);
                 tracing::info!(id, chars = text.chars().count(), "Transcript ready");
                 // Stored first: "Last transcript" + Copy is the fallback
                 // whenever the paste does not land.

@@ -26,6 +26,7 @@
     autoPaste: true,
     overlaySize: 'medium',
     boostWords: [],
+    tone: 'formal',
     trigger: { key: DEFAULT_TRIGGER, label: DEFAULT_TRIGGER, warnings: [], isDefault: true },
     triggerPresets: [],
   });
@@ -41,6 +42,7 @@
   let dictationError = $state('');
   let copied = $state(false);
   let autoPasteBusy = $state(false);
+  let toneBusy = $state(false);
   // One boost word per line; saved only on "Save words".
   let wordsDraft = $state('');
   let wordsBusy = $state(false);
@@ -184,6 +186,19 @@
     } finally {
       box.checked = app.autoPaste;
       autoPasteBusy = false;
+    }
+  }
+
+  async function toggleTone(event) {
+    const box = event.currentTarget;
+    toneBusy = true;
+    try {
+      app.tone = await invoke('set_tone', { tone: box.checked ? 'informal' : 'formal' });
+    } catch (e) {
+      error = 'Could not change Informal tone.';
+    } finally {
+      box.checked = app.tone === 'informal';
+      toneBusy = false;
     }
   }
 
@@ -343,6 +358,23 @@
           checked={app.autoPaste}
           disabled={autoPasteBusy}
           onchange={toggleAutoPaste}
+        />
+        <span class="track" aria-hidden="true"><span class="thumb"></span></span>
+      </span>
+    </label>
+    <label class="switch-row" for="informal-tone">
+      <span class="row-text">
+        <span>Informal tone</span>
+        <span class="hint">Chat abbreviations like BTW, and no final full stop.</span>
+      </span>
+      <span class="switch">
+        <input
+          id="informal-tone"
+          type="checkbox"
+          role="switch"
+          checked={app.tone === 'informal'}
+          disabled={toneBusy}
+          onchange={toggleTone}
         />
         <span class="track" aria-hidden="true"><span class="thumb"></span></span>
       </span>

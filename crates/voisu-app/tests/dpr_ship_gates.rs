@@ -29,8 +29,8 @@ use voisu_core::{
     CompositionDecision, Credential, DeliveryAdapter, DeliveryFlags, DeliveryOutcome,
     DprDiagnosticMode, FormatEditCandidate, LocalBaseline, LocalBaselineOptions, LocalTiming,
     PauseBoundary, Provider, ProviderState, RenderingPolicy, RenderingRoute, SourceSelection,
-    SourceTranscript, StructuredCandidate, SttProvider, SurfaceHint, TimingCertainty, Transcript,
-    TranscriptSelection, compose_structured_candidate, organize_local_baseline,
+    SourceTranscript, StructuredCandidate, SttProvider, SurfaceHint, TimingCertainty, Tone,
+    Transcript, TranscriptSelection, compose_structured_candidate, organize_local_baseline,
     parse_format_edit_candidate_json, parse_structured_candidate_json,
 };
 
@@ -719,6 +719,7 @@ async fn orchestration_deadline_compose_call_count_delivery_and_diagnostics() {
                 },
                 clock: &clock,
                 small_edit_contract: false,
+                tone: Tone::Formal,
             },
             &mut delivery,
         )
@@ -883,6 +884,7 @@ async fn cloud_call_budget_covers_zero_call_and_failed_attempt_paths() {
                 },
                 clock: &clock,
                 small_edit_contract: false,
+                tone: Tone::Formal,
             },
             &mut delivery,
         )
@@ -952,6 +954,7 @@ async fn cloud_call_budget_covers_zero_call_and_failed_attempt_paths() {
                 },
                 clock: &clock,
                 small_edit_contract: false,
+                tone: Tone::Formal,
             },
             &mut delivery,
         )
@@ -1053,6 +1056,7 @@ async fn formatting_apply_relaxes_lexical_source_words_without_dropping_safety()
             },
             clock: &clock,
             small_edit_contract: true,
+            tone: Tone::Formal,
         },
         &mut wording_delivery,
     )
@@ -1116,6 +1120,7 @@ async fn formatting_apply_relaxes_lexical_source_words_without_dropping_safety()
             },
             clock: &clock,
             small_edit_contract: true,
+            tone: Tone::Formal,
         },
         &mut unsafe_delivery,
     )
@@ -1179,6 +1184,7 @@ async fn dpr_flag_off_smart_writing_regression() {
             dictionary_terms: &[],
             protected_names: &[],
             credential: CredentialGateEvidence::default(),
+            tone: Tone::Formal,
         },
         &mut delivery,
     )

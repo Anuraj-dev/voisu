@@ -1,7 +1,7 @@
 //! Minimal persisted daemon configuration.
 //!
 //! Today this holds the Deepgram Provider switch, Delivery mode, Writing Mode,
-//! Developer Prompt Rendering policy, and ASR mode. It is persisted as TOML at
+//! Developer Prompt Rendering policy, Tone, and ASR mode. It is persisted as TOML at
 //! `$XDG_CONFIG_HOME/voisu/config.toml` (default `~/.config/voisu/config.toml`).
 //! `asr_mode` is re-read at Start/Replay admission under the shared config lock.
 //! Other keys may still be snapshotted at daemon start.
@@ -21,7 +21,9 @@
 //! `VOISU_DISABLE_DEEPGRAM` env override). Writing Mode defaults to **Smart**
 //! on a fresh install; unreadable files and unknown values fail closed to
 //! Literal. Rendering Policy defaults to **Adaptive**; unreadable files and
-//! unknown values fail closed to **Natural** (local-only safest). The file is
+//! unknown values fail closed to **Natural** (local-only safest). Tone
+//! defaults to **Formal**, and unreadable files and unknown values also
+//! resolve to Formal. The file is
 //! deliberately hand-parsed — a few small root keys do not justify a full TOML
 //! dependency, and the parser tolerates comments, blank lines, surrounding
 //! whitespace, and unrelated keys so a hand-edited file degrades to a defined
@@ -40,7 +42,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// Re-export for CLI and callers that already import config modes.
-pub use voisu_core::{AsrMode, RenderingPolicy};
+pub use voisu_core::{AsrMode, RenderingPolicy, Tone};
 
 /// The single configuration key: whether the Deepgram Provider is enabled.
 const DEEPGRAM_ENABLED_KEY: &str = "deepgram_enabled";
@@ -53,6 +55,9 @@ const WRITING_MODE_KEY: &str = "writing_mode";
 
 /// The root configuration key selecting Developer Prompt Rendering policy.
 const RENDERING_POLICY_KEY: &str = "rendering_policy";
+
+/// The root configuration key selecting Formal or Informal Tone.
+const TONE_KEY: &str = "tone";
 
 /// The root configuration key selecting Cloud or Local ASR.
 pub(crate) const ASR_MODE_KEY: &str = "asr_mode";
@@ -335,6 +340,14 @@ pub fn rendering_policy() -> RenderingPolicy {
     resolve_rendering_policy(read_rendering_policy(&config_path()))
 }
 
+/// The configured Tone. A missing file or key, an unreadable file, and an
+/// unrecognised value all resolve to [`Tone::Formal`], so informal output
+/// only ever follows an explicit `voisu tone informal`. Callers snapshot this
+/// at Recording start, like [`rendering_policy`].
+pub fn tone() -> Tone {
+    read_tone(&config_path()).unwrap_or_default()
+}
+
 /// Whether the Developer Prompt Rendering pipeline is active for this daemon
 /// process. On unless [`ENABLE_DPR_ENV`] rolls it back. This is deliberately
 /// not inferred from `rendering_policy`: policy can be configured while the
@@ -474,6 +487,15 @@ pub fn set_rendering_policy(policy: RenderingPolicy) -> Result<PathBuf, String> 
     let path = config_path();
     let _lock = ConfigLock::acquire(&path)?;
     write_rendering_policy(&path, policy)?;
+    Ok(path)
+}
+
+/// Persists the Tone, creating the `voisu` config directory if needed, and
+/// returns the path written so the CLI can report it.
+pub fn set_tone(tone: Tone) -> Result<PathBuf, String> {
+    let path = config_path();
+    let _lock = ConfigLock::acquire(&path)?;
+    write_tone(&path, tone)?;
     Ok(path)
 }
 
@@ -849,6 +871,58 @@ fn parse_rendering_policy(contents: &str) -> RenderingPolicyLoad {
     RenderingPolicyLoad::Missing
 }
 
+/// Reads the persisted Tone. `None` (Formal) when the file is missing, has no
+/// root `tone` key, cannot be read, or holds an unrecognised value.
+fn read_tone(path: &Path) -> Option<Tone> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => parse_tone(&contents),
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        Err(error) => {
+            eprintln!(
+                "voisu: ignoring unreadable config at {}: {error}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// Parses the root-scope `tone` string. Tolerance and table scoping mirror
+/// [`parse_rendering_policy`]; an unrecognised value fails closed to Formal
+/// with a bounded, value-free diagnostic.
+fn parse_tone(contents: &str) -> Option<Tone> {
+    for line in contents.lines() {
+        let line = strip_comment(line).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            return None;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != TONE_KEY {
+            continue;
+        }
+        let value = value.trim();
+        let tone = value
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+            .or_else(|| {
+                value
+                    .strip_prefix('\'')
+                    .and_then(|rest| rest.strip_suffix('\''))
+            })
+            .and_then(Tone::parse);
+        if tone.is_none() {
+            eprintln!("voisu: unrecognized tone in config; using formal");
+        }
+        return tone;
+    }
+    None
+}
+
 /// Returns `line` with any comment removed. Supported values are simple
 /// booleans or fixed quoted strings, so a `#` anywhere begins a comment.
 fn strip_comment(line: &str) -> &str {
@@ -860,13 +934,13 @@ fn strip_comment(line: &str) -> &str {
 const MANAGED_LINES: [&str; 3] = [
     "# Voisu daemon configuration.",
     "# ASR mode is re-read at Start/Replay; other keys may be snapshotted at daemon start.",
-    "# Managed by the `voisu deepgram`, `voisu delivery`, `voisu writing`, `voisu layout`, and `voisu engine` commands.",
+    "# Managed by the `voisu deepgram`, `voisu delivery`, `voisu writing`, `voisu layout`, `voisu tone`, and `voisu engine` commands.",
 ];
 
 /// Managed header lines emitted by earlier releases. Stripped alongside
 /// [`MANAGED_LINES`] so upgrading an existing config never strands stale
 /// headers above the rewritten block.
-const LEGACY_MANAGED_LINES: [&str; 10] = [
+const LEGACY_MANAGED_LINES: [&str; 11] = [
     "# Whether the Deepgram Provider participates in a Recording.",
     "# Managed by `voisu deepgram on|off`; read once at daemon start.",
     // Pre-Writing-Mode managed body lines (delivery-only era).
@@ -881,6 +955,8 @@ const LEGACY_MANAGED_LINES: [&str; 10] = [
     "# Recording Provider, Delivery, Writing Mode, Rendering Policy, and ASR mode settings; read once at daemon start.",
     // Pre-plain-words managed body line (`rendering` / `mode` command era).
     "# Managed by the `voisu deepgram`, `voisu delivery`, `voisu writing`, `voisu rendering`, and `voisu mode` commands.",
+    // Pre-Tone managed body line.
+    "# Managed by the `voisu deepgram`, `voisu delivery`, `voisu writing`, `voisu layout`, and `voisu engine` commands.",
 ];
 
 /// Persists the toggle, creating the parent `voisu` directory if needed and
@@ -888,27 +964,32 @@ const LEGACY_MANAGED_LINES: [&str; 10] = [
 /// same-directory temp file is fully written then renamed into place, so an
 /// interrupted write never leaves a partially written config.
 fn write_setting(path: &Path, enabled: bool) -> Result<(), String> {
-    write_config(path, Some(enabled), None, None, None, None)
+    write_config(path, Some(enabled), None, None, None, None, None)
 }
 
 /// Persists the Delivery mode without discarding the other managed root keys.
 fn write_delivery_mode(path: &Path, mode: DeliveryMode) -> Result<(), String> {
-    write_config(path, None, Some(mode), None, None, None)
+    write_config(path, None, Some(mode), None, None, None, None)
 }
 
 /// Persists the Writing Mode without discarding the other managed root keys.
 fn write_writing_mode(path: &Path, mode: WritingMode) -> Result<(), String> {
-    write_config(path, None, None, Some(mode), None, None)
+    write_config(path, None, None, Some(mode), None, None, None)
 }
 
 /// Persists the Rendering Policy without discarding the other managed root keys.
 fn write_rendering_policy(path: &Path, policy: RenderingPolicy) -> Result<(), String> {
-    write_config(path, None, None, None, Some(policy), None)
+    write_config(path, None, None, None, Some(policy), None, None)
+}
+
+/// Persists the Tone without discarding the other managed root keys.
+fn write_tone(path: &Path, tone: Tone) -> Result<(), String> {
+    write_config(path, None, None, None, None, None, Some(tone))
 }
 
 /// Persists ASR mode. Caller must already hold [`ConfigLock`].
 pub(crate) fn write_asr_mode_unlocked(path: &Path, mode: AsrMode) -> Result<(), String> {
-    write_config(path, None, None, None, None, Some(mode))
+    write_config(path, None, None, None, None, Some(mode), None)
 }
 
 /// Rewrites managed root settings while preserving every other line. Only the
@@ -921,6 +1002,7 @@ fn write_config(
     writing_mode: Option<WritingMode>,
     rendering_policy: Option<RenderingPolicy>,
     asr_mode: Option<AsrMode>,
+    tone: Option<Tone>,
 ) -> Result<(), String> {
     let parent = path
         .parent()
@@ -954,6 +1036,7 @@ fn write_config(
             writing_mode,
             rendering_policy,
             asr_mode,
+            tone,
         ),
     )
 }
@@ -1003,6 +1086,7 @@ fn merge_content(
     writing_mode: Option<WritingMode>,
     rendering_policy: Option<RenderingPolicy>,
     asr_mode: Option<AsrMode>,
+    tone: Option<Tone>,
 ) -> String {
     let mut in_root = true;
     let mut preserved: Vec<&str> = Vec::new();
@@ -1038,7 +1122,13 @@ fn merge_content(
             && trimmed
                 .split_once('=')
                 .is_some_and(|(key, _)| is_asr_mode_key(key.trim()));
+        let is_root_tone = tone.is_some()
+            && in_root
+            && trimmed
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == TONE_KEY);
         if is_managed_comment
+            || is_root_tone
             || is_root_deepgram_enabled
             || is_root_delivery_mode
             || is_root_writing_mode
@@ -1055,6 +1145,7 @@ fn merge_content(
         writing_mode,
         rendering_policy,
         asr_mode,
+        tone,
     );
     let body = preserved.join("\n");
     let body = body.trim_matches('\n');
@@ -1073,6 +1164,7 @@ fn render(
     writing_mode: Option<WritingMode>,
     rendering_policy: Option<RenderingPolicy>,
     asr_mode: Option<AsrMode>,
+    tone: Option<Tone>,
 ) -> String {
     let mut out = String::new();
     for line in MANAGED_LINES {
@@ -1096,6 +1188,9 @@ fn render(
     }
     if let Some(mode) = asr_mode {
         out.push_str(&format!("{ASR_MODE_KEY} = \"{}\"\n", mode.as_str()));
+    }
+    if let Some(tone) = tone {
+        out.push_str(&format!("{TONE_KEY} = \"{}\"\n", tone.as_str()));
     }
     out
 }
@@ -1418,19 +1513,33 @@ other_key = 5
     #[test]
     fn a_rendered_file_round_trips_through_the_parser() {
         assert_eq!(
-            parse_deepgram_enabled(&render(Some(true), None, None, None, None)),
+            parse_deepgram_enabled(&render(Some(true), None, None, None, None, None)),
             Some(true)
         );
         assert_eq!(
-            parse_deepgram_enabled(&render(Some(false), None, None, None, None)),
+            parse_deepgram_enabled(&render(Some(false), None, None, None, None, None)),
             Some(false)
         );
         assert_eq!(
-            parse_writing_mode(&render(None, None, Some(WritingMode::Literal), None, None)),
+            parse_writing_mode(&render(
+                None,
+                None,
+                Some(WritingMode::Literal),
+                None,
+                None,
+                None
+            )),
             WritingModeLoad::Known(WritingMode::Literal)
         );
         assert_eq!(
-            parse_writing_mode(&render(None, None, Some(WritingMode::Smart), None, None)),
+            parse_writing_mode(&render(
+                None,
+                None,
+                Some(WritingMode::Smart),
+                None,
+                None,
+                None
+            )),
             WritingModeLoad::Known(WritingMode::Smart)
         );
         assert_eq!(
@@ -1439,6 +1548,7 @@ other_key = 5
                 None,
                 None,
                 Some(RenderingPolicy::Structured),
+                None,
                 None,
             )),
             RenderingPolicyLoad::Known(RenderingPolicy::Structured)
@@ -1449,6 +1559,7 @@ other_key = 5
                 None,
                 None,
                 Some(RenderingPolicy::Adaptive),
+                None,
                 None,
             )),
             RenderingPolicyLoad::Known(RenderingPolicy::Adaptive)
@@ -1923,7 +2034,7 @@ other_key = 5
     #[test]
     fn writing_asr_mode_replaces_quoted_and_bare_keys() {
         let existing = "\"asr_mode\" = \"local\"\n'asr_mode' = \"local\"\ncustom = 1\n";
-        let out = merge_content(existing, None, None, None, None, Some(AsrMode::Cloud));
+        let out = merge_content(existing, None, None, None, None, Some(AsrMode::Cloud), None);
         assert_eq!(out.matches("asr_mode").count(), 1, "{out}");
         assert!(out.contains("asr_mode = \"cloud\""), "{out}");
         assert!(!out.contains("\"asr_mode\""), "{out}");
@@ -2015,5 +2126,62 @@ other_key = 5
             "the managed header appears exactly once: {contents}"
         );
         assert_eq!(read_setting(&path), Some(true));
+    }
+
+    #[test]
+    fn tone_is_formal_when_missing_unreadable_or_unrecognised() {
+        assert_eq!(Tone::default(), Tone::Formal);
+        assert_eq!(parse_tone(""), None);
+        assert_eq!(parse_tone("other_key = true\n"), None);
+        assert_eq!(parse_tone("[other]\ntone = \"informal\"\n"), None);
+        assert_eq!(parse_tone("tone = \"casual\"\n"), None);
+        assert_eq!(parse_tone("tone = informal\n"), None);
+        assert_eq!(parse_tone("tone = \"Informal\"\n"), None);
+        assert_eq!(read_tone(Path::new("/nonexistent/voisu/config.toml")), None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, [0xff, 0xfe, 0x00, 0x42]).unwrap();
+        assert_eq!(read_tone(&path), None);
+        assert_eq!(read_tone(&path).unwrap_or_default(), Tone::Formal);
+    }
+
+    #[test]
+    fn tone_values_parse_in_either_quote_style() {
+        assert_eq!(parse_tone("tone = \"informal\"\n"), Some(Tone::Informal));
+        assert_eq!(parse_tone("tone = 'informal'\n"), Some(Tone::Informal));
+        assert_eq!(parse_tone("tone = \"formal\" # chat\n"), Some(Tone::Formal));
+        assert_eq!(
+            parse_tone("tone = \"informal\"\n[other]\ntone = \"formal\"\n"),
+            Some(Tone::Informal)
+        );
+    }
+
+    #[test]
+    fn writing_then_reading_tone_round_trips_and_keeps_other_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("voisu").join("config.toml");
+        write_writing_mode(&path, WritingMode::Literal).unwrap();
+        write_rendering_policy(&path, RenderingPolicy::Structured).unwrap();
+
+        write_tone(&path, Tone::Informal).unwrap();
+        assert_eq!(read_tone(&path), Some(Tone::Informal));
+        write_tone(&path, Tone::Formal).unwrap();
+        assert_eq!(read_tone(&path), Some(Tone::Formal));
+        write_tone(&path, Tone::Informal).unwrap();
+        write_setting(&path, false).unwrap();
+
+        assert_eq!(read_tone(&path), Some(Tone::Informal));
+        assert_eq!(
+            read_writing_mode(&path),
+            WritingModeLoad::Known(WritingMode::Literal)
+        );
+        assert_eq!(
+            read_rendering_policy(&path),
+            RenderingPolicyLoad::Known(RenderingPolicy::Structured)
+        );
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents.matches("tone =").count(), 1, "{contents}");
+        assert_eq!(contents.matches(MANAGED_LINES[2]).count(), 1, "{contents}");
     }
 }

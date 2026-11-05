@@ -7,6 +7,7 @@ use std::path::Path;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
+use voisu_core::Tone;
 
 use crate::trigger_key::TriggerChord;
 
@@ -51,6 +52,11 @@ pub struct Settings {
     /// The user's boost words, normalized (see `vocabulary::normalize`).
     #[serde(deserialize_with = "lenient_terms")]
     pub boost_words: Vec<String>,
+    /// Formal keeps full words; informal turns chat phrases into
+    /// abbreviations like BTW and drops the final full stop. Read as each
+    /// Recording starts; anything unknown is formal.
+    #[serde(deserialize_with = "lenient")]
+    pub tone: Tone,
 }
 
 /// A field with a value this version does not understand (a size a later
@@ -106,6 +112,7 @@ impl Default for Settings {
             auto_paste: true,
             overlay_size: OverlaySize::Medium,
             boost_words: Vec::new(),
+            tone: Tone::Formal,
         }
     }
 }
@@ -264,6 +271,7 @@ mod tests {
         assert_eq!(settings.overlay_size, OverlaySize::Medium);
         assert_eq!(settings.overlay_size.scale(), 1.0);
         assert!(settings.boost_words.is_empty());
+        assert_eq!(settings.tone, Tone::Formal);
     }
 
     #[test]
@@ -292,11 +300,13 @@ mod tests {
             auto_paste: false,
             overlay_size: OverlaySize::Large,
             boost_words: vec!["Voisu".to_owned(), "Tauri".to_owned()],
+            tone: Tone::Informal,
             ..Settings::default()
         };
         settings.save(&path).unwrap();
         let json = fs::read_to_string(&path).unwrap();
         assert!(json.contains(r#""overlay_size": "large""#), "{json}");
+        assert!(json.contains(r#""tone": "informal""#), "{json}");
         assert!(json.contains(r#""auto_paste": false"#), "{json}");
         assert_eq!(Settings::load(&path), settings);
     }
@@ -308,7 +318,7 @@ mod tests {
         fs::write(
             &path,
             br#"{"autostart_default_applied": true, "auto_paste": "yes",
-                 "overlay_size": "huge", "boost_words": ["Voisu"]}"#,
+                 "overlay_size": "huge", "boost_words": ["Voisu"], "tone": "casual"}"#,
         )
         .unwrap();
         let settings = Settings::load(&path);
@@ -316,6 +326,7 @@ mod tests {
         assert!(settings.auto_paste, "a mistyped toggle keeps its default");
         assert_eq!(settings.overlay_size, OverlaySize::Medium);
         assert_eq!(settings.boost_words, ["Voisu"]);
+        assert_eq!(settings.tone, Tone::Formal, "an unknown tone is formal");
     }
 
     #[test]

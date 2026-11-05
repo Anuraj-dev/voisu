@@ -63,6 +63,9 @@ pub use dpr_diagnostics::{
     DprAcceptedLateCandidate, DprLateEvaluationRecord, MAX_DPR_RETAINED_LATE_TEXT_UTF8_BYTES,
 };
 
+mod tone;
+pub use tone::{Tone, apply_tone};
+
 mod formatting_commands;
 pub use formatting_commands::{
     CommandEvent, CommandKind, NumberedListItem, ParsedCommands, SourceSpan,
