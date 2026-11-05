@@ -183,6 +183,7 @@ def inventory(input_dir: Path, refs_path: Path, consent_path: Path, corpus_id: s
         _require(record_id not in seen_ids, f"duplicate record id: {record_id}")
         seen_ids.add(record_id)
         language = _normalise_language(row.get("language"))
+        _require(row.get("review_status") != "unreviewed", f'{record_id} is still a draft: check its reference, then set review_status to "reviewed"')
         reference = row.get("reference", "")
         _require(isinstance(reference, str), f"reference for {record_id} must be text")
         _require(len(reference) <= MAX_REFERENCE_CHARS, f"reference for {record_id} is too long")

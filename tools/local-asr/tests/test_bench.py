@@ -165,6 +165,56 @@ class AddCapturesTests(unittest.TestCase):
             bench.add_captures(eval_dir, diagnostics, 7, now_ms=NOW_MS)
             self.assertEqual(existing.read_bytes(), kept)
 
+    def test_orphan_wav_from_a_died_run_gets_its_reference_added(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            eval_dir = make_eval_dir(root)
+            diagnostics = make_diagnostics(root, [{"id": "rec-4-1", "pcm": pcm(11), "transcript": "orphaned text"}, {"id": "rec-4-2", "pcm": pcm(12), "transcript": "fresh text"}])
+            # The earlier run wrote the WAV, then died before saving references.draft.json.
+            orphan = eval_dir / "audio" / "cap-rec-4-1.wav"
+            orphan.write_bytes(bench.pcm_to_wav(pcm(11)))
+            result = bench.add_captures(eval_dir, diagnostics, 7, now_ms=NOW_MS)
+            self.assertEqual(result["added"], ["cap-rec-4-1.wav", "cap-rec-4-2.wav"])
+            self.assertNotIn("duplicate audio (already in corpus or captures)", result["skipped"])
+            refs = json.loads((eval_dir / "references.draft.json").read_text())
+            self.assertEqual(refs["cap-rec-4-1.wav"]["reference"], "orphaned text")
+            self.assertEqual(refs["cap-rec-4-1.wav"]["review_status"], "unreviewed")
+            self.assertEqual(orphan.read_bytes(), bench.pcm_to_wav(pcm(11)))
+            self.assertEqual(bench.add_captures(eval_dir, diagnostics, 7, now_ms=NOW_MS)["added"], [])
+            # A same-named file with other content is still left alone.
+            diagnostics = make_diagnostics(root / "again", [{"id": "rec-4-3", "pcm": pcm(13), "transcript": "x"}])
+            clash = eval_dir / "audio" / "cap-rec-4-3.wav"
+            make_wav(clash, 4000)
+            kept = clash.read_bytes()
+            self.assertEqual(bench.add_captures(eval_dir, diagnostics, 7, now_ms=NOW_MS)["added"], [])
+            self.assertEqual(clash.read_bytes(), kept)
+
+    def test_inventory_refuses_a_draft_whose_language_was_set_but_review_status_was_not(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            eval_dir = make_eval_dir(root)
+            diagnostics = make_diagnostics(root, [{"id": "rec-5-1", "pcm": pcm(21), "transcript": "hello there"}])
+            bench.add_captures(eval_dir, diagnostics, 7, now_ms=NOW_MS)
+            draft = eval_dir / "references.draft.json"
+            refs = json.loads(draft.read_text())
+            refs["cap-rec-5-1.wav"].update(language="english", reference="hello there friend")  # review_status stays "unreviewed"
+            draft.write_text(json.dumps(refs), encoding="utf-8")
+            with self.assertRaisesRegex(benchmark.BenchmarkError, 'set review_status to "reviewed"'):
+                benchmark.inventory(eval_dir / "audio", draft, eval_dir / "consent.json", "synthetic-v3")
+            refs["cap-rec-5-1.wav"]["review_status"] = "reviewed"
+            draft.write_text(json.dumps(refs), encoding="utf-8")
+            self.assertEqual(len(benchmark.inventory(eval_dir / "audio", draft, eval_dir / "consent.json", "synthetic-v3")["records"]), 4)
+
+    def test_add_captures_output_says_how_to_mark_a_draft_reviewed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            eval_dir = make_eval_dir(root)
+            diagnostics = make_diagnostics(root, [{"id": "rec-6-1", "pcm": pcm(31), "transcript": "hello"}])
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                self.assertEqual(bench.main(["add-captures", "--eval-dir", str(eval_dir), "--diagnostics-dir", str(diagnostics), "--since", "100000"]), 0)
+            self.assertIn('set review_status to "reviewed" and remove the "unreviewed" tag', stdout.getvalue())
+
     def test_next_steps_reuse_corpus_seed_and_never_overwrite_the_frozen_corpus(self):
         with tempfile.TemporaryDirectory() as directory:
             eval_dir = make_eval_dir(Path(directory))
@@ -188,6 +238,7 @@ class ModelDiscoveryTests(unittest.TestCase):
             (manifests / "qwen3-asr-0.6b.json").write_text(json.dumps({"model_id": "qwen3-asr-0.6b", "device": "cuda:0", "model_path": str(weights), "files": []}), encoding="utf-8")
             (manifests / "qwen3-asr-1.7b.json").write_text(json.dumps({"model_id": "qwen3-asr-1.7b", "device": "cuda:0", "model_path": str(root / "gone"), "runtime": {"python": str(root / "no-python")}, "files": [{"path": str(root / "gone.bin")}]}), encoding="utf-8")
             (manifests / "qwen3-asr-0.6b.fingerprints.json").write_text("{}", encoding="utf-8")
+            (manifests / "qwen3-asr-1.7b.fingerprints.json").write_text("{}", encoding="utf-8")
             (manifests / "broken.json").write_text("{", encoding="utf-8")
             found = bench.discover_models(root)
             self.assertEqual([(m["model_id"], m["ready"]) for m in found], [("qwen3-asr-0.6b", True), ("qwen3-asr-1.7b", False)])
@@ -199,11 +250,46 @@ class ModelDiscoveryTests(unittest.TestCase):
                 bench.resolve_models(["nemotron-3.5-0.6b"], root)
             pinned = root / "worker.py"
             pinned.write_text("changed", encoding="utf-8")
-            (manifests / "stale-model.json").write_text(json.dumps({"model_id": "stale-model", "files": [{"path": str(pinned), "bytes": 999}]}), encoding="utf-8")
-            stale = {m["model_id"]: m for m in bench.discover_models(root)}["stale-model"]
+            (manifests / "parakeet-tdt-0.6b-v3.json").write_text(json.dumps({"model_id": "parakeet-tdt-0.6b-v3", "files": [{"path": str(pinned), "bytes": 999}]}), encoding="utf-8")
+            (manifests / "parakeet-tdt-0.6b-v3.fingerprints.json").write_text("{}", encoding="utf-8")
+            stale = {m["model_id"]: m for m in bench.discover_models(root)}["parakeet-tdt-0.6b-v3"]
             self.assertFalse(stale["ready"])
             self.assertEqual(stale["missing"], ["1 stale pin(s): regenerate the manifest"])
             self.assertEqual(bench.resolve_models([f"x-model={manifests}/a.json"], root), [f"x-model={manifests}/a.json"])
+
+    def test_ready_matches_what_replay_loads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registered = root / "local-dev" / "manifests"
+            private = root / "private-manifests"
+            registered.mkdir(parents=True)
+            private.mkdir()
+            body = json.dumps({"model_id": "qwen3-asr-0.6b", "device": "cpu"})
+            # A private manifest alone is not registered, so replay would refuse it.
+            (private / "qwen3-asr-0.6b.json").write_text(body, encoding="utf-8")
+            only_private = bench.discover_models(root)[0]
+            self.assertFalse(only_private["ready"])
+            self.assertIn("not registered", only_private["missing"][0])
+            # Registered but without the fingerprints file: not ready.
+            (registered / "qwen3-asr-0.6b.json").write_text(body, encoding="utf-8")
+            (registered / "not-in-catalog.json").write_text(json.dumps({"model_id": "not-in-catalog"}), encoding="utf-8")
+            (registered / "not-in-catalog.fingerprints.json").write_text("{}", encoding="utf-8")
+            (registered / "renamed.json").write_text(json.dumps({"model_id": "qwen3-asr-1.7b"}), encoding="utf-8")
+            (registered / "renamed.fingerprints.json").write_text("{}", encoding="utf-8")
+            found = {m["model_id"]: m for m in bench.discover_models(root)}
+            self.assertEqual(found["qwen3-asr-0.6b"]["missing"], ["no fingerprints file"])
+            self.assertEqual(found["not-in-catalog"]["missing"], ["not in the development catalog"])
+            self.assertEqual(found["qwen3-asr-1.7b"]["missing"], ["file name differs from model_id"])
+            # Registered with fingerprints: ready, and the registered copy wins over the private one.
+            (registered / "qwen3-asr-0.6b.fingerprints.json").write_text("{}", encoding="utf-8")
+            found = {m["model_id"]: m for m in bench.discover_models(root)}
+            self.assertTrue(found["qwen3-asr-0.6b"]["ready"])
+            self.assertEqual(found["qwen3-asr-0.6b"]["path"], str(registered / "qwen3-asr-0.6b.json"))
+
+    def test_catalog_ids_come_from_the_rust_source(self):
+        ids = bench.catalog_ids()
+        self.assertIsNotNone(ids)
+        self.assertIn("qwen3-asr-0.6b", ids)
 
 
 FAKE_CLI = """#!/usr/bin/env python3
@@ -252,9 +338,11 @@ class RunTests(unittest.TestCase):
         self.assertEqual(sorted(m["model_id"] for m in report["models"]), ["model-a", "model-b"])
         lines = table.splitlines()
         self.assertTrue(lines[0].startswith("model"))
-        rows = {line.split()[0]: line for line in lines[1:3]}
-        self.assertIn("0.0%", rows["model-a"])
-        self.assertNotIn("0.0%", rows["model-b"].split("  ", 1)[1].split()[1:2])
+        header = [cell for cell in lines[0].split("  ") if cell.strip()]
+        raw_column = header.index("raw WER")
+        rows = {line.split()[0]: [cell for cell in line.split("  ") if cell.strip()] for line in lines[1:3]}
+        self.assertEqual(rows["model-a"][raw_column], "0.0%")
+        self.assertNotEqual(rows["model-b"][raw_column], "0.0%")  # model-b dropped a word
         self.assertIn("FIXTURE", table)
         self.assertNotIn("ship the release", table)  # transcript text never goes to the table
         self.assertEqual((run_dir / "table.txt").read_text().strip(), table.strip())
@@ -278,7 +366,7 @@ class RunTests(unittest.TestCase):
         _, _, table = self.run_bench([self.manifest("model-b", 0)])
         self.assertIn("[base] model-b", table)
         _, _, table = self.run_bench([self.manifest("model-a", 0)], baseline_id="model-z")
-        self.assertIn("no earlier run of baseline model-z", table)
+        self.assertIn("no earlier full run of baseline model-z", table)
         self.assertNotIn("[base]", table)
 
     def test_reports_on_a_different_corpus_or_real_evidence_are_not_baselines(self):
@@ -287,7 +375,56 @@ class RunTests(unittest.TestCase):
         self.assertEqual(bench.pick_baseline(history, "0" * 64, "fixture", None), (None, None))
         self.assertEqual(bench.pick_baseline(history, history[0]["report"]["corpus_manifest_sha256"], "real", None), (None, None))
 
-    def test_failed_replay_leaves_no_run_folder(self):
+    def partial_manifest(self, model_id, keep):
+        path = self.root / f"{model_id}-partial.json"
+        texts = json.loads(Path(self.manifest(model_id, 0).split("=", 1)[1]).read_text())["fake_texts"][:keep]
+        path.write_text(json.dumps({"model_id": model_id, "fake_texts": texts}), encoding="utf-8")
+        return f"{model_id}={path}"
+
+    def test_partial_runs_are_never_baselines_and_never_produce_deltas(self):
+        full, _, _ = self.run_bench([self.manifest("model-a", 0)])
+        _, report, table = self.run_bench([self.partial_manifest("model-a", 2)], baseline_id="model-a")
+        self.assertEqual(report["models"][0]["status"], "measured_partial")
+        self.assertIn(f"runs/{full.name}/report.json", table)  # compared against the full run only
+        row = next(line for line in table.splitlines() if line.startswith("model-a "))
+        self.assertNotIn("pp", row)  # 2 of 3 clips against 3 of 3 is not a like-for-like delta
+        self.assertNotIn("d raw", table.splitlines()[0])
+        # With the partial run in the history, a later full run still compares with the full one.
+        _, _, again = self.run_bench([self.manifest("model-a", 1)], baseline_id="model-a")
+        self.assertIn(f"runs/{full.name}/report.json", again)
+        self.assertIn("(1 earlier run(s)", again)
+        # A history that holds only a partial run offers no baseline at all.
+        history = bench.load_history(self.eval_dir)
+        only_partial = [entry for entry in history if any(m["status"] == "measured_partial" for m in entry["report"]["models"])]
+        self.assertEqual(len(only_partial), 1)
+        corpus_sha = only_partial[0]["report"]["corpus_manifest_sha256"]
+        baseline, note = bench.pick_baseline(only_partial, corpus_sha, "fixture", "model-a")
+        self.assertIsNone(baseline)
+        self.assertIn("no earlier full run", note)
+
+    def test_baseline_must_come_from_the_same_device_and_host(self):
+        self.run_bench([self.manifest("model-a", 0)])
+        history = bench.load_history(self.eval_dir)
+        corpus_sha = history[0]["report"]["corpus_manifest_sha256"]
+        gpu = {"requested_device": "cuda:0", "observed_device": "cuda:0", "host_profile": "unprofiled"}
+        cpu = {"requested_device": "cpu", "observed_device": "cpu", "host_profile": "unprofiled"}
+        history[0]["report"]["models"][0]["identity"] = gpu
+
+        def pick(identity):
+            return bench.pick_baseline(history, corpus_sha, "fixture", None, scopes={bench._scope({"identity": identity})})[0]
+
+        self.assertIsNotNone(pick(gpu))
+        self.assertIsNone(pick(cpu))
+        self.assertIsNone(pick(dict(gpu, host_profile="laptop")))
+        # A row on another device gets no delta even when a baseline was chosen.
+        report = {"models": [{"model_id": "model-a", "status": "measured", "identity": cpu, "sample_count": 3, "expected_sample_count": 3,
+                              "raw_strict": {"wer": 0.5}, "timings": {"warm_inference_ms": {"p50_ms": 5, "p95_ms": 6}}}]}
+        baseline = {"model_id": "model-a", "label": "x", "runs": 1, "model": history[0]["report"]["models"][0]}
+        row = next(line for line in bench.build_table(report, baseline).splitlines() if line.startswith("model-a "))
+        self.assertNotIn("pp", row)
+        self.assertNotIn("ms ", row.split("5/6")[-1])
+
+    def test_unavailable_model_is_reported_without_fake_numbers_and_a_crashed_run_leaves_no_folder(self):
         broken = self.root / "broken.json"
         broken.write_text(json.dumps({"model_id": "model-a", "fake_texts": []}), encoding="utf-8")
         _, report, table = self.run_bench([f"model-a={broken}"])  # the fake CLI crashes: rows become "unavailable", not an exception

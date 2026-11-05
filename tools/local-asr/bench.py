@@ -27,8 +27,9 @@ repository.  Run it through `tools/dev bench ...` or directly.
       to <eval-dir>/audio/cap-<id>.wav and a draft entry prefilled with the
       delivered transcript goes into <eval-dir>/references.draft.json.  The
       transcript is the pipeline's guess, not ground truth.  Each new entry
-      has language "unreviewed" so `benchmark.py inventory` refuses it until
-      you correct the text and set the language by hand.  Existing audio and
+      has language "unreviewed" and review_status "unreviewed", and `benchmark.py
+      inventory` refuses it until you correct the text, set the language, set
+      review_status to "reviewed" and drop the "unreviewed" tag by hand.  Existing audio and
       references are never overwritten; duplicates (by audio hash) are skipped.
 
 Tests: python3 -m unittest discover -s tools/local-asr/tests
@@ -48,7 +49,7 @@ import sys
 import tempfile
 import time
 import wave
-from typing import Any, Mapping, Sequence
+from typing import Any, Collection, Mapping, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import benchmark  # noqa: E402  (sibling module; the single source of replay/score logic)
@@ -129,9 +130,32 @@ def _missing_paths(manifest: Mapping[str, Any]) -> list[str]:
     return missing
 
 
-def discover_models(root: Path) -> list[dict[str, Any]]:
-    """Model manifests found under the state root, one per model id."""
+# The ids replay accepts live in the Rust source (DEVELOPMENT_CATALOG); read them
+# from there at runtime so this list cannot drift from it.
+CATALOG_SOURCE = Path(__file__).resolve().parents[2] / "crates" / "voisu-app" / "src" / "local_model" / "development.rs"
+CATALOG_ID_RE = re.compile(r'DevCatalogEntry\s*\{\s*model_id:\s*"([^"]+)"')
+REGISTERED_DIR = "local-dev/manifests"
 
+
+def catalog_ids() -> set[str] | None:
+    """Model ids replay knows, or None when the Rust source is not readable."""
+
+    try:
+        return set(CATALOG_ID_RE.findall(CATALOG_SOURCE.read_text(encoding="utf-8")))
+    except OSError:
+        return None
+
+
+def discover_models(root: Path) -> list[dict[str, Any]]:
+    """Model manifests found under the state root, one per model id.
+
+    "ready" mirrors what replay loads: the registered snapshot in
+    local-dev/manifests (id in the catalog, a <id>.fingerprints.json beside it)
+    with its files on disk.  It cannot replicate the inode/mtime fingerprint
+    check, so replay stays the final judge.
+    """
+
+    known_ids = catalog_ids()
     found: dict[str, dict[str, Any]] = {}
     for relative in MANIFEST_DIRS:
         directory = root / relative
@@ -147,7 +171,17 @@ def discover_models(root: Path) -> list[dict[str, Any]]:
             model_id = manifest.get("model_id") if isinstance(manifest, dict) else None
             if not isinstance(model_id, str) or not benchmark.MODEL_ID_RE.fullmatch(model_id) or model_id in found:
                 continue
-            missing = _missing_paths(manifest)
+            if relative != REGISTERED_DIR:
+                missing = [f"not registered: voisu local-dev register --manifest {path}"]
+            else:
+                missing = []
+                if known_ids is not None and model_id not in known_ids:
+                    missing.append("not in the development catalog")
+                if path.stem != model_id:
+                    missing.append("file name differs from model_id")
+                if not path.with_suffix(".fingerprints.json").is_file():
+                    missing.append("no fingerprints file")
+                missing += _missing_paths(manifest)
             found[model_id] = {"model_id": model_id, "path": str(path), "device": manifest.get("device"), "ready": not missing, "missing": missing}
     return sorted(found.values(), key=lambda item: (not item["ready"], item["model_id"]))
 
@@ -213,23 +247,41 @@ def load_history(eval_dir: Path) -> list[dict[str, Any]]:
     return history
 
 
+def _scope(model: Mapping[str, Any]) -> tuple[str, str]:
+    """Device and host a result was measured on; latency is only comparable within one."""
+
+    identity = model.get("identity")
+    identity = identity if isinstance(identity, dict) else {}
+    device = identity.get("requested_device"), identity.get("observed_device")
+    return json.dumps(device), json.dumps(identity.get("host_profile"))
+
+
 def _runs_per_model(history: Sequence[Mapping[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    """Fully measured earlier results per model; a partial run covers fewer clips and is never a baseline."""
+
     runs: dict[str, list[dict[str, Any]]] = {}
     for entry in history:
         for model in entry["report"]["models"]:
-            if model.get("status") in {"measured", "measured_partial"}:
+            if model.get("status") == "measured":
                 runs.setdefault(model["model_id"], []).append({"label": entry["label"], "corpus": entry["report"].get("corpus_manifest_sha256"), "evidence_class": model.get("evidence_class"), "model": model})
     return runs
 
 
-def pick_baseline(history: Sequence[Mapping[str, Any]], corpus_sha: str, evidence_class: str, wanted: str | None, current: Sequence[str] = ()) -> tuple[dict[str, Any] | None, str | None]:
-    """Latest comparable earlier result for the baseline model, plus a note."""
+def pick_baseline(history: Sequence[Mapping[str, Any]], corpus_sha: str, evidence_class: str, wanted: str | None, current: Sequence[str] = (),
+                  scopes: Collection[tuple[str, str]] = ()) -> tuple[dict[str, Any] | None, str | None]:
+    """Latest comparable earlier result for the baseline model, plus a note.
 
-    comparable = {model_id: [run for run in runs if run["corpus"] == corpus_sha and run["evidence_class"] == evidence_class] for model_id, runs in _runs_per_model(history).items()}
+    Comparable means fully measured on the same corpus and evidence class and,
+    when `scopes` (device, host of this run's measured models) is given, on one
+    of those devices and hosts: GPU latency is never compared with a CPU report.
+    """
+
+    comparable = {model_id: [run for run in runs if run["corpus"] == corpus_sha and run["evidence_class"] == evidence_class and (not scopes or _scope(run["model"]) in scopes)]
+                  for model_id, runs in _runs_per_model(history).items()}
     comparable = {model_id: runs for model_id, runs in comparable.items() if runs}
     if wanted is not None:
         if wanted not in comparable:
-            return None, f"no earlier run of baseline {wanted} on this corpus; no deltas shown"
+            return None, f"no earlier full run of baseline {wanted} on this corpus and device; no deltas shown"
         chosen = wanted
     elif comparable:
         # Most runs wins; a tie goes to a model in this run, then to the most recent.
@@ -292,6 +344,9 @@ def build_table(report: Mapping[str, Any], baseline: Mapping[str, Any] | None) -
 
     def row_for(label: str, model: Mapping[str, Any], compare: Mapping[str, Any] | None) -> dict[str, str]:
         m = model_metrics(model)
+        # A delta needs both sides fully measured (same clips) on the same device and host.
+        if compare is not None and not (model.get("status") == "measured" and baseline and baseline["model"].get("status") == "measured" and _scope(model) == _scope(baseline["model"])):
+            compare = None
         samples = f"{m['samples']}" if m["samples"] == m["expected"] else f"{m['samples']}/{m['expected']}"
         return {
             "model": label, "n": samples, "raw": _pct(m["raw"]), "d_raw": _delta(m["raw"], compare["raw"], 100, "pp", 1) if compare else "-",
@@ -311,7 +366,8 @@ def build_table(report: Mapping[str, Any], baseline: Mapping[str, Any] | None) -
     if report.get("quality_evidence") is False:
         notes.append("FIXTURE or unverified evidence: these numbers are not quality evidence.")
     if baseline:
-        notes.append(f"[base] and d columns: {baseline['model_id']} from {baseline['label']} ({baseline['runs']} earlier run(s) on this corpus).")
+        notes.append(f"[base] and d columns: {baseline['model_id']} from {baseline['label']} ({baseline['runs']} earlier run(s) on this corpus). "
+                     "A d column is blank for a row that is partial or ran on another device or host.")
     if dropped:
         notes.append("no data for: " + ", ".join(dropped) + ".")
     return table + ("\n" + "\n".join(notes) if notes else "")
@@ -358,7 +414,8 @@ def run_bench(eval_dir: Path, corpus_path: Path, model_args: Sequence[str], root
             run_dir.rmdir()
         raise
     evidence_class = "fixture" if fixture else "real"
-    baseline, note = pick_baseline(history, corpus["manifest_sha256"], evidence_class, baseline_id, model_ids)
+    scopes = {_scope(model) for model in report["models"] if model.get("status") == "measured"}
+    baseline, note = pick_baseline(history, corpus["manifest_sha256"], evidence_class, baseline_id, model_ids, scopes)
     table = build_table(report, baseline)
     if note:
         table += "\n" + note
@@ -411,13 +468,18 @@ def pcm_to_wav(pcm: bytes) -> bytes:
     return buffer.getvalue()
 
 
-def _known_audio_hashes(eval_dir: Path) -> set[str]:
+def _corpus_audio_hashes(eval_dir: Path) -> set[str]:
     hashes: set[str] = set()
     for name in ("corpus.json", "inventory.json"):
         path = eval_dir / name
         if path.is_file():
             records = benchmark.read_json(path).get("records", [])
             hashes.update(r["audio_sha256"] for r in records if isinstance(r, dict) and isinstance(r.get("audio_sha256"), str))
+    return hashes
+
+
+def _known_audio_hashes(eval_dir: Path) -> set[str]:
+    hashes = _corpus_audio_hashes(eval_dir)
     audio_dir = eval_dir / "audio"
     if audio_dir.is_dir():
         hashes.update(benchmark.sha256_file(p) for p in audio_dir.glob("*.wav"))
@@ -453,6 +515,21 @@ def _capture_skip_reason(row: Mapping[str, Any], pcm_dir: Path, now_ms: float, s
     return None
 
 
+def _draft_entry(row: Mapping[str, Any]) -> dict[str, Any]:
+    captured = row["debug_audio"].get("captured_at_unix_ms", row.get("recorded_at_unix_ms"))
+    return {
+        "language": UNREVIEWED_LANGUAGE,
+        "reference": row["final_transcript"],
+        "review_status": "unreviewed",
+        "tags": ["capture", "unreviewed"],
+        "source": {
+            "kind": "debug-capture", "correlation_id": row["correlation_id"],
+            "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(captured / 1000)),
+            "prefill": "delivered transcript from the live pipeline; not ground truth",
+        },
+    }
+
+
 def add_captures(eval_dir: Path, diagnostics: Path, since_days: float, dry_run: bool = False, now_ms: float | None = None) -> dict[str, Any]:
     """Copy recent captures into eval_dir/audio and add unreviewed draft references."""
 
@@ -463,9 +540,10 @@ def add_captures(eval_dir: Path, diagnostics: Path, since_days: float, dry_run: 
     since_ms = now_ms - since_days * 86_400_000
     audio_dir, references_path = eval_dir / "audio", eval_dir / DRAFT_REFERENCES_NAME
     known = _known_audio_hashes(eval_dir)
+    in_corpus = _corpus_audio_hashes(eval_dir)
     references = _load_reference_map(references_path)
     skipped: dict[str, int] = {}
-    pending: list[tuple[str, bytes, dict[str, Any]]] = []
+    pending: list[tuple[str, bytes | None, dict[str, Any]]] = []  # wav None: the file is already there
 
     def skip(reason: str) -> None:
         skipped[reason] = skipped.get(reason, 0) + 1
@@ -493,24 +571,20 @@ def add_captures(eval_dir: Path, diagnostics: Path, since_days: float, dry_run: 
         wav = pcm_to_wav(pcm)
         digest = hashlib.sha256(wav).hexdigest()
         name = f"cap-{SAFE_ID_RE.sub('-', row['correlation_id'])}.wav"
-        if digest in known:
+        target = audio_dir / name
+        if name not in references and digest not in in_corpus and target.is_file() and benchmark.sha256_file(target) == digest:
+            # A run that died after writing the WAV but before saving the references
+            # left this orphan; add its reference now instead of skipping it forever.
+            entry = _draft_entry(row)
+            pending.append((name, None, entry))
+            references[name] = entry
+        elif digest in known:
             skip("duplicate audio (already in corpus or captures)")
-        elif name in references or (audio_dir / name).exists():
+        elif name in references or target.exists():
             skip("name already used by different content (kept existing)")
         else:
             known.add(digest)
-            captured = row["debug_audio"].get("captured_at_unix_ms", row.get("recorded_at_unix_ms"))
-            entry = {
-                "language": UNREVIEWED_LANGUAGE,
-                "reference": row["final_transcript"],
-                "review_status": "unreviewed",
-                "tags": ["capture", "unreviewed"],
-                "source": {
-                    "kind": "debug-capture", "correlation_id": row["correlation_id"],
-                    "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(captured / 1000)),
-                    "prefill": "delivered transcript from the live pipeline; not ground truth",
-                },
-            }
+            entry = _draft_entry(row)
             pending.append((name, wav, entry))
             references[name] = entry
     added = [name for name, _, _ in pending]
@@ -519,6 +593,8 @@ def add_captures(eval_dir: Path, diagnostics: Path, since_days: float, dry_run: 
         written: list[Path] = []
         try:
             for name, wav, _ in pending:
+                if wav is None:
+                    continue
                 target = audio_dir / name
                 with open(target, "xb") as handle:  # exclusive: never overwrite existing audio
                     written.append(target)
@@ -565,8 +641,8 @@ def cmd_add_captures(args: argparse.Namespace) -> int:
     if result["unreviewed_total"] and not result["dry_run"]:
         print(
             "\nReview before they count: edit the file above. For each entry with review_status \"unreviewed\", correct \"reference\" to exactly what was said,\n"
-            "set \"language\" (english, hinglish, or negative with an empty reference), then set review_status to \"reviewed\".  To drop a clip, delete its entry\n"
-            "and its WAV in audio/.  `inventory` rejects entries whose language is still \"unreviewed\".\n\n"
+            "set \"language\" (english, hinglish, or negative with an empty reference), set review_status to \"reviewed\" and remove the \"unreviewed\" tag.\n"
+            "To drop a clip, delete its entry and its WAV in audio/.  `inventory` rejects entries whose language or review_status is still \"unreviewed\".\n\n"
             "After review:"
         )
         print(next_steps(eval_dir, _utc_stamp()))
@@ -596,7 +672,7 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--timeout-seconds", type=float, default=120.0, help="per-clip replay timeout")
     run.add_argument("--normalizer", type=Path, help="optional spelling normalization file for benchmark.py score")
     run.add_argument("--fixture", action="store_true", help="synthetic seam evidence for tests; never quality evidence")
-    captures = sub.add_parser("add-captures", help="turn recent debug captures into unreviewed corpus candidates")
+    captures = sub.add_parser("add-captures", help="turn recent debug captures into unreviewed corpus candidates (to count: fix the text, set language, review_status \"reviewed\", drop the \"unreviewed\" tag)")
     common(captures)
     captures.add_argument("--since", type=float, default=7.0, metavar="DAYS", help="only captures newer than this many days (default 7, the retention window)")
     captures.add_argument("--diagnostics-dir", type=Path, help="captures directory (default: <state-dir>/diagnostics)")

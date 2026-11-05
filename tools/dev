@@ -65,44 +65,78 @@ sctl() { systemctl --user "$@"; }
 
 dropin_path() { printf '%s/%s.d/50-dev.conf\n' "$unit_dir" "$1"; }
 
+# Fails (status 1, message on stderr) when 50-dev.conf exists but is not ours.
+dropin_free() {
+	local file
+	file=$(dropin_path "$1")
+	if [ -f "$file" ] && [ "$(head -n1 "$file")" != "$dropin_marker" ]; then
+		echo "refusing to overwrite $file: it was not written by tools/dev (no marker line); move it aside first" >&2
+		return 1
+	fi
+}
+
 # $1 unit, $2 dev binary, $3 the packaged unit's ExecStart arguments
 write_dropin() {
 	local file
+	dropin_free "$1" || return 1
 	file=$(dropin_path "$1")
 	mkdir -p "$(dirname "$file")"
 	# The empty ExecStart= clears the packaged command before ours is set.
 	printf '%s\n[Service]\nExecStart=\nExecStart=%s %s\n' "$dropin_marker" "$2" "$3" >"$file"
 }
 
-# Removes the drop-in only when this tool wrote it; returns 0 if it removed one.
+# Removes the drop-in only when this tool wrote it.  Status: 0 removed one,
+# 1 none of ours to remove, 2 removal failed.  (Callers use it in an `if`, where
+# `set -e` is off, so every failure is returned explicitly.)
 remove_dropin() {
 	local file
 	file=$(dropin_path "$1")
 	if [ -f "$file" ] && [ "$(head -n1 "$file")" = "$dropin_marker" ]; then
-		rm -f "$file"
-		rmdir --ignore-fail-on-non-empty "$(dirname "$file")"
+		rm -f "$file" || return 2
+		rmdir --ignore-fail-on-non-empty "$(dirname "$file")" || return 2
 		return 0
 	fi
 	return 1
 }
 
-# Restart returns at once for Type=simple units, so poll until the unit stays
-# active; a crash loop must fail the switch instead of looking fine.
+# Restart returns at once for Type=simple units, so poll until the unit has
+# stayed active for about 3 s; a crash loop must fail the switch instead of
+# looking fine.
 wait_active() {
-	local unit=$1 i
+	local unit=$1 i k
 	for i in $(seq 1 30); do
 		if sctl is-active --quiet "$unit"; then
-			sleep 1
-			if sctl is-active --quiet "$unit"; then return 0; fi
+			for k in 1 2 3; do
+				sleep 1
+				sctl is-active --quiet "$unit" || continue 2
+			done
+			return 0
 		fi
 		sleep 0.5
 	done
-	echo "$unit did not become active; see: journalctl --user -u $unit -n 50" >&2
+	echo "$unit did not stay active; see: journalctl --user -u $unit -n 50" >&2
 	return 1
 }
 
 unit_exec_path() {
 	sctl show -p ExecStart "$1" | sed -n 's/.*{ path=\([^ ]*\) ;.*/\1/p' | head -n1
+}
+
+# The binary a unit runs after a switch: the dev build or the package.
+expected_exec_path() {
+	local bin=voisu-daemon
+	if [ "$1" = voisu-overlay.service ]; then bin=voisu-overlay; fi
+	if [ "$2" = dev ]; then printf '%s/%s\n' "$dev_bin" "$bin"; else printf '/usr/bin/%s\n' "$bin"; fi
+}
+
+verify_exec_path() {
+	local unit=$1 want actual
+	want=$(expected_exec_path "$unit" "$2")
+	actual=$(unit_exec_path "$unit")
+	if [ "$actual" != "$want" ]; then
+		echo "$unit runs ${actual:-nothing}, expected $want (another drop-in may override ExecStart)" >&2
+		return 1
+	fi
 }
 
 status() {
@@ -128,16 +162,59 @@ status() {
 	printf 'dev CLI: %s/voisu   (e.g. %s/voisu doctor)\n' "$dev_bin" "$dev_bin"
 }
 
-finish_switch() {
+# ERR trap while switching: say where each unit is now, since a half-done
+# switch can leave the daemon on a build that does not start.
+switch_failed() {
+	[ "$BASHPID" = "$$" ] || return 0 # a failing $(...) subshell; the parent reports
+	trap - ERR
 	local unit
+	echo >&2
+	echo "switch failed. The units now run:" >&2
+	for unit in voisu.service voisu-overlay.service; do
+		printf '  %s: %s\n' "$unit" "$(unit_exec_path "$unit" 2>/dev/null || true)" >&2
+	done
+	echo "Return to the installed package with: tools/dev use prod" >&2
+}
+
+# $1 dev|prod, then the units to restart
+finish_switch() {
+	local mode=$1 unit
+	shift
 	sctl daemon-reload
+	# A crash-looping dev daemon can hit the start limit; clear it so the restart
+	# (and a later `use prod`) is not refused.
+	sctl reset-failed "$@" 2>/dev/null || true
 	sctl restart "$@"
-	for unit in "$@"; do wait_active "$unit"; done
+	for unit in "$@"; do
+		wait_active "$unit"
+		verify_exec_path "$unit" "$mode"
+	done
 	status
 }
 
+# Copy every binary to .new first, then rename them all, so a failed copy never
+# leaves a mix of old and new.  Renaming leaves a running inode alone, while
+# overwriting a running binary fails with "Text file busy".
+install_bins() {
+	local out=$1 name
+	shift
+	mkdir -p "$dev_bin"
+	for name in "$@"; do
+		cp "$out/$name" "$dev_bin/$name.new" || {
+			rm -f "$dev_bin"/*.new
+			return 1
+		}
+	done
+	for name in "$@"; do
+		mv -f "$dev_bin/$name.new" "$dev_bin/$name" || {
+			rm -f "$dev_bin"/*.new
+			return 1
+		}
+	done
+}
+
 use_dev() {
-	local overlay=no name
+	local overlay=no
 	case "${1:-}" in
 	--overlay) overlay=yes ;;
 	'') ;;
@@ -147,6 +224,10 @@ use_dev() {
 		;;
 	esac
 
+	# Refuse before building if a drop-in we would write is someone else's.
+	dropin_free voisu.service
+	if [ "$overlay" = yes ]; then dropin_free voisu-overlay.service; fi
+
 	step cargo build --release --locked -p voisu-app --bin voisu --bin voisu-daemon
 	local bins=(voisu voisu-daemon)
 	if [ "$overlay" = yes ]; then
@@ -155,14 +236,7 @@ use_dev() {
 		bins+=(voisu-overlay)
 	fi
 
-	# Copy to .new, then rename: overwriting a running binary fails with "Text
-	# file busy", while a rename leaves the running inode alone.
-	local out=${CARGO_TARGET_DIR:-$root/target}/release
-	mkdir -p "$dev_bin"
-	for name in "${bins[@]}"; do
-		cp "$out/$name" "$dev_bin/$name.new"
-		mv -f "$dev_bin/$name.new" "$dev_bin/$name"
-	done
+	install_bins "${CARGO_TARGET_DIR:-$root/target}/release" "${bins[@]}"
 
 	local dirty=no
 	if [ -n "$(git status --porcelain --untracked-files=no)" ]; then dirty=yes; fi
@@ -175,27 +249,49 @@ use_dev() {
 	EOF
 
 	write_dropin voisu.service "$dev_bin/voisu-daemon" --systemd
-	local restart=(voisu.service)
+	local restart=(voisu.service) rc=0
 	if [ "$overlay" = yes ]; then
 		write_dropin voisu-overlay.service "$dev_bin/voisu-overlay" --supervise
 		restart+=(voisu-overlay.service)
-	elif remove_dropin voisu-overlay.service; then
+	else
 		# Without --overlay the Overlay returns to the package, so a stale dev
 		# Overlay never runs against a newer daemon.
-		restart+=(voisu-overlay.service)
+		remove_dropin voisu-overlay.service || rc=$?
+		case $rc in
+		0) restart+=(voisu-overlay.service) ;;
+		1) ;;
+		*) return 1 ;;
+		esac
 	fi
-	finish_switch "${restart[@]}"
+	finish_switch dev "${restart[@]}"
 }
 
 use_prod() {
-	local restart=() unit
+	local restart=() unit rc
 	for unit in voisu.service voisu-overlay.service; do
-		if remove_dropin "$unit"; then restart+=("$unit"); fi
+		rc=0
+		remove_dropin "$unit" || rc=$?
+		case $rc in
+		0) restart+=("$unit") ;;
+		1) ;;
+		*) return 1 ;;
+		esac
 	done
 	# Restart the daemon even when no drop-in was ours, so it lands on the package.
 	if [ "${#restart[@]}" -eq 0 ]; then restart=(voisu.service); fi
-	finish_switch "${restart[@]}"
+	finish_switch prod "${restart[@]}"
 }
+
+# Run a switch with the failure report armed.
+run_switch() {
+	set -E
+	trap switch_failed ERR
+	"$@"
+	trap - ERR
+}
+
+# Sourced (by the drop-in tests) only for the functions above.
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then return 0; fi
 
 case "${1:-}" in
 check) check "${2:-}" ;;
@@ -207,8 +303,8 @@ setup)
 link) bash tools/git-hooks/post-checkout 0000000000000000000000000000000000000000 ;;
 use)
 	case "${2:-}" in
-	dev) use_dev "${3:-}" ;;
-	prod) use_prod ;;
+	dev) run_switch use_dev "${3:-}" ;;
+	prod) run_switch use_prod ;;
 	*)
 		echo "usage: tools/dev use dev [--overlay] | tools/dev use prod" >&2
 		exit 2
