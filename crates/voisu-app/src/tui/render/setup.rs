@@ -116,10 +116,15 @@ fn body_lines(
             None,
         ),
         Screen::Done(summary) => (done_lines(summary, look, width), None),
-        Screen::Failed(message) => (
-            titled(look, "Setup didn't finish", &[message.as_str()], width),
-            None,
-        ),
+        Screen::Failed { message, detail } => {
+            let mut lines = title_lines(look, "Setup didn't finish");
+            lines.extend(wrapped(look, message, width, Tone::Plain));
+            if let Some(detail) = detail {
+                lines.push(Line::default());
+                lines.extend(wrapped(look, detail, width, Tone::Dim));
+            }
+            (lines, None)
+        }
     }
 }
 
@@ -253,6 +258,7 @@ fn key_row(
     let word = field.word.as_deref().unwrap_or("Checking…");
     let (right, right_tone): (String, Tone) = match &field.state {
         KeyState::Checking => ("Checking…".to_owned(), Tone::Dim),
+        KeyState::Saving => ("Saving…".to_owned(), Tone::Dim),
         KeyState::Works => ("✓ Works".to_owned(), Tone::Success),
         KeyState::Unverified => ("Saved, not checked yet".to_owned(), Tone::Caution),
         KeyState::Rejected => ("✕ Rejected".to_owned(), Tone::Failure),
@@ -797,7 +803,10 @@ mod tests {
         let lines = screen(
             vec![SetupEvent::Finished {
                 code: 4,
-                finish: Finish::Failed("Voisu has no working key yet.".to_owned()),
+                finish: Finish::Failed {
+                    message: "Voisu has no working key yet.".to_owned(),
+                    detail: None,
+                },
             }],
             &UNICODE,
             (80, 24),

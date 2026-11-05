@@ -65,6 +65,12 @@ const ESC_USES_CLOUD: &str = "Esc uses Cloud for now.";
 const ESC_LEAVES: &str = "Esc leaves setup.";
 const REJECTED_NOTE: &str = "That key didn't work. Check you copied all of it.";
 const COULD_NOT_TELL_NOTE: &str = "Voisu couldn't check it. ↵ saves it anyway.";
+const TRIGGER_FAILED: &str =
+    "Voisu couldn't set the key that starts talking. Run voisu setup to try again.";
+const SETUP_FAILED: &str = "Voisu couldn't finish setting up. Run voisu setup to try again.";
+/// The keyring refused, so the store fell back to its private file. Its own
+/// warning goes to stderr, which the interface silences.
+const SAVED_IN_FILE: &str = "Your keyring is locked, so Voisu saved it in a private file instead.";
 const SAVE_FAILED: &str = "Voisu couldn't save it. Check your keyring is unlocked, then try again.";
 const NOTHING_TO_PASTE: &str = "Nothing to paste. Copy your key first.";
 const NO_CLIPBOARD: &str = "Can't read the clipboard here. Use your terminal's paste key.";
@@ -87,6 +93,27 @@ pub(super) fn spawn(replies: Sender<Reply>) -> Sender<SetupAnswer> {
         questions.link.send(SetupEvent::Finished { code, finish });
     });
     answer
+}
+
+/// The flow's reasons speak to developers: plain words first, theirs below.
+fn failure_finish(reason: Option<String>) -> Finish {
+    let Some(detail) = reason else {
+        return Finish::Failed {
+            message: NO_WORKING_KEY.to_owned(),
+            detail: None,
+        };
+    };
+    let trigger = detail.starts_with("Hyprland setup incomplete")
+        || detail.starts_with("Ubuntu setup incomplete");
+    Finish::Failed {
+        message: if trigger {
+            TRIGGER_FAILED
+        } else {
+            SETUP_FAILED
+        }
+        .to_owned(),
+        detail: Some(detail),
+    }
 }
 
 /// The two directions between the flow and the screen.
@@ -163,11 +190,7 @@ impl TuiQuestions {
             return (SETUP_INCOMPLETE, Finish::Left);
         }
         if code != 0 {
-            let message = self.failure.take();
-            return (
-                code,
-                Finish::Failed(message.unwrap_or_else(|| NO_WORKING_KEY.to_owned())),
-            );
+            return (code, failure_finish(self.failure.take()));
         }
         self.link.busy(STEPS, "Making sure Voisu is running…");
         if self.deepgram_changed {
@@ -796,8 +819,15 @@ impl KeySlot {
                 self.outcome = outcome;
                 self.end = end;
                 self.stored = None;
+                let in_file = matches!(
+                    store.diagnose(self.provider),
+                    Diagnosis::Found {
+                        location: KeyLocation::PlaintextFile,
+                        ..
+                    }
+                );
                 self.plaintext = false;
-                self.update(link, state, None, None);
+                self.update(link, state, None, in_file.then(|| SAVED_IN_FILE.to_owned()));
             }
             // The store's own message speaks to developers.
             Err(_) => self.update(
@@ -1100,6 +1130,7 @@ mod tests {
 
     #[derive(Default)]
     struct FakeStore {
+        keyring_locked: bool,
         keys: HashMap<&'static str, String>,
         plaintext: bool,
         env: bool,
@@ -1122,7 +1153,7 @@ mod tests {
                 provider.secret_service_value(),
                 credential.expose_to_boundary().to_owned(),
             );
-            self.plaintext = false;
+            self.plaintext = self.keyring_locked;
             Ok(())
         }
 
@@ -1385,6 +1416,55 @@ mod tests {
         );
         assert_eq!(states(&run)[1], &KeyState::Failed(SAVE_FAILED.to_owned()));
         assert_eq!(run.result.outcome.groq, ProviderOutcome::Skipped);
+    }
+
+    #[test]
+    fn a_locked_keyring_says_where_the_key_went() {
+        let mut store = FakeStore {
+            keyring_locked: true,
+            ..FakeStore::default()
+        };
+        let run = run_with(
+            &mut store,
+            ProviderKeyStatus::Valid,
+            no_clipboard,
+            vec![check(KEY), SetupAnswer::KeysDone],
+        );
+        assert_eq!(store.keys["groq"], KEY);
+        assert!(run.events.iter().any(|event| matches!(
+            event,
+            SetupEvent::KeyUpdate {
+                state: KeyState::Works,
+                note: Some(note),
+                ..
+            } if note == SAVED_IN_FILE
+        )));
+    }
+
+    #[test]
+    fn a_failure_leads_with_plain_words_and_keeps_the_reason_below() {
+        let hyprland = "Hyprland setup incomplete: invalid `hyprctl binds -j` response";
+        assert_eq!(
+            failure_finish(Some(hyprland.to_owned())),
+            Finish::Failed {
+                message: TRIGGER_FAILED.to_owned(),
+                detail: Some(hyprland.to_owned()),
+            }
+        );
+        assert_eq!(
+            failure_finish(Some("could not write config".to_owned())),
+            Finish::Failed {
+                message: SETUP_FAILED.to_owned(),
+                detail: Some("could not write config".to_owned()),
+            }
+        );
+        assert_eq!(
+            failure_finish(None),
+            Finish::Failed {
+                message: NO_WORKING_KEY.to_owned(),
+                detail: None,
+            }
+        );
     }
 
     #[test]

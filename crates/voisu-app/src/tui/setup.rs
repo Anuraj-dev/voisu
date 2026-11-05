@@ -58,6 +58,8 @@ pub enum KeyState {
     /// Set by an environment variable, which wins whatever is stored.
     Outside,
     Checking,
+    /// Saving a key the check couldn't answer for. A slow keyring takes seconds.
+    Saving,
     Works,
     Rejected,
     /// The check could not tell, in the Settings tab's words. `↵` saves anyway.
@@ -101,7 +103,11 @@ pub struct Summary {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Finish {
     Ready(Summary),
-    Failed(String),
+    Failed {
+        message: String,
+        /// The flow's own words, for whoever has to fix it.
+        detail: Option<String>,
+    },
     /// The person left; there is nothing to say.
     Left,
 }
@@ -225,7 +231,12 @@ impl KeyField {
 
     /// Whether the terminal cursor belongs on this field.
     pub fn takes_typing(&self) -> bool {
-        !matches!(self.state, KeyState::Checking | KeyState::Outside)
+        !self.busy() && self.state != KeyState::Outside
+    }
+
+    /// Whether Voisu is still working on this key.
+    fn busy(&self) -> bool {
+        matches!(self.state, KeyState::Checking | KeyState::Saving)
     }
 
     fn usable(&self) -> bool {
@@ -246,7 +257,7 @@ impl KeyField {
 
     fn enter(&self) -> Enter {
         match &self.state {
-            KeyState::Checking => Enter::Nothing,
+            KeyState::Checking | KeyState::Saving => Enter::Nothing,
             KeyState::Saved => Enter::Replace,
             KeyState::Outside | KeyState::Works | KeyState::Unverified => Enter::Continue,
             _ if self.text.chars() > 0 => Enter::Check,
@@ -332,11 +343,7 @@ impl KeysScreen {
             self.selected += 1;
             return Ok(Outcome::Stay);
         }
-        if self
-            .fields
-            .iter()
-            .any(|field| field.state == KeyState::Checking)
-        {
+        if self.fields.iter().any(KeyField::busy) {
             self.notice = Some("Still checking a key…");
             return Ok(Outcome::Stay);
         }
@@ -394,14 +401,22 @@ impl Installing {
 
 #[derive(Debug)]
 pub enum Screen {
-    Busy { title: String, line: String },
+    Busy {
+        title: String,
+        line: String,
+    },
     Choose(Choose),
     Keys(KeysScreen),
     Installing(Installing),
-    Waiting { title: String },
+    Waiting {
+        title: String,
+    },
     Leaving,
     Done(Summary),
-    Failed(String),
+    Failed {
+        message: String,
+        detail: Option<String>,
+    },
 }
 
 /// What a key press leaves for the model to do.
@@ -459,8 +474,13 @@ impl SetupState {
                 let field = keys.field();
                 Context::SetupKey {
                     enter: field.enter().label(),
+                    // Just saved, `↵ continue` already keeps it.
                     keep: field.saved
-                        && !matches!(field.state, KeyState::Checking | KeyState::Outside),
+                        && !field.busy()
+                        && !matches!(
+                            field.state,
+                            KeyState::Outside | KeyState::Works | KeyState::Unverified
+                        ),
                     editable: field.takes_typing(),
                 }
             }
@@ -470,7 +490,7 @@ impl SetupState {
             }) => Context::SetupInstallFailed { esc },
             Screen::Busy { .. } | Screen::Installing(_) | Screen::Leaving => Context::SetupBusy,
             Screen::Waiting { .. } => Context::SetupWaiting,
-            Screen::Done(_) | Screen::Failed(_) => Context::SetupDone,
+            Screen::Done(_) | Screen::Failed { .. } => Context::SetupDone,
         }
     }
 
@@ -520,7 +540,7 @@ impl SetupState {
                 self.screen = one_moment();
                 Outcome::Answer(SetupAnswer::Later)
             }
-            (Screen::Done(_) | Screen::Failed(_), Action::Submit) => Outcome::Close,
+            (Screen::Done(_) | Screen::Failed { .. }, Action::Submit) => Outcome::Close,
             (Screen::Choose(_) | Screen::Keys(_), Action::Close) => {
                 self.screen = Screen::Leaving;
                 Outcome::Answer(SetupAnswer::Left)
@@ -543,7 +563,7 @@ impl SetupState {
             }
             Enter::Check => Outcome::Answer(field.start_check()),
             Enter::SaveAnyway => {
-                field.state = KeyState::Checking;
+                field.state = KeyState::Saving;
                 field.note = None;
                 Outcome::Answer(SetupAnswer::SaveAnyway {
                     provider: field.provider,
@@ -689,7 +709,9 @@ impl SetupState {
                         self.step = STEPS;
                         self.screen = Screen::Done(summary);
                     }
-                    Finish::Failed(message) => self.screen = Screen::Failed(message),
+                    Finish::Failed { message, detail } => {
+                        self.screen = Screen::Failed { message, detail };
+                    }
                     Finish::Left => return Landed::Gone { code },
                 }
                 return Landed::Finished { code };
@@ -959,9 +981,15 @@ mod tests {
                 provider: Provider::Groq
             })
         ));
+        assert_eq!(keys(&state).fields[0].state, KeyState::Saving);
+        assert_eq!(enter_label(&state), None);
         update(&mut state, Provider::Groq, KeyState::Unverified);
         assert_eq!(keys(&state).fields[0].word.as_deref(), Some(KEY_UNVERIFIED));
         assert!(keys(&state).fields[0].usable());
+        assert!(
+            matches!(state.context(), Context::SetupKey { keep: false, .. }),
+            "`↵ continue` already keeps a key just saved"
+        );
     }
 
     #[test]
