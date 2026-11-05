@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.70.1
+Version:        0.71.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -167,6 +167,9 @@ install -D -m 0644 packaging/icons/voisu.svg %{buildroot}%{_datadir}/icons/hicol
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Thu Nov 05 2026 Voisu maintainers <voisu@example.invalid> - 0.71.0-1
+- feat(tone): add informal tone with chat abbreviations (#305)
+
 * Thu Nov 05 2026 Voisu maintainers <voisu@example.invalid> - 0.70.1-1
 - fix(delivery): read Omarchy's paste chords from its binding (#304)
 - chore(dev): switch the real Voisu to a dev build and bench local models (#303)
