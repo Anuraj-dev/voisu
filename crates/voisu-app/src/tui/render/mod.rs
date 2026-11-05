@@ -722,6 +722,7 @@ mod tests {
         );
 
         let _ = update(&mut app, Msg::Reply(Reply::SetupNeeded(true)), at(0));
+        app.setup = None; // left the setup that opened by itself
         let lines = screen(&mut app, &UNICODE, (80, 24));
         assert_eq!(lines[5], "   Voisu isn't set up yet");
         assert_eq!(lines[6], "   ↵ Run setup");

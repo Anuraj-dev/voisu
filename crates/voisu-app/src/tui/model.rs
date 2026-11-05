@@ -560,6 +560,8 @@ pub struct App {
     pub setup: Option<SetupState>,
     /// What `voisu setup` exits with. Bare `voisu` always exits 0.
     pub setup_exit: Option<u8>,
+    /// Setup has opened once by itself this session; Esc out of it stays out.
+    setup_auto_opened: bool,
     failed_polls: u8,
     guard_until_mono_ms: u64,
     recording_since_mono_ms: Option<u64>,
@@ -599,6 +601,7 @@ impl App {
             should_quit: false,
             setup: None,
             setup_exit: None,
+            setup_auto_opened: false,
             failed_polls: 0,
             guard_until_mono_ms: 0,
             recording_since_mono_ms: None,
@@ -1055,6 +1058,11 @@ impl App {
             Reply::SetupNeeded(needed) => {
                 self.dirty |= self.setup_needed != Some(needed);
                 self.setup_needed = Some(needed);
+                // A first run with nothing set up opens on setup, once.
+                if needed && !self.setup_auto_opened && self.setup.is_none() {
+                    self.setup_auto_opened = true;
+                    self.start_setup(effects);
+                }
             }
             Reply::Doctor(rows) => {
                 self.dirty |= self.doctor.as_ref() != Some(&rows);
@@ -2167,6 +2175,7 @@ mod tests {
         );
 
         let _ = update(&mut app, Msg::Reply(Reply::SetupNeeded(true)), at(0));
+        app.setup = None; // left the setup that opened by itself
         let _ = update(
             &mut app,
             Msg::Reply(Reply::ServiceDone {
@@ -2606,6 +2615,27 @@ mod tests {
         assert!(!local_switch_allowed(false, false));
         assert!(local_switch_allowed(true, false));
         assert!(local_switch_allowed(false, true));
+    }
+
+    #[test]
+    fn a_first_run_opens_on_setup_once() {
+        let mut app = App::new((80, 24), at(0));
+        let effects = update(&mut app, Msg::Reply(Reply::SetupNeeded(true)), at(0));
+        assert!(matches!(effects.as_slice(), [Effect::StartSetup]));
+        assert!(app.setup.is_some());
+
+        // Esc out of setup: the next check still says not set up, but the
+        // tabs stay, with Run setup as the fix.
+        app.setup = None;
+        let effects = update(&mut app, Msg::Reply(Reply::SetupNeeded(true)), at(0));
+        assert!(effects.is_empty());
+        assert!(app.setup.is_none());
+        assert_eq!(app.hero(), Hero::NotSetUp);
+
+        let mut set_up = App::new((80, 24), at(0));
+        let effects = update(&mut set_up, Msg::Reply(Reply::SetupNeeded(false)), at(0));
+        assert!(effects.is_empty());
+        assert!(set_up.setup.is_none());
     }
 
     #[test]

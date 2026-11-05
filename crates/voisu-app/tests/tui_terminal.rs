@@ -257,10 +257,7 @@ fn quitting_with_q_restores_the_terminal_and_exits_zero() {
 #[test]
 fn setup_runs_inside_the_interface_and_comes_back_to_it() {
     let mut interface = Interface::open();
-    // A fresh home is not set up, so ↵ is Run setup.
-    interface.wait_for_output(b"Not set up");
-    interface.type_keys(b"\r");
-
+    // A fresh home is not set up, so bare voisu opens straight on setup.
     interface.wait_for_output(b"Setup didn't finish");
     let failed = interface.output.len();
     assert!(
@@ -272,6 +269,9 @@ fn setup_runs_inside_the_interface_and_comes_back_to_it() {
     interface.type_keys(b"\r");
     interface.wait_for_output_after(failed, b"Settings");
     assert_eq!(interface.local_flags() & COOKED, 0, "raw after setup");
+    // Back on the tabs it stays there, offering setup again instead of
+    // reopening it.
+    interface.wait_for_output_after(failed, b"Not set up");
 
     interface.type_keys(b"q");
     assert_eq!(

@@ -277,6 +277,20 @@ fn delivery_row(
     access: impl FnOnce() -> RemoteDesktopAccess,
 ) -> DoctorRow {
     const LABEL: &str = "Delivery";
+    // A service that answers with a pre-rename word is an older Voisu build;
+    // restarting it reads the file again but can never understand `paste` or
+    // `copy`, so asking for a restart would loop forever.
+    if matches!(stored, Some(StoredDelivery::Mode(_)))
+        && !matches!(readiness.delivery_mode.as_str(), "paste" | "copy")
+    {
+        return DoctorRow::new(
+            LABEL,
+            ReadinessStatus::Fail,
+            "the running Voisu service is an older version that doesn't know your Delivery setting",
+        )
+        .value("Your Voisu service is older than this app")
+        .action("update Voisu, then run voisu service restart");
+    }
     if let Some(StoredDelivery::Mode(chosen)) = stored
         && readiness.delivery_mode != chosen.as_str()
     {
@@ -660,7 +674,7 @@ mod delivery_row_tests {
     #[test]
     fn a_service_started_before_the_last_change_asks_for_a_restart() {
         let stale = readiness(
-            "clipboard",
+            "copy",
             PasteActionState::ClipboardOnly,
             PasteBackend::NotRequired,
         );
@@ -674,6 +688,29 @@ mod delivery_row_tests {
             )
         );
         assert_eq!(row.fix, Some(DoctorFix::RestartVoisu));
+    }
+
+    #[test]
+    fn an_older_service_says_update_instead_of_looping_on_restart() {
+        // 0.69.1 answers `type` or `clipboard`; restarting it never helps.
+        for word in ["type", "clipboard"] {
+            let old = readiness(
+                word,
+                PasteActionState::NotRequired,
+                PasteBackend::NotRequired,
+            );
+            let row = delivery_row(&old, PASTE, no_probe);
+            assert_eq!(
+                shown(&row),
+                (
+                    "Your Voisu service is older than this app",
+                    ReadinessStatus::Fail,
+                    Some("update Voisu, then run voisu service restart")
+                ),
+                "{word}"
+            );
+            assert_eq!(row.fix, None, "{word}");
+        }
     }
 
     #[test]
