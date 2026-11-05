@@ -414,7 +414,7 @@ mod tests {
         assert!(lines[8].starts_with("   Last       "), "{}", lines[8]);
         assert_eq!(lines[9], "   Engine     Cloud");
         assert_eq!(lines[10], "   Delivery   Paste");
-        assert_eq!(lines[11], "   Writing    Clean · Auto");
+        assert_eq!(lines[11], "   Writing    Clean · Auto · Formal");
         assert_eq!(lines[12], "   Health     15 passed · 1 warning");
         assert_eq!(
             lines[23],
@@ -446,18 +446,36 @@ mod tests {
         assert_eq!(lines[6], "   Delivery      Paste");
         assert_eq!(lines[7], "   Writing       Clean");
         assert_eq!(lines[8], "   Layout        Auto");
-        assert_eq!(lines[9], "   Deepgram      On");
-        assert_eq!(lines[10], "   Groq key      Works");
-        assert_eq!(lines[11], "   Deepgram key  Can't reach it");
-        assert_eq!(lines[12], "   Trigger Key   Not bound");
-        assert_eq!(lines[13], "   Run setup");
-        assert_eq!(lines[14], "");
-        assert_eq!(lines[15], "   Where your speech becomes text.");
+        assert_eq!(lines[9], "   Tone          Formal");
+        assert_eq!(lines[10], "   Deepgram      On");
+        assert_eq!(lines[11], "   Groq key      Works");
+        assert_eq!(lines[12], "   Deepgram key  Can't reach it");
+        assert_eq!(lines[13], "   Trigger Key   Not bound");
+        assert_eq!(lines[14], "   Run setup");
+        assert_eq!(lines[15], "");
+        assert_eq!(lines[16], "   Where your speech becomes text.");
         assert_eq!(
-            lines[16],
+            lines[17],
             "     ● Cloud  Fast and accurate. Needs internet."
         );
-        assert_eq!(lines[17], "       Local  Private. Stays on this computer.");
+        assert_eq!(lines[18], "       Local  Private. Stays on this computer.");
+    }
+
+    #[test]
+    fn the_guide_explains_both_tones() {
+        let mut app = app_on('2');
+        app.settings_selected = 4;
+        let lines = screen(&mut app, &UNICODE, (80, 24));
+        assert_eq!(lines[9], " ▌ Tone          Formal");
+        assert_eq!(lines[16], "   How casual your words read.");
+        assert_eq!(
+            lines[17],
+            "     ● Formal    Full words and a closing full stop."
+        );
+        assert_eq!(
+            lines[18],
+            "       Informal  Chat abbreviations like BTW; no final full stop."
+        );
     }
 
     #[test]
@@ -466,10 +484,10 @@ mod tests {
         let _ = press(&mut app, KeyCode::Down, 0);
         let lines = screen(&mut app, &UNICODE, (80, 24));
         assert_eq!(lines[6], " ▌ Delivery      Paste");
-        assert_eq!(lines[15], "   How your words reach your window.");
-        assert_eq!(lines[16], "     ● Paste  Puts your words into your window.");
-        assert_eq!(lines[17], "       Copy   Copies only; you press Ctrl+V.");
-        assert_eq!(lines[18], "", "Delivery offers exactly two choices");
+        assert_eq!(lines[16], "   How your words reach your window.");
+        assert_eq!(lines[17], "     ● Paste  Puts your words into your window.");
+        assert_eq!(lines[18], "       Copy   Copies only; you press Ctrl+V.");
+        assert_eq!(lines[19], "", "Delivery offers exactly two choices");
     }
 
     #[test]
@@ -480,13 +498,13 @@ mod tests {
         let _ = press(&mut app, KeyCode::Down, 0);
         let lines = screen(&mut app, &UNICODE, (80, 24));
         // `●` stays on the value in effect; `▌` follows the highlight.
-        assert!(lines[16].starts_with("     ● Paste"), "{}", lines[16]);
-        assert!(lines[17].starts_with("   ▌   Copy"), "{}", lines[17]);
+        assert!(lines[17].starts_with("     ● Paste"), "{}", lines[17]);
+        assert!(lines[18].starts_with("   ▌   Copy"), "{}", lines[18]);
         assert_eq!(lines[22], "", "the toast line stays free");
         assert_eq!(lines[23], " ↑↓ pick   ↵ choose   Esc cancel");
         let ascii = screen(&mut app, &ASCII, (80, 24));
-        assert!(ascii[16].starts_with("     * Paste"), "{}", ascii[16]);
-        assert!(ascii[17].starts_with("   >   Copy"), "{}", ascii[17]);
+        assert!(ascii[17].starts_with("     * Paste"), "{}", ascii[17]);
+        assert!(ascii[18].starts_with("   >   Copy"), "{}", ascii[18]);
     }
 
     #[test]
@@ -510,12 +528,12 @@ mod tests {
         assert_eq!(
             lines[9],
             beside(
-                "   Deepgram      On",
+                "   Tone          Formal",
                 "    Local  Private. Stays on this computer."
             )
         );
-        assert_eq!(lines[13], beside("   Run setup", ""));
-        assert_eq!(lines[14], "", "nothing below the rows");
+        assert_eq!(lines[14], beside("   Run setup", ""));
+        assert_eq!(lines[15], "", "nothing below the rows");
 
         // Picking happens in the panel, the same lines gaining the highlight.
         let _ = press(&mut app, KeyCode::Enter, 0);
@@ -923,7 +941,7 @@ mod tests {
         const SECRET: &str = "gsk_secret_value";
         for look in [UNICODE, ASCII] {
             let mut app = app_on('2');
-            app.settings_selected = 5;
+            app.settings_selected = 6;
             let _ = press(&mut app, KeyCode::Enter, 0);
             type_text(&mut app, SECRET, 0);
             let lines = screen(&mut app, &look, (80, 24));
@@ -945,7 +963,7 @@ mod tests {
         let mut app = app_on('2');
         app.key_in_check = Some(Provider::Deepgram);
         let lines = screen(&mut app, &UNICODE, (80, 24));
-        assert_eq!(lines[11], "   Deepgram key  Checking…");
+        assert_eq!(lines[12], "   Deepgram key  Checking…");
     }
 
     // --- Footer and overlay agree -------------------------------------------------

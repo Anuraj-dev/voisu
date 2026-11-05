@@ -11,6 +11,8 @@ use voisu_core::{
     AsrMode, AsrModeStatus, Credential, DaemonState, Provider, ProviderKeyStatus, ReadinessStatus,
 };
 
+// Aliased: `Tone` here is the interface's text styling from `look`.
+use crate::config::Tone as WritingTone;
 use crate::config::{DeliveryMode, RenderingPolicy, WritingMode};
 pub use crate::doctor::DoctorFix as Fix;
 use crate::doctor::DoctorRow;
@@ -108,6 +110,7 @@ pub struct SettingsSnapshot {
     pub legacy_delivery: bool,
     pub writing: WritingMode,
     pub rendering: RenderingPolicy,
+    pub tone: WritingTone,
     pub deepgram: bool,
 }
 
@@ -181,6 +184,7 @@ pub enum Job {
     SetDelivery(DeliveryMode),
     SetWriting(WritingMode),
     SetRendering(RenderingPolicy),
+    SetTone(WritingTone),
     SetDeepgram(bool),
     SetEngine {
         mode: AsrMode,
@@ -216,6 +220,7 @@ impl fmt::Debug for Job {
             Job::SetDelivery(mode) => write!(f, "SetDelivery({mode:?})"),
             Job::SetWriting(mode) => write!(f, "SetWriting({mode:?})"),
             Job::SetRendering(policy) => write!(f, "SetRendering({policy:?})"),
+            Job::SetTone(tone) => write!(f, "SetTone({tone:?})"),
             Job::SetDeepgram(enabled) => write!(f, "SetDeepgram({enabled})"),
             Job::SetEngine { mode, local_ready } => write!(f, "SetEngine({mode:?}, {local_ready})"),
             Job::AddTerm(term) => write!(f, "AddTerm({term:?})"),
@@ -331,6 +336,7 @@ const LAYOUTS: [RenderingPolicy; 3] = [
     RenderingPolicy::Adaptive,
     RenderingPolicy::Structured,
 ];
+const TONES: [WritingTone; 2] = [WritingTone::Formal, WritingTone::Informal];
 
 const ENGINE_CHOICES: [Choice; 2] = [
     choice("Cloud", "Fast and accurate. Needs internet."),
@@ -348,6 +354,13 @@ const LAYOUT_CHOICES: [Choice; 3] = [
     choice("Plain", "Punctuation only."),
     choice("Auto", "Organizes when you speak in parts."),
     choice("Sections", "Adds headings."),
+];
+const TONE_CHOICES: [Choice; 2] = [
+    choice("Formal", "Full words and a closing full stop."),
+    choice(
+        "Informal",
+        "Chat abbreviations like BTW; no final full stop.",
+    ),
 ];
 
 pub fn engine_label(mode: AsrMode) -> &'static str {
@@ -373,6 +386,10 @@ pub fn writing_label(mode: WritingMode) -> &'static str {
 
 pub fn layout_label(policy: RenderingPolicy) -> &'static str {
     LAYOUT_CHOICES[position(&LAYOUTS, policy)].label
+}
+
+pub fn tone_label(tone: WritingTone) -> &'static str {
+    TONE_CHOICES[position(&TONES, tone)].label
 }
 
 /// A provider key's check result in plain words.
@@ -442,6 +459,7 @@ pub enum SettingsRow {
     Delivery,
     Writing,
     Rendering,
+    Tone,
     Deepgram,
     GroqKey,
     DeepgramKey,
@@ -450,11 +468,12 @@ pub enum SettingsRow {
 }
 
 impl SettingsRow {
-    pub const ALL: [SettingsRow; 9] = [
+    pub const ALL: [SettingsRow; 10] = [
         SettingsRow::Engine,
         SettingsRow::Delivery,
         SettingsRow::Writing,
         SettingsRow::Rendering,
+        SettingsRow::Tone,
         SettingsRow::Deepgram,
         SettingsRow::GroqKey,
         SettingsRow::DeepgramKey,
@@ -468,6 +487,7 @@ impl SettingsRow {
             SettingsRow::Delivery => "Delivery",
             SettingsRow::Writing => "Writing",
             SettingsRow::Rendering => "Layout",
+            SettingsRow::Tone => "Tone",
             SettingsRow::Deepgram => "Deepgram",
             SettingsRow::GroqKey => "Groq key",
             SettingsRow::DeepgramKey => "Deepgram key",
@@ -483,6 +503,7 @@ impl SettingsRow {
             SettingsRow::Delivery => &DELIVERY_CHOICES,
             SettingsRow::Writing => &WRITING_CHOICES,
             SettingsRow::Rendering => &LAYOUT_CHOICES,
+            SettingsRow::Tone => &TONE_CHOICES,
             _ => &[],
         }
     }
@@ -504,6 +525,7 @@ impl SettingsRow {
             SettingsRow::Delivery => "How your words reach your window.",
             SettingsRow::Writing => "How much Voisu tidies your words.",
             SettingsRow::Rendering => "How your words are laid out.",
+            SettingsRow::Tone => "How casual your words read.",
             SettingsRow::Deepgram => {
                 "Uses Deepgram alongside Groq for better accuracy on technical \
                  words. Off uses Groq alone."
@@ -881,6 +903,9 @@ impl App {
             }),
             SettingsRow::Rendering => self.settings.map_or_else(loading, |settings| {
                 plain(layout_label(settings.rendering).to_owned())
+            }),
+            SettingsRow::Tone => self.settings.map_or_else(loading, |settings| {
+                plain(tone_label(settings.tone).to_owned())
             }),
             SettingsRow::Deepgram => self.settings.map_or_else(loading, |settings| {
                 plain(if settings.deepgram { "On" } else { "Off" }.to_owned())
@@ -1314,7 +1339,8 @@ impl App {
             SettingsRow::Engine
             | SettingsRow::Delivery
             | SettingsRow::Writing
-            | SettingsRow::Rendering => {
+            | SettingsRow::Rendering
+            | SettingsRow::Tone => {
                 let Some(picked) = self.current_choice(row) else {
                     return;
                 };
@@ -1346,6 +1372,7 @@ impl App {
             SettingsRow::Delivery => position(&DELIVERIES, settings.delivery),
             SettingsRow::Writing => position(&WRITINGS, settings.writing),
             SettingsRow::Rendering => position(&LAYOUTS, settings.rendering),
+            SettingsRow::Tone => position(&TONES, settings.tone),
             _ => return None,
         })
     }
@@ -1388,6 +1415,10 @@ impl App {
             SettingsRow::Rendering => {
                 settings.rendering = LAYOUTS[picked];
                 Job::SetRendering(settings.rendering)
+            }
+            SettingsRow::Tone => {
+                settings.tone = TONES[picked];
+                Job::SetTone(settings.tone)
             }
             _ => return,
         };
@@ -1671,6 +1702,7 @@ pub(super) mod test_support {
             legacy_delivery: false,
             writing: WritingMode::Smart,
             rendering: RenderingPolicy::Adaptive,
+            tone: WritingTone::Formal,
             deepgram: true,
         }
     }
@@ -1909,7 +1941,7 @@ mod tests {
     fn a_key_prompt_accepts_paste_and_stops_at_a_line_break() {
         let mut app = ready_app();
         app.tab = Tab::Settings;
-        app.settings_selected = 5; // Groq key
+        app.settings_selected = 6; // Groq key
         let _ = press(&mut app, KeyCode::Enter, 0);
         let _ = update(&mut app, Msg::Paste("gsk_abc\nextra".to_owned()), at(0));
         let Some(Prompt::Key(Provider::Groq, text)) = &app.prompt else {
@@ -1962,7 +1994,7 @@ mod tests {
 
     fn deepgram_turned_off(app: &mut App) {
         app.tab = Tab::Settings;
-        app.settings_selected = 4;
+        app.settings_selected = 5;
         let _ = press(app, KeyCode::Enter, 0);
         let _ = update(
             app,
@@ -2563,7 +2595,7 @@ mod tests {
             matches!(effects.as_slice(), [Effect::Job(Job::SetRendering(policy))] if *policy == LAYOUTS[next])
         );
 
-        app.settings_selected = 4;
+        app.settings_selected = 5;
         let effects = press(&mut app, KeyCode::Enter, 0);
         assert!(matches!(
             effects.as_slice(),
@@ -2573,10 +2605,45 @@ mod tests {
     }
 
     #[test]
+    fn tone_sends_its_own_job_and_applies_to_the_next_recording() {
+        let mut app = ready_app();
+        app.tab = Tab::Settings;
+        app.settings_selected = 4;
+        assert_eq!(app.selected_setting(), SettingsRow::Tone);
+        assert_eq!(app.setting_value(SettingsRow::Tone).0, "Formal");
+
+        assert!(press(&mut app, KeyCode::Enter, 0).is_empty());
+        let _ = press(&mut app, KeyCode::Down, 0);
+        let effects = press(&mut app, KeyCode::Enter, 0);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Job(Job::SetTone(WritingTone::Informal))]
+        ));
+        assert_eq!(app.current_choice(SettingsRow::Tone), Some(1));
+        assert!(app.prompt.is_none());
+
+        // Tone is read at each Recording start, so nothing waits on a restart.
+        let _ = update(
+            &mut app,
+            Msg::Reply(Reply::Applied {
+                kind: Tone::Success,
+                text: "Tone set to Informal. It applies to your next Recording.".to_owned(),
+                refresh: &[Refresh::Settings, Refresh::Doctor],
+            }),
+            at(0),
+        );
+        assert!(app.restart_pending.is_empty());
+        assert_eq!(
+            app.setting_value(SettingsRow::Tone),
+            ("Informal".to_owned(), Tone::Plain)
+        );
+    }
+
+    #[test]
     fn the_trigger_key_row_is_read_only() {
         let mut app = ready_app();
         app.tab = Tab::Settings;
-        app.settings_selected = 7;
+        app.settings_selected = 8;
         assert!(press(&mut app, KeyCode::Enter, 0).is_empty());
         assert!(app.prompt.is_none());
         assert_eq!(
@@ -2642,7 +2709,7 @@ mod tests {
     fn run_setup_row_hands_off_to_the_wizard() {
         let mut app = ready_app();
         app.tab = Tab::Settings;
-        app.settings_selected = 8;
+        app.settings_selected = 9;
         let effects = press(&mut app, KeyCode::Enter, 0);
         assert!(matches!(effects.as_slice(), [Effect::StartSetup]));
         assert!(app.setup.is_some());
@@ -2664,7 +2731,7 @@ mod tests {
         const SECRET: &str = "gsk_very_secret_value";
         let mut app = ready_app();
         app.tab = Tab::Settings;
-        app.settings_selected = 5;
+        app.settings_selected = 6;
         let _ = press(&mut app, KeyCode::Enter, 0);
         type_text(&mut app, SECRET, 0);
         assert!(!format!("{:?}", app.prompt).contains(SECRET));
@@ -2683,7 +2750,7 @@ mod tests {
     fn an_empty_key_stays_in_the_prompt() {
         let mut app = ready_app();
         app.tab = Tab::Settings;
-        app.settings_selected = 6;
+        app.settings_selected = 7;
         let _ = press(&mut app, KeyCode::Enter, 0);
         assert!(press(&mut app, KeyCode::Enter, 0).is_empty());
         assert!(matches!(
