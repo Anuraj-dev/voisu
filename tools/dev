@@ -7,6 +7,12 @@
 #   tools/dev setup          install the git hook that links private agent files
 #                            into every new worktree
 #   tools/dev link           link them into the current worktree now
+#   tools/dev use dev [--overlay]
+#                            build this worktree and run it as your real Voisu
+#                            (same keys, settings, Trigger Key); --overlay also
+#                            builds and runs the dev Overlay
+#   tools/dev use prod       go back to the installed package (dev build stays on disk)
+#   tools/dev status         which binary each Voisu unit runs, and its version
 set -euo pipefail
 
 root=$(git rev-parse --show-toplevel)
@@ -41,6 +47,154 @@ check() {
 	printf '\nall checks passed\n'
 }
 
+# --- use dev|prod -----------------------------------------------------------
+# Switches the real user units between the installed package and a build of
+# this worktree with systemd drop-ins named 50-dev.conf. Only that one file per
+# unit is ever written or removed, so the other drop-ins (debug audio, flags)
+# keep applying in both modes. The packaged sandbox needs no exception for this:
+# ProtectSystem=strict makes the file system read-only but still executable,
+# and the units set no ProtectHome, NoExecPaths or ExecPaths.
+dev_home=${XDG_DATA_HOME:-$HOME/.local/share}/voisu-dev
+dev_bin=$dev_home/bin
+unit_dir=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
+dropin_marker="# Written by tools/dev use dev; removed by tools/dev use prod."
+
+sctl() { systemctl --user "$@"; }
+
+dropin_path() { printf '%s/%s.d/50-dev.conf\n' "$unit_dir" "$1"; }
+
+# $1 unit, $2 dev binary, $3 the packaged unit's ExecStart arguments
+write_dropin() {
+	local file
+	file=$(dropin_path "$1")
+	mkdir -p "$(dirname "$file")"
+	# The empty ExecStart= clears the packaged command before ours is set.
+	printf '%s\n[Service]\nExecStart=\nExecStart=%s %s\n' "$dropin_marker" "$2" "$3" >"$file"
+}
+
+# Removes the drop-in only when this tool wrote it; returns 0 if it removed one.
+remove_dropin() {
+	local file
+	file=$(dropin_path "$1")
+	if [ -f "$file" ] && [ "$(head -n1 "$file")" = "$dropin_marker" ]; then
+		rm -f "$file"
+		rmdir --ignore-fail-on-non-empty "$(dirname "$file")"
+		return 0
+	fi
+	return 1
+}
+
+# Restart returns at once for Type=simple units, so poll until the unit stays
+# active; a crash loop must fail the switch instead of looking fine.
+wait_active() {
+	local unit=$1 i
+	for i in $(seq 1 30); do
+		if sctl is-active --quiet "$unit"; then
+			sleep 1
+			if sctl is-active --quiet "$unit"; then return 0; fi
+		fi
+		sleep 0.5
+	done
+	echo "$unit did not become active; see: journalctl --user -u $unit -n 50" >&2
+	return 1
+}
+
+unit_exec_path() {
+	sctl show -p ExecStart "$1" | sed -n 's/.*{ path=\([^ ]*\) ;.*/\1/p' | head -n1
+}
+
+status() {
+	local unit path kind any_dev=no
+	for unit in voisu.service voisu-overlay.service; do
+		path=$(unit_exec_path "$unit")
+		case "$path" in
+		"$dev_bin"/*) kind=dev ;;
+		/usr/*) kind=packaged ;;
+		'') kind='not installed' ;;
+		*) kind=other ;;
+		esac
+		printf '%s: %s (%s), %s\n' "$unit" "${path:--}" "$kind" "$(sctl is-active "$unit" || true)"
+		if [ -n "$path" ]; then
+			printf '  version: %s\n' "$("$path" --version 2>&1 | head -n1 || true)"
+		fi
+		if [ "$kind" = dev ]; then any_dev=yes; fi
+	done
+	if [ "$any_dev" = yes ] && [ -f "$dev_home/source" ]; then
+		echo "dev build:"
+		sed 's/^/  /' "$dev_home/source"
+	fi
+	printf 'dev CLI: %s/voisu   (e.g. %s/voisu doctor)\n' "$dev_bin" "$dev_bin"
+}
+
+finish_switch() {
+	local unit
+	sctl daemon-reload
+	sctl restart "$@"
+	for unit in "$@"; do wait_active "$unit"; done
+	status
+}
+
+use_dev() {
+	local overlay=no name
+	case "${1:-}" in
+	--overlay) overlay=yes ;;
+	'') ;;
+	*)
+		echo "usage: tools/dev use dev [--overlay]" >&2
+		exit 2
+		;;
+	esac
+
+	step cargo build --release --locked -p voisu-app --bin voisu --bin voisu-daemon
+	local bins=(voisu voisu-daemon)
+	if [ "$overlay" = yes ]; then
+		# Same invocation the packaging uses; the overlay feature is not default.
+		step cargo build --release --locked -p voisu-app --features overlay --bin voisu-overlay
+		bins+=(voisu-overlay)
+	fi
+
+	# Copy to .new, then rename: overwriting a running binary fails with "Text
+	# file busy", while a rename leaves the running inode alone.
+	local out=${CARGO_TARGET_DIR:-$root/target}/release
+	mkdir -p "$dev_bin"
+	for name in "${bins[@]}"; do
+		cp "$out/$name" "$dev_bin/$name.new"
+		mv -f "$dev_bin/$name.new" "$dev_bin/$name"
+	done
+
+	local dirty=no
+	if [ -n "$(git status --porcelain --untracked-files=no)" ]; then dirty=yes; fi
+	cat >"$dev_home/source" <<-EOF
+		worktree: $root
+		branch: $(git rev-parse --abbrev-ref HEAD)
+		commit: $(git rev-parse --short HEAD)
+		dirty: $dirty
+		built: $(date '+%Y-%m-%d %H:%M:%S %z')
+	EOF
+
+	write_dropin voisu.service "$dev_bin/voisu-daemon" --systemd
+	local restart=(voisu.service)
+	if [ "$overlay" = yes ]; then
+		write_dropin voisu-overlay.service "$dev_bin/voisu-overlay" --supervise
+		restart+=(voisu-overlay.service)
+	elif remove_dropin voisu-overlay.service; then
+		# Without --overlay the Overlay returns to the package, so a stale dev
+		# Overlay never runs against a newer daemon.
+		restart+=(voisu-overlay.service)
+	fi
+	finish_switch "${restart[@]}"
+}
+
+use_prod() {
+	local restart=() unit
+	for unit in voisu.service voisu-overlay.service; do
+		if remove_dropin "$unit"; then restart+=("$unit"); fi
+	done
+	# Restart the daemon even when no drop-in was ours, so it lands on the package.
+	if [ "${#restart[@]}" -eq 0 ]; then restart=(voisu.service); fi
+	finish_switch "${restart[@]}"
+}
+
 case "${1:-}" in
 check) check "${2:-}" ;;
 setup)
@@ -49,8 +203,19 @@ setup)
 	echo "installed $hooks/post-checkout"
 	;;
 link) bash tools/git-hooks/post-checkout 0000000000000000000000000000000000000000 ;;
+use)
+	case "${2:-}" in
+	dev) use_dev "${3:-}" ;;
+	prod) use_prod ;;
+	*)
+		echo "usage: tools/dev use dev [--overlay] | tools/dev use prod" >&2
+		exit 2
+		;;
+	esac
+	;;
+status) status ;;
 *)
-	sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
+	sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
 	exit 2
 	;;
 esac

@@ -3,6 +3,7 @@
 - Run the app: `cargo run -p voisu-app --bin voisu -- --help` (CLI); install units and use `systemctl --user` for the daemon/overlay as in `README.md`.
 - Run tests: `cargo test --workspace` — mandatory RED → GREEN → REFACTOR cycles; test observable behavior via public interfaces.
 - Before pushing: `tools/dev check` runs the CI format, lint, doc and unit-test gates locally (`--full` adds the whole suite).
+- Run your real Voisu from a worktree: `tools/dev use dev [--overlay]` builds it and points the user units at it through a `50-dev.conf` drop-in; `tools/dev use prod` returns to the package; `tools/dev status` shows which is running.
 - PR titles are Conventional Commits (`feat(tui): …`, `fix(daemon): …`). The squash commit takes the title and `version-bump.yml` reads its type; CI fails a title without one.
 - New worktree on a fresh clone: run `tools/dev setup` once so every worktree gets the private agent files.
 - Naming: use the ubiquitous language in `CONTEXT.md` exactly (Recording, Transcript, Source Transcript,
