@@ -1,6 +1,6 @@
 [package]
 name = "voisu-app"
-version = "0.72.0"
+version = "0.73.0"
 description = "Voice dictation for Linux desktops (Cloud or Local)"
 edition.workspace = true
 license.workspace = true
