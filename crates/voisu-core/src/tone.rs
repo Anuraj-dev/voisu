@@ -58,18 +58,31 @@ pub fn apply_tone(text: &str, tone: Tone) -> String {
 #[derive(Clone, Copy)]
 enum Position {
     Anywhere,
-    /// Anywhere except right after one of these words.
-    NotAfter(&'static [&'static str]),
+    /// A request to the listener: imperative, or after "please" or "can you"
+    /// ("he'll let me know" and "he called and let me know" stay).
+    Request,
     /// A discourse marker: clause-initial, or right after a conjunction or
     /// interjection ("you to be honest" and "tell by the way he talks" stay).
     ClauseStart,
+    /// A `ClauseStart` that must end its clause or precede one of these words
+    /// ("I don't know what to do" is `idk`, "I don't know him" stays).
+    ClauseStartBefore(&'static [&'static str]),
+    /// A `ClauseStart` not followed by one of these words ("not going to lie
+    /// down" stays).
+    ClauseStartNotBefore(&'static [&'static str]),
     /// A clause of its own ("never mind the cost" and "it's no problem" stay).
     WholeClause,
-    /// About the speaker: at clause start, where it also absorbs one of these
-    /// subjects ("I'll be right back" is `brb`, "he'll be right back" stays).
+    /// About the speaker: it absorbs one of these subjects at clause start
+    /// ("I'll be right back" is `brb`, "he'll be right back" stays). With no
+    /// subject it must open the sentence, since after "and" or a comma it may
+    /// continue someone else's clause ("he left and will be right back" stays).
     Subject(&'static [&'static [&'static str]]),
-    /// The speaker leaving: a `Subject` that must also end its clause ("I got
-    /// to go to the store" stays). `bare` allows the phrase with no subject.
+    /// A `Subject` that must stand alone when it has no subject ("on my way
+    /// home, I saw a dog" stays).
+    SubjectOrAlone(&'static [&'static [&'static str]]),
+    /// The speaker leaving, which must open the sentence and finish the thought
+    /// ("last year, I got to go" and "I got to go, and it was great" stay).
+    /// `bare` allows the phrase with no subject.
     Leaving {
         bare: bool,
     },
@@ -79,10 +92,16 @@ const I_WILL: &[&[&str]] = &[&["i'll"], &["i", "will"], &["will"]];
 const I_AM: &[&[&str]] = &[&["i'm"], &["i", "am"]];
 const I_AM_OR_WAS: &[&[&str]] = &[&["i'm"], &["i", "am"], &["i", "was"]];
 const I_LEAVING: &[&[&str]] = &[&["i"], &["i've"]];
-const LET_ME_KNOW_BLOCKERS: &[&str] = &[
-    "to", "he", "she", "they", "it", "not", "never", "didn't", "doesn't", "don't", "won't",
-    "couldn't", "wouldn't",
+const REQUEST_VERBS: [&str; 4] = ["can", "could", "would", "will"];
+const AFTER_IDK: &[&str] = &[
+    "what", "where", "when", "who", "why", "how", "if", "whether", "which", "about", "but",
+    "though",
 ];
+const AFTER_LITERAL_LIE: &[&str] = &[
+    "down", "to", "about", "there", "here", "around", "back", "on", "in", "still", "low", "flat",
+];
+/// After a comma these carry the sentence on, so the phrase was not a goodbye.
+const CONTINUATIONS: [&str; 6] = ["and", "which", "but", "because", "so", "though"];
 
 /// Spoken phrases (lowercase words) and their abbreviations. Closed: add a
 /// phrase only through the spec. Matching prefers the longest phrase.
@@ -102,8 +121,16 @@ const PHRASES: &[(&[&str], &str, Position)] = &[
     ),
     (&["to", "be", "honest"], "tbh", Position::ClauseStart),
     (&["to", "be", "fair"], "tbf", Position::ClauseStart),
-    (&["not", "gonna", "lie"], "ngl", Position::ClauseStart),
-    (&["not", "going", "to", "lie"], "ngl", Position::ClauseStart),
+    (
+        &["not", "gonna", "lie"],
+        "ngl",
+        Position::ClauseStartNotBefore(AFTER_LITERAL_LIE),
+    ),
+    (
+        &["not", "going", "to", "lie"],
+        "ngl",
+        Position::ClauseStartNotBefore(AFTER_LITERAL_LIE),
+    ),
     (&["in", "my", "opinion"], "imo", Position::ClauseStart),
     (
         &["in", "my", "humble", "opinion"],
@@ -115,18 +142,18 @@ const PHRASES: &[(&[&str], &str, Position)] = &[
         "afaik",
         Position::Anywhere,
     ),
-    (&["i", "don't", "know"], "idk", Position::ClauseStart),
+    (
+        &["i", "don't", "know"],
+        "idk",
+        Position::ClauseStartBefore(AFTER_IDK),
+    ),
     (&["never", "mind"], "nvm", Position::WholeClause),
     (&["no", "problem"], "np", Position::WholeClause),
-    (
-        &["let", "me", "know"],
-        "lmk",
-        Position::NotAfter(LET_ME_KNOW_BLOCKERS),
-    ),
+    (&["let", "me", "know"], "lmk", Position::Request),
     (&["what", "the", "fuck"], "wtf", Position::Anywhere),
     (&["in", "real", "life"], "irl", Position::Anywhere),
     (&["away", "from", "keyboard"], "afk", Position::Anywhere),
-    (&["on", "my", "way"], "omw", Position::Subject(I_AM)),
+    (&["on", "my", "way"], "omw", Position::SubjectOrAlone(I_AM)),
     (&["be", "right", "back"], "brb", Position::Subject(I_WILL)),
     (
         &["talk", "to", "you", "later"],
@@ -163,9 +190,15 @@ const PHRASES: &[(&[&str], &str, Position)] = &[
 ];
 
 /// Words that may precede a discourse marker without clause punctuation.
-const DISCOURSE_LEADS: [&str; 9] = [
-    "and", "but", "so", "well", "oh", "hey", "ok", "okay", "sorry",
-];
+const DISCOURSE_LEADS: [&str; 8] = ["and", "but", "so", "well", "oh", "hey", "ok", "okay"];
+
+/// Words that may also lead a sentence before a phrase about the speaker
+/// ("sorry, I got to go"). Mid-sentence they mark nothing ("I'm sorry for your
+/// information being leaked").
+const SENTENCE_OPENERS: [&str; 3] = ["sorry", "anyway", "alright"];
+
+/// Marks that end a sentence-like unit before the next token.
+const SENTENCE_MARKS: [char; 5] = ['.', '!', '?', ';', ':'];
 
 /// Punctuation that may trail a phrase's last word. It is ignored for
 /// matching and kept after the abbreviation.
@@ -273,8 +306,7 @@ impl<'a> Words<'_, 'a> {
             }
             let raw_last = self.tokens[last].2;
             let suffix = &raw_last[raw_last.trim_end_matches(TRAILING_PUNCT).len()..];
-            let ends_clause = !suffix.is_empty() || last + 1 == self.tokens.len();
-            let Some(subject) = self.position_allows(position, i, floor, ends_clause) else {
+            let Some(subject) = self.position_allows(position, i, last, floor) else {
                 continue;
             };
             best = Some(Hit {
@@ -287,61 +319,119 @@ impl<'a> Words<'_, 'a> {
         best
     }
 
-    /// The subject tokens to absorb if `position` allows a phrase at `i`.
+    /// The subject tokens to absorb if `position` allows a phrase spanning
+    /// tokens `i..=last`.
     fn position_allows(
         &self,
         position: Position,
         i: usize,
+        last: usize,
         floor: usize,
-        ends_clause: bool,
     ) -> Option<usize> {
+        let leads_clause = || self.starts_clause(i) || self.opens_sentence(i);
         match position {
             Position::Anywhere => Some(0),
-            Position::NotAfter(words) => {
-                (i == 0 || !words.contains(&self.lower[i - 1].as_str())).then_some(0)
-            }
+            Position::Request => self.is_request(i).then_some(0),
             Position::ClauseStart => self.starts_clause(i).then_some(0),
+            Position::ClauseStartBefore(words) => (leads_clause()
+                && (self.ends_clause(last) || self.next_word_in(last, words)))
+            .then_some(0),
+            Position::ClauseStartNotBefore(words) => {
+                (self.starts_clause(i) && !self.next_word_in(last, words)).then_some(0)
+            }
             // "Never mind I found it" without a comma stays unchanged, so a
             // discourse lead does not count here.
             Position::WholeClause => {
-                (ends_clause && (i == 0 || self.after_punctuation(i))).then_some(0)
+                (self.ends_clause(last) && (i == 0 || self.after_punctuation(i))).then_some(0)
             }
-            Position::Subject(subjects) => self.subject_before(i, floor, subjects),
+            Position::Subject(subjects) => self
+                .subject_before(i, floor, subjects, false)
+                .or_else(|| (self.opens_sentence(i) || self.after_one_word(i)).then_some(0)),
+            Position::SubjectOrAlone(subjects) => self
+                .subject_before(i, floor, subjects, false)
+                .or_else(|| (self.opens_sentence(i) && self.ends_thought(last)).then_some(0)),
             Position::Leaving { bare } => {
-                if !ends_clause {
+                let finishes = self.ends_clause(last)
+                    && !self.tokens[last].2.ends_with('?')
+                    && !self.next_word_in(last, &CONTINUATIONS);
+                if !finishes {
                     return None;
                 }
-                self.subject_before(i, floor, I_LEAVING)
-                    .filter(|&subject| bare || subject > 0)
+                self.subject_before(i, floor, I_LEAVING, true)
+                    .or_else(|| (bare && self.opens_sentence(i)).then_some(0))
             }
         }
     }
 
     /// How many tokens of an allowed subject sit before `i`, with the subject
-    /// itself at clause start; `0` if the phrase needs none and is at clause
-    /// start; `None` if neither holds.
-    fn subject_before(&self, i: usize, floor: usize, subjects: &[&[&str]]) -> Option<usize> {
-        for subject in subjects {
+    /// itself leading a clause. A subject naming the speaker may follow "and"
+    /// or a comma unless `strict`; bare "will" may not, because "he left and
+    /// will be right back" is someone else's clause.
+    fn subject_before(
+        &self,
+        i: usize,
+        floor: usize,
+        subjects: &[&[&str]],
+        strict: bool,
+    ) -> Option<usize> {
+        subjects.iter().find_map(|subject| {
             let n = subject.len();
             if i < n || i - n < floor {
-                continue;
+                return None;
             }
             let start = i - n;
-            if self.skip[start..i].iter().all(|&s| !s)
+            let matches = self.skip[start..i].iter().all(|&s| !s)
                 && subject
                     .iter()
                     .zip(&self.lower[start..i])
-                    .all(|(w, t)| w == t)
-                && self.starts_clause(start)
-            {
-                return Some(n);
-            }
+                    .all(|(w, t)| w == t);
+            let names_speaker = subject[0].starts_with('i');
+            let leads = self.opens_sentence(start)
+                || (!strict && names_speaker && self.starts_clause(start));
+            (matches && leads).then_some(n)
+        })
+    }
+
+    fn is_request(&self, i: usize) -> bool {
+        if i == 0 || self.after_punctuation(i) || self.opens_sentence(i) {
+            return true;
         }
-        self.starts_clause(i).then_some(0)
+        match self.lower[i - 1].as_str() {
+            "please" => true,
+            "just" => self.opens_sentence(i - 1),
+            "you" => i >= 2 && REQUEST_VERBS.contains(&self.lower[i - 2].as_str()),
+            _ => false,
+        }
     }
 
     fn starts_clause(&self, i: usize) -> bool {
         i == 0 || self.after_punctuation(i) || DISCOURSE_LEADS.contains(&self.lower[i - 1].as_str())
+    }
+
+    /// Whether token `i` begins a sentence, allowing leading interjections
+    /// ("sorry, I got to go") but no other words before it.
+    fn opens_sentence(&self, i: usize) -> bool {
+        if self.after_sentence_mark(i) {
+            return true;
+        }
+        let lead = self.lower[i - 1].trim_end_matches(TRAILING_PUNCT);
+        (DISCOURSE_LEADS.contains(&lead) || SENTENCE_OPENERS.contains(&lead))
+            && self.opens_sentence(i - 1)
+    }
+
+    fn after_sentence_mark(&self, i: usize) -> bool {
+        i == 0
+            || self.tokens[i - 1]
+                .2
+                .trim_end_matches(CLOSERS)
+                .ends_with(SENTENCE_MARKS)
+    }
+
+    /// Whether a one-word clause and a comma lead into token `i` ("thanks, talk
+    /// to you later"), as opposed to a longer clause ("she walked in, laughing
+    /// out loud").
+    fn after_one_word(&self, i: usize) -> bool {
+        i > 0 && self.tokens[i - 1].2.ends_with(',') && self.after_sentence_mark(i - 1)
     }
 
     fn after_punctuation(&self, i: usize) -> bool {
@@ -349,6 +439,23 @@ impl<'a> Words<'_, 'a> {
             .2
             .trim_end_matches(CLOSERS)
             .ends_with(TRAILING_PUNCT)
+    }
+
+    fn ends_clause(&self, last: usize) -> bool {
+        last + 1 == self.tokens.len() || self.tokens[last].2.ends_with(TRAILING_PUNCT)
+    }
+
+    /// Whether the phrase ending at `last` is a statement that is over: a comma
+    /// may continue it ("on my way, I saw a dog"), and a question is not one.
+    fn ends_thought(&self, last: usize) -> bool {
+        let token = self.tokens[last].2;
+        !token.ends_with('?') && (last + 1 == self.tokens.len() || token.ends_with(['.', '!', ';']))
+    }
+
+    fn next_word_in(&self, last: usize, words: &[&str]) -> bool {
+        self.lower
+            .get(last + 1)
+            .is_some_and(|next| words.contains(&next.trim_end_matches(TRAILING_PUNCT)))
     }
 }
 
@@ -664,6 +771,127 @@ mod tests {
             informal("She didn't let me know."),
             "she didn't let me know"
         );
+        for unchanged in [
+            "my manager let me know she was out",
+            "he'll let me know",
+            "he hasn't let me know",
+            "she just let me know",
+            "the email let me know it failed",
+            "he called and let me know",
+        ] {
+            assert_eq!(informal(unchanged), unchanged);
+        }
+        assert_eq!(informal("Just let me know."), "just lmk");
+        assert_eq!(informal("Could you let me know?"), "could you lmk?");
+        assert_eq!(informal("If it works, let me know."), "if it works, lmk");
+        assert_eq!(informal("Ok let me know."), "ok lmk");
+    }
+
+    #[test]
+    fn a_coordinated_verb_about_someone_else_stays_as_words() {
+        for unchanged in [
+            "he left and will be right back",
+            "he went to lunch but will be right back",
+            "he'll grab it and be right back",
+            "she'll finish up and talk to you later",
+            "he stepped out and will talk to you later",
+            "john is out, will be right back",
+            "she walked in, laughing out loud",
+            "he kept dancing and laughing out loud",
+        ] {
+            assert_eq!(informal(unchanged), unchanged);
+        }
+        assert_eq!(informal("Will be right back."), "brb");
+        assert_eq!(
+            informal("He left and I'll be right back."),
+            "he left and brb"
+        );
+        assert_eq!(informal("Thanks, talk to you later."), "thanks, ttyl");
+        assert_eq!(informal("Ok, be right back."), "ok, brb");
+        assert_eq!(informal("Sorry I'll be right back."), "sorry brb");
+    }
+
+    #[test]
+    fn on_my_way_without_a_subject_must_stand_alone() {
+        for (input, expected) in [
+            (
+                "On my way home, I saw a dog.",
+                "on my way home, i saw a dog",
+            ),
+            ("On my way, I saw a dog.", "on my way, i saw a dog"),
+            (
+                "I went to the store and on my way back I saw him.",
+                "i went to the store and on my way back i saw him",
+            ),
+            (
+                "So on my way here I got lost.",
+                "so on my way here i got lost",
+            ),
+            (
+                "He went home, on my way here.",
+                "he went home, on my way here",
+            ),
+        ] {
+            assert_eq!(informal(input), expected, "input: {input}");
+        }
+        assert_eq!(informal("Ok, on my way!"), "ok, omw!");
+    }
+
+    #[test]
+    fn got_to_go_as_a_past_chance_stays_as_words() {
+        for (input, expected) in [
+            ("Last year, I got to go.", "last year, i got to go"),
+            ("Finally, I got to go.", "finally, i got to go"),
+            (
+                "My dad had tickets and I got to go!",
+                "my dad had tickets and i got to go!",
+            ),
+            (
+                "I got to go, and it was great.",
+                "i got to go, and it was great",
+            ),
+            (
+                "So I got to go, which was great.",
+                "so i got to go, which was great",
+            ),
+            (
+                "We went to the park and got to go.",
+                "we went to the park and got to go",
+            ),
+            ("Wait, I have to go?", "wait, i have to go?"),
+        ] {
+            assert_eq!(informal(input), expected, "input: {input}");
+        }
+        assert_eq!(informal("Anyway, I gotta go."), "anyway, g2g");
+        assert_eq!(informal("Ok, I have to go."), "ok, g2g");
+    }
+
+    #[test]
+    fn literal_lie_and_know_stay_as_words() {
+        assert_eq!(
+            informal("Not going to lie down yet."),
+            "not going to lie down yet"
+        );
+        assert_eq!(informal("Not gonna lie to you."), "not gonna lie to you");
+        assert_eq!(informal("Not gonna lie I love it."), "ngl i love it");
+        assert_eq!(informal("I don't know him."), "i don't know him");
+        assert_eq!(informal("I don't know John."), "i don't know John");
+        assert_eq!(
+            informal("I don't know anyone here."),
+            "i don't know anyone here"
+        );
+        assert_eq!(informal("I don't know, maybe."), "idk, maybe");
+        assert_eq!(informal("I don't know if it works."), "idk if it works");
+        assert_eq!(informal("Sorry I don't know."), "sorry idk");
+    }
+
+    #[test]
+    fn sorry_mid_sentence_is_not_a_clause_lead() {
+        assert_eq!(
+            informal("I'm sorry for your information being leaked."),
+            "i'm sorry for your information being leaked"
+        );
+        assert_eq!(informal("I'm sorry I got to go."), "i'm sorry i got to go");
     }
 
     #[test]
