@@ -1,6 +1,6 @@
 //! The setup screens' state: what is on screen and what each key does there.
 //! Pure, like the rest of the model. The questions come from
-//! [`super::setup_bridge`], which runs the one setup flow on its own thread.
+//! `setup_bridge`, which runs the one setup flow on its own thread.
 //!
 //! No secret ever enters a [`SetupEvent`], which is copied around freely: a key
 //! the person typed leaves here once, inside a [`SetupAnswer`], and only its
