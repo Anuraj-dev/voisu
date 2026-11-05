@@ -43,7 +43,7 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub const ALL: [Tab; 4] = [Tab::Home, Tab::History, Tab::Dictionary, Tab::Settings];
+    pub const ALL: [Tab; 4] = [Tab::Home, Tab::Settings, Tab::Dictionary, Tab::History];
 
     pub fn title(self) -> &'static str {
         match self {
@@ -1740,12 +1740,12 @@ mod tests {
     fn while_dictating_every_key_but_ctrl_c_is_ignored() {
         for state in [DaemonState::Recording, DaemonState::Processing] {
             let mut app = ready_app();
-            let _ = press(&mut app, KeyCode::Char('4'), 0); // Settings
+            let _ = press(&mut app, KeyCode::Char('2'), 0); // Settings
             let _ = set_status(&mut app, state, 10);
             for code in [
                 KeyCode::Char('q'),
                 KeyCode::Char('d'),
-                KeyCode::Char('2'),
+                KeyCode::Char('4'),
                 KeyCode::Char('?'),
                 KeyCode::Tab,
                 KeyCode::Enter,
@@ -1856,7 +1856,7 @@ mod tests {
         assert_eq!(app.hero(), Hero::NeedsRestart);
         assert!(app.guarded(), "the old daemon may still be dictating");
         assert_eq!(app.fix(), None, "a dictated newline must not be the fix");
-        for code in [KeyCode::Char('q'), KeyCode::Enter, KeyCode::Char('4')] {
+        for code in [KeyCode::Char('q'), KeyCode::Enter, KeyCode::Char('2')] {
             assert!(press(&mut app, code, 600).is_empty(), "{code:?}");
         }
         assert!(!app.should_quit);
@@ -2433,22 +2433,22 @@ mod tests {
     fn every_tab_key_reaches_its_tab() {
         let mut app = ready_app();
         let _ = press(&mut app, KeyCode::Right, 0);
-        assert_eq!(app.tab, Tab::History);
+        assert_eq!(app.tab, Tab::Settings);
         let _ = press(&mut app, KeyCode::Tab, 0);
         assert_eq!(app.tab, Tab::Dictionary);
         let _ = press(&mut app, KeyCode::Char('l'), 0);
-        assert_eq!(app.tab, Tab::Settings);
+        assert_eq!(app.tab, Tab::History);
         let _ = press(&mut app, KeyCode::Right, 0);
         assert_eq!(app.tab, Tab::Home, "wraps");
         let _ = press(&mut app, KeyCode::Left, 0);
-        assert_eq!(app.tab, Tab::Settings, "wraps back");
+        assert_eq!(app.tab, Tab::History, "wraps back");
         let _ = press(&mut app, KeyCode::Char('h'), 0);
         assert_eq!(app.tab, Tab::Dictionary);
         let _ = press(&mut app, KeyCode::BackTab, 0);
-        assert_eq!(app.tab, Tab::History);
+        assert_eq!(app.tab, Tab::Settings);
         let _ = press(&mut app, KeyCode::Char('1'), 0);
         assert_eq!(app.tab, Tab::Home);
-        let _ = press(&mut app, KeyCode::Char('4'), 0);
+        let _ = press(&mut app, KeyCode::Char('2'), 0);
         assert_eq!(app.tab, Tab::Settings);
     }
 
@@ -2480,7 +2480,7 @@ mod tests {
     fn a_too_small_screen_only_answers_to_quit() {
         let mut app = ready_app();
         let _ = update(&mut app, Msg::Resize(52, 14), at(0));
-        let _ = press(&mut app, KeyCode::Char('2'), 0);
+        let _ = press(&mut app, KeyCode::Char('4'), 0);
         let _ = press(&mut app, KeyCode::Char('?'), 0);
         assert_eq!(app.tab, Tab::Home);
         assert!(!app.overlay);
@@ -2768,7 +2768,7 @@ mod tests {
             ]))),
             at(0),
         );
-        let _ = press(&mut app, KeyCode::Char('2'), 0);
+        let _ = press(&mut app, KeyCode::Char('4'), 0);
         let effects = press(&mut app, KeyCode::Char('c'), 0);
         assert!(matches!(
             effects.as_slice(),
@@ -2796,7 +2796,7 @@ mod tests {
             ]))),
             at(0),
         );
-        let _ = press(&mut app, KeyCode::Char('2'), 0);
+        let _ = press(&mut app, KeyCode::Char('4'), 0);
         for _ in 0..50 {
             let _ = press(&mut app, KeyCode::PageDown, 0);
         }

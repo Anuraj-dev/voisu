@@ -112,12 +112,12 @@ It is keyboard-only: `←` `→` (or `1`–`4`) switch tabs, `↑` `↓` move, `
 - **Home** shows the one thing that matters right now: ready to dictate, or the
   problem and the single key that fixes it (start Voisu, restart it, run setup).
   `d` shows every check `voisu doctor` runs.
-- **History** lists recent Recordings; `c` copies one.
-- **Dictionary** holds the words Voisu should spell your way; `a` adds, `d`
-  removes.
 - **Settings** changes Engine, Delivery, Writing, Layout, Deepgram and your
   keys, explains each choice beside it, and offers a restart when the running
   service needs one to pick up a change.
+- **Dictionary** holds the words Voisu should spell your way; `a` adds, `d`
+  removes.
+- **History** lists recent Recordings; `c` copies one.
 
 If nothing is set up yet, `voisu` opens straight on the setup screens: Cloud or
 Local, your Groq and Deepgram keys (checked as you save them, paste with

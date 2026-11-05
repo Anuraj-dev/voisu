@@ -383,7 +383,7 @@ mod tests {
     }
 
     fn with_records() -> App {
-        let mut app = app_on('2');
+        let mut app = app_on('4');
         let records = vec![
             item(Some("Hey, so the current CLI is okay."), None),
             item(None, Some("No Transcript. No words heard")),
@@ -402,7 +402,7 @@ mod tests {
         assert!(lines[0].ends_with("● Ready"), "{}", lines[0]);
         assert_eq!(lines[0].chars().count(), 79);
         assert_eq!(lines[1], "");
-        assert_eq!(lines[2], " Home    History    Dictionary    Settings");
+        assert_eq!(lines[2], " Home    Settings    Dictionary    History");
         assert_eq!(lines[3], " ━━━━");
         assert_eq!(lines[4], "");
         assert_eq!(lines[5], "   Ready to dictate");
@@ -440,7 +440,7 @@ mod tests {
 
     #[test]
     fn the_settings_tab_matches_the_reference_layout() {
-        let mut app = app_on('4');
+        let mut app = app_on('2');
         let lines = screen(&mut app, &UNICODE, (80, 24));
         assert_eq!(lines[5], " ▌ Engine        Cloud");
         assert_eq!(lines[6], "   Delivery      Paste");
@@ -462,7 +462,7 @@ mod tests {
 
     #[test]
     fn the_guide_explains_every_delivery_choice_before_any_is_picked() {
-        let mut app = app_on('4');
+        let mut app = app_on('2');
         let _ = press(&mut app, KeyCode::Down, 0);
         let lines = screen(&mut app, &UNICODE, (80, 24));
         assert_eq!(lines[6], " ▌ Delivery      Paste");
@@ -474,7 +474,7 @@ mod tests {
 
     #[test]
     fn enter_turns_the_guide_into_the_picker_in_place() {
-        let mut app = app_on('4');
+        let mut app = app_on('2');
         let _ = press(&mut app, KeyCode::Down, 0);
         let _ = press(&mut app, KeyCode::Enter, 0);
         let _ = press(&mut app, KeyCode::Down, 0);
@@ -491,7 +491,7 @@ mod tests {
 
     #[test]
     fn wide_terminals_put_the_guide_in_a_panel_beside_the_rows() {
-        let mut app = app_on('4');
+        let mut app = app_on('2');
         let lines = screen(&mut app, &UNICODE, (120, 40));
         let beside = |row: &str, panel: &str| format!("{row:<44} │ {panel}").trim_end().to_owned();
         assert_eq!(lines[5], beside(" ▌ Engine        Cloud", "Engine"));
@@ -529,7 +529,7 @@ mod tests {
 
     #[test]
     fn a_narrow_panel_wraps_each_choice_instead_of_cutting_it() {
-        let mut app = app_on('4');
+        let mut app = app_on('2');
         let _ = press(&mut app, KeyCode::Down, 0);
         let _ = press(&mut app, KeyCode::Down, 0);
         let lines = screen(&mut app, &UNICODE, (90, 24));
@@ -545,7 +545,7 @@ mod tests {
     fn every_panel_guide_shows_whole_at_both_wide_sizes() {
         for size in [(90, 24), (120, 40)] {
             for index in 0..SettingsRow::ALL.len() {
-                let mut app = app_on('4');
+                let mut app = app_on('2');
                 app.settings_selected = index;
                 let row = app.selected_setting();
                 let lines = screen(&mut app, &UNICODE, size);
@@ -579,7 +579,7 @@ mod tests {
         }
 
         // The longest value a row can hold still shows whole beside the panel.
-        let mut app = app_on('4');
+        let mut app = app_on('2');
         let _ = update(
             &mut app,
             Msg::Reply(Reply::Status(StatusPoll::Unavailable)),
@@ -597,16 +597,16 @@ mod tests {
         for size in SIZES {
             for (key, title) in [
                 ('1', "Home"),
-                ('2', "History"),
+                ('2', "Settings"),
                 ('3', "Dictionary"),
-                ('4', "Settings"),
+                ('4', "History"),
             ] {
                 let mut app = app_on(key);
                 let lines = screen(&mut app, &UNICODE, size);
                 let joined = joined(&lines);
                 assert!(lines[0].contains("voisu"), "{size:?} {title}");
                 assert!(lines[0].contains("● Ready"), "{size:?} {title}");
-                assert!(joined.contains("Home    History    Dictionary    Settings"));
+                assert!(joined.contains("Home    Settings    Dictionary    History"));
                 assert!(
                     lines[size.1 as usize - 1].contains("q quit"),
                     "{size:?} {title}"
@@ -614,7 +614,7 @@ mod tests {
                 // The rule sits under the active tab's title.
                 let tab_row = lines
                     .iter()
-                    .position(|l| l.contains("Home    History"))
+                    .position(|l| l.contains("Home    Settings"))
                     .expect("tabs");
                 let rule = &lines[tab_row + 1];
                 let column = lines[tab_row].find(title).expect("title");
@@ -627,7 +627,7 @@ mod tests {
     #[test]
     fn every_settings_row_and_its_guide_fit_where_they_should() {
         for index in 0..SettingsRow::ALL.len() {
-            let mut app = app_on('4');
+            let mut app = app_on('2');
             app.settings_selected = index;
             let row = app.selected_setting();
 
@@ -842,7 +842,7 @@ mod tests {
 
     #[test]
     fn history_empty_state_reads_as_specified() {
-        let mut app = app_on('2');
+        let mut app = app_on('4');
         let body = joined(&screen(&mut app, &UNICODE, (80, 24)));
         assert!(body.contains("Nothing yet. Your dictations will appear here."));
         assert!(!body.contains("c copy"), "nothing to copy");
@@ -850,7 +850,7 @@ mod tests {
 
     #[test]
     fn a_long_transcript_scrolls_inside_its_pane() {
-        let mut app = app_on('2');
+        let mut app = app_on('4');
         let long = (0..300)
             .map(|n| format!("word{n}"))
             .collect::<Vec<_>>()
@@ -873,7 +873,7 @@ mod tests {
 
     #[test]
     fn a_hostile_transcript_cannot_reach_the_terminal() {
-        let mut app = app_on('2');
+        let mut app = app_on('4');
         let hostile = text::clean_block("safe\x1b[2J text");
         let _ = update(
             &mut app,
@@ -922,7 +922,7 @@ mod tests {
     fn a_key_prompt_only_ever_shows_bullets() {
         const SECRET: &str = "gsk_secret_value";
         for look in [UNICODE, ASCII] {
-            let mut app = app_on('4');
+            let mut app = app_on('2');
             app.settings_selected = 5;
             let _ = press(&mut app, KeyCode::Enter, 0);
             type_text(&mut app, SECRET, 0);
@@ -942,7 +942,7 @@ mod tests {
 
     #[test]
     fn a_saved_key_shows_checking_until_the_doctor_answers() {
-        let mut app = app_on('4');
+        let mut app = app_on('2');
         app.key_in_check = Some(Provider::Deepgram);
         let lines = screen(&mut app, &UNICODE, (80, 24));
         assert_eq!(lines[11], "   Deepgram key  Checking…");
@@ -993,7 +993,7 @@ mod tests {
 
     #[test]
     fn without_colour_selection_and_state_are_still_there_in_text() {
-        let mut app = app_on('4');
+        let mut app = app_on('2');
         let lines = screen(&mut app, &NO_COLOR, (80, 24));
         assert!(lines[5].starts_with(" ▌ Engine"));
         assert!(lines[0].ends_with("● Ready"));
@@ -1048,7 +1048,7 @@ mod tests {
             assert!(body.is_ascii(), "{body}");
             assert!(body.contains("* Ready"));
         }
-        let mut app = app_on('4');
+        let mut app = app_on('2');
         let lines = screen(&mut app, &ASCII, (80, 24));
         assert!(lines[5].starts_with(" > Engine"), "{}", lines[5]);
         assert_eq!(lines[3].trim().len(), "Settings".len());
@@ -1056,7 +1056,7 @@ mod tests {
 
     #[test]
     fn user_facing_settings_only() {
-        let mut app = app_on('4');
+        let mut app = app_on('2');
         let body = joined(&screen(&mut app, &UNICODE, (120, 40))).to_lowercase();
         for hidden in ["local-dev", "replay", "export", "retention", "revision"] {
             assert!(!body.contains(hidden), "{hidden} leaked");

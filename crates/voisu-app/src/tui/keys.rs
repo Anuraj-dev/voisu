@@ -146,9 +146,9 @@ fn tabs() -> Binding {
             (letter('h'), Action::PrevTab),
             (letter('l'), Action::NextTab),
             (letter('1'), Action::GoTab(Tab::Home)),
-            (letter('2'), Action::GoTab(Tab::History)),
+            (letter('2'), Action::GoTab(Tab::Settings)),
             (letter('3'), Action::GoTab(Tab::Dictionary)),
-            (letter('4'), Action::GoTab(Tab::Settings)),
+            (letter('4'), Action::GoTab(Tab::History)),
         ],
     }
 }
