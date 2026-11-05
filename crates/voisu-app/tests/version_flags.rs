@@ -27,7 +27,7 @@ commands:
   delivery [paste|copy]         paste the text for you, or only copy it
   writing [clean|exact]         fix grammar and misheard words, or keep your words as spoken
   layout [plain|auto|sections]  punctuation only, organize when you speak in parts, or add headings
-  tone [formal|informal]        full words, or chat abbreviations like BTW with no final full stop
+  tone [formal|informal]        full words, or lowercase start, abbreviations like BTW, no final full stop
   dictionary add <term>         add a word Voisu should spell your way
   dictionary remove <term>      remove a word
   dictionary list [--json]      list your words

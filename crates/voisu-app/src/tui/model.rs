@@ -359,7 +359,7 @@ const TONE_CHOICES: [Choice; 2] = [
     choice("Formal", "Full words and a closing full stop."),
     choice(
         "Informal",
-        "Chat abbreviations like BTW; no final full stop.",
+        "Lowercase start, abbreviations like BTW, no final full stop.",
     ),
 ];
 

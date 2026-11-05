@@ -365,7 +365,7 @@
     <label class="switch-row" for="informal-tone">
       <span class="row-text">
         <span>Informal tone</span>
-        <span class="hint">Chat abbreviations like BTW, and no final full stop.</span>
+        <span class="hint">Lowercase start, abbreviations like BTW, and no final full stop.</span>
       </span>
       <span class="switch">
         <input

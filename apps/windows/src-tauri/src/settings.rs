@@ -52,8 +52,8 @@ pub struct Settings {
     /// The user's boost words, normalized (see `vocabulary::normalize`).
     #[serde(deserialize_with = "lenient_terms")]
     pub boost_words: Vec<String>,
-    /// Formal keeps full words; informal turns chat phrases into
-    /// abbreviations like BTW and drops the final full stop. Read as each
+    /// Formal keeps full words; informal starts lowercase, turns chat phrases
+    /// into abbreviations like BTW and drops the final full stop. Read as each
     /// Recording starts; anything unknown is formal.
     #[serde(deserialize_with = "lenient")]
     pub tone: Tone,

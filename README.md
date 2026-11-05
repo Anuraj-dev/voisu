@@ -273,7 +273,7 @@ local to your machine.
 | `voisu delivery [paste\|copy]` | Paste the Transcript into your window, or only copy it |
 | `voisu writing [clean\|exact]` | `clean` fixes punctuation and formatting; `exact` keeps your words as spoken |
 | `voisu layout [plain\|auto\|sections]` | Choose how text is laid out: plain, automatic, or sections |
-| `voisu tone [formal\|informal]` | `formal` keeps full words; `informal` uses chat abbreviations like BTW and drops the final full stop |
+| `voisu tone [formal\|informal]` | `formal` keeps full words; `informal` starts lowercase, uses chat abbreviations like BTW and drops the final full stop |
 | `voisu dictionary add` / `remove <term>` / `list` | Personal pronunciation dictionary |
 | `voisu history [--json\|--verbose]` | List recent Recordings |
 | `voisu export <correlation-id>` | Redacted diagnostic export for one Recording |
