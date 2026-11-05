@@ -76,13 +76,33 @@ const TIER_ONE: &[(&[&str], &str)] = &[
     (&["to", "be", "fair"], "TBF"),
 ];
 
+/// Abbreviations that only fire as a clause-initial discourse marker.
+const CLAUSE_MARKERS: [&str; 6] = ["BTW", "FYI", "TBH", "TBF", "NGL", "IMO"];
+
+/// Words that may precede a discourse marker without clause punctuation.
+const DISCOURSE_LEADS: [&str; 8] = ["and", "but", "so", "well", "oh", "hey", "ok", "okay"];
+
+/// Words before "got to go" that make it past-tense "had the chance".
+const G2G_PAST_MARKERS: [&str; 5] = ["never", "ever", "finally", "not", "just"];
+
 /// Punctuation that may trail a phrase's last word. It is ignored for
 /// matching and kept after the abbreviation.
 const TRAILING_PUNCT: [char; 6] = [',', '.', '!', '?', ';', ':'];
 
 fn abbreviate(text: &str) -> String {
+    // Lines inside a ``` fence are code and stay untouched.
+    let mut in_fence = false;
     text.split('\n')
-        .map(abbreviate_line)
+        .map(|line| {
+            if line.trim_start().starts_with("```") {
+                in_fence = !in_fence;
+                line.to_owned()
+            } else if in_fence {
+                line.to_owned()
+            } else {
+                abbreviate_line(line)
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -149,8 +169,25 @@ fn match_at<'a>(
             continue;
         }
         // "got to go" is also ordinary English ("I got to go to the store").
-        // It becomes G2G only when it ends its clause.
-        if *abbreviation == "G2G" && suffix.is_empty() && last + 1 != tokens.len() {
+        // It becomes G2G only when it ends its clause and is not "never got
+        // to go" / "finally got to go".
+        if *abbreviation == "G2G"
+            && ((suffix.is_empty() && last + 1 != tokens.len())
+                || (i > 0 && G2G_PAST_MARKERS.contains(&lower[i - 1].as_str())))
+        {
+            continue;
+        }
+        // These double as ordinary phrases ("you to be honest", "tell by the
+        // way he talks"). They become abbreviations only as a discourse
+        // marker: clause-initial, or right after a conjunction/interjection.
+        if CLAUSE_MARKERS.contains(abbreviation)
+            && !(i == 0
+                || tokens[i - 1]
+                    .2
+                    .trim_end_matches(['"', '\u{201d}', ')'])
+                    .ends_with(TRAILING_PUNCT)
+                || DISCOURSE_LEADS.contains(&lower[i - 1].as_str()))
+        {
             continue;
         }
         best = Some((n, abbreviation, suffix));
@@ -213,7 +250,14 @@ fn drop_final_full_stop(text: &str) -> String {
         return text.to_owned();
     };
     let last_line = trimmed.rsplit('\n').next().unwrap_or(trimmed);
-    if last_word.contains('.') || !body.ends_with(last_word) || is_command_shaped(last_line) {
+    const ABBREVIATION_STEMS: [&str; 14] = [
+        "etc", "mr", "mrs", "ms", "dr", "vs", "inc", "jr", "sr", "st", "ltd", "co", "prof", "no",
+    ];
+    if last_word.contains('.')
+        || ABBREVIATION_STEMS.contains(&last_word.to_ascii_lowercase().as_str())
+        || !body.ends_with(last_word)
+        || is_command_shaped(last_line)
+    {
         return text.to_owned();
     }
     format!("{body}{trail}")
@@ -297,6 +341,40 @@ mod tests {
         assert_eq!(informal("by the wayside"), "by the wayside");
         // Punctuation inside the phrase breaks it.
         assert_eq!(informal("By the, way"), "By the, way");
+    }
+
+    #[test]
+    fn discourse_markers_need_a_clause_position() {
+        assert_eq!(
+            informal("I want you to be honest."),
+            "I want you to be honest"
+        );
+        assert_eq!(
+            informal("It's important to be fair to everyone."),
+            "It's important to be fair to everyone"
+        );
+        assert_eq!(
+            informal("You can tell by the way he talks."),
+            "You can tell by the way he talks"
+        );
+        assert_eq!(
+            informal("Thanks for your information."),
+            "Thanks for your information"
+        );
+        assert_eq!(informal("By the way, it works."), "BTW, it works");
+        assert_eq!(informal("And by the way it works."), "And BTW it works");
+        assert_eq!(informal("It was, to be honest, fine."), "It was, TBH, fine");
+        assert_eq!(informal("I never got to go."), "I never got to go");
+    }
+
+    #[test]
+    fn fenced_code_is_unchanged_and_abbreviations_keep_their_stop() {
+        assert_eq!(informal("```\nby the way\n```"), "```\nby the way\n```");
+        assert_eq!(
+            informal("Bring apples, pears, etc."),
+            "Bring apples, pears, etc."
+        );
+        assert_eq!(informal("Say hi to Mr."), "Say hi to Mr.");
     }
 
     #[test]
