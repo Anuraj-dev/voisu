@@ -66,7 +66,7 @@ enum Position {
     ClauseStart,
     /// A `ClauseStart` that must end its clause or precede one of these words
     /// ("I don't know what to do" is `idk`, "I don't know him" stays, and with
-    /// no words, "not going to lie, it works" is `ngl`, "not going to lie down"
+    /// no words, "not gonna lie, it works" is `ngl`, "not gonna lie down"
     /// stays).
     ClauseStartBefore(&'static [&'static str]),
     /// A clause of its own ("never mind the cost" and "it's no problem" stay).
@@ -81,11 +81,9 @@ enum Position {
     SubjectOrAlone(&'static [&'static [&'static str]]),
     /// The speaker leaving, which must open the sentence and end it ("last
     /// year, I got to go" and "I have to go, right?" stay). `bare` allows the
-    /// phrase with no subject. `may_continue` allows a comma after it, for a
-    /// form with no "had the chance to" reading ("gotta go, bye").
+    /// phrase with no subject.
     Leaving {
         bare: bool,
-        may_continue: bool,
     },
 }
 
@@ -119,11 +117,6 @@ const PHRASES: &[(&[&str], &str, Position)] = &[
     (&["to", "be", "fair"], "tbf", Position::ClauseStart),
     (
         &["not", "gonna", "lie"],
-        "ngl",
-        Position::ClauseStartBefore(&[]),
-    ),
-    (
-        &["not", "going", "to", "lie"],
         "ngl",
         Position::ClauseStartBefore(&[]),
     ),
@@ -179,26 +172,13 @@ const PHRASES: &[(&[&str], &str, Position)] = &[
     (
         &["got", "to", "go"],
         "g2g",
-        Position::Leaving {
-            bare: true,
-            may_continue: false,
-        },
+        Position::Leaving { bare: true },
     ),
-    (
-        &["gotta", "go"],
-        "g2g",
-        Position::Leaving {
-            bare: true,
-            may_continue: true,
-        },
-    ),
+    (&["gotta", "go"], "g2g", Position::Leaving { bare: true }),
     (
         &["have", "to", "go"],
         "g2g",
-        Position::Leaving {
-            bare: false,
-            may_continue: false,
-        },
+        Position::Leaving { bare: false },
     ),
 ];
 
@@ -357,13 +337,8 @@ impl<'a> Words<'_, 'a> {
             Position::SubjectOrAlone(subjects) => self
                 .subject_before(i, floor, subjects, false)
                 .or_else(|| (self.opens_sentence(i) && self.ends_thought(last)).then_some(0)),
-            Position::Leaving { bare, may_continue } => {
-                let finishes = if may_continue {
-                    self.ends_clause(last) && !self.tokens[last].2.ends_with('?')
-                } else {
-                    self.ends_thought(last)
-                };
-                if !finishes {
+            Position::Leaving { bare } => {
+                if !self.ends_thought(last) {
                     return None;
                 }
                 self.subject_before(i, floor, I_LEAVING, true)
@@ -614,7 +589,6 @@ mod tests {
         ("Send it as soon as possible.", "send it asap"),
         ("To be honest, it shipped.", "tbh, it shipped"),
         ("Not gonna lie, it shipped.", "ngl, it shipped"),
-        ("Not going to lie, it shipped.", "ngl, it shipped"),
         ("In my opinion, it shipped.", "imo, it shipped"),
         ("In my humble opinion, it shipped.", "imho, it shipped"),
         ("As far as I know, it shipped.", "afaik, it shipped"),
@@ -895,6 +869,14 @@ mod tests {
             "not going to lie under oath"
         );
         assert_eq!(informal("Not gonna lie."), "ngl");
+        assert_eq!(
+            informal("She is honest and not going to lie."),
+            "she is honest and not going to lie"
+        );
+        assert_eq!(
+            informal("Not going to lie, it shipped."),
+            "not going to lie, it shipped"
+        );
         assert_eq!(informal("I don't know him."), "i don't know him");
         assert_eq!(informal("I don't know John."), "i don't know John");
         assert_eq!(
@@ -1008,10 +990,11 @@ mod tests {
             "we got to go, and it was great"
         );
         assert_eq!(informal("I got to go, bye."), "i got to go, bye");
-        assert_eq!(informal("Gotta go, bye."), "g2g, bye");
+        assert_eq!(informal("Gotta go, bye."), "gotta go, bye");
+        assert_eq!(informal("I gotta go, right?"), "i gotta go, right?");
         assert_eq!(
             informal("Gotta go, but I'll call you later."),
-            "g2g, but i'll call you later"
+            "gotta go, but i'll call you later"
         );
         assert_eq!(informal("Gotta go?"), "gotta go?");
         assert_eq!(informal("Sorry I got to go."), "sorry g2g");
