@@ -2405,11 +2405,11 @@ mod tests {
             voisu_core::apply_tone(&formal.rendered, Tone::Informal)
         );
         assert!(
-            informal.rendered.starts_with("BTW"),
+            informal.rendered.starts_with("btw"),
             "{}",
             informal.rendered
         );
-        assert!(informal.rendered.ends_with("TTYL"), "{}", informal.rendered);
+        assert!(informal.rendered.ends_with("ttyl"), "{}", informal.rendered);
     }
 
     #[tokio::test]
