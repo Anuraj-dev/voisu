@@ -474,7 +474,7 @@ mod tests {
         );
         assert_eq!(
             lines[18],
-            "       Informal  Lowercase start, abbreviations like BTW, no final full stop."
+            "       Informal  Lowercase, abbreviations like btw, no final full stop."
         );
     }
 
