@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.73.0
+Version:        0.73.1
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -167,6 +167,9 @@ install -D -m 0644 packaging/icons/voisu.svg %{buildroot}%{_datadir}/icons/hicol
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Fri Nov 06 2026 Voisu maintainers <voisu@example.invalid> - 0.73.1-1
+- fix(tone): keep sentence-start capitals and I in informal text (#308)
+
 * Thu Nov 05 2026 Voisu maintainers <voisu@example.invalid> - 0.73.0-1
 - feat(tone): write informal text in lowercase with more abbreviations (#307)
 
