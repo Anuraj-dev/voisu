@@ -1,5 +1,6 @@
 <script>
   import { onMount } from 'svelte';
+  import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { ui, keysReady, refresh, refreshTranscript, onRecordingState } from './state.svelte.js';
   import Setup from './Setup.svelte';
@@ -42,6 +43,22 @@
     };
   });
 
+  let updating = $state(false);
+  let updateError = $state('');
+
+  async function installUpdate() {
+    updating = true;
+    updateError = '';
+    try {
+      // Ends this process when the installer starts.
+      await invoke('install_update');
+    } catch (e) {
+      updateError = typeof e === 'string' ? e : 'Could not start the update.';
+    } finally {
+      updating = false;
+    }
+  }
+
   function onTabKey(event) {
     const i = TABS.findIndex((t) => t.id === tab);
     const next = {
@@ -64,6 +81,19 @@
     </main>
   {:else}
     <main class="tabbed">
+      <!-- Above the tabs, so a waiting update shows whichever tab is open. -->
+      {#if ui.app.updateVersion}
+        <div class="update" role="status">
+          <span class="update-text">
+            <strong>Update available</strong>
+            <span>Voisu {ui.app.updateVersion.replace(/^v/, '')} is ready to install.</span>
+            {#if updateError}<span class="update-error" role="alert">{updateError}</span>{/if}
+          </span>
+          <button type="button" class="pill" onclick={installUpdate} disabled={updating}>
+            {updating ? 'Restarting…' : 'Restart to update'}
+          </button>
+        </div>
+      {/if}
       <!-- svelte-ignore a11y_interactive_supports_focus -->
       <div class="tabs" role="tablist" aria-label="Voisu" onkeydown={onTabKey}>
         {#each TABS as t (t.id)}
@@ -104,6 +134,24 @@
   .tabbed {
     display: flex;
     flex-direction: column;
+  }
+  .update {
+    flex: none;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 24px;
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+    border-bottom: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  }
+  .update-text {
+    display: flex;
+    flex-direction: column;
+    font-size: 13px;
+  }
+  .update-error {
+    color: var(--failure);
   }
   .tabs {
     flex: none;

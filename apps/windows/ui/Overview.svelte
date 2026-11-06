@@ -1,11 +1,9 @@
 <script>
-  import { invoke } from '@tauri-apps/api/core';
   import { ui } from './state.svelte.js';
 
   let now = $state(Date.now());
   let copiedFor = $state(null);
   let error = $state('');
-  let updating = $state(false);
 
   const recording = $derived(ui.phase === 'recording' || ui.phase === 'handsFree');
   const copied = $derived(copiedFor !== null && copiedFor === ui.transcript);
@@ -62,18 +60,6 @@
     }
   }
 
-  async function installUpdate() {
-    updating = true;
-    error = '';
-    try {
-      // Ends this process when the installer starts.
-      await invoke('install_update');
-    } catch (e) {
-      error = typeof e === 'string' ? e : 'Could not start the update.';
-    } finally {
-      updating = false;
-    }
-  }
 </script>
 
 <!-- The timer sits outside the accessibility tree, so the live region
@@ -90,13 +76,6 @@
     <p class="muted">{hero.detail}</p>
   {/if}
 </section>
-
-{#if ui.app.updateVersion}
-  <div class="card update">
-    <span>Voisu {ui.app.updateVersion.replace(/^v/, '')} is ready</span>
-    <button type="button" class="pill" onclick={installUpdate} disabled={updating}>Restart to update</button>
-  </div>
-{/if}
 
 <dl class="rows">
   <div>
@@ -162,14 +141,6 @@
     50% {
       opacity: 0.35;
     }
-  }
-  .update {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    margin-bottom: 16px;
-    border-color: var(--border);
   }
   .rows {
     margin: 0 0 20px;

@@ -16,6 +16,7 @@
   let busy = $state(false);
   let done = $state(false);
   let error = $state('');
+  let startAtLogin = $state(true);
 
   const saved = $derived({ groq: ui.app.groqSaved, deepgram: ui.app.deepgramSaved });
   const unsaved = $derived(PROVIDERS.filter((p) => !saved[p.id]));
@@ -42,6 +43,14 @@
       results = { groq: res.groq, deepgram: res.deepgram };
       if (res.saved) {
         values = { groq: '', deepgram: '' };
+        // Saving keys switches Start at login on by default; this applies
+        // the user's choice after it. A failure here is not worth blocking
+        // setup over: the Settings tab can still change it.
+        try {
+          await invoke('set_autostart', { enabled: startAtLogin });
+        } catch (e) {
+          console.warn('set_autostart failed', e);
+        }
         done = true;
         await refresh();
         setTimeout(() => (finishing = false), DONE_MS);
@@ -109,6 +118,19 @@
     </section>
   {/each}
 
+  {#if !done}
+    <label class="card login" for="start-at-login">
+      <span class="login-text">
+        <span>Start Voisu when I sign in</span>
+        <span class="hint">So it's ready after every restart.</span>
+      </span>
+      <span class="switch">
+        <input id="start-at-login" type="checkbox" role="switch" bind:checked={startAtLogin} disabled={busy} />
+        <span class="track" aria-hidden="true"><span class="thumb"></span></span>
+      </span>
+    </label>
+  {/if}
+
   {#if done}
     <p class="done ok" role="status">
       <span aria-hidden="true">✓</span> You're set. Hold <kbd>{ui.app.trigger.label}</kbd> and speak.
@@ -153,6 +175,17 @@
   h2 {
     font-size: 15px;
     font-weight: 600;
+  }
+  .login {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    cursor: pointer;
+  }
+  .login-text {
+    display: flex;
+    flex-direction: column;
   }
   .primary {
     margin-top: 4px;

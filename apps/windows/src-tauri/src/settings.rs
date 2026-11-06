@@ -111,7 +111,7 @@ impl Default for Settings {
             hotkey: TriggerChord::default(),
             auto_paste: true,
             overlay_size: OverlaySize::Medium,
-            boost_words: Vec::new(),
+            boost_words: vec!["Voisu".to_owned()],
             tone: Tone::Formal,
         }
     }
@@ -265,12 +265,12 @@ mod tests {
     }
 
     #[test]
-    fn defaults_paste_automatically_at_the_medium_size_with_no_boost_words() {
+    fn defaults_paste_automatically_at_the_medium_size_boosting_voisu() {
         let settings = Settings::default();
         assert!(settings.auto_paste);
         assert_eq!(settings.overlay_size, OverlaySize::Medium);
         assert_eq!(settings.overlay_size.scale(), 1.0);
-        assert!(settings.boost_words.is_empty());
+        assert_eq!(settings.boost_words, ["Voisu"]);
         assert_eq!(settings.tone, Tone::Formal);
     }
 
