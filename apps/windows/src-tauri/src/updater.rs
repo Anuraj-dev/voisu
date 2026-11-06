@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
 /// What `plugins.updater.pubkey` holds until a signing key exists. Builds
@@ -122,13 +122,16 @@ async fn check(app: &AppHandle) -> bool {
             if let Some(tray) = app.state::<crate::AppState>().tray.get() {
                 tray.show_update(&version);
             }
+            // The window's update banner reads it from `get_state`.
+            let _ = app.emit(crate::STATE_CHANGED, ());
         }
         Err(error) => tracing::warn!(%error, %version, "update download failed"),
     }
     true
 }
 
-fn pending_version(app: &AppHandle) -> Option<String> {
+/// The downloaded update's version, if one waits to be installed.
+pub fn pending_version(app: &AppHandle) -> Option<String> {
     let state = app.state::<UpdaterState>();
     let ready = state.ready.lock().unwrap();
     ready.as_ref().map(|ready| ready.update.version.clone())

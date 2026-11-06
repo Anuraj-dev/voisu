@@ -14,7 +14,7 @@
 
 use std::cell::RefCell;
 use std::io;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::thread;
 
@@ -73,6 +73,9 @@ const SILENT_HOOK_MS: u32 = 30_000;
 static LAST_CALLBACK: AtomicU32 = AtomicU32::new(0);
 /// The hook thread, for [`set_chord`]; 0 until installed.
 static HOOK_THREAD: AtomicU32 = AtomicU32::new(0);
+/// Set when a reinstall fails, leaving only the hook that was presumed dead;
+/// cleared when a later reinstall succeeds. The window reads it on focus.
+static HOOK_LOST: AtomicBool = AtomicBool::new(false);
 
 struct HookState {
     tracker: ChordTracker,
@@ -97,6 +100,12 @@ pub fn install(trigger: Trigger, chord: TriggerChord) -> io::Result<()> {
     ready_rx
         .recv()
         .map_err(|_| io::Error::other("hotkey thread exited"))?
+}
+
+/// Whether the hook is installed and listening, for the window's "needs a
+/// restart" line.
+pub fn is_running() -> bool {
+    HOOK_THREAD.load(Ordering::Acquire) != 0 && !HOOK_LOST.load(Ordering::Acquire)
 }
 
 /// Switches the hook to a new chord, effective from the next key event.
@@ -268,7 +277,9 @@ fn reinstall() -> io::Result<()> {
 }
 
 fn reinstall_logged(reason: &'static str) {
-    match reinstall() {
+    let result = reinstall();
+    HOOK_LOST.store(result.is_err(), Ordering::Release);
+    match result {
         Ok(()) => tracing::info!(reason, "Trigger Key hook reinstalled"),
         Err(error) => tracing::error!(%error, reason, "Trigger Key hook reinstall failed"),
     }

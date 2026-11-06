@@ -100,7 +100,6 @@ struct UiState {
     deepgram_saved: bool,
     autostart: bool,
     version: String,
-    log_dir: String,
     auto_paste: bool,
     overlay_size: OverlaySize,
     boost_words: Vec<String>,
@@ -108,6 +107,11 @@ struct UiState {
     trigger: UiTrigger,
     /// The only Trigger Keys the window offers, the default first.
     trigger_presets: Vec<UiPreset>,
+    /// False when the keyboard hook is down, so the Trigger Key does nothing
+    /// until Voisu restarts.
+    hook_ok: bool,
+    /// A downloaded update waiting for "Restart to update".
+    update_version: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -177,6 +181,17 @@ fn is_dead_key(_vk: u8) -> bool {
     false
 }
 
+#[cfg(windows)]
+fn hook_ok() -> bool {
+    platform::hotkey::is_running()
+}
+
+/// Off Windows there is no hook to lose.
+#[cfg(not(windows))]
+fn hook_ok() -> bool {
+    true
+}
+
 #[tauri::command]
 fn get_state(app: AppHandle) -> UiState {
     let mut store = CredentialManagerStore;
@@ -186,13 +201,14 @@ fn get_state(app: AppHandle) -> UiState {
         deepgram_saved: store.has_key(Provider::Deepgram),
         autostart: autostart_enabled(&app),
         version: app.package_info().version.to_string(),
-        log_dir: paths::log_dir().display().to_string(),
         auto_paste: settings.auto_paste,
         overlay_size: settings.overlay_size,
         boost_words: settings.boost_words,
         tone: settings.tone,
         trigger: UiTrigger::of(settings.hotkey),
         trigger_presets: ui_presets(),
+        hook_ok: hook_ok(),
+        update_version: updater::pending_version(&app),
     }
 }
 
@@ -376,6 +392,35 @@ fn open_key_page(app: AppHandle, provider: KeyPage) -> Result<(), String> {
         .map_err(|_| "Couldn't open the browser.".to_owned())
 }
 
+/// The Windows setup guide on the project site; fixed like the key pages.
+const GUIDE_URL: &str = "https://anuraj-dev.github.io/voisu/docs/windows-setup.html";
+
+#[tauri::command]
+fn open_guide(app: AppHandle) -> Result<(), String> {
+    app.opener()
+        .open_url(GUIDE_URL, None::<&str>)
+        .map_err(|_| "Couldn't open the browser.".to_owned())
+}
+
+/// Opens the local log folder in Explorer; the logs never leave this PC
+/// unless the user sends them (ADR 0006).
+#[tauri::command]
+fn open_logs(app: AppHandle) -> Result<(), String> {
+    let dir = paths::log_dir();
+    app.opener()
+        .open_path(dir.to_string_lossy(), None::<&str>)
+        .map_err(|_| "Couldn't open the logs folder.".to_owned())
+}
+
+/// The window's "Restart to update": the tray item's install path.
+#[tauri::command]
+fn install_update(app: AppHandle) {
+    updater::install(&app, true);
+    // Reached only when the installer did not start; the window rereads
+    // whether the update is still pending.
+    let _ = app.emit(STATE_CHANGED, ());
+}
+
 /// Wires hook → gesture thread → engine. The engine reports each finished
 /// Recording back to the gesture thread, which is created after it, so the
 /// sink reads the trigger from a cell filled once both exist.
@@ -402,6 +447,8 @@ fn start_dictation(app: &AppHandle) {
     #[cfg(windows)]
     if let Err(error) = platform::hotkey::install(trigger, chord) {
         tracing::error!(%error, "keyboard hook failed to start");
+        // The window shows "needs a restart" from `hook_ok`.
+        let _ = app.emit(STATE_CHANGED, ());
     }
     #[cfg(not(windows))]
     drop((trigger, chord));
@@ -440,6 +487,9 @@ pub fn run() {
             set_tone,
             set_trigger_key,
             open_key_page,
+            open_guide,
+            open_logs,
+            install_update,
             engine::last_transcript
         ])
         .setup(|app| {
@@ -520,7 +570,7 @@ mod tests {
     #[test]
     fn the_window_resets_to_the_default_trigger_key() {
         // Read from the window itself, so the two can't drift apart.
-        const APP: &str = include_str!("../../ui/App.svelte");
+        const APP: &str = include_str!("../../ui/state.svelte.js");
         let default = APP
             .split_once("const DEFAULT_TRIGGER = '")
             .and_then(|(_, rest)| rest.split_once('\''))

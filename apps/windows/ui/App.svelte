@@ -1,103 +1,21 @@
 <script>
   import { onMount } from 'svelte';
-  import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
+  import { ui, keysReady, refresh, refreshTranscript, onRecordingState } from './state.svelte.js';
+  import Setup from './Setup.svelte';
+  import Overview from './Overview.svelte';
+  import Settings from './Settings.svelte';
 
-  const PROVIDERS = [
-    { id: 'groq', name: 'Groq' },
-    { id: 'deepgram', name: 'Deepgram' },
+  const TABS = [
+    { id: 'overview', name: 'Overview' },
+    { id: 'settings', name: 'Settings' },
   ];
-  const GLYPH = { valid: '✓', invalid: '✕', missing: '✕', kept: '•' };
-  const SIZES = [
-    { id: 'small', name: 'Small' },
-    { id: 'medium', name: 'Medium' },
-    { id: 'large', name: 'Large' },
-  ];
-  // The written form, as the backend stores it. The presets themselves come
-  // from the backend, which accepts nothing else.
-  const DEFAULT_TRIGGER = 'Ctrl+Win';
 
-  let app = $state({
-    groqSaved: false,
-    deepgramSaved: false,
-    autostart: false,
-    version: '',
-    logDir: '',
-    autoPaste: true,
-    overlaySize: 'medium',
-    boostWords: [],
-    tone: 'formal',
-    trigger: { key: DEFAULT_TRIGGER, label: DEFAULT_TRIGGER, warnings: [], isDefault: true },
-    triggerPresets: [],
-  });
-  let values = $state({ groq: '', deepgram: '' });
-  let shown = $state({ groq: false, deepgram: false });
-  let results = $state({ groq: null, deepgram: null });
-  let busy = $state(false);
-  let banner = $state('');
-  let error = $state('');
-  let autostartBusy = $state(false);
-  // Held in the backend's memory only; never written to disk.
-  let transcript = $state(null);
-  let dictationError = $state('');
-  let copied = $state(false);
-  let autoPasteBusy = $state(false);
-  let toneBusy = $state(false);
-  // One boost word per line; saved only on "Save words".
-  let wordsDraft = $state('');
-  let wordsBusy = $state(false);
-  let wordsStatus = $state('');
-  let triggerBusy = $state(false);
-  let triggerError = $state('');
-
-  const saved = $derived({ groq: app.groqSaved, deepgram: app.deepgramSaved });
-  const blank = $derived(!values.groq.trim() && !values.deepgram.trim());
-  const canSubmit = $derived(!busy && !(blank && saved.groq && saved.deepgram));
-  const wordsDirty = $derived(wordsDraft !== app.boostWords.join('\n'));
-
-  async function refresh() {
-    try {
-      const saved = app.boostWords.join('\n');
-      app = await invoke('get_state');
-      // Never overwrite boost words the user is editing, including any typed
-      // while this call was in flight.
-      if (wordsDraft === saved) wordsDraft = app.boostWords.join('\n');
-    } catch (e) {
-      error = 'Could not read app state.';
-    }
-  }
-
-  async function refreshTranscript() {
-    try {
-      const next = await invoke('last_transcript');
-      if (next !== transcript) copied = false;
-      transcript = next;
-    } catch (e) {
-      // Leave the last shown transcript in place.
-    }
-  }
-
-  function onRecordingState(event) {
-    const { state, message } = event.payload;
-    if (state === 'error') {
-      dictationError = message ?? 'Dictation failed.';
-    } else if (state === 'recording') {
-      dictationError = '';
-    } else if (state === 'idle' || state === 'done') {
-      dictationError = '';
-      refreshTranscript();
-    }
-  }
-
-  async function copyTranscript() {
-    if (!transcript) return;
-    try {
-      await navigator.clipboard.writeText(transcript);
-      copied = true;
-    } catch (e) {
-      error = 'Could not copy to the clipboard.';
-    }
-  }
+  let tab = $state('overview');
+  // Setup holds the screen while it checks keys and while it shows its
+  // "You're set" line, so a save never flashes the tabs early.
+  let finishing = $state(false);
+  const inSetup = $derived(!keysReady() || finishing);
 
   onMount(() => {
     refresh();
@@ -112,697 +30,117 @@
     subscribe('state-changed', async () => {
       await refresh();
       // Saving both keys resolves a "keys missing" refusal.
-      if (app.groqSaved && app.deepgramSaved) dictationError = '';
+      if (keysReady() && ui.phase === 'error') ui.phase = 'idle';
       refreshTranscript();
     });
-    subscribe('recording-state', onRecordingState);
+    subscribe('recording-state', (event) => onRecordingState(event.payload));
+    // The hook and Start at login can change outside the window; reread them
+    // whenever it comes back to the front.
+    window.addEventListener('focus', refresh);
     return () => {
       disposed = true;
       unlisteners.forEach((fn) => fn());
+      window.removeEventListener('focus', refresh);
     };
   });
 
-  async function chooseTrigger(key) {
-    if (triggerBusy) return;
-    triggerBusy = true;
-    triggerError = '';
-    try {
-      app.trigger = await invoke('set_trigger_key', { key });
-    } catch (e) {
-      triggerError = typeof e === 'string' ? e : 'Could not change the Trigger Key.';
-    } finally {
-      triggerBusy = false;
-    }
-  }
-
-  async function submit(event) {
+  function onTabKey(event) {
+    const i = TABS.findIndex((t) => t.id === tab);
+    const next = {
+      ArrowRight: (i + 1) % TABS.length,
+      ArrowLeft: (i - 1 + TABS.length) % TABS.length,
+      Home: 0,
+      End: TABS.length - 1,
+    }[event.key];
+    if (next === undefined) return;
     event.preventDefault();
-    if (!canSubmit) return;
-    busy = true;
-    banner = '';
-    error = '';
-    try {
-      const res = await invoke('save_keys', {
-        groq: values.groq.trim() || null,
-        deepgram: values.deepgram.trim() || null,
-      });
-      results = { groq: res.groq, deepgram: res.deepgram };
-      if (res.saved) {
-        values = { groq: '', deepgram: '' };
-        shown = { groq: false, deepgram: false };
-        banner = 'Saved. Voisu is running in the tray — you can close this window.';
-        await refresh();
-      }
-    } catch (e) {
-      // The backend rejects with a user-facing sentence; anything else is unexpected.
-      error = typeof e === 'string' ? e : 'Something went wrong while saving. Your input is kept; try again.';
-    } finally {
-      busy = false;
-    }
-  }
-
-  async function toggleAutostart(event) {
-    const box = event.currentTarget;
-    const requested = box.checked;
-    autostartBusy = true;
-    try {
-      app.autostart = await invoke('set_autostart', { enabled: requested });
-    } catch (e) {
-      error = 'Could not change Start at login.';
-    } finally {
-      // Render the backend's actual state, not the requested value.
-      box.checked = app.autostart;
-      autostartBusy = false;
-    }
-  }
-
-  async function toggleAutoPaste(event) {
-    const box = event.currentTarget;
-    autoPasteBusy = true;
-    try {
-      app.autoPaste = await invoke('set_auto_paste', { enabled: box.checked });
-    } catch (e) {
-      error = 'Could not change Paste automatically.';
-    } finally {
-      box.checked = app.autoPaste;
-      autoPasteBusy = false;
-    }
-  }
-
-  async function toggleTone(event) {
-    const box = event.currentTarget;
-    toneBusy = true;
-    try {
-      app.tone = await invoke('set_tone', { tone: box.checked ? 'informal' : 'formal' });
-    } catch (e) {
-      error = 'Could not change Informal tone.';
-    } finally {
-      box.checked = app.tone === 'informal';
-      toneBusy = false;
-    }
-  }
-
-  async function chooseSize(size) {
-    try {
-      app.overlaySize = await invoke('set_overlay_size', { size });
-    } catch (e) {
-      error = 'Could not change the overlay size.';
-      // The DOM radio moved but the stored size did not; move it back.
-      const current = document.querySelector(`input[name="overlay-size"][value="${app.overlaySize}"]`);
-      if (current) current.checked = true;
-    }
-  }
-
-  async function saveWords() {
-    if (!wordsDirty || wordsBusy) return;
-    wordsBusy = true;
-    wordsStatus = '';
-    try {
-      const words = await invoke('set_boost_words', { words: wordsDraft.split('\n') });
-      app.boostWords = words;
-      // Show what is stored: trimmed, blank lines and repeats removed.
-      wordsDraft = words.join('\n');
-      wordsStatus = words.length === 1 ? 'Saved 1 word.' : `Saved ${words.length} words.`;
-    } catch (e) {
-      error = 'Could not save boost words.';
-    } finally {
-      wordsBusy = false;
-    }
-  }
-
-  function openKeyPage(provider) {
-    invoke('open_key_page', { provider }).catch(() => {
-      error = 'Could not open the browser.';
-    });
-  }
-
-  function resultClass(state) {
-    return state === 'valid' ? 'ok' : state === 'kept' ? 'muted' : 'bad';
+    tab = TABS[next].id;
+    document.getElementById(`tab-${tab}`)?.focus();
   }
 </script>
 
-<main>
-  <header>
-    <h1>Voisu</h1>
-    <p class="lede">
-      Paste your Groq and Deepgram API keys. Voisu keeps them in Windows Credential Manager.
-    </p>
-  </header>
-
-  <form onsubmit={submit} autocomplete="off">
-    {#each PROVIDERS as p (p.id)}
-      <div class="field">
-        <div class="label-row">
-          <label for="key-{p.id}">{p.name} API key</label>
-          {#if saved[p.id]}<span class="badge">Saved</span>{/if}
-        </div>
-        <div class="input-wrap">
-          <input
-            id="key-{p.id}"
-            name="{p.id}-key"
-            type={shown[p.id] ? 'text' : 'password'}
-            autocomplete="off"
-            autocapitalize="off"
-            spellcheck="false"
-            placeholder={saved[p.id] ? 'Saved — leave blank to keep' : `Paste your ${p.name} key`}
-            bind:value={values[p.id]}
-            disabled={busy}
-          />
+{#if ui.loaded}
+  {#if inSetup}
+    <main class="scroll">
+      <Setup bind:finishing />
+    </main>
+  {:else}
+    <main class="tabbed">
+      <!-- svelte-ignore a11y_interactive_supports_focus -->
+      <div class="tabs" role="tablist" aria-label="Voisu" onkeydown={onTabKey}>
+        {#each TABS as t (t.id)}
           <button
             type="button"
-            class="reveal"
-            aria-pressed={shown[p.id]}
-            aria-label="{shown[p.id] ? 'Hide' : 'Show'} {p.name} key"
-            onclick={() => (shown[p.id] = !shown[p.id])}
+            role="tab"
+            id="tab-{t.id}"
+            aria-selected={tab === t.id}
+            aria-controls="panel-{t.id}"
+            tabindex={tab === t.id ? 0 : -1}
+            onclick={() => (tab = t.id)}
           >
-            {shown[p.id] ? 'Hide' : 'Show'}
+            {t.name}
           </button>
-        </div>
-        <div class="under">
-          <button type="button" class="link" onclick={() => openKeyPage(p.id)}>Get a key</button>
-          <span class="result {results[p.id] ? resultClass(results[p.id].state) : ''}" role="status">
-            {#if results[p.id]}
-              <span aria-hidden="true">{GLYPH[results[p.id].state] ?? '•'}</span>
-              {results[p.id].message}
-            {/if}
-          </span>
-        </div>
-      </div>
-    {/each}
-
-    <button type="submit" class="primary" class:busy disabled={!canSubmit}>
-      {busy ? 'Checking…' : 'Validate & save'}
-    </button>
-
-    <p class="banner" role="status">
-      {#if banner}<span aria-hidden="true">✓</span> {banner}{/if}
-    </p>
-    {#if error}<p class="error" role="alert"><span aria-hidden="true">✕</span> {error}</p>{/if}
-  </form>
-
-  <section class="card trigger" aria-labelledby="trigger-title">
-    <div class="transcript-head">
-      <h2 id="trigger-title">Trigger key</h2>
-      <kbd class="chord">{app.trigger.label}</kbd>
-    </div>
-    <div class="presets" role="group" aria-label="Trigger key">
-      {#each app.triggerPresets as preset (preset.key)}
-        <button
-          type="button"
-          class="chip"
-          class:on={app.trigger.key === preset.key}
-          aria-pressed={app.trigger.key === preset.key}
-          disabled={triggerBusy}
-          onclick={() => chooseTrigger(preset.key)}
-        >
-          {preset.name}
-        </button>
-      {/each}
-    </div>
-    {#each app.trigger.warnings as warning (warning)}
-      <p class="hint warn"><span aria-hidden="true">!</span> {warning}</p>
-    {/each}
-    {#if triggerError}<p class="error" role="alert"><span aria-hidden="true">✕</span> {triggerError}</p>{/if}
-    {#if !app.trigger.isDefault}
-      <button type="button" class="link reset" disabled={triggerBusy} onclick={() => chooseTrigger(DEFAULT_TRIGGER)}>
-        Reset to Ctrl+Win
-      </button>
-    {/if}
-  </section>
-
-  <div class="card">
-    <label class="switch-row" for="autostart">
-      <span>Start at login</span>
-      <span class="switch">
-        <input
-          id="autostart"
-          type="checkbox"
-          role="switch"
-          checked={app.autostart}
-          disabled={autostartBusy}
-          onchange={toggleAutostart}
-        />
-        <span class="track" aria-hidden="true"><span class="thumb"></span></span>
-      </span>
-    </label>
-    <label class="switch-row" for="auto-paste">
-      <span class="row-text">
-        <span>Paste automatically</span>
-        <span class="hint">Off: the transcript goes to the clipboard for you to paste.</span>
-      </span>
-      <span class="switch">
-        <input
-          id="auto-paste"
-          type="checkbox"
-          role="switch"
-          checked={app.autoPaste}
-          disabled={autoPasteBusy}
-          onchange={toggleAutoPaste}
-        />
-        <span class="track" aria-hidden="true"><span class="thumb"></span></span>
-      </span>
-    </label>
-    <label class="switch-row" for="informal-tone">
-      <span class="row-text">
-        <span>Informal tone</span>
-        <span class="hint">Lowercase, abbreviations like btw, no final full stop.</span>
-      </span>
-      <span class="switch">
-        <input
-          id="informal-tone"
-          type="checkbox"
-          role="switch"
-          checked={app.tone === 'informal'}
-          disabled={toneBusy}
-          onchange={toggleTone}
-        />
-        <span class="track" aria-hidden="true"><span class="thumb"></span></span>
-      </span>
-    </label>
-    <div class="switch-row">
-      <span id="size-label">Overlay size</span>
-      <div class="segmented" role="radiogroup" aria-labelledby="size-label">
-        {#each SIZES as size (size.id)}
-          <label class:on={app.overlaySize === size.id}>
-            <input
-              type="radio"
-              name="overlay-size"
-              value={size.id}
-              checked={app.overlaySize === size.id}
-              onchange={() => chooseSize(size.id)}
-            />
-            {size.name}
-          </label>
         {/each}
       </div>
-    </div>
-  </div>
-
-  <section class="card words" aria-labelledby="words-title">
-    <div class="transcript-head">
-      <h2 id="words-title">Boost words</h2>
-      <button type="button" class="copy" onclick={saveWords} disabled={!wordsDirty || wordsBusy}>
-        {wordsBusy ? 'Saving…' : 'Save words'}
-      </button>
-    </div>
-    <label class="note" for="boost-words">Names and terms Voisu should hear and spell your way, one per line.</label>
-    <textarea
-      id="boost-words"
-      rows="4"
-      spellcheck="false"
-      autocomplete="off"
-      placeholder={'Voisu\nDeepgram'}
-      bind:value={wordsDraft}
-      oninput={() => (wordsStatus = '')}
-      disabled={wordsBusy}
-    ></textarea>
-    <p class="hint" role="status">{wordsStatus}</p>
-  </section>
-
-  <section class="card transcript" aria-labelledby="transcript-title">
-    <div class="transcript-head">
-      <h2 id="transcript-title">Last transcript</h2>
-      <button type="button" class="copy" onclick={copyTranscript} disabled={!transcript}>
-        {copied ? 'Copied' : 'Copy'}
-      </button>
-    </div>
-    {#if transcript}
-      <p class="transcript-text">{transcript}</p>
-    {:else}
-      <p class="note">Hold {app.trigger.label} and speak. Release to transcribe; double-tap for hands-free, Esc to cancel.</p>
-    {/if}
-    {#if dictationError}<p class="error" role="alert"><span aria-hidden="true">✕</span> {dictationError}</p>{/if}
-  </section>
-
-  <footer>
-    <div>Version {app.version}</div>
-    <div class="logs">Logs: <span class="path">{app.logDir}</span></div>
-  </footer>
-</main>
+      <div class="panel" role="tabpanel" id="panel-{tab}" aria-labelledby="tab-{tab}" tabindex="0">
+        {#if tab === 'overview'}
+          <Overview />
+        {:else}
+          <Settings />
+        {/if}
+      </div>
+    </main>
+  {/if}
+{:else if ui.error}
+  <main class="scroll"><p class="error" role="alert">{ui.error}</p></main>
+{/if}
 
 <style>
   main {
-    padding: 24px 24px 16px;
+    height: 100vh;
+  }
+  .scroll {
+    overflow-y: auto;
+    padding: 28px 24px 20px;
+  }
+  .tabbed {
     display: flex;
     flex-direction: column;
-    gap: 16px;
-    min-height: 100vh;
   }
-  h1 {
-    margin: 0;
-    font-size: 22px;
-    font-weight: 600;
-    letter-spacing: -0.01em;
-  }
-  .lede {
-    margin: 4px 0 0;
-    color: var(--text-2);
-  }
-  form {
+  .tabs {
+    flex: none;
     display: flex;
-    flex-direction: column;
-    gap: 14px;
+    gap: 4px;
+    padding: 10px 24px 0;
+    border-bottom: 1px solid var(--overlay-2);
   }
-  .field {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-  }
-  .label-row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  label {
-    font-weight: 600;
-  }
-  .badge {
-    font-size: 12px;
-    color: var(--success);
-    background: var(--overlay-2);
-    border-radius: 32px;
-    padding: 1px 8px;
-  }
-  .input-wrap {
-    display: flex;
-    background: var(--overlay-1);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-  }
-  .input-wrap:focus-within {
-    outline: 2px solid var(--accent);
-    outline-offset: 1px;
-  }
-  .input-wrap input {
-    flex: 1;
-    min-width: 0;
-    background: transparent;
-    border: 0;
-    outline: 0;
-    padding: 9px 12px;
-    border-radius: 10px;
-  }
-  .input-wrap input::placeholder {
-    color: var(--text-2);
-    opacity: 1;
-  }
-  .input-wrap input:disabled {
-    opacity: 0.7;
-  }
-  .reveal {
-    background: transparent;
-    border: 0;
-    color: var(--text-2);
-    padding: 0 12px;
-    cursor: pointer;
-    border-radius: 10px;
-  }
-  .reveal:hover {
-    color: var(--text);
-    background: var(--overlay-2);
-  }
-  button:focus-visible,
-  .switch input:focus-visible + .track {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
-  }
-  .under {
-    display: flex;
-    align-items: baseline;
-    gap: 12px;
-    min-height: 20px;
-  }
-  .link {
+  [role='tab'] {
     background: none;
     border: 0;
-    padding: 0;
-    color: var(--processing);
-    text-decoration: underline;
-    cursor: pointer;
-    flex: none;
-  }
-  .result {
-    font-size: 13px;
-    color: var(--text-2);
-  }
-  .result.ok {
-    color: var(--success);
-  }
-  .result.bad {
-    color: var(--failure);
-  }
-  .result.muted {
-    color: var(--text-2);
-  }
-  .primary {
-    align-self: stretch;
-    background: var(--accent);
-    color: var(--surface);
-    border: 0;
-    border-radius: 32px;
-    padding: 11px 20px;
-    font-weight: 600;
-    cursor: pointer;
-  }
-  .primary:disabled {
-    background: var(--overlay-2);
-    color: var(--text-2);
-    cursor: not-allowed;
-  }
-  .primary.busy:disabled {
-    background: var(--processing);
-    color: var(--surface);
-    cursor: progress;
-  }
-  .banner {
-    margin: 0;
-    min-height: 20px;
-    color: var(--success);
-  }
-  .error {
-    margin: 0;
-    color: var(--failure);
-  }
-  .card {
-    background: var(--overlay-1);
-    border: 1px solid var(--overlay-2);
-    border-radius: 12px;
-    padding: 12px 14px;
-  }
-  .switch-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    font-weight: 400;
-    cursor: pointer;
-  }
-  .switch {
-    position: relative;
-    display: inline-block;
-    width: 40px;
-    height: 22px;
-  }
-  .switch input {
-    position: absolute;
-    inset: 0;
-    width: 100%;
-    height: 100%;
-    margin: 0;
-    opacity: 0;
-    cursor: pointer;
-  }
-  .track {
-    position: absolute;
-    inset: 0;
-    border-radius: 32px;
-    background: var(--overlay-2);
-    border: 1px solid var(--border);
-    transition: background 0.15s;
-    pointer-events: none;
-  }
-  .thumb {
-    position: absolute;
-    top: 2px;
-    left: 2px;
-    width: 16px;
-    height: 16px;
-    border-radius: 50%;
-    background: var(--text);
-    transition: transform 0.15s;
-  }
-  .switch input:checked + .track {
-    background: var(--accent);
-    border-color: var(--accent);
-  }
-  .switch input:checked + .track .thumb {
-    transform: translateX(18px);
-    background: var(--surface);
-  }
-  .switch input:disabled + .track {
-    opacity: 0.6;
-  }
-  .note {
-    margin: 0;
-    color: var(--text-2);
-    font-weight: 400;
-  }
-  .trigger {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-  }
-  .chord {
-    font: inherit;
-    font-weight: 600;
-    padding: 2px 10px;
-    border-radius: 8px;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-bottom-width: 2px;
-  }
-  .presets {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-  }
-  .chip {
-    background: var(--overlay-2);
-    color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: 32px;
-    padding: 3px 12px;
-    cursor: pointer;
-  }
-  .chip.on {
-    background: var(--accent);
-    border-color: var(--accent);
-    color: var(--surface);
-  }
-  .chip:disabled:not(.on) {
-    color: var(--text-2);
-    cursor: not-allowed;
-  }
-  .warn span {
-    font-weight: 700;
-    color: var(--processing);
-  }
-  .reset {
-    align-self: flex-start;
-  }
-  .card:not(.transcript):not(.words):not(.trigger) {
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-  }
-  .row-text {
-    display: flex;
-    flex-direction: column;
-  }
-  .hint {
-    margin: 0;
-    font-size: 12px;
-    color: var(--text-2);
-  }
-  .segmented {
-    display: flex;
-    gap: 2px;
-    padding: 2px;
-    border-radius: 32px;
-    background: var(--overlay-2);
-    border: 1px solid var(--border);
-  }
-  .segmented label {
-    position: relative;
-    padding: 2px 12px;
-    border-radius: 32px;
-    font-weight: 400;
-    color: var(--text-2);
-    cursor: pointer;
-    transition: background 0.15s, color 0.15s;
-  }
-  .segmented label.on {
-    background: var(--accent);
-    color: var(--surface);
-  }
-  .segmented input {
-    position: absolute;
-    inset: 0;
-    width: 100%;
-    height: 100%;
-    margin: 0;
-    opacity: 0;
-    cursor: pointer;
-  }
-  .segmented label:has(input:focus-visible) {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
-  }
-  .words {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-  }
-  .words textarea {
-    resize: vertical;
-    min-height: 72px;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 10px;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
     padding: 8px 12px;
-    outline: 0;
-  }
-  .words textarea:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 1px;
-  }
-  .words textarea::placeholder {
     color: var(--text-2);
-    opacity: 1;
-  }
-  .words .hint:empty {
-    display: none;
-  }
-  .transcript {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-  }
-  .transcript-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-  }
-  h2 {
-    margin: 0;
-    font-size: 14px;
     font-weight: 600;
+    border-radius: 6px 6px 0 0;
   }
-  .copy {
-    background: var(--overlay-2);
+  [role='tab']:hover {
     color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: 32px;
-    padding: 3px 12px;
-    cursor: pointer;
   }
-  .copy:disabled {
-    color: var(--text-2);
-    cursor: not-allowed;
+  [role='tab'][aria-selected='true'] {
+    color: var(--text);
+    border-bottom-color: var(--accent);
   }
-  .transcript-text {
-    margin: 0;
-    white-space: pre-wrap;
-    user-select: text;
-    max-height: 160px;
+  [role='tab']:focus-visible {
+    outline-offset: -2px;
+  }
+  .panel {
+    flex: 1;
+    min-height: 0;
     overflow-y: auto;
+    padding: 20px 24px 16px;
   }
-  footer {
-    margin-top: auto;
-    color: var(--text-2);
-    font-size: 12px;
-  }
-  .logs .path {
-    user-select: text;
-    word-break: break-all;
+  .panel:focus-visible {
+    outline-offset: -2px;
   }
 </style>
