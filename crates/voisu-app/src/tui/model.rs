@@ -357,10 +357,7 @@ const LAYOUT_CHOICES: [Choice; 3] = [
 ];
 const TONE_CHOICES: [Choice; 2] = [
     choice("Formal", "Full words and a closing full stop."),
-    choice(
-        "Informal",
-        "Lowercase, abbreviations like btw, no final full stop.",
-    ),
+    choice("Informal", "Abbreviations like btw, no final full stop."),
 ];
 
 pub fn engine_label(mode: AsrMode) -> &'static str {

@@ -546,7 +546,7 @@ mod tests {
             };
             assert!(formal.ends_with("later."), "{mode:?}: {formal}");
             assert_eq!(*informal, voisu_core::apply_tone(formal, Tone::Informal));
-            assert_eq!(informal, "btw it works. ttyl", "{mode:?}");
+            assert_eq!(informal, "Btw it works. Ttyl", "{mode:?}");
         }
     }
 

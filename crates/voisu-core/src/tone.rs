@@ -2,8 +2,8 @@
 //!
 //! `Formal` is the default and returns the text unchanged, so formal output
 //! stays byte-identical to the formatter's. `Informal` swaps a closed table of
-//! spoken phrases for lowercase chat abbreviations, lowercases sentence starts
-//! and the pronoun `I`, and drops the final full stop. It runs once on the text
+//! spoken phrases for chat abbreviations (lowercase, with a capital first
+//! letter at a sentence start) and drops the final full stop. It runs once on the text
 //! about to be delivered, so cloud and local ASR, and clean and exact Writing
 //! Modes, all pass through the same stage.
 
@@ -19,7 +19,7 @@ pub enum Tone {
     /// Today's output, unchanged.
     #[default]
     Formal,
-    /// Chat abbreviations, lowercase sentence starts, no final full stop.
+    /// Chat abbreviations and no final full stop.
     Informal,
 }
 
@@ -214,7 +214,7 @@ fn casual(text: &str) -> String {
             } else if in_fence || is_command_shaped(line) {
                 line.to_owned()
             } else {
-                lowercase_line(&abbreviate_line(line))
+                case_abbreviations(&abbreviate_line(line))
             }
         })
         .collect::<Vec<_>>()
@@ -470,21 +470,28 @@ fn protected_mask(tokens: &[(usize, usize, &str)]) -> Vec<bool> {
     skip
 }
 
-/// Lowercases what chat leaves lowercase: sentence starts, the pronoun `I`, and
-/// abbreviations the transcript already spelled in capitals. Quotes, code and
-/// names mid-sentence keep their case.
-fn lowercase_line(line: &str) -> String {
+/// Cases the chat abbreviations: lowercase mid-sentence, a capital first
+/// letter at a sentence start (`Btw`). Everything else keeps the formatter's
+/// case, so sentence starts, the pronoun `I` and names stay as written.
+/// Quotes and code are untouched.
+fn case_abbreviations(line: &str) -> String {
     let tokens = word_tokens(line);
     let skip = protected_mask(&tokens);
     let mut out = String::with_capacity(line.len());
     let mut cursor = 0usize;
     for (i, &(start, end, token)) in tokens.iter().enumerate() {
         out.push_str(&line[cursor..start]);
-        if skip[i] {
+        let starts_sentence = i == 0 || ends_sentence(tokens[i - 1].2, i - 1);
+        if skip[i] || !is_abbreviation(token) {
             out.push_str(token);
+        } else if starts_sentence {
+            let lower = token.to_ascii_lowercase();
+            let mut chars = lower.chars();
+            if let Some(first) = chars.next() {
+                out.extend(first.to_uppercase().chain(chars));
+            }
         } else {
-            let starts_sentence = i == 0 || ends_sentence(tokens[i - 1].2, i - 1);
-            out.push_str(&lowercase_token(token, starts_sentence));
+            out.push_str(&token.to_ascii_lowercase());
         }
         cursor = end;
     }
@@ -492,43 +499,12 @@ fn lowercase_line(line: &str) -> String {
     out
 }
 
-fn lowercase_token(token: &str, starts_sentence: bool) -> String {
+/// A table abbreviation, in any case, with its trailing punctuation.
+fn is_abbreviation(token: &str) -> bool {
     let word = token.trim_end_matches(TRAILING_PUNCT);
-    if PHRASES
+    PHRASES
         .iter()
         .any(|(_, abbreviation, _)| word.eq_ignore_ascii_case(abbreviation))
-    {
-        return token.to_ascii_lowercase();
-    }
-    if !is_first_person(word) && !(starts_sentence && is_plain_capitalized(word)) {
-        return token.to_owned();
-    }
-    let mut chars = token.chars();
-    let Some(first) = chars.next() else {
-        return String::new();
-    };
-    first.to_lowercase().chain(chars).collect()
-}
-
-/// `I`, `I'm`, `I'll`, `I've` or `I'd`, with a straight or curly apostrophe.
-fn is_first_person(word: &str) -> bool {
-    let Some(rest) = word.strip_prefix('I') else {
-        return false;
-    };
-    rest.is_empty()
-        || rest
-            .strip_prefix(['\'', '\u{2019}'])
-            .is_some_and(|tail| matches!(tail, "m" | "ll" | "ve" | "d"))
-}
-
-/// A word safe to lowercase at a sentence start. Another capital marks an
-/// acronym or brand (`API`, `GitHub`), and these marks a file name or address
-/// (`Cargo.toml`, `Https://example.com`).
-fn is_plain_capitalized(word: &str) -> bool {
-    let mut chars = word.chars();
-    chars.next().is_some_and(char::is_uppercase)
-        && !chars.any(char::is_uppercase)
-        && !word.contains(['.', '/', '\\', '_', '@', ':', '=', '#'])
 }
 
 /// Whether `token`, at index `index` of its line, ends a sentence. A period
@@ -582,34 +558,34 @@ mod tests {
 
     /// Every table phrase, as a formatted sentence and the expected output.
     const PHRASES: &[(&str, &str)] = &[
-        ("By the way, it shipped.", "btw, it shipped"),
-        ("Oh my god, it shipped.", "omg, it shipped"),
-        ("Oh my gosh, it shipped.", "omg, it shipped"),
-        ("For your information, it shipped.", "fyi, it shipped"),
-        ("Send it as soon as possible.", "send it asap"),
-        ("To be honest, it shipped.", "tbh, it shipped"),
-        ("Not gonna lie, it shipped.", "ngl, it shipped"),
-        ("In my opinion, it shipped.", "imo, it shipped"),
-        ("In my humble opinion, it shipped.", "imho, it shipped"),
-        ("As far as I know, it shipped.", "afaik, it shipped"),
-        ("I don't know.", "idk"),
-        ("Never mind.", "nvm"),
-        ("No problem.", "np"),
-        ("Let me know if it works.", "lmk if it works"),
-        ("I'm on my way.", "omw"),
-        ("What the fuck is this?", "wtf is this?"),
-        ("I'll be right back.", "brb"),
-        ("Talk to you later.", "ttyl"),
-        ("We met in real life.", "we met irl"),
-        ("I was away from keyboard.", "i was afk"),
-        ("I am shaking my head.", "smh"),
-        ("I was laughing out loud.", "lol"),
-        ("I was laughing my ass off.", "lmao"),
-        ("I was rolling on the floor laughing.", "rofl"),
-        ("Sorry, I got to go.", "sorry, g2g"),
-        ("I gotta go.", "g2g"),
-        ("I have to go.", "g2g"),
-        ("To be fair, it shipped.", "tbf, it shipped"),
+        ("By the way, it shipped.", "Btw, it shipped"),
+        ("Oh my god, it shipped.", "Omg, it shipped"),
+        ("Oh my gosh, it shipped.", "Omg, it shipped"),
+        ("For your information, it shipped.", "Fyi, it shipped"),
+        ("Send it as soon as possible.", "Send it asap"),
+        ("To be honest, it shipped.", "Tbh, it shipped"),
+        ("Not gonna lie, it shipped.", "Ngl, it shipped"),
+        ("In my opinion, it shipped.", "Imo, it shipped"),
+        ("In my humble opinion, it shipped.", "Imho, it shipped"),
+        ("As far as I know, it shipped.", "Afaik, it shipped"),
+        ("I don't know.", "Idk"),
+        ("Never mind.", "Nvm"),
+        ("No problem.", "Np"),
+        ("Let me know if it works.", "Lmk if it works"),
+        ("I'm on my way.", "Omw"),
+        ("What the fuck is this?", "Wtf is this?"),
+        ("I'll be right back.", "Brb"),
+        ("Talk to you later.", "Ttyl"),
+        ("We met in real life.", "We met irl"),
+        ("I was away from keyboard.", "I was afk"),
+        ("I am shaking my head.", "Smh"),
+        ("I was laughing out loud.", "Lol"),
+        ("I was laughing my ass off.", "Lmao"),
+        ("I was rolling on the floor laughing.", "Rofl"),
+        ("Sorry, I got to go.", "Sorry, g2g"),
+        ("I gotta go.", "G2g"),
+        ("I have to go.", "G2g"),
+        ("To be fair, it shipped.", "Tbf, it shipped"),
     ];
 
     #[test]
@@ -630,24 +606,24 @@ mod tests {
 
     #[test]
     fn matching_ignores_case_and_keeps_trailing_punctuation() {
-        assert_eq!(informal("by the way, it shipped"), "btw, it shipped");
-        assert_eq!(informal("BY THE WAY it shipped"), "btw it shipped");
-        assert_eq!(informal("It shipped, by the way."), "it shipped, btw");
-        assert_eq!(informal("Did it ship, by the way?"), "did it ship, btw?");
-        assert_eq!(informal("Oh my god!"), "omg!");
-        assert_eq!(informal("To be honest; it shipped"), "tbh; it shipped");
+        assert_eq!(informal("by the way, it shipped"), "Btw, it shipped");
+        assert_eq!(informal("BY THE WAY it shipped"), "Btw it shipped");
+        assert_eq!(informal("It shipped, by the way."), "It shipped, btw");
+        assert_eq!(informal("Did it ship, by the way?"), "Did it ship, btw?");
+        assert_eq!(informal("Oh my god!"), "Omg!");
+        assert_eq!(informal("To be honest; it shipped"), "Tbh; it shipped");
     }
 
     #[test]
     fn partial_phrases_and_lone_words_never_fire() {
         for (input, expected) in [
-            ("By the river.", "by the river"),
-            ("Is it by the", "is it by the"),
-            ("The way it works.", "the way it works"),
-            ("Be honest with me", "be honest with me"),
-            ("As far as Paris", "as far as Paris"),
-            ("We got to the station", "we got to the station"),
-            ("A real life story", "a real life story"),
+            ("By the river.", "By the river"),
+            ("Is it by the", "Is it by the"),
+            ("The way it works.", "The way it works"),
+            ("Be honest with me", "Be honest with me"),
+            ("As far as Paris", "As far as Paris"),
+            ("We got to the station", "We got to the station"),
+            ("A real life story", "A real life story"),
         ] {
             assert_eq!(informal(input), expected, "input: {input}");
         }
@@ -655,44 +631,44 @@ mod tests {
 
     #[test]
     fn phrases_need_word_boundaries() {
-        assert_eq!(informal("Standby the way"), "standby the way");
+        assert_eq!(informal("Standby the way"), "Standby the way");
         assert_eq!(informal("by the wayside"), "by the wayside");
         // Punctuation inside the phrase breaks it.
-        assert_eq!(informal("By the, way"), "by the, way");
+        assert_eq!(informal("By the, way"), "By the, way");
     }
 
     #[test]
     fn discourse_markers_need_a_clause_position() {
         assert_eq!(
             informal("I want you to be honest."),
-            "i want you to be honest"
+            "I want you to be honest"
         );
         assert_eq!(
             informal("It's important to be fair to everyone."),
-            "it's important to be fair to everyone"
+            "It's important to be fair to everyone"
         );
         assert_eq!(
             informal("You can tell by the way he talks."),
-            "you can tell by the way he talks"
+            "You can tell by the way he talks"
         );
         assert_eq!(
             informal("Thanks for your information."),
-            "thanks for your information"
+            "Thanks for your information"
         );
-        assert_eq!(informal("By the way, it works."), "btw, it works");
-        assert_eq!(informal("And by the way it works."), "and btw it works");
-        assert_eq!(informal("It was, to be honest, fine."), "it was, tbh, fine");
+        assert_eq!(informal("By the way, it works."), "Btw, it works");
+        assert_eq!(informal("And by the way it works."), "And btw it works");
+        assert_eq!(informal("It was, to be honest, fine."), "It was, tbh, fine");
     }
 
     #[test]
     fn i_dont_know_needs_a_clause_position() {
-        assert_eq!(informal("I don't know what to do."), "idk what to do");
-        assert_eq!(informal("I don\u{2019}t know."), "idk");
-        assert_eq!(informal("Honestly, I don't know."), "honestly, idk");
-        assert_eq!(informal("But I don't know."), "but idk");
+        assert_eq!(informal("I don't know what to do."), "Idk what to do");
+        assert_eq!(informal("I don\u{2019}t know."), "Idk");
+        assert_eq!(informal("Honestly, I don't know."), "Honestly, idk");
+        assert_eq!(informal("But I don't know."), "But idk");
         assert_eq!(
             informal("That is what I don't know."),
-            "that is what i don't know"
+            "That is what I don't know"
         );
     }
 
@@ -701,58 +677,58 @@ mod tests {
         assert_eq!(informal("```\nBy the way\n```"), "```\nBy the way\n```");
         assert_eq!(
             informal("Bring apples, pears, etc."),
-            "bring apples, pears, etc."
+            "Bring apples, pears, etc."
         );
-        assert_eq!(informal("Say hi to Mr."), "say hi to Mr.");
+        assert_eq!(informal("Say hi to Mr."), "Say hi to Mr.");
     }
 
     #[test]
     fn a_subject_before_the_phrase_is_absorbed_only_at_clause_start() {
-        assert_eq!(informal("Sorry, I'll be right back."), "sorry, brb");
-        assert_eq!(informal("I will be right back."), "brb");
-        assert_eq!(informal("Be right back."), "brb");
-        assert_eq!(informal("I'll talk to you later."), "ttyl");
-        assert_eq!(informal("I'm on my way to work."), "omw to work");
-        assert_eq!(informal("I\u{2019}m on my way."), "omw");
-        assert_eq!(informal("On my way."), "omw");
-        assert_eq!(informal("I'm shaking my head."), "smh");
-        assert_eq!(informal("I'm laughing my ass off."), "lmao");
-        assert_eq!(informal("And I'm on my way."), "and omw");
+        assert_eq!(informal("Sorry, I'll be right back."), "Sorry, brb");
+        assert_eq!(informal("I will be right back."), "Brb");
+        assert_eq!(informal("Be right back."), "Brb");
+        assert_eq!(informal("I'll talk to you later."), "Ttyl");
+        assert_eq!(informal("I'm on my way to work."), "Omw to work");
+        assert_eq!(informal("I\u{2019}m on my way."), "Omw");
+        assert_eq!(informal("On my way."), "Omw");
+        assert_eq!(informal("I'm shaking my head."), "Smh");
+        assert_eq!(informal("I'm laughing my ass off."), "Lmao");
+        assert_eq!(informal("And I'm on my way."), "And omw");
     }
 
     #[test]
     fn phrases_about_someone_else_stay_as_words() {
-        assert_eq!(informal("He'll be right back."), "he'll be right back");
+        assert_eq!(informal("He'll be right back."), "He'll be right back");
         assert_eq!(
             informal("I want to talk to you later."),
-            "i want to talk to you later"
+            "I want to talk to you later"
         );
-        assert_eq!(informal("It's on my way."), "it's on my way");
+        assert_eq!(informal("It's on my way."), "It's on my way");
         assert_eq!(
             informal("I'll stop by on my way home."),
-            "i'll stop by on my way home"
+            "I'll stop by on my way home"
         );
         assert_eq!(
             informal("He was laughing out loud."),
-            "he was laughing out loud"
+            "He was laughing out loud"
         );
         assert_eq!(
             informal("So I said what I'm on my way."),
-            "so i said what i'm on my way"
+            "So I said what I'm on my way"
         );
     }
 
     #[test]
     fn let_me_know_stays_when_it_is_about_someone_else() {
-        assert_eq!(informal("Please let me know."), "please lmk");
-        assert_eq!(informal("Can you let me know?"), "can you lmk?");
+        assert_eq!(informal("Please let me know."), "Please lmk");
+        assert_eq!(informal("Can you let me know?"), "Can you lmk?");
         assert_eq!(
             informal("He forgot to let me know."),
-            "he forgot to let me know"
+            "He forgot to let me know"
         );
         assert_eq!(
             informal("She didn't let me know."),
-            "she didn't let me know"
+            "She didn't let me know"
         );
         for unchanged in [
             "my manager let me know she was out",
@@ -764,10 +740,10 @@ mod tests {
         ] {
             assert_eq!(informal(unchanged), unchanged);
         }
-        assert_eq!(informal("Just let me know."), "just lmk");
-        assert_eq!(informal("Could you let me know?"), "could you lmk?");
-        assert_eq!(informal("If it works, let me know."), "if it works, lmk");
-        assert_eq!(informal("Ok let me know."), "ok lmk");
+        assert_eq!(informal("Just let me know."), "Just lmk");
+        assert_eq!(informal("Could you let me know?"), "Could you lmk?");
+        assert_eq!(informal("If it works, let me know."), "If it works, lmk");
+        assert_eq!(informal("Ok let me know."), "Ok lmk");
     }
 
     #[test]
@@ -784,14 +760,14 @@ mod tests {
         ] {
             assert_eq!(informal(unchanged), unchanged);
         }
-        assert_eq!(informal("Will be right back."), "brb");
+        assert_eq!(informal("Will be right back."), "Brb");
         assert_eq!(
             informal("He left and I'll be right back."),
-            "he left and brb"
+            "He left and brb"
         );
-        assert_eq!(informal("Thanks, talk to you later."), "thanks, ttyl");
-        assert_eq!(informal("Ok, be right back."), "ok, brb");
-        assert_eq!(informal("Sorry I'll be right back."), "sorry brb");
+        assert_eq!(informal("Thanks, talk to you later."), "Thanks, ttyl");
+        assert_eq!(informal("Ok, be right back."), "Ok, brb");
+        assert_eq!(informal("Sorry I'll be right back."), "Sorry brb");
     }
 
     #[test]
@@ -799,111 +775,111 @@ mod tests {
         for (input, expected) in [
             (
                 "On my way home, I saw a dog.",
-                "on my way home, i saw a dog",
+                "On my way home, I saw a dog",
             ),
-            ("On my way, I saw a dog.", "on my way, i saw a dog"),
+            ("On my way, I saw a dog.", "On my way, I saw a dog"),
             (
                 "I went to the store and on my way back I saw him.",
-                "i went to the store and on my way back i saw him",
+                "I went to the store and on my way back I saw him",
             ),
             (
                 "So on my way here I got lost.",
-                "so on my way here i got lost",
+                "So on my way here I got lost",
             ),
             (
                 "He went home, on my way here.",
-                "he went home, on my way here",
+                "He went home, on my way here",
             ),
         ] {
             assert_eq!(informal(input), expected, "input: {input}");
         }
-        assert_eq!(informal("Ok, on my way!"), "ok, omw!");
+        assert_eq!(informal("Ok, on my way!"), "Ok, omw!");
     }
 
     #[test]
     fn got_to_go_as_a_past_chance_stays_as_words() {
         for (input, expected) in [
-            ("Last year, I got to go.", "last year, i got to go"),
-            ("Finally, I got to go.", "finally, i got to go"),
+            ("Last year, I got to go.", "Last year, I got to go"),
+            ("Finally, I got to go.", "Finally, I got to go"),
             (
                 "My dad had tickets and I got to go!",
-                "my dad had tickets and i got to go!",
+                "My dad had tickets and I got to go!",
             ),
             (
                 "I got to go, and it was great.",
-                "i got to go, and it was great",
+                "I got to go, and it was great",
             ),
             (
                 "So I got to go, which was great.",
-                "so i got to go, which was great",
+                "So I got to go, which was great",
             ),
             (
                 "We went to the park and got to go.",
-                "we went to the park and got to go",
+                "We went to the park and got to go",
             ),
-            ("Wait, I have to go?", "wait, i have to go?"),
+            ("Wait, I have to go?", "Wait, I have to go?"),
         ] {
             assert_eq!(informal(input), expected, "input: {input}");
         }
-        assert_eq!(informal("Anyway, I gotta go."), "anyway, g2g");
-        assert_eq!(informal("Ok, I have to go."), "ok, g2g");
+        assert_eq!(informal("Anyway, I gotta go."), "Anyway, g2g");
+        assert_eq!(informal("Ok, I have to go."), "Ok, g2g");
     }
 
     #[test]
     fn literal_lie_and_know_stay_as_words() {
         assert_eq!(
             informal("Not going to lie down yet."),
-            "not going to lie down yet"
+            "Not going to lie down yet"
         );
-        assert_eq!(informal("Not gonna lie to you."), "not gonna lie to you");
+        assert_eq!(informal("Not gonna lie to you."), "Not gonna lie to you");
         assert_eq!(
             informal("Not gonna lie I love it."),
-            "not gonna lie i love it"
+            "Not gonna lie I love it"
         );
         assert_eq!(
             informal("Not going to lie anymore."),
-            "not going to lie anymore"
+            "Not going to lie anymore"
         );
         assert_eq!(
             informal("Not going to lie under oath."),
-            "not going to lie under oath"
+            "Not going to lie under oath"
         );
-        assert_eq!(informal("Not gonna lie."), "ngl");
+        assert_eq!(informal("Not gonna lie."), "Ngl");
         assert_eq!(
             informal("She is honest and not going to lie."),
-            "she is honest and not going to lie"
+            "She is honest and not going to lie"
         );
         assert_eq!(
             informal("Not going to lie, it shipped."),
-            "not going to lie, it shipped"
+            "Not going to lie, it shipped"
         );
-        assert_eq!(informal("I don't know him."), "i don't know him");
-        assert_eq!(informal("I don't know John."), "i don't know John");
+        assert_eq!(informal("I don't know him."), "I don't know him");
+        assert_eq!(informal("I don't know John."), "I don't know John");
         assert_eq!(
             informal("I don't know anyone here."),
-            "i don't know anyone here"
+            "I don't know anyone here"
         );
-        assert_eq!(informal("I don't know, maybe."), "idk, maybe");
-        assert_eq!(informal("I don't know if it works."), "idk if it works");
-        assert_eq!(informal("Sorry I don't know."), "sorry idk");
+        assert_eq!(informal("I don't know, maybe."), "Idk, maybe");
+        assert_eq!(informal("I don't know if it works."), "Idk if it works");
+        assert_eq!(informal("Sorry I don't know."), "Sorry idk");
     }
 
     #[test]
     fn a_goodbye_must_end_the_sentence() {
         for (input, expected) in [
-            ("I have to go?", "i have to go?"),
-            ("I have to go, right?", "i have to go, right?"),
-            ("I have to go, don't I?", "i have to go, don't i?"),
+            ("I have to go?", "I have to go?"),
+            ("I have to go, right?", "I have to go, right?"),
+            ("I have to go, don't I?", "I have to go, don't I?"),
             (
                 "I have to go, unless it rains.",
-                "i have to go, unless it rains",
+                "I have to go, unless it rains",
             ),
             (
                 "I got to go, thanks to my dad.",
-                "i got to go, thanks to my dad",
+                "I got to go, thanks to my dad",
             ),
-            ("I have to go. But I'll call you.", "g2g. but i'll call you"),
-            ("Gotta go. So talk to you later.", "g2g. so ttyl"),
+            ("I have to go. But I'll call you.", "G2g. But I'll call you"),
+            ("Gotta go. So talk to you later.", "G2g. So ttyl"),
         ] {
             assert_eq!(informal(input), expected, "input: {input}");
         }
@@ -914,23 +890,23 @@ mod tests {
         for (input, expected) in [
             (
                 "Laughing out loud is good for you.",
-                "laughing out loud is good for you",
+                "Laughing out loud is good for you",
             ),
             (
                 "Laughing out loud, she walked in.",
-                "laughing out loud, she walked in",
+                "Laughing out loud, she walked in",
             ),
             (
                 "She, laughing out loud, walked in.",
-                "she, laughing out loud, walked in",
+                "She, laughing out loud, walked in",
             ),
             (
                 "Rolling on the floor laughing is not normal.",
-                "rolling on the floor laughing is not normal",
+                "Rolling on the floor laughing is not normal",
             ),
-            ("Shaking my head, she left.", "shaking my head, she left"),
-            ("Laughing out loud.", "lol"),
-            ("I was laughing out loud at it.", "lol at it"),
+            ("Shaking my head, she left.", "Shaking my head, she left"),
+            ("Laughing out loud.", "Lol"),
+            ("I was laughing out loud at it.", "Lol at it"),
         ] {
             assert_eq!(informal(input), expected, "input: {input}");
         }
@@ -940,87 +916,87 @@ mod tests {
     fn an_abbreviation_stop_does_not_open_a_sentence() {
         assert_eq!(
             informal("The Dr. will be right back."),
-            "the Dr. will be right back"
+            "The Dr. will be right back"
         );
         assert_eq!(
             informal("Acme Inc. will talk to you later."),
-            "acme Inc. will talk to you later"
+            "Acme Inc. will talk to you later"
         );
-        assert_eq!(informal("Wait. Will be right back."), "wait. brb");
+        assert_eq!(informal("Wait. Will be right back."), "Wait. Brb");
     }
 
     #[test]
     fn a_question_about_letting_me_know_stays_as_words() {
-        assert_eq!(informal("Did you let me know?"), "did you let me know?");
-        assert_eq!(informal("On my way?"), "on my way?");
+        assert_eq!(informal("Did you let me know?"), "Did you let me know?");
+        assert_eq!(informal("On my way?"), "On my way?");
     }
 
     #[test]
     fn sorry_mid_sentence_is_not_a_clause_lead() {
         assert_eq!(
             informal("I'm sorry for your information being leaked."),
-            "i'm sorry for your information being leaked"
+            "I'm sorry for your information being leaked"
         );
-        assert_eq!(informal("I'm sorry I got to go."), "i'm sorry i got to go");
+        assert_eq!(informal("I'm sorry I got to go."), "I'm sorry I got to go");
     }
 
     #[test]
     fn no_problem_fires_only_when_it_is_a_whole_clause() {
-        assert_eq!(informal("Thanks, no problem."), "thanks, np");
-        assert_eq!(informal("It's no problem."), "it's no problem");
-        assert_eq!(informal("No problem with that."), "no problem with that");
+        assert_eq!(informal("Thanks, no problem."), "Thanks, np");
+        assert_eq!(informal("It's no problem."), "It's no problem");
+        assert_eq!(informal("No problem with that."), "No problem with that");
     }
 
     #[test]
     fn leaving_phrases_fire_only_when_they_end_a_clause_for_the_speaker() {
         assert_eq!(
             informal("I got to go to the store."),
-            "i got to go to the store"
+            "I got to go to the store"
         );
         assert_eq!(
             informal("I have to go to the store."),
-            "i have to go to the store"
+            "I have to go to the store"
         );
         assert_eq!(
             informal("We got to go home, then slept."),
-            "we got to go home, then slept"
+            "We got to go home, then slept"
         );
         assert_eq!(
             informal("We got to go, and it was great."),
-            "we got to go, and it was great"
+            "We got to go, and it was great"
         );
-        assert_eq!(informal("I got to go, bye."), "i got to go, bye");
-        assert_eq!(informal("Gotta go, bye."), "gotta go, bye");
-        assert_eq!(informal("I gotta go, right?"), "i gotta go, right?");
+        assert_eq!(informal("I got to go, bye."), "I got to go, bye");
+        assert_eq!(informal("Gotta go, bye."), "Gotta go, bye");
+        assert_eq!(informal("I gotta go, right?"), "I gotta go, right?");
         assert_eq!(
             informal("Gotta go, but I'll call you later."),
-            "gotta go, but i'll call you later"
+            "Gotta go, but I'll call you later"
         );
-        assert_eq!(informal("Gotta go?"), "gotta go?");
-        assert_eq!(informal("Sorry I got to go."), "sorry g2g");
-        assert_eq!(informal("I've got to go."), "g2g");
-        assert_eq!(informal("Gotta go."), "g2g");
-        assert_eq!(informal("Got to go."), "g2g");
-        assert_eq!(informal("I never got to go."), "i never got to go");
-        assert_eq!(informal("You have to go."), "you have to go");
-        assert_eq!(informal("You got to go."), "you got to go");
-        assert_eq!(informal("Do I have to go?"), "do i have to go?");
+        assert_eq!(informal("Gotta go?"), "Gotta go?");
+        assert_eq!(informal("Sorry I got to go."), "Sorry g2g");
+        assert_eq!(informal("I've got to go."), "G2g");
+        assert_eq!(informal("Gotta go."), "G2g");
+        assert_eq!(informal("Got to go."), "G2g");
+        assert_eq!(informal("I never got to go."), "I never got to go");
+        assert_eq!(informal("You have to go."), "You have to go");
+        assert_eq!(informal("You got to go."), "You got to go");
+        assert_eq!(informal("Do I have to go?"), "Do I have to go?");
     }
 
     #[test]
     fn never_mind_fires_only_when_it_is_a_whole_clause() {
-        assert_eq!(informal("Never mind the cost."), "never mind the cost");
-        assert_eq!(informal("Never mind that"), "never mind that");
-        assert_eq!(informal("I never mind waiting."), "i never mind waiting");
-        assert_eq!(informal("I never mind."), "i never mind");
-        assert_eq!(informal("Never mind"), "nvm");
-        assert_eq!(informal("never mind."), "nvm");
-        assert_eq!(informal("Never mind, I found it."), "nvm, i found it");
-        assert_eq!(informal("Oh, never mind."), "oh, nvm");
-        assert_eq!(informal("It broke. Never mind!"), "it broke. nvm!");
+        assert_eq!(informal("Never mind the cost."), "Never mind the cost");
+        assert_eq!(informal("Never mind that"), "Never mind that");
+        assert_eq!(informal("I never mind waiting."), "I never mind waiting");
+        assert_eq!(informal("I never mind."), "I never mind");
+        assert_eq!(informal("Never mind"), "Nvm");
+        assert_eq!(informal("never mind."), "Nvm");
+        assert_eq!(informal("Never mind, I found it."), "Nvm, I found it");
+        assert_eq!(informal("Oh, never mind."), "Oh, nvm");
+        assert_eq!(informal("It broke. Never mind!"), "It broke. Nvm!");
         assert_eq!(
             informal("Wait.\nNever mind, it works."),
-            "wait.\nnvm, it works"
+            "Wait.\nNvm, it works"
         );
     }
 
@@ -1028,23 +1004,23 @@ mod tests {
     fn quoted_spans_are_unchanged() {
         assert_eq!(
             informal(r#"She wrote "By the way, I agree." twice."#),
-            r#"she wrote "By the way, I agree." twice"#
+            r#"She wrote "By the way, I agree." twice"#
         );
         assert_eq!(
             informal("She wrote \u{201c}To be honest\u{201d} twice."),
-            "she wrote \u{201c}To be honest\u{201d} twice"
+            "She wrote \u{201c}To be honest\u{201d} twice"
         );
         assert_eq!(
             informal(r#"He said "never mind." By the way, hi."#),
-            r#"he said "never mind." btw, hi"#
+            r#"He said "never mind." Btw, hi"#
         );
         assert_eq!(
             informal("Type `I think. So` here."),
-            "type `I think. So` here"
+            "Type `I think. So` here"
         );
         assert_eq!(
             informal("Say quote I think unquote now"),
-            "say quote I think unquote now"
+            "Say quote I think unquote now"
         );
     }
 
@@ -1055,84 +1031,84 @@ mod tests {
         assert_eq!(informal("Git commit -m hello"), "Git commit -m hello");
         assert_eq!(
             informal("By the way, run this.\ncargo test --by the way"),
-            "btw, run this.\ncargo test --by the way"
+            "Btw, run this.\ncargo test --by the way"
         );
         assert_eq!(
             informal("Hello\nGit commit -m hi"),
-            "hello\nGit commit -m hi"
+            "Hello\nGit commit -m hi"
         );
     }
 
     #[test]
     fn only_the_final_full_stop_is_dropped() {
-        assert_eq!(informal("It shipped. It works."), "it shipped. it works");
+        assert_eq!(informal("It shipped. It works."), "It shipped. It works");
         assert_eq!(
             informal("It shipped. Does it work?"),
-            "it shipped. does it work?"
+            "It shipped. Does it work?"
         );
-        assert_eq!(informal("It shipped. It works!"), "it shipped. it works!");
-        assert_eq!(informal("It shipped. It works"), "it shipped. it works");
-        assert_eq!(informal("First.\n\nSecond.\n"), "first.\n\nsecond\n");
-        assert_eq!(informal("IMO we shouldn't wait."), "imo we shouldn't wait");
-        assert_eq!(informal("I said no."), "i said no");
+        assert_eq!(informal("It shipped. It works!"), "It shipped. It works!");
+        assert_eq!(informal("It shipped. It works"), "It shipped. It works");
+        assert_eq!(informal("First.\n\nSecond.\n"), "First.\n\nSecond\n");
+        assert_eq!(informal("IMO we shouldn't wait."), "Imo we shouldn't wait");
+        assert_eq!(informal("I said no."), "I said no");
         assert_eq!(informal(""), "");
         assert_eq!(informal("."), ".");
     }
 
     #[test]
     fn final_full_stop_on_abbreviations_ellipses_and_quotes_stays() {
-        assert_eq!(informal("Meet at 5 p.m."), "meet at 5 p.m.");
-        assert_eq!(informal("Bring fruit, e.g."), "bring fruit, e.g.");
-        assert_eq!(informal("Open config.toml."), "open config.toml.");
-        assert_eq!(informal("Well..."), "well...");
-        assert_eq!(informal(r#"He said "hi.""#), r#"he said "hi.""#);
+        assert_eq!(informal("Meet at 5 p.m."), "Meet at 5 p.m.");
+        assert_eq!(informal("Bring fruit, e.g."), "Bring fruit, e.g.");
+        assert_eq!(informal("Open config.toml."), "Open config.toml.");
+        assert_eq!(informal("Well..."), "Well...");
+        assert_eq!(informal(r#"He said "hi.""#), r#"He said "hi.""#);
     }
 
     #[test]
-    fn sentence_starts_and_every_i_are_lowercase() {
-        assert_eq!(informal("Hello there."), "hello there");
-        assert_eq!(informal("A quick one."), "a quick one");
-        assert_eq!(informal("Élan matters."), "élan matters");
-        assert_eq!(informal("  Hello there."), "  hello there");
-        assert_eq!(informal("Hi. How are you?"), "hi. how are you?");
-        assert_eq!(informal("Hi! How are you?"), "hi! how are you?");
-        assert_eq!(informal("Why? Because."), "why? because");
-        assert_eq!(informal("Well... Then what?"), "well... then what?");
-        assert_eq!(informal("No. Thanks."), "no. thanks");
-        assert_eq!(informal("First.\nSecond."), "first.\nsecond");
+    fn sentence_starts_and_every_i_keep_their_capital() {
+        assert_eq!(informal("Hello there."), "Hello there");
+        assert_eq!(informal("A quick one."), "A quick one");
+        assert_eq!(informal("Élan matters."), "Élan matters");
+        assert_eq!(informal("  Hello there."), "  Hello there");
+        assert_eq!(informal("Hi. How are you?"), "Hi. How are you?");
+        assert_eq!(informal("Hi! How are you?"), "Hi! How are you?");
+        assert_eq!(informal("Why? Because."), "Why? Because");
+        assert_eq!(informal("Well... Then what?"), "Well... Then what?");
+        assert_eq!(informal("No. Thanks."), "No. Thanks");
+        assert_eq!(informal("First.\nSecond."), "First.\nSecond");
         assert_eq!(
             informal("I think I should go, and I'm sure I'll be fine."),
-            "i think i should go, and i'm sure i'll be fine"
+            "I think I should go, and I'm sure I'll be fine"
         );
         assert_eq!(
             informal("Yes, I\u{2019}ve seen it."),
-            "yes, i\u{2019}ve seen it"
+            "Yes, I\u{2019}ve seen it"
         );
-        assert_eq!(informal("So did I."), "so did i");
-        assert_eq!(informal("So did I, and you?"), "so did i, and you?");
+        assert_eq!(informal("So did I."), "So did I");
+        assert_eq!(informal("So did I, and you?"), "So did I, and you?");
     }
 
     #[test]
-    fn typed_abbreviations_from_the_transcript_go_lowercase() {
-        assert_eq!(informal("BTW it works"), "btw it works");
-        assert_eq!(informal("OMG!"), "omg!");
-        assert_eq!(informal("LOL, it works"), "lol, it works");
-        assert_eq!(informal("Send it ASAP."), "send it asap");
-        assert_eq!(informal("G2G"), "g2g");
-        assert_eq!(informal("It works IMO, really."), "it works imo, really");
+    fn typed_abbreviations_are_lowercase_except_at_a_sentence_start() {
+        assert_eq!(informal("BTW it works"), "Btw it works");
+        assert_eq!(informal("OMG!"), "Omg!");
+        assert_eq!(informal("LOL, it works"), "Lol, it works");
+        assert_eq!(informal("Send it ASAP."), "Send it asap");
+        assert_eq!(informal("G2G"), "G2g");
+        assert_eq!(informal("It works IMO, really."), "It works imo, really");
     }
 
     #[test]
     fn names_mid_sentence_stay_capitalized() {
         assert_eq!(
             informal("Sent it to Raja. He agreed."),
-            "sent it to Raja. he agreed"
+            "Sent it to Raja. He agreed"
         );
-        assert_eq!(informal("Meet Mr. Smith today."), "meet Mr. Smith today");
-        assert_eq!(informal("See e.g. Python docs."), "see e.g. Python docs");
+        assert_eq!(informal("Meet Mr. Smith today."), "Meet Mr. Smith today");
+        assert_eq!(informal("See e.g. Python docs."), "See e.g. Python docs");
         assert_eq!(
             informal("At 5 p.m. Monday works."),
-            "at 5 p.m. Monday works"
+            "At 5 p.m. Monday works"
         );
     }
 
@@ -1156,7 +1132,7 @@ mod tests {
         }
         assert_eq!(
             informal("It's down. API keys rotated."),
-            "it's down. API keys rotated"
+            "It's down. API keys rotated"
         );
     }
 
