@@ -3,8 +3,8 @@
 //! `Formal` is the default and returns the text unchanged, so formal output
 //! stays byte-identical to the formatter's. `Informal` swaps a closed table of
 //! spoken phrases for chat abbreviations (lowercase, with a capital first
-//! letter at a sentence start) and drops the final full stop. It runs once on the text
-//! about to be delivered, so cloud and local ASR, and clean and exact Writing
+//! letter at a sentence or list-item start) and drops the final full stop. It
+//! runs once on the text about to be delivered, so cloud and local ASR, and clean and exact Writing
 //! Modes, all pass through the same stage.
 
 use serde::{Deserialize, Serialize};
@@ -481,7 +481,9 @@ fn case_abbreviations(line: &str) -> String {
     let mut cursor = 0usize;
     for (i, &(start, end, token)) in tokens.iter().enumerate() {
         out.push_str(&line[cursor..start]);
-        let starts_sentence = i == 0 || ends_sentence(tokens[i - 1].2, i - 1);
+        let starts_sentence = i == 0
+            || ends_sentence(tokens[i - 1].2, i - 1)
+            || (i == 1 && is_list_marker(tokens[0].2));
         if skip[i] || !is_abbreviation(token) {
             out.push_str(token);
         } else if starts_sentence {
@@ -510,6 +512,16 @@ fn is_abbreviation(token: &str) -> bool {
 /// Whether `token`, at index `index` of its line, ends a sentence. A period
 /// closing an abbreviation (`Mr.`, `p.m.`) or a leading list number (`1.`) does
 /// not.
+/// A line-leading list marker: `1.`, `2)`, `-` or `*`. The word after it
+/// starts a list item, which the formatter capitalizes like a sentence.
+fn is_list_marker(token: &str) -> bool {
+    if matches!(token, "-" | "*" | "•") {
+        return true;
+    }
+    let stem = token.strip_suffix(['.', ')']).unwrap_or("");
+    !stem.is_empty() && stem.chars().all(|c| c.is_ascii_digit())
+}
+
 fn ends_sentence(token: &str, index: usize) -> bool {
     let end = token.trim_end_matches(CLOSERS);
     if end.ends_with(['!', '?']) {
@@ -551,6 +563,20 @@ fn drop_final_full_stop(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_abbreviation_starting_a_list_item_keeps_its_capital() {
+        assert_eq!(
+            apply_tone("1. By the way, it shipped.", Tone::Informal),
+            "1. Btw, it shipped"
+        );
+        assert_eq!(
+            apply_tone("Items:\n1. By the way, it works.", Tone::Informal),
+            "Items:\n1. Btw, it works"
+        );
+        assert_eq!(apply_tone("- LOL", Tone::Informal), "- Lol");
+        assert_eq!(apply_tone("2) LOL", Tone::Informal), "2) Lol");
+    }
 
     fn informal(text: &str) -> String {
         apply_tone(text, Tone::Informal)
