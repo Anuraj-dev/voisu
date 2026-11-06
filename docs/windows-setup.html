@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Set up Voisu on Windows — Voisu docs</title>
+<meta name="description" content="Step by step: install Voisu on Windows, get your two free API keys, and make your first Recording.">
+<link rel="canonical" href="https://anuraj-dev.github.io/voisu/docs/windows-setup.html">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#17191d">
+<meta name="theme-color" media="(prefers-color-scheme: light)" content="#e8eae5">
+<link rel="icon" type="image/png" sizes="32x32" href="../assets/favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="../assets/favicon-16.png">
+<link rel="apple-touch-icon" href="../assets/apple-touch-icon.png">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Voisu">
+<meta property="og:title" content="Set up Voisu on Windows — Voisu docs">
+<meta property="og:description" content="Step by step: install Voisu on Windows, get your two free API keys, and make your first Recording.">
+<meta property="og:url" content="https://anuraj-dev.github.io/voisu/docs/windows-setup.html">
+<meta property="og:image" content="https://anuraj-dev.github.io/voisu/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Voisu: Hold a key, speak. Your words land where you're typing.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,100..900&amp;family=Martian+Mono:wdth,wght@75..112.5,100..800&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<script>document.documentElement.classList.add("js")</script>
+<script src="../assets/site.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../" aria-label="Voisu home">
+      <img class="mark" src="../assets/logo.svg" alt="" width="32" height="32">
+      <span>voisu</span>
+    </a>
+    <nav aria-label="Main">
+      <ul class="site-nav">
+        <li><a href="../#install">Install</a></li>
+        <li><a href="./" aria-current="page">Docs</a></li>
+        <li><a class="gh" href="https://github.com/Anuraj-dev/voisu"><svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg><span>GitHub</span></a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap docs">
+  <nav class="docs-nav" aria-label="Docs">
+    <h2>Start here</h2>
+    <ul>
+        <li><a href="./">Overview</a></li>
+        <li><a href="getting-started.html">Getting started</a></li>
+        <li><a href="windows-setup.html" aria-current="page">Set up on Windows</a></li>
+        <li><a href="agents.html">Install with an agent</a></li>
+    </ul>
+    <h2>Guides</h2>
+    <ul>
+        <li><a href="using.html">Dictating</a></li>
+        <li><a href="providers.html">Providers &amp; API keys</a></li>
+        <li><a href="updating.html">Updating &amp; uninstalling</a></li>
+    </ul>
+    <h2>Reference</h2>
+    <ul>
+        <li><a href="settings.html">Settings &amp; commands</a></li>
+        <li><a href="privacy.html">Privacy</a></li>
+    </ul>
+    <h2>Help</h2>
+    <ul>
+        <li><a href="troubleshooting.html">Troubleshooting</a></li>
+    </ul>
+  </nav>
+
+  <main id="main" class="doc">
+<h1>Set up Voisu on Windows</h1>
+<p class="lead">Five minutes, start to finish. You install Voisu, paste two free API keys, and hold <kbd>Ctrl</kbd>&nbsp;<kbd>Win</kbd> to dictate anywhere you type.</p>
+
+<nav class="toc" aria-label="On this page">
+  <a href="#install">1. Install</a>
+  <a href="#groq">2. Groq key</a>
+  <a href="#deepgram">3. Deepgram key</a>
+  <a href="#save">4. Save and start</a>
+  <a href="#dictate">5. Dictate</a>
+  <a href="#settings">Settings</a>
+  <a href="#help">If something's wrong</a>
+</nav>
+
+<h2 id="install">1. Install Voisu</h2>
+<ol class="steps">
+  <li>
+    <p><strong>Download the installer.</strong></p>
+    <p><a class="btn primary" href="https://github.com/Anuraj-dev/voisu/releases/latest/download/Voisu-Setup-x64.exe"><svg viewBox="0 0 16 16" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" d="M8 2v8.5M4.5 7 8 10.5 11.5 7M3 13.5h10"/></svg><span>Download for Windows <small>Voisu-Setup-x64.exe</small></span></a></p>
+  </li>
+  <li><p><strong>Run it.</strong> The installer isn't code-signed yet, so SmartScreen may warn you. Choose <strong>More info</strong>, then <strong>Run anyway</strong>. Voisu installs for your user only; no admin rights needed.</p></li>
+  <li><p><strong>The setup screen opens.</strong> It asks for two keys, one from Groq and one from Deepgram. You'll see it only until both are saved.</p></li>
+</ol>
+<figure class="shot">
+  <img src="../assets/windows/setup.png" alt="The Set up Voisu screen: a Groq card and a Deepgram card, each with a paste box and a Get a free API key button, then Save and start." width="460" height="640" loading="lazy">
+  <figcaption>The setup screen. Each card has its own <strong>Get a free API key</strong> button.</figcaption>
+</figure>
+
+<h2 id="groq">2. Get your Groq key</h2>
+<ol class="steps">
+  <li><p>On the <strong>1. Groq</strong> card, choose <strong>Get a free API key</strong>. Your browser opens the Groq console.</p></li>
+  <li><p>Sign in or sign up (Google or email works).</p></li>
+  <li><p>On <em>API Keys</em>, choose <strong>Create API Key</strong>, give it any name (for example <code>voisu</code>), and create it.</p></li>
+  <li><p><strong>Copy the key now.</strong> It starts with <code>gsk_</code>, and Groq shows it only once.</p></li>
+  <li><p>Back in Voisu, paste it into the Groq box. <strong>Show</strong> lets you check what you pasted.</p></li>
+</ol>
+
+<h2 id="deepgram">3. Get your Deepgram key</h2>
+<ol class="steps">
+  <li><p>On the <strong>2. Deepgram</strong> card, choose <strong>Get a free API key</strong>. Your browser opens the Deepgram console.</p></li>
+  <li><p>Sign in or sign up. New accounts get free credit.</p></li>
+  <li><p>Open <em>API Keys</em> and choose <strong>Create a New API Key</strong>. Any name and the default permissions are fine.</p></li>
+  <li><p><strong>Copy the key</strong> and paste it into the Deepgram box in Voisu.</p></li>
+</ol>
+<p>Both providers have free allowances that cover everyday dictation; check their sites for current limits. Voisu adds no charge of its own.</p>
+
+<h2 id="save">4. Save and start</h2>
+<ol class="steps">
+  <li><p>Choose <strong>Save and start</strong>. Voisu checks each key with its provider. This takes a second or two.</p></li>
+  <li><p>If a key is wrong, a red line under it says so. Copy the key again (no spaces at the ends) and paste it over the old one.</p></li>
+  <li><p>When both pass, Voisu says <strong>You're set</strong> and opens the Overview.</p></li>
+</ol>
+<figure class="shot">
+  <img src="../assets/windows/setup-error.png" alt="The setup screen with the Groq card marked as rejected and an explanation under it." width="460" height="640" loading="lazy">
+  <figcaption>A rejected key is marked on its own card. Fix it and choose <strong>Save and start</strong> again.</figcaption>
+</figure>
+<div class="callout tip">
+  <p><strong>Your keys stay on your PC.</strong> They're stored in Windows Credential Manager and sent only to the provider they belong to. Voisu never shows a saved key again.</p>
+</div>
+
+<h2 id="dictate">5. Dictate</h2>
+<ol class="steps">
+  <li><p>Click into any text box: a chat, an email, a document.</p></li>
+  <li><p><strong>Hold <kbd>Ctrl</kbd>&nbsp;<kbd>Win</kbd></strong> and speak. The capsule at the bottom of the screen shows your voice.</p></li>
+  <li><p><strong>Release.</strong> Your words are pasted where you were typing.</p></li>
+</ol>
+<p>For long dictation, double-tap the Trigger Key for hands-free, then press it once more to finish. <kbd>Esc</kbd> cancels.</p>
+<figure class="shot">
+  <img src="../assets/windows/overview.png" alt="The Overview tab: Ready to dictate, with Trigger Key, Delivery, Writing and Start at login rows and the last Transcript with a Copy button." width="460" height="640" loading="lazy">
+  <figcaption>The Overview tab shows whether Voisu is ready, how it delivers, and your last Transcript with <strong>Copy</strong>.</figcaption>
+</figure>
+<p>Voisu lives in the tray and starts with Windows. Close the window any time; <strong>Settings…</strong> in the tray menu reopens it.</p>
+
+<h2 id="settings">Settings</h2>
+<p>The <strong>Settings</strong> tab holds everything you can change:</p>
+<ul>
+  <li><strong>Trigger Key</strong>: the key you hold to dictate.</li>
+  <li><strong>Paste automatically</strong>: off puts the Transcript on your clipboard instead.</li>
+  <li><strong>Informal tone</strong>: abbreviations like btw and no final full stop, for chat.</li>
+  <li><strong>Boost words</strong>: names and terms Voisu should hear and spell your way.</li>
+  <li><strong>Overlay size</strong>, <strong>Start at login</strong>, and <strong>API keys</strong> (choose <strong>Replace</strong> to paste a new one).</li>
+</ul>
+<figure class="shot">
+  <img src="../assets/windows/settings.png" alt="The Settings tab with Dictation, Appearance, System, API keys and About groups." width="460" height="640" loading="lazy">
+  <figcaption>The Settings tab. See <a href="settings.html#windows">Settings &amp; commands</a> for every option.</figcaption>
+</figure>
+
+<h2 id="help">If something's wrong</h2>
+<ul>
+  <li><strong>The Overview says “Voisu needs a restart”.</strong> Windows stopped delivering the Trigger Key to Voisu. Choose <strong>Quit Voisu</strong> in the tray and open it again.</li>
+  <li><strong>“Last dictation failed”.</strong> The reason is shown under it. A provider rejecting your key means it was revoked or ran out of credit: replace it in <strong>Settings → API keys</strong>.</li>
+  <li><strong>Nothing gets pasted.</strong> Your words are kept: copy them from the Overview. <a href="troubleshooting.html">Troubleshooting</a> covers apps that block pasting.</li>
+</ul>
+
+    <nav class="pager" aria-label="Docs pages">
+      <a class="prev" href="getting-started.html"><small>Previous</small>Getting started</a><a class="next" href="agents.html"><small>Next</small>Install with an agent</a>
+    </nav>
+  </main>
+</div>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="foot-grid">
+      <div class="foot-brand">
+        <a class="brand" href="../"><img class="mark" src="../assets/logo.svg" alt="" width="32" height="32"><span>voisu</span></a>
+        <p>Voice dictation for Linux and Windows. MIT licensed. © 2026 Anuraj Jit Saikia.</p>
+      </div>
+      <div>
+        <h2>Docs</h2>
+        <ul>
+          <li><a href="getting-started.html">Getting started</a></li>
+          <li><a href="agents.html">Install with an agent</a></li>
+          <li><a href="using.html">Dictating</a></li>
+          <li><a href="settings.html">Settings &amp; commands</a></li>
+          <li><a href="troubleshooting.html">Troubleshooting</a></li>
+          <li><a href="privacy.html">Privacy</a></li>
+        </ul>
+      </div>
+      <div>
+        <h2>Project</h2>
+        <ul>
+          <li><a href="https://github.com/Anuraj-dev/voisu">Source on GitHub</a></li>
+          <li><a href="https://github.com/Anuraj-dev/voisu/releases">Releases</a></li>
+          <li><a href="https://github.com/Anuraj-dev/voisu/issues">Report a problem</a></li>
+          <li><a href="https://github.com/Anuraj-dev/voisu/blob/main/LICENSE">MIT License</a></li>
+        </ul>
+      </div>
+    </div>
+    <p class="foot-key">apt signing key · 4149 EE38 68B3 6B60 0759 2966 D08B CFDC 3412 5B28</p>
+  </div>
+</footer>
+</body>
+</html>

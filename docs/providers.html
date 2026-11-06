@@ -54,6 +54,7 @@
     <ul>
         <li><a href="./">Overview</a></li>
         <li><a href="getting-started.html">Getting started</a></li>
+        <li><a href="windows-setup.html">Set up on Windows</a></li>
         <li><a href="agents.html">Install with an agent</a></li>
     </ul>
     <h2>Guides</h2>
@@ -94,11 +95,11 @@
 
 <h2 id="windows">Adding keys on Windows</h2>
 <ol class="steps">
-  <li><p>Open <strong>Settings…</strong> from the Voisu tray icon. It opens by itself on first launch.</p></li>
-  <li><p>Paste each key into its field. <strong>Show</strong> reveals what you pasted; <strong>Get a key</strong> opens the provider's console.</p></li>
-  <li><p>Choose <strong>Validate &amp; save</strong>. Voisu checks every new key with its provider and saves only when they all pass.</p></li>
+  <li><p>On first launch Voisu opens its setup screen. <strong>Get a free API key</strong> on each card opens that provider's console.</p></li>
+  <li><p>Paste each key into its box. <strong>Show</strong> reveals what you pasted.</p></li>
+  <li><p>Choose <strong>Save and start</strong>. Voisu checks every new key with its provider and saves only when they all pass. The <a href="windows-setup.html">Windows setup guide</a> has screenshots of each step.</p></li>
 </ol>
-<p>Keys are stored in <strong>Windows Credential Manager</strong> under your user account, as <code>groq-api-key.Voisu</code> and <code>deepgram-api-key.Voisu</code>. Once saved, a field shows “Saved — leave blank to keep”. Paste a new key over it to replace one.</p>
+<p>Keys are stored in <strong>Windows Credential Manager</strong> under your user account, as <code>groq-api-key.Voisu</code> and <code>deepgram-api-key.Voisu</code>. Voisu never shows a saved key again. To change one, open <strong>Settings → API keys</strong> and choose <strong>Replace</strong>.</p>
 
 <h2 id="linux">Adding keys on Linux</h2>
 <p><code>voisu setup</code> asks for both keys and checks them. To change one later:</p>

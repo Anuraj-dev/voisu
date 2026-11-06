@@ -1572,6 +1572,26 @@ details.more > :last-child {
   --tone: var(--fail);
 }
 
+.doc figure.shot {
+  margin: 1.2em 0 1.8em;
+}
+
+.doc figure.shot img {
+  display: block;
+  width: 100%;
+  max-width: 400px;
+  height: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #17191d;
+}
+
+.doc figure.shot figcaption {
+  margin-top: 8px;
+  color: var(--ink-3);
+  font-size: 0.92rem;
+}
+
 ol.steps {
   list-style: none;
   padding: 0;

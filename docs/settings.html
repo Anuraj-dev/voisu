@@ -54,6 +54,7 @@
     <ul>
         <li><a href="./">Overview</a></li>
         <li><a href="getting-started.html">Getting started</a></li>
+        <li><a href="windows-setup.html">Set up on Windows</a></li>
         <li><a href="agents.html">Install with an agent</a></li>
     </ul>
     <h2>Guides</h2>
@@ -85,23 +86,22 @@
 </nav>
 
 <h2 id="windows">Windows settings window</h2>
-<p>Open it from the tray icon with <strong>Settings…</strong>. It opens by itself the first time you run Voisu.</p>
+<p>Open it from the tray icon with <strong>Settings…</strong>. The first time you run Voisu it shows a setup screen for your two keys (see the <a href="windows-setup.html">Windows setup guide</a>). After that it has two tabs: <strong>Overview</strong> shows whether Voisu is ready and your last Transcript; <strong>Settings</strong> holds the options below.</p>
 <div class="table-scroll">
 <table>
   <thead><tr><th>Setting</th><th>What it does</th></tr></thead>
   <tbody>
-    <tr><td data-label="Setting">Groq key</td><td data-label="What it does">Your Groq API key. Leave the field blank to keep the saved key.</td></tr>
-    <tr><td data-label="Setting">Deepgram key</td><td data-label="What it does">Your Deepgram API key. Leave the field blank to keep the saved key.</td></tr>
-    <tr><td data-label="Setting">Validate &amp; save</td><td data-label="What it does">Checks new keys with each provider, then saves them to Credential Manager. Nothing is saved unless every key passes.</td></tr>
+    <tr><td data-label="Setting">Trigger Key</td><td data-label="What it does">The key you hold to dictate. <kbd>Ctrl</kbd>&nbsp;<kbd>Win</kbd> by default.</td></tr>
     <tr><td data-label="Setting">Paste automatically</td><td data-label="What it does">On by default. Turn it off and Voisu only puts the Transcript on your clipboard; you paste it yourself with <kbd>Ctrl</kbd>&nbsp;<kbd>V</kbd>.</td></tr>
     <tr><td data-label="Setting">Overlay size</td><td data-label="What it does">Small, Medium or Large. The capsule previews at the new size when you pick one.</td></tr>
+    <tr><td data-label="Setting">Informal tone</td><td data-label="What it does">Off by default. On swaps phrases for chat abbreviations like btw and drops the final full stop. Sentence starts and “I” keep their capitals.</td></tr>
     <tr><td data-label="Setting">Boost words</td><td data-label="What it does">Names and terms Voisu should favour, one per entry. Blanks and duplicates are dropped. They're sent to Deepgram and Groq with each Recording.</td></tr>
     <tr><td data-label="Setting">Start at login</td><td data-label="What it does">Starts Voisu in the tray when you sign in to Windows. Turned on after your first successful setup.</td></tr>
-    <tr><td data-label="Setting">Last transcript</td><td data-label="What it does">Your most recent Transcript, with a <strong>Copy</strong> button. Held in memory only.</td></tr>
+    <tr><td data-label="Setting">API keys</td><td data-label="What it does">Shows whether each key is saved. <strong>Replace</strong> pastes a new one, checked with the provider before it's saved. Saved keys are never shown.</td></tr>
   </tbody>
 </table>
 </div>
-<p>The footer shows the installed version and the folder Voisu writes its logs to.</p>
+<p><strong>About</strong> shows the installed version, whether an update is waiting, and opens the logs folder. Your last Transcript, with <strong>Copy</strong>, is on the Overview tab and held in memory only.</p>
 
 <h2 id="tray">Windows tray menu</h2>
 <div class="table-scroll">
