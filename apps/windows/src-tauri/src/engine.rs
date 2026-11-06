@@ -13,7 +13,7 @@
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -104,10 +104,46 @@ impl CloudHost for WindowsCloudHost {
     }
 }
 
-/// Engine state the UI reads: the last Transcript, in memory only.
+/// Engine state the UI reads, in memory only: the last Transcript and the
+/// phase of the dictation under way.
 #[derive(Default)]
 pub struct EngineState {
     last_transcript: Mutex<Option<String>>,
+    /// The phase under way and when its Recording started; `None` once it
+    /// ends.
+    phase: Mutex<Option<(Phase, Instant)>>,
+}
+
+/// The dictation under way, so a window opened during one starts from it.
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhaseNow {
+    pub state: Phase,
+    /// Milliseconds since the Recording started.
+    pub elapsed_ms: u64,
+}
+
+pub fn current_phase(app: &AppHandle) -> Option<PhaseNow> {
+    let engine = app.try_state::<EngineState>()?;
+    let (state, since) = (*engine.phase.lock().unwrap())?;
+    Some(PhaseNow {
+        state,
+        elapsed_ms: u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX),
+    })
+}
+
+/// The phase under way after `state` is reported. Hands-free and processing
+/// continue the Recording already running; a terminal state ends it.
+fn next_phase(
+    prev: Option<(Phase, Instant)>,
+    state: Phase,
+    now: Instant,
+) -> Option<(Phase, Instant)> {
+    match state {
+        Phase::Idle | Phase::Done | Phase::Error => None,
+        Phase::Recording => Some((state, now)),
+        Phase::HandsFree | Phase::Processing => Some((state, prev.map_or(now, |(_, since)| since))),
+    }
 }
 
 #[tauri::command]
@@ -506,6 +542,11 @@ impl Engine {
     }
 
     fn emit_state(&self, state: Phase, message: Option<String>) {
+        {
+            let engine = self.app.state::<EngineState>();
+            let mut phase = engine.phase.lock().unwrap();
+            *phase = next_phase(*phase, state, Instant::now());
+        }
         if let Some(tray) = self.app.state::<crate::AppState>().tray.get() {
             match state {
                 Phase::Recording | Phase::HandsFree => tray.set_status("Voisu: recording…"),
@@ -584,6 +625,25 @@ mod tests {
     use std::task::Poll;
 
     use super::*;
+
+    #[test]
+    fn a_recording_keeps_its_start_until_it_ends() {
+        let start = Instant::now();
+        let later = start + Duration::from_secs(5);
+        let recording = next_phase(None, Phase::Recording, start);
+        let hands_free = next_phase(recording, Phase::HandsFree, later);
+        assert_eq!(hands_free, Some((Phase::HandsFree, start)));
+        let processing = next_phase(hands_free, Phase::Processing, later);
+        assert_eq!(processing, Some((Phase::Processing, start)));
+        for end in [Phase::Idle, Phase::Done, Phase::Error] {
+            assert_eq!(next_phase(processing, end, later), None);
+        }
+        // The next Recording starts its own clock.
+        assert_eq!(
+            next_phase(processing, Phase::Recording, later),
+            Some((Phase::Recording, later))
+        );
+    }
 
     fn both_providers_heard(text: &str) -> Vec<SourceTranscript> {
         [Provider::Groq, Provider::Deepgram]
