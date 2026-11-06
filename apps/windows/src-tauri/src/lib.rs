@@ -112,6 +112,9 @@ struct UiState {
     hook_ok: bool,
     /// A downloaded update waiting for "Restart to update".
     update_version: Option<String>,
+    /// The dictation under way, if any; later changes arrive as
+    /// `recording-state` events.
+    phase: Option<engine::PhaseNow>,
 }
 
 #[derive(Serialize)]
@@ -209,6 +212,7 @@ fn get_state(app: AppHandle) -> UiState {
         trigger_presets: ui_presets(),
         hook_ok: hook_ok(),
         update_version: updater::pending_version(&app),
+        phase: engine::current_phase(&app),
     }
 }
 
@@ -414,11 +418,12 @@ fn open_logs(app: AppHandle) -> Result<(), String> {
 
 /// The window's "Restart to update": the tray item's install path.
 #[tauri::command]
-fn install_update(app: AppHandle) {
-    updater::install(&app, true);
+fn install_update(app: AppHandle) -> Result<(), String> {
+    let result = updater::install(&app, true);
     // Reached only when the installer did not start; the window rereads
     // whether the update is still pending.
     let _ = app.emit(STATE_CHANGED, ());
+    result
 }
 
 /// Wires hook → gesture thread → engine. The engine reports each finished
@@ -445,10 +450,16 @@ fn start_dictation(app: &AppHandle) {
     };
     let _ = trigger_cell.set(trigger.clone());
     #[cfg(windows)]
-    if let Err(error) = platform::hotkey::install(trigger, chord) {
-        tracing::error!(%error, "keyboard hook failed to start");
-        // The window shows "needs a restart" from `hook_ok`.
-        let _ = app.emit(STATE_CHANGED, ());
+    {
+        // The window's "needs a restart" line follows `hook_ok`.
+        let health_app = app.clone();
+        let health_changed = move || {
+            let _ = health_app.emit(STATE_CHANGED, ());
+        };
+        if let Err(error) = platform::hotkey::install(trigger, chord, health_changed) {
+            tracing::error!(%error, "keyboard hook failed to start");
+            let _ = app.emit(STATE_CHANGED, ());
+        }
     }
     #[cfg(not(windows))]
     drop((trigger, chord));

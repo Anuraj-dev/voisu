@@ -141,11 +141,11 @@ pub fn pending_version(app: &AppHandle) -> Option<String> {
 /// nothing when no update is pending. An installer that fails before the
 /// app is torn down stays pending so the menu item can retry it; one that
 /// fails after leaves no tray, so the app exits and the next launch finds
-/// the update again.
-pub fn install(app: &AppHandle, relaunch: bool) {
+/// the update again. An error is the message to show.
+pub fn install(app: &AppHandle, relaunch: bool) -> Result<(), String> {
     let state = app.state::<UpdaterState>();
     let Some(ready) = state.ready.lock().unwrap().take() else {
-        return;
+        return Ok(());
     };
     tracing::info!(version = %ready.update.version, relaunch, "installing update");
     let update = ready.update.clone().restart_after_install(relaunch);
@@ -153,12 +153,16 @@ pub fn install(app: &AppHandle, relaunch: bool) {
         tracing::warn!(%error, "update install failed");
         if state.torn_down.load(Ordering::SeqCst) {
             app.exit(1);
-            return;
+        } else {
+            // A newer download that landed meanwhile wins.
+            state.ready.lock().unwrap().get_or_insert(ready);
         }
-        // A newer download that landed meanwhile wins.
-        state.ready.lock().unwrap().get_or_insert(ready);
+        return Err(INSTALL_FAILED.to_owned());
     }
+    Ok(())
 }
+
+const INSTALL_FAILED: &str = "The update couldn't start. Try again, or restart Voisu.";
 
 #[cfg(test)]
 mod tests {

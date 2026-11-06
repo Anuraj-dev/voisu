@@ -29,8 +29,6 @@
       });
     subscribe('state-changed', async () => {
       await refresh();
-      // Saving both keys resolves a "keys missing" refusal.
-      if (keysReady() && ui.phase === 'error') ui.phase = 'idle';
       refreshTranscript();
     });
     subscribe('recording-state', (event) => onRecordingState(event.payload));
@@ -74,7 +72,7 @@
             role="tab"
             id="tab-{t.id}"
             aria-selected={tab === t.id}
-            aria-controls="panel-{t.id}"
+            aria-controls={tab === t.id ? `panel-${t.id}` : undefined}
             tabindex={tab === t.id ? 0 : -1}
             onclick={() => (tab = t.id)}
           >

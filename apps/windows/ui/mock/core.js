@@ -39,6 +39,8 @@ const state = {
   ],
   hookOk: screen !== 'hook-down',
   updateVersion: screen === 'update' ? '0.74.0' : null,
+  // Twelve seconds in, so the timer reads 0:12.
+  phase: screen === 'recording' ? { state: 'recording', elapsedMs: 12_000 } : null,
 };
 const transcript = inSetup
   ? null
@@ -105,16 +107,14 @@ async function drive() {
     type($('#key-deepgram'), 'dg_example_key');
     await until(() => !$('button[type="submit"]').disabled);
     $('button[type="submit"]').click();
-  } else if (screen === 'recording' || screen === 'processing' || screen === 'failed') {
+  } else if (screen === 'processing' || screen === 'failed') {
+    // `recording` is seeded from get_state; these arrive as events.
     await until(() => hasListener('recording-state'));
     if (screen === 'failed') {
       emit('recording-state', { state: 'error', message: "Couldn't reach Groq. Check your internet connection." });
     } else {
       emit('recording-state', { state: 'recording' });
-      // Twelve seconds in, so the timer reads 0:12.
-      const real = Date.now;
-      Date.now = () => real() + 12_000;
-      if (screen === 'processing') emit('recording-state', { state: 'processing' });
+      emit('recording-state', { state: 'processing' });
     }
   } else if (screen === 'settings' || screen === 'replace-key') {
     (await until(() => $('#tab-settings'))).click();

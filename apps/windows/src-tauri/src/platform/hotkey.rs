@@ -14,6 +14,7 @@
 
 use std::cell::RefCell;
 use std::io;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::thread;
@@ -74,8 +75,14 @@ static LAST_CALLBACK: AtomicU32 = AtomicU32::new(0);
 /// The hook thread, for [`set_chord`]; 0 until installed.
 static HOOK_THREAD: AtomicU32 = AtomicU32::new(0);
 /// Set when a reinstall fails, leaving only the hook that was presumed dead;
-/// cleared when a later reinstall succeeds. The window reads it on focus.
+/// cleared when a later reinstall succeeds or that hook delivers a key after
+/// all.
 static HOOK_LOST: AtomicBool = AtomicBool::new(false);
+/// What [`HEALTH_CHANGED`] was last told [`is_running`] returns.
+static REPORTED_OK: AtomicBool = AtomicBool::new(true);
+/// Set once by [`install`]. A static rather than [`HookState`], so calling it
+/// never holds the `STATE` borrow the hook callback needs.
+static HEALTH_CHANGED: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
 
 struct HookState {
     tracker: ChordTracker,
@@ -91,8 +98,14 @@ thread_local! {
 }
 
 /// Starts the hook thread for `chord` and returns once the hook is
-/// installed.
-pub fn install(trigger: Trigger, chord: TriggerChord) -> io::Result<()> {
+/// installed. `health_changed` runs on the hook thread, outside the hook
+/// callback, whenever [`is_running`] flips.
+pub fn install(
+    trigger: Trigger,
+    chord: TriggerChord,
+    health_changed: impl Fn() + Send + Sync + 'static,
+) -> io::Result<()> {
+    let _ = HEALTH_CHANGED.set(Box::new(health_changed));
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     thread::Builder::new()
         .name("voisu-hotkey".into())
@@ -283,6 +296,18 @@ fn reinstall_logged(reason: &'static str) {
         Ok(()) => tracing::info!(reason, "Trigger Key hook reinstalled"),
         Err(error) => tracing::error!(%error, reason, "Trigger Key hook reinstall failed"),
     }
+    report_health();
+}
+
+/// Tells the window when [`is_running`] changed since it was last told.
+/// Never called from the hook callback, which must not block.
+fn report_health() {
+    let ok = is_running();
+    if REPORTED_OK.swap(ok, Ordering::Relaxed) != ok
+        && let Some(health_changed) = HEALTH_CHANGED.get()
+    {
+        health_changed();
+    }
 }
 
 fn watcher_window() -> windows::core::Result<HWND> {
@@ -327,8 +352,12 @@ unsafe extern "system" fn watcher_proc(
         WM_POWERBROADCAST if wparam.0 as u32 == PBT_APMRESUMEAUTOMATIC => {
             reinstall_logged("resumed");
         }
-        WM_TIMER if wparam.0 == HEALTH_TIMER && hook_went_silent() => {
-            reinstall_logged("hook stopped receiving input");
+        WM_TIMER if wparam.0 == HEALTH_TIMER => {
+            if hook_went_silent() {
+                reinstall_logged("hook stopped receiving input");
+            }
+            // Picks up a false alarm the callback cleared.
+            report_health();
         }
         _ => {}
     }
@@ -466,6 +495,10 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
     unsafe {
         if code == HC_ACTION as i32 {
             LAST_CALLBACK.store(GetTickCount(), Ordering::Relaxed);
+            // The hook a failed reinstall left behind still works after all.
+            if HOOK_LOST.load(Ordering::Relaxed) {
+                HOOK_LOST.store(false, Ordering::Relaxed);
+            }
             let event = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
             if on_key(event, wparam.0 as u32) {
                 return LRESULT(1);

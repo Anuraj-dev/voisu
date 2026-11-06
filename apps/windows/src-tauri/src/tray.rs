@@ -213,10 +213,12 @@ pub fn build(
                     crate::apply_autostart(app, wanted);
                 }
             }
-            MENU_UPDATE => crate::updater::install(app, true),
+            MENU_UPDATE => {
+                let _ = crate::updater::install(app, true);
+            }
             MENU_QUIT => {
                 // A downloaded update installs on the way out, without relaunching.
-                crate::updater::install(app, false);
+                let _ = crate::updater::install(app, false);
                 app.exit(0);
             }
             _ => {}

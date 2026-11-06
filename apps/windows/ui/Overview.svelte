@@ -34,9 +34,9 @@
     }
     switch (ui.phase) {
       case 'recording':
-        return { tone: 'recording', title: `Recording ${elapsed}`, detail: 'Release to transcribe. Esc cancels.' };
+        return { tone: 'recording', title: 'Recording', timer: true, detail: 'Release to transcribe. Esc cancels.' };
       case 'handsFree':
-        return { tone: 'recording', title: `Recording ${elapsed}`, hint: 'handsFree' };
+        return { tone: 'recording', title: 'Recording', timer: true, hint: 'handsFree' };
       case 'processing':
         return { tone: 'processing', title: 'Working on your Transcript…', detail: '' };
       case 'error':
@@ -69,15 +69,19 @@
       // Ends this process when the installer starts.
       await invoke('install_update');
     } catch (e) {
-      error = 'Could not start the update.';
+      error = typeof e === 'string' ? e : 'Could not start the update.';
     } finally {
       updating = false;
     }
   }
 </script>
 
+<!-- The timer sits outside the accessibility tree, so the live region
+     speaks status changes only, not every tick. -->
 <section class="hero {hero.tone}" aria-live="polite">
-  <h1><span class="dot" aria-hidden="true"></span>{hero.title}</h1>
+  <h1>
+    <span class="dot" aria-hidden="true"></span>{hero.title}{#if hero.timer}<span aria-hidden="true">&nbsp;{elapsed}</span>{/if}
+  </h1>
   {#if hero.hint === 'ready'}
     <p class="muted">Hold <kbd>{ui.app.trigger.label}</kbd>, speak, release. Double-tap for hands-free, Esc to cancel.</p>
   {:else if hero.hint === 'handsFree'}
