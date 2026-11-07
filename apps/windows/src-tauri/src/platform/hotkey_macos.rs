@@ -18,6 +18,7 @@
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::io;
+use std::panic::{self, AssertUnwindSafe};
 use std::ptr::{self, NonNull};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
@@ -279,7 +280,9 @@ unsafe extern "C-unwind" fn tap_callback(
     event: NonNull<CGEvent>,
     _user_info: *mut c_void,
 ) -> *mut CGEvent {
-    match kind {
+    // A panic must not unwind into the window server's callback: log it and
+    // let the event through.
+    let handled = panic::catch_unwind(AssertUnwindSafe(|| match kind {
         CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput => {
             with_state(|state| {
                 // Key-ups may have gone by while it was off.
@@ -294,6 +297,12 @@ unsafe extern "C-unwind" fn tap_callback(
         }
         // SAFETY: the system passes a live event for the callback's duration.
         _ => on_event(kind, unsafe { event.as_ref() }),
+    }));
+    if handled.is_err() {
+        tracing::error!(
+            ?kind,
+            "Trigger Key event handler panicked; event passed through"
+        );
     }
     // A listen-only tap's return value is ignored; hand the event back.
     event.as_ptr()

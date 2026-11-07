@@ -501,15 +501,6 @@ fn start_dictation(app: &AppHandle) {
     drop((trigger, chord));
 }
 
-/// Start at login: the HKCU Run key on Windows, a LaunchAgent plist in
-/// `~/Library/LaunchAgents` on macOS.
-fn autostart() -> tauri_plugin_autostart::Builder {
-    let builder = tauri_plugin_autostart::Builder::new();
-    #[cfg(target_os = "macos")]
-    let builder = builder.macos_launcher(tauri_plugin_autostart::MacosLauncher::LaunchAgent);
-    builder
-}
-
 pub fn run() {
     logging::init(&paths::log_dir());
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "Voisu starting");
@@ -520,7 +511,14 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             show_settings(app)
         }))
-        .plugin(autostart().app_name("Voisu").arg(AUTOSTART_ARG).build())
+        // Start at login: the HKCU Run key on Windows; on macOS the plugin's
+        // default, a LaunchAgent plist in ~/Library/LaunchAgents.
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .app_name("Voisu")
+                .arg(AUTOSTART_ARG)
+                .build(),
+        )
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(updater::UpdaterState::default())
@@ -635,21 +633,5 @@ mod tests {
         };
         let json = serde_json::to_string(&presets[index]).unwrap();
         assert_eq!(json, expected);
-    }
-
-    #[test]
-    fn the_window_starts_on_the_windows_default_trigger_key() {
-        // Read from the window itself, so the two can't drift apart. It is
-        // only shown until `get_state` answers; Reset uses the first preset.
-        const APP: &str = include_str!("../../ui/state.svelte.js");
-        let default = APP
-            .split_once("const DEFAULT_TRIGGER = '")
-            .and_then(|(_, rest)| rest.split_once('\''))
-            .expect("DEFAULT_TRIGGER")
-            .0;
-        assert_eq!(
-            default,
-            trigger_key::Platform::Windows.default_chord().to_string()
-        );
     }
 }

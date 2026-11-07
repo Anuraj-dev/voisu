@@ -18,6 +18,9 @@ on:
       - .github/workflows/macos-app.yml
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -93,22 +96,25 @@ jobs:
           # shellcheck disable=SC2086
           security list-keychains -d user -s "$keychain" $existing
 
-          # Trust the self-signed root for code signing. Best effort: signing by
-          # SHA-1 hash below works with an untrusted certificate too.
-          cert_pem="$RUNNER_TEMP/voisu-cert.pem"
-          security find-certificate -c "Voisu Self-Signed" -p "$keychain" > "$cert_pem"
-          if sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$cert_pem"; then
-            echo "Certificate trusted for code signing."
-          else
-            echo "::warning::add-trusted-cert failed; signing by hash with an untrusted certificate."
-          fi
-
+          # Checked first: under `set -e` a missing certificate would
+          # otherwise stop the step at find-certificate, before this message.
           echo "Identities in the temporary keychain:"
-          security find-identity -p codesigning "$keychain"
-          hash="$(security find-identity -p codesigning "$keychain" | awk '/"Voisu Self-Signed"/ { print $2; exit }')"
+          identities="$(security find-identity -p codesigning "$keychain" || true)"
+          echo "$identities"
+          hash="$(awk '/"Voisu Self-Signed"/ { print $2; exit }' <<<"$identities")"
           if [ -z "$hash" ]; then
             echo "::error::No 'Voisu Self-Signed' codesigning identity in the imported certificate."
             exit 1
+          fi
+
+          # Trust the self-signed root for code signing. Best effort: signing by
+          # SHA-1 hash below works with an untrusted certificate too.
+          cert_pem="$RUNNER_TEMP/voisu-cert.pem"
+          if security find-certificate -c "Voisu Self-Signed" -p "$keychain" > "$cert_pem" \
+            && sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$cert_pem"; then
+            echo "Certificate trusted for code signing."
+          else
+            echo "::warning::Could not trust the certificate; signing by hash with an untrusted certificate."
           fi
           echo "Signing identity SHA-1: $hash"
           {
@@ -124,10 +130,13 @@ jobs:
           KEYCHAIN: ${{ steps.cert.outputs.keychain }}
         run: |
           set -euo pipefail
+          # The bundle holds no nested code, so it is signed without the
+          # deprecated --deep; the --deep --strict verify below fails if that
+          # ever changes.
           if [ "$SIGNED" = "true" ]; then
-            codesign --force --deep --keychain "$KEYCHAIN" --sign "$IDENTITY" --identifier "$BUNDLE_ID" "$APP_PATH"
+            codesign --force --keychain "$KEYCHAIN" --sign "$IDENTITY" --identifier "$BUNDLE_ID" "$APP_PATH"
           else
-            codesign --force --deep --sign - --identifier "$BUNDLE_ID" "$APP_PATH"
+            codesign --force --sign - --identifier "$BUNDLE_ID" "$APP_PATH"
           fi
           codesign --verify --deep --strict --verbose=2 "$APP_PATH"
           echo "--- codesign -dv --verbose=4"
@@ -137,13 +146,15 @@ jobs:
           echo "$requirement"
           if [ "$SIGNED" = "true" ]; then
             details="$(codesign -dv --verbose=4 "$APP_PATH" 2>&1)"
-            echo "$details" | grep -q '^Authority=Voisu Self-Signed' \
+            # Here-strings, not pipes: with pipefail an early `grep -q` exit
+            # can fail the echo and report a match as a miss.
+            grep -q '^Authority=Voisu Self-Signed' <<<"$details" \
               || { echo "::error::app is not signed by Voisu Self-Signed"; exit 1; }
-            echo "$details" | grep -q '^Identifier=app.voisu.desktop$' \
+            grep -q '^Identifier=app.voisu.desktop$' <<<"$details" \
               || { echo "::error::signing identifier is not $BUNDLE_ID"; exit 1; }
-            echo "$requirement" | grep -q 'certificate' \
+            grep -q 'certificate' <<<"$requirement" \
               || { echo "::error::designated requirement does not pin the certificate"; exit 1; }
-            if echo "$requirement" | grep -q 'cdhash'; then
+            if grep -q 'cdhash' <<<"$requirement"; then
               echo "::error::designated requirement is a cdhash, not the certificate"
               exit 1
             fi

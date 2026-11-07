@@ -35,7 +35,7 @@ use crate::overlay::{
     RecordingStatePayload,
 };
 use crate::platform::capture::{CpalCapture, LevelSink};
-use crate::platform::delivery::{self, DeliveryTarget};
+use crate::platform::delivery::{self, DeliveryOutcome, DeliveryTarget};
 use crate::platform::secrets::CredentialManagerStore;
 use crate::settings::Settings;
 use crate::vocabulary;
@@ -50,9 +50,6 @@ const CLEANUP_DRAIN: Duration = Duration::from_secs(2);
 const LANGUAGE: &str = "en";
 
 const KEYS_MISSING: &str = "Add your Groq and Deepgram keys to start dictating.";
-/// Accessible label for `done` when auto-paste is off and nothing was pasted.
-const COPIED: &str = "Transcript copied to the clipboard";
-
 /// Tells the trigger that the engine finished or refused a Recording.
 pub type EndedSink = Arc<dyn Fn(u64) + Send + Sync>;
 
@@ -360,7 +357,9 @@ impl Engine {
         if !self.settings().auto_paste {
             let copied = tokio::task::spawn_blocking(move || delivery::copy(&text)).await;
             let message = match copied {
-                Ok(Ok(())) => return self.emit_state(Phase::Done, Some(COPIED.to_owned())),
+                Ok(Ok(())) => {
+                    return self.emit_state(Phase::Done, Some(delivery::COPIED.to_owned()));
+                }
                 Ok(Err(error)) => {
                     tracing::warn!(id, %error, "copy failed");
                     Some(error.to_string())
@@ -376,6 +375,11 @@ impl Engine {
             });
         });
         let message = match result.await {
+            // macOS could only copy it: the same check mark as auto-paste
+            // off, not an error.
+            Ok(result @ Ok(DeliveryOutcome::Copied)) => {
+                return self.emit_state(Phase::Done, delivery::notice(&result));
+            }
             Ok(result) => delivery::notice(&result),
             Err(_) => {
                 tracing::warn!(id, "delivery task ended without a result");

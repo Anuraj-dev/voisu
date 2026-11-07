@@ -140,12 +140,6 @@ pub struct ChordTracker {
     carried: Option<(u8, u16)>,
 }
 
-impl Default for ChordTracker {
-    fn default() -> Self {
-        Self::new(TriggerChord::default())
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 struct SideSet {
     left: bool,
@@ -482,7 +476,7 @@ mod tests {
 
     #[test]
     fn ctrl_then_win_presses_once_and_masks_start() {
-        let mut t = ChordTracker::default();
+        let mut t = ChordTracker::new(TriggerChord::CTRL_WIN);
         let v = feed(&mut t, &[(LCTRL, true), (LWIN, true)], false);
         assert_eq!(signals(&v), [ChordSignal::Pressed]);
         assert!(v[1].inject_mask && v[1].pass);
@@ -491,7 +485,7 @@ mod tests {
 
     #[test]
     fn win_then_ctrl_presses_too() {
-        let mut t = ChordTracker::default();
+        let mut t = ChordTracker::new(TriggerChord::CTRL_WIN);
         let v = feed(&mut t, &[(LWIN, true), (LCTRL, true)], false);
         assert_eq!(signals(&v), [ChordSignal::Pressed]);
         assert!(v[1].inject_mask);
@@ -499,7 +493,7 @@ mod tests {
 
     #[test]
     fn modifiers_always_pass_through() {
-        let mut t = ChordTracker::default();
+        let mut t = ChordTracker::new(TriggerChord::CTRL_WIN);
         let v = feed(
             &mut t,
             &[(LCTRL, true), (LWIN, true), (LWIN, false), (LCTRL, false)],
@@ -510,7 +504,7 @@ mod tests {
 
     #[test]
     fn auto_repeat_does_not_press_again() {
-        let mut t = ChordTracker::default();
+        let mut t = ChordTracker::new(TriggerChord::CTRL_WIN);
         let v = feed(
             &mut t,
             &[(LCTRL, true), (LWIN, true), (LWIN, true), (LCTRL, true)],
@@ -522,7 +516,7 @@ mod tests {
 
     #[test]
     fn releasing_win_first_releases() {
-        let mut t = ChordTracker::default();
+        let mut t = ChordTracker::new(TriggerChord::CTRL_WIN);
         let v = feed(
             &mut t,
             &[(LCTRL, true), (LWIN, true), (LWIN, false), (LCTRL, false)],
@@ -534,7 +528,7 @@ mod tests {
 
     #[test]
     fn releasing_ctrl_first_releases() {
-        let mut t = ChordTracker::default();
+        let mut t = ChordTracker::new(TriggerChord::CTRL_WIN);
         let v = feed(
             &mut t,
             &[(LCTRL, true), (LWIN, true), (LCTRL, false), (LWIN, false)],
@@ -547,7 +541,7 @@ mod tests {
     #[test]
     fn re_pressing_the_released_modifier_forms_the_chord_again() {
         // Double tap by tapping Win while Ctrl stays held.
-        let mut t = ChordTracker::default();
+        let mut t = ChordTracker::new(TriggerChord::CTRL_WIN);
         let v = feed(
             &mut t,
             &[(LCTRL, true), (LWIN, true), (LWIN, false), (LWIN, true)],
@@ -566,7 +560,7 @@ mod tests {
     #[test]
     fn other_key_mid_chord_interrupts_and_passes() {
         // Ctrl+Win+D (new virtual desktop) must still reach Windows.
-        let mut t = ChordTracker::default();
+        let mut t = ChordTracker::new(TriggerChord::CTRL_WIN);
         let v = feed(
             &mut t,
             &[
@@ -588,7 +582,7 @@ mod tests {
 
     #[test]
     fn interrupted_chord_cannot_re_form_until_both_modifiers_are_up() {
-        let mut t = ChordTracker::default();
+        let mut t = ChordTracker::new(TriggerChord::CTRL_WIN);
         let v = feed(
             &mut t,
             &[
@@ -618,7 +612,7 @@ mod tests {
     #[test]
     fn shortcuts_with_another_key_first_never_press() {
         // Ctrl+C, then Win while Ctrl is still held.
-        let mut t = ChordTracker::default();
+        let mut t = ChordTracker::new(TriggerChord::CTRL_WIN);
         let v = feed(
             &mut t,
             &[(LCTRL, true), (C, true), (C, false), (LWIN, true)],
@@ -626,7 +620,7 @@ mod tests {
         );
         assert!(signals(&v).is_empty());
         // Win+Shift+S, then Ctrl.
-        let mut t = ChordTracker::default();
+        let mut t = ChordTracker::new(TriggerChord::CTRL_WIN);
         let v = feed(
             &mut t,
             &[(LWIN, true), (LSHIFT, true), (LCTRL, true)],
@@ -639,7 +633,7 @@ mod tests {
     #[test]
     fn an_extra_modifier_held_first_is_a_different_shortcut() {
         // Ctrl+Shift+Win is not Ctrl+Win.
-        let mut t = ChordTracker::default();
+        let mut t = ChordTracker::new(TriggerChord::CTRL_WIN);
         let v = feed(
             &mut t,
             &[(LSHIFT, true), (LCTRL, true), (LWIN, true)],
@@ -650,7 +644,7 @@ mod tests {
 
     #[test]
     fn plain_win_tap_is_untouched() {
-        let mut t = ChordTracker::default();
+        let mut t = ChordTracker::new(TriggerChord::CTRL_WIN);
         let v = feed(&mut t, &[(LWIN, true), (LWIN, false)], false);
         assert!(signals(&v).is_empty());
         assert!(v.iter().all(|v| v.pass && !v.inject_mask));
@@ -658,7 +652,7 @@ mod tests {
 
     #[test]
     fn other_side_release_keeps_the_modifier_held() {
-        let mut t = ChordTracker::default();
+        let mut t = ChordTracker::new(TriggerChord::CTRL_WIN);
         let v = feed(
             &mut t,
             &[(LCTRL, true), (RCTRL, true), (RCTRL, false), (LWIN, true)],
@@ -669,7 +663,7 @@ mod tests {
 
     #[test]
     fn missed_key_up_is_corrected_by_the_os_view() {
-        let mut t = ChordTracker::default();
+        let mut t = ChordTracker::new(TriggerChord::CTRL_WIN);
         // Ctrl went down, then its key-up was lost (e.g. the lock screen).
         t.handle(LCTRL, true, ModMask::default, false);
         // Win now goes down; the OS reports Ctrl as up.
@@ -680,7 +674,7 @@ mod tests {
 
     #[test]
     fn a_missed_extra_modifier_up_does_not_block_the_chord() {
-        let mut t = ChordTracker::default();
+        let mut t = ChordTracker::new(TriggerChord::CTRL_WIN);
         // Shift's key-up was lost; the OS now reports only Ctrl.
         t.handle(LSHIFT, true, ModMask::default, false);
         t.handle(LCTRL, true, ModMask::default, false);
@@ -693,7 +687,7 @@ mod tests {
 
     #[test]
     fn escape_is_swallowed_only_when_armed() {
-        let mut t = ChordTracker::default();
+        let mut t = ChordTracker::new(TriggerChord::CTRL_WIN);
         let v = feed(&mut t, &[(Key::Escape, true), (Key::Escape, false)], false);
         assert!(v.iter().all(|v| v.pass && v.signal.is_none()));
 
@@ -712,7 +706,7 @@ mod tests {
 
     #[test]
     fn escape_up_is_swallowed_even_after_disarming() {
-        let mut t = ChordTracker::default();
+        let mut t = ChordTracker::new(TriggerChord::CTRL_WIN);
         let down = t.handle(Key::Escape, true, ModMask::default, true);
         let up = t.handle(Key::Escape, false, ModMask::default, false);
         assert!(!down.pass && !up.pass);
@@ -720,7 +714,7 @@ mod tests {
 
     #[test]
     fn escape_during_the_chord_cancels_before_arming() {
-        let mut t = ChordTracker::default();
+        let mut t = ChordTracker::new(TriggerChord::CTRL_WIN);
         let v = feed(
             &mut t,
             &[(LCTRL, true), (LWIN, true), (Key::Escape, true)],
@@ -731,7 +725,7 @@ mod tests {
 
     #[test]
     fn reset_clears_held_state() {
-        let mut t = ChordTracker::default();
+        let mut t = ChordTracker::new(TriggerChord::CTRL_WIN);
         feed(&mut t, &[(LCTRL, true), (LWIN, true)], false);
         assert_eq!(
             t.reset(),
@@ -956,7 +950,7 @@ mod tests {
         assert!(!t.admits_injected(LCTRL, false), "injected modifiers never");
         assert!(!t.admits_injected(D, false));
         assert!(!t.admits_injected(Key::Escape, false));
-        assert!(!ChordTracker::default().admits_injected(f24, false));
+        assert!(!ChordTracker::new(TriggerChord::CTRL_WIN).admits_injected(f24, false));
     }
 
     #[test]
@@ -1001,7 +995,7 @@ mod tests {
 
     #[test]
     fn set_chord_switches_live() {
-        let mut t = ChordTracker::default();
+        let mut t = ChordTracker::new(TriggerChord::CTRL_WIN);
         feed(&mut t, &[(LCTRL, true)], false);
         t.set_chord(chord("Ctrl+Alt"));
         let v = feed(&mut t, &[(LCTRL, true), (LALT, true)], false);

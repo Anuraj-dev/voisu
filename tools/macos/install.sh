@@ -11,7 +11,8 @@ set -eu
 
 APP_NAME="Voisu.app"
 DEST="/Applications/$APP_NAME"
-BUNDLE_ID="app.voisu.desktop"
+# Matches only the installed app's own process, by its executable's path.
+RUNNING="$DEST/Contents/MacOS/"
 
 say() { printf '==> %s\n' "$*"; }
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
@@ -31,7 +32,9 @@ cleanup() {
   fi
   rm -rf "$WORK"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+# Ctrl+C: stop with the usual status; the EXIT trap still cleans up.
+trap 'exit 130' INT TERM
 
 # 1. Find Voisu.app inside the download.
 case "$SRC" in
@@ -54,17 +57,18 @@ case "$SRC" in
 esac
 [ -d "$APP_SRC" ] || die "no $APP_NAME found inside $SRC."
 
-# 2. Quit a running Voisu so its files can be replaced.
-if pgrep -x Voisu >/dev/null 2>&1; then
+# 2. Quit a running Voisu so its files can be replaced. A signal, not
+# AppleScript, which would ask for Automation access to Voisu.
+if pgrep -f "$RUNNING" >/dev/null 2>&1; then
   say "Quitting the running Voisu"
-  osascript -e "tell application id \"$BUNDLE_ID\" to quit" >/dev/null 2>&1 || true
+  pkill -TERM -f "$RUNNING" || true
   i=0
-  while pgrep -x Voisu >/dev/null 2>&1 && [ "$i" -lt 10 ]; do
+  while pgrep -f "$RUNNING" >/dev/null 2>&1 && [ "$i" -lt 10 ]; do
     sleep 1
     i=$((i + 1))
   done
-  if pgrep -x Voisu >/dev/null 2>&1; then
-    pkill -x Voisu || true
+  if pgrep -f "$RUNNING" >/dev/null 2>&1; then
+    pkill -KILL -f "$RUNNING" || true
     sleep 1
   fi
 fi

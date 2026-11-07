@@ -88,8 +88,7 @@ impl TrayHandles {
         if let Err(error) = self.icon.set_tooltip(Some(tooltip)) {
             tracing::warn!(%error, "tray tooltip update failed");
         }
-        let app = self.icon.app_handle();
-        if let Some(icon) = app.default_window_icon() {
+        if let Some(icon) = tray_image(self.icon.app_handle()) {
             let dotted = with_dot(icon.rgba(), icon.width(), icon.height());
             let image = Image::new_owned(dotted, icon.width(), icon.height());
             if let Err(error) = self.icon.set_icon(Some(image)) {
@@ -142,6 +141,36 @@ fn with_dot(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
 }
 
 const MENU_ON_CLICK: bool = cfg!(target_os = "macos");
+/// macOS draws a menu bar icon as a template: only its alpha counts, tinted
+/// to suit a light or dark bar.
+const TEMPLATE: bool = cfg!(target_os = "macos");
+
+/// The tray icon: the app icon on Windows, its template on macOS.
+fn tray_image(app: &AppHandle) -> Option<Image<'static>> {
+    let icon = app.default_window_icon()?;
+    let rgba = if TEMPLATE {
+        template(icon.rgba())
+    } else {
+        icon.rgba().to_vec()
+    };
+    Some(Image::new_owned(rgba, icon.width(), icon.height()))
+}
+
+/// Keeps only the app icon's green bars, in black; the dark tile they sit
+/// on drops out. How much greener than red a pixel is says how much of it is
+/// bar, so the bars' anti-aliased edges stay soft.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn template(rgba: &[u8]) -> Vec<u8> {
+    rgba.as_chunks::<4>()
+        .0
+        .iter()
+        .flat_map(|px| {
+            let green = f32::from(px[1].saturating_sub(px[0]));
+            let mark = ((green - 16.0) / 80.0).clamp(0.0, 1.0);
+            [0, 0, 0, (f32::from(px[3]) * mark).round() as u8]
+        })
+        .collect()
+}
 
 pub fn build(
     app: &AppHandle,
@@ -201,6 +230,7 @@ pub fn build(
         // A Mac menu bar item opens its menu on a click; on Windows a left
         // click opens the window and the right click the menu.
         .show_menu_on_left_click(MENU_ON_CLICK)
+        .icon_as_template(TEMPLATE)
         .on_menu_event(|app, event| match event.id().as_ref() {
             MENU_SETTINGS => crate::show_settings(app),
             MENU_PREVIEW_OVERLAY => crate::overlay::preview(app),
@@ -238,8 +268,8 @@ pub fn build(
                 crate::show_settings(tray.app_handle());
             }
         });
-    if let Some(icon) = app.default_window_icon() {
-        builder = builder.icon(icon.clone());
+    if let Some(icon) = tray_image(app) {
+        builder = builder.icon(icon);
     }
     let icon = builder.build(app)?;
     Ok(TrayHandles {
@@ -256,6 +286,19 @@ pub fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_mac_template_keeps_the_bars_and_drops_the_tile() {
+        let bar = [104, 222, 165, 255];
+        let tile = [24, 26, 30, 255];
+        let clear = [0, 0, 0, 0];
+        let half_bar = [104, 222, 165, 128];
+        let pixels = [bar, tile, clear, half_bar].concat();
+        assert_eq!(
+            template(&pixels),
+            [[0, 0, 0, 255], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 128]].concat()
+        );
+    }
 
     #[test]
     fn status_line_tells_ready_from_setup_needed() {

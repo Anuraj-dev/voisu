@@ -4,10 +4,12 @@
 //!
 //! 1. Preflight: the app has quit, or it is Voisu itself.
 //! 2. Without Accessibility macOS drops posted keystrokes, so the Transcript
-//!    is only copied and the outcome says so.
-//! 3. Snapshot every item and type on the pasteboard, within
-//!    `SNAPSHOT_BUDGET`.
-//! 4. Bring the target back to the front if something else took it.
+//!    is only copied and the outcome is `Copied`.
+//! 3. Bring the target back to the front if something else took it. If
+//!    macOS refuses or it takes too long, the Transcript is only copied.
+//! 4. Snapshot the pasteboard: every item's types and bytes, in pasteboard
+//!    order. It is not restored at all if it holds a type
+//!    [`mac_never_restore`] names or more than `SNAPSHOT_BUDGET`.
 //! 5. Write the Transcript, marked transient and concealed so clipboard
 //!    managers that follow the nspasteboard.org conventions skip it, and
 //!    post Cmd+V tagged with `MASK_TAG` so the Trigger Key's tap ignores it.
@@ -35,8 +37,8 @@ use objc2_core_graphics::{
 use objc2_foundation::{NSArray, NSData, NSString};
 
 use super::{
-    CHORD_HOLD, DeliveryError, DeliveryOutcome, Integrity, Probe, SNAPSHOT_BUDGET, mac_restore_due,
-    may_restore, preflight,
+    CHORD_HOLD, DeliveryError, DeliveryOutcome, Integrity, Probe, SNAPSHOT_BUDGET,
+    mac_never_restore, mac_restore_due, may_restore, preflight,
 };
 use crate::chord::MASK_TAG;
 use crate::mac_keys::keycode;
@@ -110,7 +112,9 @@ fn deliver_serial(
         return Ok(DeliveryOutcome::Copied);
     }
     if !bring_to_front(&app) {
-        return Ok(DeliveryOutcome::FocusLost);
+        tracing::info!("target app did not come to the front; copying only");
+        write(&pasteboard, text)?;
+        return Ok(DeliveryOutcome::Copied);
     }
     let saved = snapshot(&pasteboard);
     let ours = write(&pasteboard, text)?;
@@ -123,7 +127,9 @@ fn deliver_serial(
     let now = pasteboard.changeCount();
     // The change count is the pasteboard's sequence number; any write since
     // Voisu's means the user or another app put something new there.
-    if may_restore(true, now as u32, ours as u32) {
+    if let Some(saved) = saved
+        && may_restore(true, now as u32, ours as u32)
+    {
         restore(&pasteboard, saved);
     }
     Ok(DeliveryOutcome::NotConfirmed)
@@ -144,41 +150,62 @@ fn queue() -> std::sync::MutexGuard<'static, ()> {
     serial
 }
 
+/// Whether the target is frontmost, activating it first if it is not. False
+/// when macOS refuses or it is still behind after `ACTIVATE_WAIT`.
 fn bring_to_front(app: &NSRunningApplication) -> bool {
-    if app.isActive() {
+    let pid = app.processIdentifier() as isize;
+    if foreground() == pid {
         return true;
     }
-    app.activateWithOptions(NSApplicationActivationOptions::empty());
+    if !app.activateWithOptions(NSApplicationActivationOptions::empty()) {
+        return false;
+    }
     let deadline = Instant::now() + ACTIVATE_WAIT;
     while Instant::now() < deadline {
         sleep(ACTIVATE_POLL);
-        if foreground() == app.processIdentifier() as isize {
+        if foreground() == pid {
             return true;
         }
     }
     false
 }
 
-/// Every item's types and bytes, oldest first. A type that would push the
-/// total past `SNAPSHOT_BUDGET` is not saved.
-fn snapshot(pasteboard: &NSPasteboard) -> Vec<Item> {
-    let mut budget = SNAPSHOT_BUDGET;
+/// Every item's types and bytes, in pasteboard order, or `None` when the
+/// clipboard must not be restored: it holds a type [`mac_never_restore`]
+/// names, or more than `SNAPSHOT_BUDGET`. Types are checked before any data
+/// is read, so a file promise is never fulfilled; data an app provides
+/// lazily is still produced by the read.
+fn snapshot(pasteboard: &NSPasteboard) -> Option<Vec<Item>> {
     let Some(items) = pasteboard.pasteboardItems() else {
-        return Vec::new();
+        return Some(Vec::new());
     };
-    items
+    let types: Vec<_> = items.iter().map(|item| item.types()).collect();
+    if types
         .iter()
-        .map(|item| {
-            item.types()
-                .iter()
-                .filter_map(|kind| {
-                    let data = item.dataForType(&kind)?;
-                    budget = budget.checked_sub(data.len())?;
-                    Some((kind, data))
-                })
-                .collect()
-        })
-        .collect()
+        .flat_map(|kinds| kinds.iter())
+        .any(|kind| mac_never_restore(&kind.to_string()))
+    {
+        tracing::debug!("clipboard is private or promised; it is not restored");
+        return None;
+    }
+    let mut budget = SNAPSHOT_BUDGET;
+    let mut saved = Vec::with_capacity(items.len());
+    for (item, kinds) in items.iter().zip(&types) {
+        let mut entry = Item::new();
+        for kind in kinds.iter() {
+            let Some(data) = item.dataForType(&kind) else {
+                continue;
+            };
+            let Some(left) = budget.checked_sub(data.len()) else {
+                tracing::warn!("clipboard too large to restore");
+                return None;
+            };
+            budget = left;
+            entry.push((kind, data));
+        }
+        saved.push(entry);
+    }
+    Some(saved)
 }
 
 fn restore(pasteboard: &NSPasteboard, saved: Vec<Item>) {

@@ -108,8 +108,9 @@ Then send `voisu-logs.zip` to Raja on Discord along with your notes.
   again. Don't open the app straight from the `.dmg`.
 - **Holding Control + Option does nothing.** Check that Voisu is on under Input
   Monitoring and Accessibility, then quit and reopen Voisu.
-- **Text doesn't appear, but Voisu reacted.** Check Accessibility, then quit and
-  reopen Voisu.
+- **Text doesn't appear, but Voisu showed a check mark.** Without Accessibility, Voisu
+  only copies the text: press ⌘ V to paste it. Then turn Voisu on under
+  Accessibility, and quit and reopen Voisu.
 - **Nothing gets heard.** Check Microphone. Also check System Settings → Sound →
   Input to make sure the right microphone is selected.
 - **To remove Voisu.** Quit it, then drag **Voisu** from Applications to the Trash. To
