@@ -3,8 +3,9 @@
 // settings; this mirrors them.
 import { invoke } from '@tauri-apps/api/core';
 
-// The written form, as the backend stores it. The presets themselves come
-// from the backend, which accepts nothing else.
+// The written form, as the backend stores it, shown only until the first
+// get_state. The presets themselves come from the backend, which accepts
+// nothing else; the first is each platform's default.
 export const DEFAULT_TRIGGER = 'Ctrl+Win';
 
 export const ui = $state({
@@ -20,6 +21,11 @@ export const ui = $state({
     trigger: { key: DEFAULT_TRIGGER, label: DEFAULT_TRIGGER, warnings: [], isDefault: true },
     triggerPresets: [],
     hookOk: true,
+    // 'windows' | 'mac'
+    platform: 'windows',
+    // macOS only: { microphone: 'granted' | 'notAsked' | 'denied',
+    // accessibility, inputMonitoring }; null on Windows.
+    permissions: null,
     updateVersion: null,
     // The dictation under way when the window loaded: { state, elapsedMs }.
     phase: null,
@@ -40,6 +46,35 @@ export const ui = $state({
 });
 
 export const keysReady = () => ui.app.groqSaved && ui.app.deepgramSaved;
+
+export const isMac = () => ui.app.platform === 'mac';
+
+export const keyStoreHint = () =>
+  isMac() ? 'Keys stay on this Mac, in the macOS Keychain.' : 'Keys stay on this PC, in Windows Credential Manager.';
+
+// The macOS permissions still to grant, in the order they matter. A mic not
+// yet asked is left out: the first Recording asks for it.
+export function missingPermissions() {
+  const p = ui.app.permissions;
+  if (!p) return [];
+  return [
+    !p.inputMonitoring && {
+      pane: 'inputMonitoring',
+      name: 'Input Monitoring',
+      why: 'So Voisu hears the Trigger Key.',
+    },
+    !p.accessibility && {
+      pane: 'accessibility',
+      name: 'Accessibility',
+      why: 'So Voisu can paste. Without it the Transcript is only copied.',
+    },
+    p.microphone === 'denied' && {
+      pane: 'microphone',
+      name: 'Microphone',
+      why: 'So Voisu can record you.',
+    },
+  ].filter(Boolean);
+}
 
 export async function refresh() {
   try {

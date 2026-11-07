@@ -1,8 +1,12 @@
 //! The configured Trigger Key chord: which modifiers (and optionally one
-//! ordinary key) must be held together. Only the [`PRESETS`] can be the
-//! Trigger Key. Parsed from and written to the settings string, and packed
-//! into a `u16` so it can cross to the keyboard hook thread inside a posted
-//! message.
+//! ordinary key) must be held together. Only the [`Platform`]'s presets can
+//! be the Trigger Key. Parsed from and written to the settings string, and
+//! packed into a `u16` so it can cross to the keyboard hook thread inside a
+//! posted message.
+//!
+//! The written form is the same on every platform and names the Windows keys
+//! (`Ctrl+Alt`, `Right Win`). On a Mac, Alt is the Option key and Win is the
+//! Command key; [`TriggerChord::label`] shows them by their Mac names.
 
 use std::fmt;
 use std::str::FromStr;
@@ -22,6 +26,7 @@ impl Modifier {
         self as usize
     }
 
+    /// The settings name, the same on every platform.
     const fn name(self) -> &'static str {
         match self {
             Self::Ctrl => "Ctrl",
@@ -30,6 +35,50 @@ impl Modifier {
             Self::Win => "Win",
         }
     }
+}
+
+/// The desktop the Trigger Key is offered and shown on. Each has its own
+/// presets and names the modifiers its own way.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Platform {
+    Windows,
+    Mac,
+}
+
+impl Platform {
+    /// The platform this build runs on. Linux builds exist only for local
+    /// checks and behave as Windows.
+    pub const CURRENT: Self = if cfg!(target_os = "macos") {
+        Self::Mac
+    } else {
+        Self::Windows
+    };
+
+    /// The only Trigger Keys offered here, the default first.
+    pub fn presets(self) -> &'static [Preset] {
+        match self {
+            Self::Windows => &WINDOWS_PRESETS,
+            Self::Mac => &MAC_PRESETS,
+        }
+    }
+
+    pub fn default_chord(self) -> TriggerChord {
+        self.presets()[0].chord
+    }
+
+    /// What the user calls the modifier on this platform's keyboard.
+    const fn modifier_name(self, modifier: Modifier) -> &'static str {
+        match (self, modifier) {
+            (Self::Mac, Modifier::Alt) => "Option",
+            (Self::Mac, Modifier::Win) => "Cmd",
+            (_, modifier) => modifier.name(),
+        }
+    }
+}
+
+/// The Trigger Keys this platform offers, the default first.
+pub fn presets() -> &'static [Preset] {
+    Platform::CURRENT.presets()
 }
 
 /// Which physical side of a modifier an event came from.
@@ -53,15 +102,21 @@ pub struct TriggerChord {
     key: Option<u8>,
 }
 
+/// The first preset: Ctrl+Win on Windows, Ctrl+Option on a Mac.
 impl Default for TriggerChord {
     fn default() -> Self {
-        Self::CTRL_WIN
+        Platform::CURRENT.default_chord()
     }
 }
 
 impl TriggerChord {
     pub const CTRL_WIN: Self = Self {
         mods: [Some(Need::Either), None, None, Some(Need::Either)],
+        key: None,
+    };
+    /// Ctrl+Option on a Mac.
+    pub const CTRL_ALT: Self = Self {
+        mods: [Some(Need::Either), Some(Need::Either), None, None],
         key: None,
     };
     /// No keys at all: what parsing and unpacking start from.
@@ -88,6 +143,8 @@ impl TriggerChord {
     /// Ctrl+Shift and Alt+Shift switch the keyboard layout. A swallowed chord
     /// key does not count as going by, so every chord that holds a modifier
     /// masks; a lone dedicated key (Caps Lock, F13) has nothing to mask.
+    /// macOS gives a bare modifier tap no meaning, so its event tap ignores
+    /// this.
     pub fn needs_mask(&self) -> bool {
         self.modifier_count() > 0
     }
@@ -128,16 +185,29 @@ impl TriggerChord {
         chord
     }
 
-    /// The preset this chord is, if any. Anything else cannot be the
-    /// Trigger Key.
+    /// The preset this chord is on this platform, if any. Anything else
+    /// cannot be the Trigger Key.
     pub fn preset(&self) -> Option<&'static Preset> {
-        PRESETS.iter().find(|preset| preset.chord == *self)
+        self.preset_on(Platform::CURRENT)
     }
 
-    /// The name shown to the user: the written form, with the key named as the
-    /// active layout names that position (`Ctrl+^` on German for ``Ctrl+` ``).
+    pub fn preset_on(&self, platform: Platform) -> Option<&'static Preset> {
+        platform
+            .presets()
+            .iter()
+            .find(|preset| preset.chord == *self)
+    }
+
+    /// The name shown to the user on this platform.
     pub fn label(&self, key_label: Option<&str>) -> String {
-        let written = self.to_string();
+        self.label_on(Platform::CURRENT, key_label)
+    }
+
+    /// The written form with `platform`'s modifier names (`Ctrl+Option` on a
+    /// Mac for `Ctrl+Alt`), and the key named as the active layout names that
+    /// position (`Ctrl+^` on German for ``Ctrl+` ``).
+    pub fn label_on(&self, platform: Platform, key_label: Option<&str>) -> String {
+        let written = Named(self, platform).to_string();
         match (self.key, key_label) {
             (Some(_), Some(local)) => match written.rsplit_once('+') {
                 Some((mods, _)) => format!("{mods}+{local}"),
@@ -158,10 +228,10 @@ pub struct Preset {
     pub warning: Option<&'static str>,
 }
 
-/// The only Trigger Keys Voisu offers, the default first. Every one holds a
-/// modifier the hook masks or is a dedicated key; see
+/// The only Trigger Keys Voisu offers on Windows, the default first. Every
+/// one holds a modifier the hook masks or is a dedicated key; see
 /// `docs/research/2026-11-03-windows-custom-trigger-key.md`.
-pub const PRESETS: [Preset; 5] = [
+pub const WINDOWS_PRESETS: [Preset; 5] = [
     Preset {
         chord: TriggerChord::CTRL_WIN,
         name: "Ctrl+Win",
@@ -203,6 +273,38 @@ pub const PRESETS: [Preset; 5] = [
     },
 ];
 
+/// The Mac's Trigger Keys, the default first. Modifiers only: the event tap
+/// listens and never swallows a key, so a chord with an ordinary key would
+/// also type it. A bare modifier does nothing on a Mac, so none needs a
+/// mask. Right Option is left out because many layouts type characters with
+/// it, and every Ctrl+Cmd chord is left out because macOS owns them
+/// (Ctrl+Cmd+Q locks the screen, Ctrl+Cmd+Space opens the emoji picker).
+pub const MAC_PRESETS: [Preset; 3] = [
+    Preset {
+        chord: TriggerChord::CTRL_ALT,
+        name: "Ctrl+Option",
+        warning: None,
+    },
+    Preset {
+        chord: TriggerChord {
+            mods: [None, Some(Need::Either), None, Some(Need::Either)],
+            key: None,
+        },
+        name: "Option+Cmd",
+        warning: None,
+    },
+    Preset {
+        chord: TriggerChord {
+            mods: [None, None, None, Some(Need::Only(Side::Right))],
+            key: None,
+        },
+        name: "Right Cmd",
+        warning: Some(
+            "Shortcuts typed with the right Cmd key, such as Cmd+C, briefly start and cancel a Recording.",
+        ),
+    },
+];
+
 /// Why a settings string is not a chord at all.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParseError {
@@ -223,8 +325,19 @@ impl fmt::Display for ParseError {
     }
 }
 
+/// The written form: the settings string, with Windows modifier names.
 impl fmt::Display for TriggerChord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Named(self, Platform::Windows).fmt(f)
+    }
+}
+
+/// A chord written with one platform's modifier names.
+struct Named<'a>(&'a TriggerChord, Platform);
+
+impl fmt::Display for Named<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self(chord, platform) = *self;
         let mut first = true;
         let mut part = |f: &mut fmt::Formatter<'_>, text: fmt::Arguments<'_>| {
             if !std::mem::take(&mut first) {
@@ -233,16 +346,15 @@ impl fmt::Display for TriggerChord {
             f.write_fmt(text)
         };
         for modifier in Modifier::ALL {
-            match self.need(modifier) {
+            let name = platform.modifier_name(modifier);
+            match chord.need(modifier) {
                 None => {}
-                Some(Need::Either) => part(f, format_args!("{}", modifier.name()))?,
-                Some(Need::Only(Side::Left)) => part(f, format_args!("Left {}", modifier.name()))?,
-                Some(Need::Only(Side::Right)) => {
-                    part(f, format_args!("Right {}", modifier.name()))?
-                }
+                Some(Need::Either) => part(f, format_args!("{name}"))?,
+                Some(Need::Only(Side::Left)) => part(f, format_args!("Left {name}"))?,
+                Some(Need::Only(Side::Right)) => part(f, format_args!("Right {name}"))?,
             }
         }
-        if let Some(vk) = self.key {
+        if let Some(vk) = chord.key {
             part(f, format_args!("{}", key_name(vk).unwrap_or("?")))?;
         }
         Ok(())
@@ -254,7 +366,7 @@ impl FromStr for TriggerChord {
 
     /// Accepts the written form (`Ctrl+Win`, `Right Alt`, `Ctrl+Alt+Space`)
     /// case-insensitively, plus the `LCtrl`/`RAlt` and `Control`/`Windows`
-    /// spellings.
+    /// spellings and the Mac names (`Option`/`Opt`, `Cmd`/`Command`).
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         let mut chord = Self::EMPTY;
         for raw in text.split('+') {
@@ -307,9 +419,9 @@ fn parse_modifier(token: &str) -> Option<(Modifier, Need)> {
 fn modifier_word(word: &str) -> Option<Modifier> {
     match word {
         "ctrl" | "control" => Some(Modifier::Ctrl),
-        "alt" => Some(Modifier::Alt),
+        "alt" | "option" | "opt" => Some(Modifier::Alt),
         "shift" => Some(Modifier::Shift),
-        "win" | "windows" => Some(Modifier::Win),
+        "win" | "windows" | "cmd" | "command" => Some(Modifier::Win),
         _ => None,
     }
 }
@@ -412,8 +524,8 @@ fn key_code(token: &str) -> Option<u8> {
 }
 
 /// Settings store the written form; a value that does not parse or is not a
-/// preset fails here, and the settings loader falls back to Ctrl+Win. A
-/// custom chord saved by v0.68 or v0.69 is one of those.
+/// preset on this platform fails here, and the settings loader falls back to
+/// the default. A custom chord saved by v0.68 or v0.69 is one of those.
 impl TryFrom<String> for TriggerChord {
     type Error = String;
 
@@ -460,14 +572,95 @@ mod tests {
         assert_eq!(parse("Ctrl+`").label(Some("^")), "Ctrl+^");
         assert_eq!(parse("CapsLock").label(Some("Feststell")), "Feststell");
         assert_eq!(parse("Ctrl+`").label(None), "Ctrl+`");
-        assert_eq!(TriggerChord::CTRL_WIN.label(Some("ignored")), "Ctrl+Win");
+        assert_eq!(
+            TriggerChord::CTRL_WIN.label_on(Platform::Windows, Some("ignored")),
+            "Ctrl+Win"
+        );
     }
 
     #[test]
-    fn the_default_is_ctrl_win_and_round_trips() {
-        assert_eq!(TriggerChord::default().to_string(), "Ctrl+Win");
-        assert_eq!(parse("Ctrl+Win"), TriggerChord::default());
-        assert_eq!(PRESETS[0].chord, TriggerChord::default());
+    fn each_platform_defaults_to_its_first_preset() {
+        assert_eq!(Platform::Windows.default_chord(), TriggerChord::CTRL_WIN);
+        assert_eq!(Platform::Mac.default_chord(), TriggerChord::CTRL_ALT);
+        assert_eq!(parse("Ctrl+Win"), TriggerChord::CTRL_WIN);
+        assert_eq!(parse("Ctrl+Alt"), TriggerChord::CTRL_ALT);
+        assert_eq!(
+            TriggerChord::default(),
+            Platform::CURRENT.presets()[0].chord
+        );
+        assert_eq!(
+            Platform::CURRENT,
+            if cfg!(target_os = "macos") {
+                Platform::Mac
+            } else {
+                Platform::Windows
+            }
+        );
+    }
+
+    #[test]
+    fn a_mac_names_option_and_cmd_but_writes_alt_and_win() {
+        assert_eq!(
+            TriggerChord::CTRL_ALT.label_on(Platform::Mac, None),
+            "Ctrl+Option"
+        );
+        assert_eq!(
+            TriggerChord::CTRL_ALT.label_on(Platform::Windows, None),
+            "Ctrl+Alt"
+        );
+        assert_eq!(
+            parse("Right Win").label_on(Platform::Mac, None),
+            "Right Cmd"
+        );
+        assert_eq!(
+            parse("Shift+Win+Space").label_on(Platform::Mac, None),
+            "Shift+Cmd+Space"
+        );
+        // The settings string stays the Windows form, so one parser reads it.
+        assert_eq!(parse("Option+Cmd").to_string(), "Alt+Win");
+        assert_eq!(parse("ctrl+opt"), TriggerChord::CTRL_ALT);
+        assert_eq!(parse("Right Command"), parse("Right Win"));
+        assert_eq!(parse("RCmd"), parse("Right Win"));
+    }
+
+    #[test]
+    fn every_preset_is_found_on_its_own_platform_only() {
+        for platform in [Platform::Windows, Platform::Mac] {
+            for preset in platform.presets() {
+                assert_eq!(preset.chord.preset_on(platform).unwrap().name, preset.name);
+            }
+        }
+        // A Mac preset's label is its button name; Windows writes Caps Lock
+        // as `CapsLock`, as it always has.
+        for preset in &MAC_PRESETS {
+            assert_eq!(preset.chord.label_on(Platform::Mac, None), preset.name);
+        }
+        assert!(parse("Right Win").preset_on(Platform::Windows).is_none());
+        assert!(parse("Ctrl+Win").preset_on(Platform::Mac).is_none());
+    }
+
+    #[test]
+    fn mac_presets_are_modifier_only_and_avoid_system_chords() {
+        let names: Vec<&str> = MAC_PRESETS.iter().map(|p| p.name).collect();
+        assert_eq!(names, ["Ctrl+Option", "Option+Cmd", "Right Cmd"]);
+        for preset in &MAC_PRESETS {
+            let chord = preset.chord;
+            assert_eq!(chord.key(), None, "{}", preset.name);
+            assert!(
+                !(chord.uses(Modifier::Ctrl) && chord.uses(Modifier::Win)),
+                "{} is a Ctrl+Cmd chord macOS owns",
+                preset.name
+            );
+            assert_ne!(chord, parse("Right Alt"), "Right Option types characters");
+        }
+        // The Windows-only presets are not Trigger Keys on a Mac, and the
+        // other way round.
+        for text in ["Ctrl+Win", "Ctrl+`", "CapsLock", "Ctrl+Shift+Space"] {
+            assert!(parse(text).preset_on(Platform::Mac).is_none(), "{text}");
+        }
+        for text in ["Ctrl+Alt", "Alt+Win", "Right Win"] {
+            assert!(parse(text).preset_on(Platform::Windows).is_none(), "{text}");
+        }
     }
 
     #[test]
@@ -560,7 +753,10 @@ mod tests {
 
     #[test]
     fn every_preset_round_trips_in_its_written_form() {
-        let written: Vec<String> = PRESETS.iter().map(|p| p.chord.to_string()).collect();
+        let written: Vec<String> = WINDOWS_PRESETS
+            .iter()
+            .map(|p| p.chord.to_string())
+            .collect();
         assert_eq!(
             written,
             [
@@ -571,11 +767,16 @@ mod tests {
                 "Ctrl+Shift+Space"
             ]
         );
-        for preset in &PRESETS {
+        let written: Vec<String> = MAC_PRESETS.iter().map(|p| p.chord.to_string()).collect();
+        assert_eq!(written, ["Ctrl+Alt", "Alt+Win", "Right Win"]);
+        for preset in WINDOWS_PRESETS.iter().chain(&MAC_PRESETS) {
             let text = preset.chord.to_string();
             assert_eq!(parse(&text), preset.chord, "{text}");
-            assert_eq!(TriggerChord::try_from(text.clone()), Ok(preset.chord));
             assert_eq!(TriggerChord::unpack(preset.chord.pack()), preset.chord);
+        }
+        for preset in presets() {
+            let text = preset.chord.to_string();
+            assert_eq!(TriggerChord::try_from(text), Ok(preset.chord));
         }
     }
 
@@ -585,6 +786,7 @@ mod tests {
         for text in [
             "Ctrl+Alt",
             "Alt+Win",
+            "Right Win",
             "Ctrl+Shift",
             "Right Alt",
             "Left Ctrl",
@@ -595,7 +797,12 @@ mod tests {
             "Win+Z",
             "Ctrl",
         ] {
-            assert!(parse(text).preset().is_none(), "{text}");
+            assert!(parse(text).preset_on(Platform::Windows).is_none(), "{text}");
+            if parse(text).preset().is_none() {
+                assert!(TriggerChord::try_from(text.to_owned()).is_err(), "{text}");
+            }
+        }
+        for text in ["Ctrl+Shift", "Ctrl", "Right Alt", "Ctrl+Win+Alt", "Win+Z"] {
             assert!(TriggerChord::try_from(text.to_owned()).is_err(), "{text}");
         }
         assert!(TriggerChord::try_from("nonsense".to_owned()).is_err());
@@ -616,7 +823,8 @@ mod tests {
         let chord = parse("Ctrl+`");
         assert_eq!(chord.to_string(), "Ctrl+`");
         assert_eq!(TriggerChord::unpack(chord.pack()), chord);
-        assert!(chord.preset().unwrap().warning.unwrap().contains("VS Code"));
+        let preset = chord.preset_on(Platform::Windows).unwrap();
+        assert!(preset.warning.unwrap().contains("VS Code"));
     }
 
     #[test]
@@ -641,20 +849,28 @@ mod tests {
 
     #[test]
     fn presets_that_clash_with_common_apps_carry_a_warning() {
-        let warned: Vec<&str> = PRESETS
-            .iter()
-            .filter(|p| p.warning.is_some())
-            .map(|p| p.name)
-            .collect();
-        assert_eq!(warned, ["Ctrl+`", "Ctrl+Shift+Space"]);
+        let warned = |platform: Platform| -> Vec<&str> {
+            platform
+                .presets()
+                .iter()
+                .filter(|p| p.warning.is_some())
+                .map(|p| p.name)
+                .collect()
+        };
+        assert_eq!(warned(Platform::Windows), ["Ctrl+`", "Ctrl+Shift+Space"]);
+        assert_eq!(warned(Platform::Mac), ["Right Cmd"]);
     }
 
     #[test]
     fn serde_uses_the_written_form() {
         let json = serde_json::to_string(&parse("Ctrl+Shift+Space")).unwrap();
         assert_eq!(json, r#""Ctrl+Shift+Space""#);
-        let back: TriggerChord = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, parse("Ctrl+Shift+Space"));
-        assert!(serde_json::from_str::<TriggerChord>(r#""Ctrl+Alt""#).is_err());
+        let json = serde_json::to_string(&TriggerChord::CTRL_ALT).unwrap();
+        assert_eq!(json, r#""Ctrl+Alt""#);
+        let last = presets().last().unwrap().chord;
+        let back: TriggerChord =
+            serde_json::from_str(&serde_json::to_string(&last).unwrap()).unwrap();
+        assert_eq!(back, last);
+        assert!(serde_json::from_str::<TriggerChord>(r#""Ctrl+Shift""#).is_err());
     }
 }

@@ -76,6 +76,9 @@ pub enum DeliveryOutcome {
     OwnWindow,
     /// The target could not be brought back to the foreground.
     FocusLost,
+    /// macOS: Voisu may not post keystrokes (no Accessibility permission),
+    /// so the Transcript was only put on the clipboard.
+    Copied,
 }
 
 impl DeliveryOutcome {
@@ -88,6 +91,7 @@ impl DeliveryOutcome {
             Self::TargetGone => Some("The window you were typing in closed"),
             Self::OwnWindow => Some("Click into another app first"),
             Self::FocusLost => Some("Couldn't return to your window"),
+            Self::Copied => Some("Copied. Allow Voisu in Accessibility to paste"),
         }
     }
 }
@@ -107,16 +111,20 @@ impl fmt::Display for DeliveryError {
         match self {
             Self::ClipboardBusy => f.write_str("Another app is holding the clipboard"),
             Self::Clipboard(what) => write!(f, "Clipboard error: {what}"),
+            Self::Input if cfg!(target_os = "macos") => {
+                f.write_str("macOS blocked the paste keystroke")
+            }
             Self::Input => f.write_str("Windows blocked the paste keystroke"),
-            Self::Unsupported => f.write_str("Pasting works on Windows only"),
+            Self::Unsupported => f.write_str("Pasting works on Windows and macOS only"),
         }
     }
 }
 
 impl std::error::Error for DeliveryError {}
 
-/// The window that had focus when the Recording started. Plain data so it can
-/// cross to the thread that delivers.
+/// The window that had focus when the Recording started (on macOS, the
+/// frontmost app's process id). Plain data so it can cross to the thread
+/// that delivers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeliveryTarget {
     hwnd: isize,
@@ -416,6 +424,18 @@ pub fn read_by_target(reader: Reader, target_pids: &[u32]) -> bool {
     }
 }
 
+/// macOS gives no receipt for a paste, so the user's clipboard comes back a
+/// fixed time after the keystroke: `NO_READ_TIMEOUT`, long enough for a slow
+/// app to read it, or sooner when another delivery is `queued`, though never
+/// before `MAC_MIN_HOLD`, so the target has had its turn.
+pub fn mac_restore_due(since_chord: Duration, queued: bool) -> bool {
+    since_chord >= NO_READ_TIMEOUT || (queued && since_chord >= MAC_MIN_HOLD)
+}
+
+/// The shortest time the Transcript stays on a Mac clipboard after the
+/// paste keystroke.
+pub const MAC_MIN_HOLD: Duration = Duration::from_millis(500);
+
 // ---- Preflight ----
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -515,7 +535,11 @@ pub fn report(app: &AppHandle, result: &Result<DeliveryOutcome, DeliveryError>) 
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+#[path = "delivery_macos.rs"]
+mod native;
+
+#[cfg(not(any(windows, target_os = "macos")))]
 mod native {
     use super::{DeliveryError, DeliveryOutcome};
 
@@ -1707,8 +1731,26 @@ mod tests {
             DeliveryOutcome::TargetGone,
             DeliveryOutcome::OwnWindow,
             DeliveryOutcome::FocusLost,
+            DeliveryOutcome::Copied,
         ] {
             assert!(outcome.notice().is_some(), "{outcome:?}");
         }
+        // Copied is not a paste: it must say what to do about it.
+        assert!(
+            DeliveryOutcome::Copied
+                .notice()
+                .unwrap()
+                .contains("Accessibility")
+        );
+    }
+
+    #[test]
+    fn a_mac_clipboard_comes_back_after_the_read_timeout_or_early_for_a_queued_paste() {
+        assert!(!mac_restore_due(ms(0), false));
+        assert!(!mac_restore_due(ms(1499), false));
+        assert!(mac_restore_due(NO_READ_TIMEOUT, false));
+        // The next delivery shortens the wait, but the target keeps its turn.
+        assert!(!mac_restore_due(ms(499), true));
+        assert!(mac_restore_due(MAC_MIN_HOLD, true));
     }
 }

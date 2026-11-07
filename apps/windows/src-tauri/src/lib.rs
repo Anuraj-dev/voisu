@@ -1,23 +1,25 @@
-//! Voisu for Windows: one process hosting the tray, the setup window and
-//! (from W2 on) the Recording → Transcript engine.
+//! Voisu for Windows and macOS: one process hosting the tray, the setup
+//! window and the Recording → Transcript engine.
 
-// Pure and tested on every platform; only the Windows hotkey and capture
-// drive them.
-#[cfg_attr(not(windows), allow(dead_code))]
+// Pure and tested on every platform; only the Windows and macOS hotkeys and
+// capture drive them.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 mod audio;
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 mod chord;
 mod engine;
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 mod gesture;
 mod logging;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod mac_keys;
 pub mod overlay;
 mod paths;
 pub mod platform;
 pub mod settings;
 pub mod setup;
 mod tray;
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 mod trigger;
 pub mod trigger_key;
 mod updater;
@@ -32,16 +34,18 @@ use tauri_plugin_opener::OpenerExt as _;
 use voisu_cloud::ProviderHttpClient;
 use voisu_core::{Provider, SecretStore, Tone};
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use platform::hotkey::{is_dead_key, key_label};
+use platform::permissions::{self, Pane, Permissions};
 use platform::secrets::CredentialManagerStore;
 use settings::{OverlaySize, Settings};
 use setup::{KeyInputs, KeyResult};
-use trigger_key::{PRESETS, TriggerChord};
+use trigger_key::TriggerChord;
 
 const SETTINGS_WINDOW: &str = "settings";
 const STATE_CHANGED: &str = "state-changed";
-/// Passed by the HKCU Run entry so a login launch stays in the tray.
+/// Passed by the HKCU Run entry (the LaunchAgent on macOS) so a login launch
+/// stays in the tray.
 const AUTOSTART_ARG: &str = "--autostart";
 
 pub struct AppState {
@@ -107,9 +111,14 @@ struct UiState {
     trigger: UiTrigger,
     /// The only Trigger Keys the window offers, the default first.
     trigger_presets: Vec<UiPreset>,
-    /// False when the keyboard hook is down, so the Trigger Key does nothing
-    /// until Voisu restarts.
+    /// False when the keyboard hook is down, so the Trigger Key does nothing:
+    /// on Windows until Voisu restarts, on macOS until Input Monitoring is
+    /// granted.
     hook_ok: bool,
+    /// `"mac"` or `"windows"`, for the wording and the permissions list.
+    platform: &'static str,
+    /// macOS privacy permissions; `None` on Windows.
+    permissions: Option<Permissions>,
     /// A downloaded update waiting for "Restart to update".
     update_version: Option<String>,
     /// The dictation under way, if any; later changes arrive as
@@ -125,7 +134,7 @@ struct UiPreset {
 }
 
 fn ui_presets() -> Vec<UiPreset> {
-    PRESETS
+    trigger_key::presets()
         .iter()
         .map(|preset| UiPreset {
             key: preset.chord.to_string(),
@@ -173,27 +182,33 @@ fn trigger_label(chord: TriggerChord) -> String {
     chord.label(chord.key().and_then(key_label).as_deref())
 }
 
-/// Off Windows there is no active layout to ask: the US names stand.
-#[cfg(not(windows))]
+/// On Linux there is no active layout to ask: the US names stand.
+#[cfg(not(any(windows, target_os = "macos")))]
 fn key_label(_vk: u8) -> Option<String> {
     None
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn is_dead_key(_vk: u8) -> bool {
     false
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn hook_ok() -> bool {
     platform::hotkey::is_running()
 }
 
-/// Off Windows there is no hook to lose.
-#[cfg(not(windows))]
+/// On Linux there is no hook to lose.
+#[cfg(not(any(windows, target_os = "macos")))]
 fn hook_ok() -> bool {
     true
 }
+
+const PLATFORM: &str = if cfg!(target_os = "macos") {
+    "mac"
+} else {
+    "windows"
+};
 
 #[tauri::command]
 fn get_state(app: AppHandle) -> UiState {
@@ -211,18 +226,20 @@ fn get_state(app: AppHandle) -> UiState {
         trigger: UiTrigger::of(settings.hotkey),
         trigger_presets: ui_presets(),
         hook_ok: hook_ok(),
+        platform: PLATFORM,
+        permissions: permissions::current(),
         update_version: updater::pending_version(&app),
         phase: engine::current_phase(&app),
     }
 }
 
-/// Saves and applies one of the [`PRESETS`] without a restart; anything else
+/// Saves and applies one of the platform's presets without a restart; anything else
 /// is refused. An error is the message to show.
 #[tauri::command]
 fn set_trigger_key(app: AppHandle, key: String) -> Result<UiTrigger, String> {
     let chord = TriggerChord::try_from(key).map_err(|error| error.to_string())?;
     // Applied before saving, so a key that can't take effect is never stored.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     if !platform::hotkey::set_chord(chord) {
         return Err(HOOK_DOWN.into());
     }
@@ -235,7 +252,7 @@ fn set_trigger_key(app: AppHandle, key: String) -> Result<UiTrigger, String> {
     Ok(trigger)
 }
 
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 const HOOK_DOWN: &str =
     "Voisu's keyboard hook isn't running, so the Trigger Key can't change. Restart Voisu.";
 
@@ -340,7 +357,7 @@ async fn save_keys(
             ""
         };
         return Err(format!(
-            "Windows Credential Manager refused to save the {} key.{also}",
+            "{KEY_STORE} refused to save the {} key.{also}",
             setup::provider_name(provider)
         ));
     }
@@ -350,6 +367,12 @@ async fn save_keys(
         deepgram: evaluation.deepgram,
     })
 }
+
+const KEY_STORE: &str = if cfg!(target_os = "macos") {
+    "The macOS Keychain"
+} else {
+    "Windows Credential Manager"
+};
 
 /// After keys are written: refresh the tray and, once both keys are stored
 /// for the first time, switch Start at login on. The default counts as
@@ -406,7 +429,7 @@ fn open_guide(app: AppHandle) -> Result<(), String> {
         .map_err(|_| "Couldn't open the browser.".to_owned())
 }
 
-/// Opens the local log folder in Explorer; the logs never leave this PC
+/// Opens the local log folder in Explorer or Finder; the logs never leave this PC
 /// unless the user sends them (ADR 0006).
 #[tauri::command]
 fn open_logs(app: AppHandle) -> Result<(), String> {
@@ -414,6 +437,19 @@ fn open_logs(app: AppHandle) -> Result<(), String> {
     app.opener()
         .open_path(dir.to_string_lossy(), None::<&str>)
         .map_err(|_| "Couldn't open the logs folder.".to_owned())
+}
+
+/// Asks macOS for one privacy permission, then opens its pane of System
+/// Settings so the user can switch Voisu on. The pane is one of three fixed
+/// links; the webview cannot choose the URL.
+#[tauri::command]
+fn open_permission_settings(app: AppHandle, pane: Pane) -> Result<(), String> {
+    tracing::info!(?pane, "opening privacy settings");
+    permissions::request(pane);
+    let _ = app.emit(STATE_CHANGED, ());
+    app.opener()
+        .open_url(pane.url(), None::<&str>)
+        .map_err(|_| "Couldn't open System Settings.".to_owned())
 }
 
 /// The window's "Restart to update": the tray item's install path.
@@ -449,7 +485,7 @@ fn start_dictation(app: &AppHandle) {
         }
     };
     let _ = trigger_cell.set(trigger.clone());
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     {
         // The window's "needs a restart" line follows `hook_ok`.
         let health_app = app.clone();
@@ -461,8 +497,17 @@ fn start_dictation(app: &AppHandle) {
             let _ = app.emit(STATE_CHANGED, ());
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     drop((trigger, chord));
+}
+
+/// Start at login: the HKCU Run key on Windows, a LaunchAgent plist in
+/// `~/Library/LaunchAgents` on macOS.
+fn autostart() -> tauri_plugin_autostart::Builder {
+    let builder = tauri_plugin_autostart::Builder::new();
+    #[cfg(target_os = "macos")]
+    let builder = builder.macos_launcher(tauri_plugin_autostart::MacosLauncher::LaunchAgent);
+    builder
 }
 
 pub fn run() {
@@ -475,12 +520,7 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             show_settings(app)
         }))
-        .plugin(
-            tauri_plugin_autostart::Builder::new()
-                .app_name("Voisu")
-                .arg(AUTOSTART_ARG)
-                .build(),
-        )
+        .plugin(autostart().app_name("Voisu").arg(AUTOSTART_ARG).build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(updater::UpdaterState::default())
@@ -500,10 +540,15 @@ pub fn run() {
             open_key_page,
             open_guide,
             open_logs,
+            open_permission_settings,
             install_update,
             engine::last_transcript
         ])
         .setup(|app| {
+            // A menu bar app: no Dock icon and no app menu; the tray opens
+            // the window (Info.plist's LSUIElement says the same at launch).
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             let handle = app.handle();
             let ready = keys_ready();
             let chord = app.state::<AppState>().settings.lock().unwrap().hotkey;
@@ -558,35 +603,53 @@ mod tests {
     #[test]
     fn the_window_learns_the_trigger_key_its_warnings_and_whether_it_is_the_default() {
         let default = UiTrigger::of(TriggerChord::default());
-        assert_eq!(default.key, "Ctrl+Win");
+        let expected = if cfg!(target_os = "macos") {
+            "Ctrl+Alt"
+        } else {
+            "Ctrl+Win"
+        };
+        assert_eq!(default.key, expected);
         assert!(default.is_default && default.warnings.is_empty());
-        let tick = UiTrigger::of("Ctrl+`".parse().unwrap());
-        assert!(!tick.is_default);
-        assert!(tick.warnings[0].contains("VS Code"), "{:?}", tick.warnings);
+        let warned = trigger_key::presets()
+            .iter()
+            .find(|preset| preset.warning.is_some())
+            .expect("a preset with a warning");
+        let other = UiTrigger::of(warned.chord);
+        assert!(!other.is_default);
+        assert_eq!(other.warnings[0], warned.warning.unwrap());
     }
 
     #[test]
     fn the_window_offers_every_preset_default_first_as_set_trigger_key_takes_it() {
         let presets = ui_presets();
-        assert_eq!(presets.len(), PRESETS.len());
+        assert_eq!(presets.len(), trigger_key::presets().len());
         assert_eq!(presets[0].key, TriggerChord::default().to_string());
         for preset in &presets {
             let chord = TriggerChord::try_from(preset.key.clone()).expect(&preset.key);
             assert_eq!(UiTrigger::of(chord).key, preset.key);
         }
-        let json = serde_json::to_string(&presets[3]).unwrap();
-        assert_eq!(json, r#"{"key":"CapsLock","name":"Caps Lock"}"#);
+        let (index, expected) = if cfg!(target_os = "macos") {
+            (2, r#"{"key":"Right Win","name":"Right Cmd"}"#)
+        } else {
+            (3, r#"{"key":"CapsLock","name":"Caps Lock"}"#)
+        };
+        let json = serde_json::to_string(&presets[index]).unwrap();
+        assert_eq!(json, expected);
     }
 
     #[test]
-    fn the_window_resets_to_the_default_trigger_key() {
-        // Read from the window itself, so the two can't drift apart.
+    fn the_window_starts_on_the_windows_default_trigger_key() {
+        // Read from the window itself, so the two can't drift apart. It is
+        // only shown until `get_state` answers; Reset uses the first preset.
         const APP: &str = include_str!("../../ui/state.svelte.js");
         let default = APP
             .split_once("const DEFAULT_TRIGGER = '")
             .and_then(|(_, rest)| rest.split_once('\''))
             .expect("DEFAULT_TRIGGER")
             .0;
-        assert_eq!(default, TriggerChord::default().to_string());
+        assert_eq!(
+            default,
+            trigger_key::Platform::Windows.default_chord().to_string()
+        );
     }
 }

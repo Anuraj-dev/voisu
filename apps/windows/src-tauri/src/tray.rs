@@ -141,6 +141,8 @@ fn with_dot(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
     out
 }
 
+const MENU_ON_CLICK: bool = cfg!(target_os = "macos");
+
 pub fn build(
     app: &AppHandle,
     keys_ready: bool,
@@ -196,7 +198,9 @@ pub fn build(
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .tooltip("Voisu")
         .menu(&menu)
-        .show_menu_on_left_click(false)
+        // A Mac menu bar item opens its menu on a click; on Windows a left
+        // click opens the window and the right click the menu.
+        .show_menu_on_left_click(MENU_ON_CLICK)
         .on_menu_event(|app, event| match event.id().as_ref() {
             MENU_SETTINGS => crate::show_settings(app),
             MENU_PREVIEW_OVERLAY => crate::overlay::preview(app),
@@ -229,6 +233,7 @@ pub fn build(
                 button_state: MouseButtonState::Up,
                 ..
             } = event
+                && !MENU_ON_CLICK
             {
                 crate::show_settings(tray.app_handle());
             }

@@ -40,7 +40,8 @@ pub struct Settings {
     /// re-save never re-enables what they turned off.
     pub autostart_default_applied: bool,
     /// The Trigger Key, in its written form (`Ctrl+Win`). A value that does
-    /// not parse or is not one of the presets falls back to Ctrl+Win.
+    /// not parse or is not one of this platform's presets falls back to the
+    /// default: Ctrl+Win, or Ctrl+Option on a Mac.
     #[serde(deserialize_with = "lenient_trigger_key")]
     pub hotkey: TriggerChord,
     /// Paste the Transcript into the focused app. Off, it only goes to the
@@ -191,38 +192,40 @@ mod tests {
     }
 
     #[test]
-    fn file_from_before_the_hotkey_field_gets_ctrl_win() {
+    fn file_from_before_the_hotkey_field_gets_the_default() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         fs::write(&path, br#"{"autostart_default_applied": true}"#).unwrap();
         let settings = Settings::load(&path);
         assert!(settings.autostart_default_applied);
-        assert_eq!(settings.hotkey, TriggerChord::CTRL_WIN);
+        assert_eq!(settings.hotkey, TriggerChord::default());
     }
 
     #[test]
     fn a_chosen_trigger_key_round_trips_in_its_written_form() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
+        // Ctrl+` on Windows, Option+Cmd on a Mac.
+        let chosen = crate::trigger_key::presets()[1].chord;
         let settings = Settings {
-            hotkey: "Ctrl+`".parse().unwrap(),
+            hotkey: chosen,
             ..Settings::default()
         };
         settings.save(&path).unwrap();
         let json = fs::read_to_string(&path).unwrap();
-        assert!(json.contains(r#""hotkey": "Ctrl+`""#), "{json}");
+        assert!(json.contains(&format!(r#""hotkey": "{chosen}""#)), "{json}");
         assert_eq!(Settings::load(&path), settings);
     }
 
     #[test]
-    fn an_unusable_trigger_key_falls_back_to_ctrl_win_alone() {
+    fn an_unusable_trigger_key_falls_back_to_the_default_alone() {
         for value in [r#""Ctrl+Hyper""#, r#""Win""#, r#""Ctrl+C""#, "7", "null"] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("settings.json");
             let json = format!(r#"{{"auto_paste": false, "hotkey": {value}}}"#);
             fs::write(&path, json).unwrap();
             let settings = Settings::load(&path);
-            assert_eq!(settings.hotkey, TriggerChord::CTRL_WIN, "{value}");
+            assert_eq!(settings.hotkey, TriggerChord::default(), "{value}");
             assert!(!settings.auto_paste, "{value} wiped another setting");
         }
     }
@@ -231,7 +234,7 @@ mod tests {
     fn every_preset_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
-        for preset in &crate::trigger_key::PRESETS {
+        for preset in crate::trigger_key::presets() {
             let settings = Settings {
                 hotkey: preset.chord,
                 ..Settings::default()
@@ -242,10 +245,10 @@ mod tests {
     }
 
     #[test]
-    fn a_custom_chord_saved_by_v0_68_or_v0_69_loads_as_ctrl_win() {
+    fn a_custom_chord_saved_by_v0_68_or_v0_69_loads_as_the_default() {
         // The removed Custom… recorder could store any allowed chord.
         for value in [
-            "Ctrl+Alt",
+            "Ctrl+Shift",
             "Right Alt",
             "F13",
             "Alt+Shift+F12",
@@ -258,7 +261,7 @@ mod tests {
             );
             fs::write(&path, json).unwrap();
             let settings = Settings::load(&path);
-            assert_eq!(settings.hotkey, TriggerChord::CTRL_WIN, "{value}");
+            assert_eq!(settings.hotkey, TriggerChord::default(), "{value}");
             assert!(settings.autostart_default_applied, "{value}");
             assert_eq!(settings.boost_words, ["Voisu"], "{value}");
         }

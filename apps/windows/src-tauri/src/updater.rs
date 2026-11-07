@@ -105,6 +105,15 @@ async fn check(app: &AppHandle) -> bool {
             tracing::info!("up to date");
             return true;
         }
+        // Releases carry no macOS build yet, so a Mac finds no entry for
+        // itself: that is "no update", not a failure worth retrying.
+        Err(
+            tauri_plugin_updater::Error::TargetNotFound(_)
+            | tauri_plugin_updater::Error::TargetsNotFound(_),
+        ) if cfg!(target_os = "macos") => {
+            tracing::debug!("no update published for this platform");
+            return true;
+        }
         Err(error) => {
             tracing::warn!(%error, "update check failed");
             return false;
@@ -137,7 +146,8 @@ pub fn pending_version(app: &AppHandle) -> Option<String> {
     ready.as_ref().map(|ready| ready.update.version.clone())
 }
 
-/// Runs the downloaded installer, which ends this process on Windows. Does
+/// Runs the downloaded installer, which ends this process on Windows (on
+/// macOS the plugin swaps the app bundle in place). Does
 /// nothing when no update is pending. An installer that fails before the
 /// app is torn down stays pending so the menu item can retry it; one that
 /// fails after leaves no tray, so the app exits and the next launch finds

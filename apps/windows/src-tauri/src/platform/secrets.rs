@@ -1,5 +1,5 @@
-//! Provider keys in Windows Credential Manager, behind voisu-core's
-//! `SecretStore` seam. Keys never touch disk, logs or the webview.
+//! Provider keys in Windows Credential Manager (the login Keychain on
+//! macOS), behind voisu-core's `SecretStore` seam. Keys never touch disk, logs or the webview.
 //!
 //! Errors carry fixed diagnostics only: a keyring error is never formatted,
 //! so nothing it might echo back can reach a log.
@@ -7,7 +7,8 @@
 use keyring::Entry;
 use voisu_core::{BoundaryError, BoundaryKind, Credential, Provider, SecretStore};
 
-/// Credential Manager target is `<account>.<SERVICE>`, e.g. `groq-api-key.Voisu`.
+/// Credential Manager target is `<account>.<SERVICE>`, e.g. `groq-api-key.Voisu`;
+/// on macOS a generic password with service `Voisu` and that account.
 const SERVICE: &str = "Voisu";
 
 fn account(provider: Provider) -> &'static str {

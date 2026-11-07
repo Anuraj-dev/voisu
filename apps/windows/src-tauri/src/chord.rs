@@ -19,7 +19,8 @@ pub use crate::trigger_key::{Modifier, Side};
 use crate::trigger_key::{Need, TriggerChord, scan_code};
 
 /// The unassigned virtual key injected as the mask, the one AutoHotkey and
-/// PowerToys use.
+/// PowerToys use. The Windows hook only.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub const MASK_VK: u8 = 0xE8;
 /// `dwExtraInfo` of every key Voisu injects ("VOIS"), so the hook can tell
 /// its own events from another app's.
@@ -40,7 +41,8 @@ pub enum Key {
 impl Key {
     /// An injected event's scan code is whatever the injecting app chose, so
     /// it never identifies a position: an injected key matches by virtual
-    /// key alone.
+    /// key alone. The Windows hook only.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub fn injected(self) -> Self {
         match self {
             Self::Other(vk, _) => Self::Other(vk, 0),
@@ -263,6 +265,8 @@ impl ChordTracker {
     /// never, so the mask cannot feed back; injected modifiers never, so an
     /// app typing on the user's behalf cannot form a chord; the chord's own
     /// key yes, so a key a remapper such as PowerToys turns into F24 works.
+    /// The Windows hook only; the Mac tap skips tagged events itself.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub fn admits_injected(&self, key: Key, tagged: bool) -> bool {
         !tagged && matches!(key, Key::Other(vk, scan) if self.is_chord_key(vk, scan))
     }

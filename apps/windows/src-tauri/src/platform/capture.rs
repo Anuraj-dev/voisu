@@ -37,9 +37,16 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const REPLACEMENT_WAIT: Duration = Duration::from_secs(2);
 const REPLACEMENT_POLL: Duration = Duration::from_millis(200);
 
+#[cfg(not(target_os = "macos"))]
 pub const MIC_BLOCKED: &str = "Windows is blocking the microphone. Open Settings → Privacy & security → Microphone and turn on access for desktop apps.";
+#[cfg(not(target_os = "macos"))]
 pub const NO_MIC: &str =
     "No microphone found. Connect one or pick a default input in Windows Sound settings.";
+#[cfg(target_os = "macos")]
+pub const MIC_BLOCKED: &str = "macOS is blocking the microphone. Open System Settings → Privacy & Security → Microphone and turn on Voisu.";
+#[cfg(target_os = "macos")]
+pub const NO_MIC: &str =
+    "No microphone found. Connect one or pick an input in System Settings → Sound.";
 const MIC_FAILED: &str = "The microphone stopped working.";
 
 /// Receives one meter reading (0.0–1.0) about 30 times a second while a
@@ -638,7 +645,14 @@ fn microphone_blocked() -> bool {
         || denied(HKEY_CURRENT_USER, desktop)
 }
 
-#[cfg(not(windows))]
+/// Denied or restricted in Privacy & Security. Not yet asked is not
+/// blocked: opening the mic shows the system prompt.
+#[cfg(target_os = "macos")]
+fn microphone_blocked() -> bool {
+    crate::platform::permissions::microphone_denied()
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn microphone_blocked() -> bool {
     false
 }

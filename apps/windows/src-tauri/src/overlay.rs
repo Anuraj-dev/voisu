@@ -174,6 +174,35 @@ pub fn placement(work: Rect, dpi_scale: f64, size: OverlaySize) -> Rect {
     }
 }
 
+/// A rectangle in AppKit points: origin at the bottom left, y growing up.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MacFrame {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// The overlay's frame on a Mac screen whose visible frame (below the menu
+/// bar, above the Dock) is `visible`. [`placement`] with y flipped: AppKit
+/// works in points, so the backing scale needs no part in it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn mac_placement(visible: MacFrame, size: OverlaySize) -> MacFrame {
+    let work = Rect {
+        left: visible.x.round() as i32,
+        top: -(visible.y + visible.height).round() as i32,
+        right: (visible.x + visible.width).round() as i32,
+        bottom: -visible.y.round() as i32,
+    };
+    let r = placement(work, 1.0, size);
+    MacFrame {
+        x: f64::from(r.left),
+        y: f64::from(-r.bottom),
+        width: f64::from(r.right - r.left),
+        height: f64::from(r.bottom - r.top),
+    }
+}
+
 /// Speech-like fake level for "Preview overlay": syllable bumps (~4 Hz) under
 /// a slower phrase envelope, with a short pause.
 pub fn preview_level(seconds: f64) -> f32 {
@@ -198,8 +227,8 @@ pub fn set_size(size: OverlaySize) {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = size;
 }
 
-/// Only the Windows placement reads it.
-#[cfg_attr(not(windows), allow(dead_code))]
+/// Only the Windows and macOS placements read it.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 fn size() -> OverlaySize {
     *SIZE
         .lock()
@@ -560,8 +589,84 @@ mod native {
     }
 }
 
-/// Non-Windows builds exist only for local checks and tests.
-#[cfg(not(windows))]
+/// The capsule as a Mac panel: shown with `orderFrontRegardless`, so Voisu
+/// never activates and the focused app keeps the keyboard (tao's `show`
+/// makes the window key). Above full-screen apps on every Space, and
+/// click-through.
+#[cfg(target_os = "macos")]
+mod native {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{
+        NSEvent, NSScreen, NSStatusWindowLevel, NSWindow, NSWindowCollectionBehavior,
+    };
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
+    use tauri::WebviewWindow;
+
+    use super::{MacFrame, mac_placement, size};
+
+    fn ns_window(window: &WebviewWindow) -> Option<&NSWindow> {
+        let ptr = window.ns_window().ok()?.cast::<NSWindow>();
+        // SAFETY: tao's live NSWindow for this window, which the WebviewWindow
+        // keeps alive; only used on the main thread for this call.
+        unsafe { ptr.as_ref() }
+    }
+
+    pub fn show(window: &WebviewWindow, place: bool) {
+        let (Some(mtm), Some(ns)) = (MainThreadMarker::new(), ns_window(window)) else {
+            return;
+        };
+        ns.setLevel(NSStatusWindowLevel);
+        ns.setIgnoresMouseEvents(true);
+        ns.setHasShadow(false);
+        ns.setCollectionBehavior(
+            NSWindowCollectionBehavior::CanJoinAllSpaces
+                | NSWindowCollectionBehavior::Stationary
+                | NSWindowCollectionBehavior::IgnoresCycle
+                | NSWindowCollectionBehavior::FullScreenAuxiliary,
+        );
+        if place && let Some(frame) = target_frame(mtm) {
+            let rect = NSRect::new(
+                NSPoint::new(frame.x, frame.y),
+                NSSize::new(frame.width, frame.height),
+            );
+            ns.setFrame_display(rect, true);
+        }
+        ns.orderFrontRegardless();
+    }
+
+    pub fn hide(window: &WebviewWindow) {
+        if let Some(ns) = ns_window(window) {
+            ns.orderOut(None);
+        }
+    }
+
+    /// The screen under the mouse pointer, else the main screen.
+    fn target_frame(mtm: MainThreadMarker) -> Option<MacFrame> {
+        let mouse = NSEvent::mouseLocation();
+        let inside = |screen: &NSScreen| {
+            let f = screen.frame();
+            (f.origin.x..f.origin.x + f.size.width).contains(&mouse.x)
+                && (f.origin.y..f.origin.y + f.size.height).contains(&mouse.y)
+        };
+        let screen = NSScreen::screens(mtm)
+            .iter()
+            .find(|screen| inside(screen))
+            .or_else(|| NSScreen::mainScreen(mtm))?;
+        let v = screen.visibleFrame();
+        Some(mac_placement(
+            MacFrame {
+                x: v.origin.x,
+                y: v.origin.y,
+                width: v.size.width,
+                height: v.size.height,
+            },
+            size(),
+        ))
+    }
+}
+
+/// Linux builds exist only for local checks and tests.
+#[cfg(not(any(windows, target_os = "macos")))]
 mod native {
     use tauri::WebviewWindow;
 
@@ -577,6 +682,44 @@ mod native {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mac_capsule_sits_centred_above_the_dock_in_points() {
+        // A 1440x900 point screen with a 25 pt menu bar and a 70 pt Dock.
+        let visible = MacFrame {
+            x: 0.0,
+            y: 70.0,
+            width: 1440.0,
+            height: 805.0,
+        };
+        let frame = mac_placement(visible, OverlaySize::Medium);
+        let windows = placement(
+            Rect {
+                left: 0,
+                top: 25,
+                right: 1440,
+                bottom: 830,
+            },
+            1.0,
+            OverlaySize::Medium,
+        );
+        assert_eq!(frame.width, f64::from(windows.right - windows.left));
+        assert_eq!(frame.height, f64::from(windows.bottom - windows.top));
+        assert_eq!(frame.x, f64::from(windows.left));
+        // The same gap above the Dock as above the taskbar.
+        assert_eq!(frame.y - visible.y, f64::from(830 - windows.bottom));
+        // A screen to the left of and below the main one keeps its offset.
+        let side = mac_placement(
+            MacFrame {
+                x: -1920.0,
+                y: -300.0,
+                ..visible
+            },
+            OverlaySize::Medium,
+        );
+        assert_eq!(side.x - frame.x, -1920.0);
+        assert_eq!(side.y - frame.y, -370.0);
+    }
 
     fn state_json(json: &str) -> Result<RecordingStatePayload, serde_json::Error> {
         serde_json::from_str(json)
