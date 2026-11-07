@@ -152,6 +152,9 @@ pub enum Reply {
     Shortcut(Option<String>),
     History(Result<Vec<HistoryItem>, String>),
     Dictionary(Result<Vec<String>, String>),
+    /// The newer release's `X.Y.Z`, or `None` when there is none or the
+    /// check could not say.
+    UpdateAvailable(Option<String>),
     Applied {
         kind: Tone,
         text: String,
@@ -181,6 +184,9 @@ pub enum Job {
     LoadHistory,
     LoadDictionary,
     LoadShortcut,
+    /// The daily release check. It may wait on the network, so the worker
+    /// gives it a thread of its own.
+    CheckUpdate,
     SetDelivery(DeliveryMode),
     SetWriting(WritingMode),
     SetRendering(RenderingPolicy),
@@ -217,6 +223,7 @@ impl fmt::Debug for Job {
             Job::LoadHistory => f.write_str("LoadHistory"),
             Job::LoadDictionary => f.write_str("LoadDictionary"),
             Job::LoadShortcut => f.write_str("LoadShortcut"),
+            Job::CheckUpdate => f.write_str("CheckUpdate"),
             Job::SetDelivery(mode) => write!(f, "SetDelivery({mode:?})"),
             Job::SetWriting(mode) => write!(f, "SetWriting({mode:?})"),
             Job::SetRendering(policy) => write!(f, "SetRendering({policy:?})"),
@@ -554,6 +561,8 @@ pub struct App {
     doctor_stale: bool,
     pub settings: Option<SettingsSnapshot>,
     pub shortcut: Option<String>,
+    /// A newer release's `X.Y.Z`, for the line on Home.
+    pub update_available: Option<String>,
     pub history: Option<Vec<HistoryItem>>,
     pub history_error: Option<String>,
     pub history_selected: usize,
@@ -600,6 +609,7 @@ impl App {
             doctor_stale: false,
             settings: None,
             shortcut: None,
+            update_available: None,
             history: None,
             history_error: None,
             history_selected: 0,
@@ -629,11 +639,13 @@ impl App {
     }
 
     /// The first round of work. History and the Trigger Key wait for the first
-    /// status poll, since both need a daemon.
+    /// status poll, since both need a daemon. The release check runs once per
+    /// session; its cache keeps it to once a day.
     pub fn start(&mut self) -> Vec<Effect> {
         let mut effects = vec![
             Effect::Job(Job::LoadSettings),
             Effect::Job(Job::LoadDictionary),
+            Effect::Job(Job::CheckUpdate),
         ];
         self.request_doctor(&mut effects);
         effects
@@ -1101,6 +1113,10 @@ impl App {
             Reply::Shortcut(value) => {
                 self.dirty |= self.shortcut != value;
                 self.shortcut = value;
+            }
+            Reply::UpdateAvailable(version) => {
+                self.dirty |= self.update_available != version;
+                self.update_available = version;
             }
             Reply::History(Ok(items)) => {
                 if self.history.as_ref() != Some(&items) || self.history_error.is_some() {
@@ -2354,6 +2370,48 @@ mod tests {
         assert!(matches!(effects.as_slice(), [Effect::Job(Job::Doctor)]));
         let effects = update(&mut app, Msg::Reply(Reply::Doctor(Vec::new())), at(0));
         assert!(effects.is_empty());
+    }
+
+    // --- Update notice ----------------------------------------------------------
+
+    #[test]
+    fn the_update_check_runs_once_per_session_at_start() {
+        let mut app = App::new((80, 24), at(0));
+        let effects = app.start();
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(effect, Effect::Job(Job::CheckUpdate)))
+                .count(),
+            1
+        );
+        let mut app = ready_app();
+        let _ = press(&mut app, KeyCode::Char('2'), 0);
+        let effects = press(&mut app, KeyCode::Char('1'), 0);
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Job(Job::CheckUpdate)))
+        );
+    }
+
+    #[test]
+    fn a_newer_release_is_kept_and_redrawn() {
+        let mut app = ready_app();
+        let _ = app.take_dirty();
+        let _ = update(
+            &mut app,
+            Msg::Reply(Reply::UpdateAvailable(Some("0.75.0".to_owned()))),
+            at(0),
+        );
+        assert_eq!(app.update_available.as_deref(), Some("0.75.0"));
+        assert!(app.take_dirty());
+        let _ = update(
+            &mut app,
+            Msg::Reply(Reply::UpdateAvailable(Some("0.75.0".to_owned()))),
+            at(0),
+        );
+        assert!(!app.take_dirty(), "the same answer redrew");
     }
 
     #[test]

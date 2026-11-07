@@ -277,6 +277,38 @@ fn check_points_the_source_package_at_the_prebuilt_switch() {
 }
 
 #[test]
+fn a_check_feeds_the_update_line_in_status_without_another_request() {
+    let host = FakeHost::new();
+    host.pacman_owner("voisu-bin");
+    host.tool("curl", "printf '%s' '{\"tag_name\":\"v99.0.0\"}'");
+    assert!(host.voisu(&["update", "--check"]).status.success());
+    // Any request from `status` would now fail loudly in the log.
+    host.tool(
+        "curl",
+        &format!("echo \"curl $*\" >> '{}'\nexit 6", host.log.display()),
+    );
+
+    // No daemon answers here; the line comes all the same, last.
+    let output = host.voisu(&["status"]);
+
+    let out = stdout(&output);
+    assert!(
+        out.ends_with("Update available: 99.0.0, run `voisu update`\n"),
+        "{out}"
+    );
+    assert!(!host.calls().contains("curl"), "status touched the network");
+}
+
+#[test]
+fn status_says_nothing_about_updates_before_any_check() {
+    let host = FakeHost::new();
+
+    let output = host.voisu(&["status"]);
+
+    assert!(!stdout(&output).contains("Update"), "{output:?}");
+}
+
+#[test]
 fn check_reports_an_unreachable_release_feed() {
     let host = FakeHost::new();
     host.tool(

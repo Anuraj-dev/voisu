@@ -97,6 +97,16 @@ fn send_command(command: Command) -> Result<Response, ExitCode> {
 }
 
 fn daemon_command(command: Command) -> ExitCode {
+    let status = matches!(command, Command::Status);
+    let code = daemon_reply(command);
+    // From the cache the TUI and `voisu update --check` keep; never the network.
+    if status && let Some(line) = voisu_app::update_notice::cached_notice() {
+        println!("{line}");
+    }
+    code
+}
+
+fn daemon_reply(command: Command) -> ExitCode {
     let response = match send_command(command) {
         Ok(response) => response,
         Err(code) => return code,

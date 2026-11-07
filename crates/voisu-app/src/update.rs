@@ -5,8 +5,9 @@
 //! `/usr/bin` and never replaces a binary itself; it only decides which
 //! package-manager command fits the install ([`plan_update`], pure) and runs
 //! it ([`run`], a thin executor). The network is touched only by
-//! `voisu update --check`, through the same restricted `curl` subprocess the
-//! provider requests use.
+//! `voisu update --check` and the TUI's daily check in
+//! [`crate::update_notice`], through the same restricted `curl` subprocess
+//! the provider requests use.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -269,6 +270,13 @@ pub fn compare_release(installed: &str, latest_tag: &str) -> ReleaseComparison {
     }
 }
 
+/// The release's `X.Y.Z` when it is newer than `installed`, rebuilt from the
+/// parsed numbers so an odd tag never reaches a terminal as it came.
+pub fn newer_release(installed: &str, latest_tag: &str) -> Option<String> {
+    let (installed, latest) = (parse_version(installed)?, parse_version(latest_tag)?);
+    (installed < latest).then(|| format!("{}.{}.{}", latest.0, latest.1, latest.2))
+}
+
 fn parse_version(value: &str) -> Option<(u64, u64, u64)> {
     let value = value.trim();
     let value = value.strip_prefix('v').unwrap_or(value);
@@ -385,6 +393,8 @@ fn check(installed: &str, owner: Option<&PackageOwner>) -> u8 {
             return 4;
         }
     };
+    // Home and `voisu status` read this, so they agree with the check at once.
+    crate::update_notice::record_release(&latest);
     let latest_display = latest.strip_prefix('v').unwrap_or(&latest);
     println!("Latest release: {latest_display}");
     match compare_release(installed, &latest) {
@@ -521,7 +531,7 @@ fn installed_version(binary: &Path) -> Option<String> {
 /// The latest GitHub Release tag, fetched through the restricted `curl`
 /// subprocess. The tag sits near the top of the response, well inside the
 /// runner's retained-stdout cap.
-fn latest_release_tag() -> Result<String, String> {
+pub(crate) fn latest_release_tag() -> Result<String, String> {
     let user_agent = format!("User-Agent: voisu/{}", env!("CARGO_PKG_VERSION"));
     let outcome = run_restricted_with_deadline(
         "curl",
@@ -756,6 +766,18 @@ mod tests {
             compare_release("0.68.0", "nightly"),
             ReleaseComparison::Unknown
         );
+    }
+
+    #[test]
+    fn only_a_newer_release_yields_a_version_to_show() {
+        assert_eq!(
+            newer_release("0.74.0", "v0.75.0").as_deref(),
+            Some("0.75.0")
+        );
+        assert_eq!(newer_release("0.74.0", "v0.74.0"), None);
+        assert_eq!(newer_release("0.75.0", "v0.74.9"), None);
+        assert_eq!(newer_release("0.74.0", "v1.0.0\u{1b}[2J"), None);
+        assert_eq!(newer_release("dev", "v0.75.0"), None);
     }
 
     #[test]

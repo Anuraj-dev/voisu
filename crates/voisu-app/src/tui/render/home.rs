@@ -27,6 +27,18 @@ pub(super) fn lines(app: &App, look: &Look, width: usize, height: usize) -> Vec<
         ));
     } else {
         lines.extend(summary_rows(app, look, width));
+        if let Some(version) = &app.update_available {
+            let notice = crate::update_notice::notice_line(version);
+            lines.push(Line::default());
+            lines.push(single(
+                look,
+                &format!(
+                    "{INDENT}{}",
+                    text::fit(&notice, width.saturating_sub(INDENT.len()))
+                ),
+                Tone::Accent,
+            ));
+        }
     }
     lines
 }

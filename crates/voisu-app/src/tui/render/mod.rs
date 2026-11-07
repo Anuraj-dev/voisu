@@ -422,6 +422,49 @@ mod tests {
         );
     }
 
+    fn with_update(version: &str) -> App {
+        let mut app = ready_app();
+        let _ = update(
+            &mut app,
+            Msg::Reply(Reply::UpdateAvailable(Some(version.to_owned()))),
+            at(0),
+        );
+        app
+    }
+
+    #[test]
+    fn home_names_a_newer_release_and_the_command_below_the_rows() {
+        let mut app = with_update("0.75.0");
+        let lines = screen(&mut app, &UNICODE, (80, 24));
+        assert_eq!(lines[12], "   Health     15 passed · 1 warning");
+        assert_eq!(lines[13], "");
+        assert_eq!(lines[14], "   Update available: 0.75.0, run `voisu update`");
+
+        let mut app = ready_app();
+        let lines = screen(&mut app, &UNICODE, (80, 24));
+        assert!(!joined(&lines).contains("Update"), "{}", joined(&lines));
+    }
+
+    #[test]
+    fn the_update_line_fits_the_minimum_size_and_yields_to_the_checks_list() {
+        for look in [UNICODE, NO_COLOR, ASCII] {
+            let mut app = with_update("10.100.1000");
+            let lines = screen(&mut app, &look, (60, 16));
+            assert!(
+                joined(&lines).contains("Update available: 10.100.1000"),
+                "{}",
+                joined(&lines)
+            );
+            for line in &lines {
+                assert!(text::width(line) <= 60, "{line}");
+            }
+        }
+        let mut app = with_update("0.75.0");
+        let _ = press(&mut app, KeyCode::Char('d'), 0);
+        let lines = screen(&mut app, &UNICODE, (80, 24));
+        assert!(!joined(&lines).contains("Update available"));
+    }
+
     #[test]
     fn the_last_row_quotes_and_truncates_the_newest_transcript() {
         let mut app = ready_app();
