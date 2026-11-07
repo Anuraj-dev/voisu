@@ -124,7 +124,7 @@ export function onRecordingState({ state, message }) {
     ui.phase = 'error';
     ui.phaseMessage = message ?? 'Dictation failed.';
   } else {
-    // idle or done
+    // idle, done or copied
     ui.phase = 'idle';
     refreshTranscript();
   }

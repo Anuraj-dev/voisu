@@ -33,8 +33,10 @@ cleanup() {
   rm -rf "$WORK"
 }
 trap cleanup EXIT
-# Ctrl+C: stop with the usual status; the EXIT trap still cleans up.
-trap 'exit 130' INT TERM
+# Stop with the usual signal status (130 for Ctrl+C, 143 for TERM); the EXIT
+# trap still cleans up.
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # 1. Find Voisu.app inside the download.
 case "$SRC" in

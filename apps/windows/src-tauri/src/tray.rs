@@ -89,7 +89,7 @@ impl TrayHandles {
             tracing::warn!(%error, "tray tooltip update failed");
         }
         if let Some(icon) = tray_image(self.icon.app_handle()) {
-            let dotted = with_dot(icon.rgba(), icon.width(), icon.height());
+            let dotted = with_dot(icon.rgba(), icon.width(), icon.height(), TEMPLATE);
             let image = Image::new_owned(dotted, icon.width(), icon.height());
             if let Err(error) = self.icon.set_icon(Some(image)) {
                 tracing::warn!(%error, "tray icon update failed");
@@ -107,8 +107,10 @@ const DOT: [u8; 3] = [0xf0, 0xb4, 0x29];
 /// Dark ring that keeps the dot visible on light and dark taskbars.
 const RING: [u8; 3] = [0x0d, 0x0f, 0x12];
 
-/// Paints an update dot into the top-right corner of an RGBA icon.
-fn with_dot(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
+/// Paints an update dot into the top-right corner of an RGBA icon. On a
+/// `template` (macOS) icon only alpha counts, so the dot is solid and the
+/// ring is a transparent gap that parts it from the bars.
+fn with_dot(rgba: &[u8], width: u32, height: u32, template: bool) -> Vec<u8> {
     let mut out = rgba.to_vec();
     let size = width.min(height) as f32;
     let radius = size * 0.2;
@@ -128,6 +130,11 @@ fn with_dot(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
             // Straight-alpha "over": a soft edge over a transparent pixel
             // keeps the dot's colour instead of fading towards black.
             let below = out[i + 3] as f32 / 255.0 * (1.0 - in_outer);
+            if template {
+                out[i..i + 3].fill(0);
+                out[i + 3] = ((in_dot + below) * 255.0).round() as u8;
+                continue;
+            }
             let alpha = in_outer + below;
             for c in 0..3 {
                 let colour = RING[c] as f32 * (1.0 - in_dot) + DOT[c] as f32 * in_dot;
@@ -324,7 +331,7 @@ mod tests {
     fn the_dot_sits_top_right_and_leaves_the_rest_alone() {
         let (w, h) = (32u32, 32u32);
         let clear = vec![0u8; (w * h * 4) as usize];
-        let dotted = with_dot(&clear, w, h);
+        let dotted = with_dot(&clear, w, h, false);
         assert_eq!(dotted.len(), clear.len());
         let pixel = |x: u32, y: u32| {
             let i = ((y * w + x) * 4) as usize;
@@ -343,5 +350,23 @@ mod tests {
                 assert!(px[c] >= RING[c].min(DOT[c]), "edge darkened: {px:?}");
             }
         }
+    }
+
+    #[test]
+    fn the_mac_dot_is_solid_with_a_transparent_gap_around_it() {
+        let (w, h) = (32u32, 32u32);
+        let filled = [0, 0, 0, 255].repeat((w * h) as usize);
+        let dotted = with_dot(&filled, w, h, true);
+        let alpha = |x: u32, y: u32| dotted[((y * w + x) * 4 + 3) as usize];
+        let radius = 32.0 * 0.2;
+        let outer = radius + 32.0 * 0.06;
+        let (cx, cy) = (32.0 - outer, outer);
+        // The dot's centre stays opaque; the ring between dot and bars is cut.
+        assert_eq!(alpha(cx as u32, cy as u32), 255);
+        let gap = (radius + outer) / 2.0;
+        assert_eq!(alpha((cx - gap) as u32, cy as u32), 0);
+        // The rest of the icon is untouched, and everything stays black.
+        assert_eq!(alpha(0, h - 1), 255);
+        assert!(dotted.chunks(4).all(|px| px[..3] == [0, 0, 0]));
     }
 }

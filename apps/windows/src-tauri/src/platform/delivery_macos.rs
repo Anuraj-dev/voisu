@@ -6,7 +6,8 @@
 //! 2. Without Accessibility macOS drops posted keystrokes, so the Transcript
 //!    is only copied and the outcome is `Copied`.
 //! 3. Bring the target back to the front if something else took it. If
-//!    macOS refuses or it takes too long, the Transcript is only copied.
+//!    macOS refuses (macOS 14 and later may, when a third app is in front)
+//!    or it takes too long, the Transcript is only copied.
 //! 4. Snapshot the pasteboard: every item's types and bytes, in pasteboard
 //!    order. It is not restored at all if it holds a type
 //!    [`mac_never_restore`] names or more than `SNAPSHOT_BUDGET`.
@@ -37,7 +38,7 @@ use objc2_core_graphics::{
 use objc2_foundation::{NSArray, NSData, NSString};
 
 use super::{
-    CHORD_HOLD, DeliveryError, DeliveryOutcome, Integrity, Probe, SNAPSHOT_BUDGET,
+    CHORD_HOLD, CopiedBecause, DeliveryError, DeliveryOutcome, Integrity, Probe, SNAPSHOT_BUDGET,
     mac_never_restore, mac_restore_due, may_restore, preflight,
 };
 use crate::chord::MASK_TAG;
@@ -109,12 +110,12 @@ fn deliver_serial(
     let pasteboard = NSPasteboard::generalPasteboard();
     if !permissions::accessibility_trusted() {
         write(&pasteboard, text)?;
-        return Ok(DeliveryOutcome::Copied);
+        return Ok(DeliveryOutcome::Copied(CopiedBecause::NoAccessibility));
     }
     if !bring_to_front(&app) {
         tracing::info!("target app did not come to the front; copying only");
         write(&pasteboard, text)?;
-        return Ok(DeliveryOutcome::Copied);
+        return Ok(DeliveryOutcome::Copied(CopiedBecause::NotFrontmost));
     }
     let saved = snapshot(&pasteboard);
     let ours = write(&pasteboard, text)?;
@@ -157,7 +158,11 @@ fn bring_to_front(app: &NSRunningApplication) -> bool {
     if foreground() == pid {
         return true;
     }
-    if !app.activateWithOptions(NSApplicationActivationOptions::empty()) {
+    // Deprecated in macOS 14, where it does nothing; macOS 13 needs it to
+    // take the front back from a third app.
+    #[allow(deprecated)]
+    let options = NSApplicationActivationOptions::ActivateIgnoringOtherApps;
+    if !app.activateWithOptions(options) {
         return false;
     }
     let deadline = Instant::now() + ACTIVATE_WAIT;

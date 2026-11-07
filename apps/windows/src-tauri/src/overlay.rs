@@ -37,6 +37,8 @@ const ERROR_DISPLAY: Duration = Duration::from_secs(3);
 /// The Delivered check mark, as brief as the Linux overlay's: the Transcript
 /// is already in the focused app, so the confirmation only needs to register.
 const DONE_DISPLAY: Duration = Duration::from_millis(600);
+/// The clipboard fallback: long enough to read that the user must paste.
+const COPIED_DISPLAY: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -47,6 +49,9 @@ pub enum RecordingState {
     Processing,
     /// The transcript was delivered: a brief check mark, then hidden.
     Done,
+    /// The transcript is only on the clipboard and the user must paste it:
+    /// amber text that says how.
+    Copied,
     Error,
 }
 
@@ -55,14 +60,15 @@ impl RecordingState {
     fn display_time(self) -> Option<Duration> {
         match self {
             Self::Done => Some(DONE_DISPLAY),
+            Self::Copied => Some(COPIED_DISPLAY),
             Self::Error => Some(ERROR_DISPLAY),
             Self::Idle | Self::Recording | Self::HandsFree | Self::Processing => None,
         }
     }
 }
 
-/// `recording-state` payload. `message` is set for `error`, and for `done`
-/// when the transcript was only copied (the overlay's accessible label).
+/// `recording-state` payload. `message` is set for `error` and `copied` (the
+/// visible text), and for `done` when auto-paste is off (the accessible label).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RecordingStatePayload {
     pub state: RecordingState,
@@ -790,6 +796,21 @@ mod tests {
             RecordingState::Done.display_time(),
             Some(Duration::from_millis(600))
         );
+    }
+
+    #[test]
+    fn copied_holds_two_seconds_through_a_following_idle() {
+        let mut presenter = Presenter::default();
+        presenter.on_state(RecordingState::Processing);
+        let (_, timer) = presenter.on_state(RecordingState::Copied);
+        assert_eq!(presenter.on_state(RecordingState::Idle).0, Step::Nothing);
+        assert_eq!(presenter.on_hide_timer(timer.unwrap()), Step::Hide);
+        assert_eq!(
+            RecordingState::Copied.display_time(),
+            Some(Duration::from_secs(2))
+        );
+        let copied = state_json(r#"{"state":"copied","message":"Copied · ⌘V"}"#).unwrap();
+        assert_eq!(copied.state, RecordingState::Copied);
     }
 
     #[test]

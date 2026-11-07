@@ -247,13 +247,18 @@ mod tests {
     #[test]
     fn a_custom_chord_saved_by_v0_68_or_v0_69_loads_as_the_default() {
         // The removed Custom… recorder could store any allowed chord.
-        for value in [
+        let mut values = vec![
             "Ctrl+Shift",
             "Right Alt",
             "F13",
             "Alt+Shift+F12",
             "Ctrl+Alt+R",
-        ] {
+        ];
+        // Ctrl+Alt is Ctrl+Option, the default preset, on a Mac.
+        if cfg!(not(target_os = "macos")) {
+            values.push("Ctrl+Alt");
+        }
+        for value in values {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("settings.json");
             let json = format!(

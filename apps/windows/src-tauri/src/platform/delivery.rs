@@ -49,8 +49,8 @@ pub const NO_READ_TIMEOUT: Duration = Duration::from_millis(1500);
 /// covers both, and the next delivery ends it early so its snapshot sees
 /// the user's clipboard, not this Transcript.
 pub const NOT_CONFIRMED_GRACE: Duration = Duration::from_secs(5);
-/// Accessible label for `done` when the Transcript was only copied: auto-paste
-/// off, or macOS could not paste.
+/// Accessible label for `done` when auto-paste is off and the Transcript was
+/// only copied, as the user asked.
 pub const COPIED: &str = "Transcript copied to the clipboard";
 /// Gap between chord phases. RDP drops a modifier pressed and released in the
 /// same instant and types a literal "v".
@@ -79,15 +79,23 @@ pub enum DeliveryOutcome {
     OwnWindow,
     /// The target could not be brought back to the foreground.
     FocusLost,
-    /// macOS: the Transcript was only put on the clipboard, because Voisu
-    /// may not post keystrokes (no Accessibility permission) or the target
-    /// app would not come back to the front. Shown like auto-paste off.
-    Copied,
+    /// macOS: the Transcript was only put on the clipboard, so the user
+    /// must paste it. Shown as the amber Copied state, not a check mark.
+    Copied(CopiedBecause),
+}
+
+/// Why macOS could only copy the Transcript.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopiedBecause {
+    /// Without Accessibility macOS drops posted keystrokes.
+    NoAccessibility,
+    /// The target app would not come back to the front.
+    NotFrontmost,
 }
 
 impl DeliveryOutcome {
     /// What to tell the user, if anything. `None` means the text landed;
-    /// `Copied` is told as the clipboard fallback, not as a failure.
+    /// `Copied` is the visible text of the clipboard fallback.
     pub fn notice(self) -> Option<&'static str> {
         match self {
             Self::Pasted | Self::NotConfirmed => None,
@@ -96,7 +104,8 @@ impl DeliveryOutcome {
             Self::TargetGone => Some("The window you were typing in closed"),
             Self::OwnWindow => Some("Click into another app first"),
             Self::FocusLost => Some("Couldn't return to your window"),
-            Self::Copied => Some(COPIED),
+            Self::Copied(CopiedBecause::NotFrontmost) => Some("Copied · ⌘V"),
+            Self::Copied(CopiedBecause::NoAccessibility) => Some("Copied · allow Accessibility"),
         }
     }
 }
@@ -541,22 +550,29 @@ pub fn notice(result: &Result<DeliveryOutcome, DeliveryError>) -> Option<String>
     }
 }
 
-/// Logs the result and shows anything short of a paste on the Overlay: the
-/// clipboard fallback as done, anything else as an error.
+/// Logs the result and returns the Overlay state for it: done when the text
+/// landed, copied when the user must paste it, error otherwise.
+pub fn overlay_state(
+    result: &Result<DeliveryOutcome, DeliveryError>,
+) -> (RecordingState, Option<String>) {
+    let message = notice(result);
+    let state = match (result, &message) {
+        (Ok(DeliveryOutcome::Copied(_)), _) => RecordingState::Copied,
+        (_, None) => RecordingState::Done,
+        (_, Some(_)) => RecordingState::Error,
+    };
+    (state, message)
+}
+
+/// Logs the result and shows anything short of a paste on the Overlay.
 pub fn report(app: &AppHandle, result: &Result<DeliveryOutcome, DeliveryError>) {
-    if let Some(message) = notice(result) {
-        let state = if matches!(result, Ok(DeliveryOutcome::Copied)) {
-            RecordingState::Done
-        } else {
-            RecordingState::Error
-        };
-        let payload = RecordingStatePayload {
-            state,
-            message: Some(message),
-        };
-        if let Err(error) = app.emit(RECORDING_STATE, payload) {
-            tracing::warn!(%error, "delivery notice not shown");
-        }
+    let (state, message) = overlay_state(result);
+    if state == RecordingState::Done {
+        return;
+    }
+    let payload = RecordingStatePayload { state, message };
+    if let Err(error) = app.emit(RECORDING_STATE, payload) {
+        tracing::warn!(%error, "delivery notice not shown");
     }
 }
 
@@ -1756,11 +1772,38 @@ mod tests {
             DeliveryOutcome::TargetGone,
             DeliveryOutcome::OwnWindow,
             DeliveryOutcome::FocusLost,
-            DeliveryOutcome::Copied,
+            DeliveryOutcome::Copied(CopiedBecause::NoAccessibility),
+            DeliveryOutcome::Copied(CopiedBecause::NotFrontmost),
         ] {
             assert!(outcome.notice().is_some(), "{outcome:?}");
         }
-        assert_eq!(DeliveryOutcome::Copied.notice(), Some(COPIED));
+    }
+
+    #[test]
+    fn a_mac_copy_shows_the_copied_state_with_how_to_paste() {
+        assert_eq!(
+            overlay_state(&Ok(DeliveryOutcome::Copied(CopiedBecause::NotFrontmost))),
+            (RecordingState::Copied, Some("Copied · ⌘V".to_owned()))
+        );
+        assert_eq!(
+            overlay_state(&Ok(DeliveryOutcome::Copied(CopiedBecause::NoAccessibility))),
+            (
+                RecordingState::Copied,
+                Some("Copied · allow Accessibility".to_owned())
+            )
+        );
+        assert_eq!(
+            overlay_state(&Ok(DeliveryOutcome::Pasted)),
+            (RecordingState::Done, None)
+        );
+        assert_eq!(
+            overlay_state(&Ok(DeliveryOutcome::FocusLost)).0,
+            RecordingState::Error
+        );
+        assert_eq!(
+            overlay_state(&Err(DeliveryError::Input)).0,
+            RecordingState::Error
+        );
     }
 
     #[test]

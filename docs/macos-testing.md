@@ -60,7 +60,9 @@ from Applications. macOS often doesn't apply those two until the app restarts.
 ## 4. How to use it
 
 - **Trigger Key: Control + Option.** Hold both keys down, speak, then let go.
-- When you let go, the text appears where your cursor was.
+- When you let go, the text appears where your cursor was, and a green ✓ flashes.
+- If Voisu can't type it for you, it puts the text on the clipboard and shows an amber
+  **Copied · ⌘V** for two seconds: press ⌘ V to paste it yourself.
 
 ## 5. What to test
 
@@ -74,9 +76,12 @@ Try each of these and note what happens:
 4. **Punctuation and names.** Say a question, a list, or a name. Is the punctuation and
    spelling right?
 5. **Quick presses.** Tap the keys briefly without speaking. Nothing odd should happen.
-6. **Restart.** Quit Voisu and open it again. Then restart the Mac. Does Voisu still
+6. **Switching apps.** Start dictating in TextEdit, then click another app before you
+   let go. Does the text still land in TextEdit, or do you see an amber **Copied · ⌘V**?
+   Note which, and your macOS version.
+7. **Restart.** Quit Voisu and open it again. Then restart the Mac. Does Voisu still
    work without asking for permissions again?
-7. **Update.** When Raja sends a newer build, install it with the script. Do your
+8. **Update.** When Raja sends a newer build, install it with the script. Do your
    permissions still work, or did macOS ask again?
 
 For anything that goes wrong, note **what you did**, **what you expected**, **what
@@ -108,9 +113,9 @@ Then send `voisu-logs.zip` to Raja on Discord along with your notes.
   again. Don't open the app straight from the `.dmg`.
 - **Holding Control + Option does nothing.** Check that Voisu is on under Input
   Monitoring and Accessibility, then quit and reopen Voisu.
-- **Text doesn't appear, but Voisu showed a check mark.** Without Accessibility, Voisu
-  only copies the text: press ⌘ V to paste it. Then turn Voisu on under
-  Accessibility, and quit and reopen Voisu.
+- **Voisu shows an amber "Copied · allow Accessibility".** Voisu can't type without
+  Accessibility, so it only copied the text: press ⌘ V to paste it. Then turn Voisu on
+  under Accessibility, and quit and reopen Voisu.
 - **Nothing gets heard.** Check Microphone. Also check System Settings → Sound →
   Input to make sure the right microphone is selected.
 - **To remove Voisu.** Quit it, then drag **Voisu** from Applications to the Trash. To
