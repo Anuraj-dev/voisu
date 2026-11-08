@@ -1262,6 +1262,7 @@ pub fn sanitize_source_transcripts(
 
 /// Whole-transcript phrases Whisper invents over silence. Matched only
 /// against the entire text, so "Send it now. Thank you." is never touched.
+/// Shared by the Cloud path here and the Local engine (`local_tail.rs`).
 const WHISPER_SILENCE_PHRASES: [&str; 8] = [
     "thank you",
     "thanks",
@@ -1273,13 +1274,18 @@ const WHISPER_SILENCE_PHRASES: [&str; 8] = [
     "bye bye",
 ];
 
-fn is_whisper_silence_phrase(text: &str) -> bool {
-    let words: Vec<String> = text
-        .split(|character: char| !(character.is_alphanumeric() || character == '\''))
+/// True when the WHOLE text is a Whisper silence phrase. Every
+/// non-alphanumeric character is a word break, so case, punctuation, quotes
+/// and "Bye-bye." do not matter.
+#[must_use]
+pub fn is_whisper_silence_phrase(text: &str) -> bool {
+    let normalized = text
+        .split(|character: char| !character.is_alphanumeric())
         .filter(|word| !word.is_empty())
         .map(str::to_lowercase)
-        .collect();
-    !words.is_empty() && WHISPER_SILENCE_PHRASES.contains(&words.join(" ").as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    WHISPER_SILENCE_PHRASES.contains(&normalized.as_str())
 }
 
 #[derive(Debug)]

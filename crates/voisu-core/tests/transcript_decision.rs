@@ -3444,6 +3444,8 @@ fn whisper_silence_phrases_clear_when_deepgram_heard_nothing() {
         "Bye.",
         "Bye-bye.",
         "  Thank you.  ",
+        "'Thank you.'",
+        "\"Thanks.\"",
     ] {
         let sanitized = sanitize_source_transcripts(deepgram_and_groq("", phrase));
         assert!(
