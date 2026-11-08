@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.74.1
+Version:        0.74.2
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -167,6 +167,9 @@ install -D -m 0644 packaging/icons/voisu.svg %{buildroot}%{_datadir}/icons/hicol
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Sun Nov 08 2026 Voisu maintainers <voisu@example.invalid> - 0.74.2-1
+- fix(core): stop Intent Reconstruction from dropping dictated speech (#312)
+
 * Sun Nov 08 2026 Voisu maintainers <voisu@example.invalid> - 0.74.1-1
 - fix(core): stop pasting "Thank you" on silent recordings (#311)
 
