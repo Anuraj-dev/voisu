@@ -1,27 +1,5 @@
 Package: voisu
 Architecture: amd64
-Version: 0.72.0-1
-Priority: optional
-Section: utils
-Maintainer: Anuraj Jit Saikia <rajasaikia1644@gmail.com>
-Installed-Size: 23152
-Depends: curl, gnome-shell (<< 51), gnome-shell (>= 50), libc6 (>= 2.39), libc6 (>= 2.43), libcairo2 (>= 1.10.0), libglib2.0-0t64 (>= 2.54.0), libgtk-4-1 (>= 4.0.0), libgtk4-layer-shell0 (>= 1.0.2), libsecret-tools, libxkbcommon0 (>= 0.5.0), pipewire-bin, wireplumber, wl-clipboard | xclip, xdg-desktop-portal
-Recommends: libei1
-Filename: pool/main/v/voisu/voisu_0.72.0-1_amd64.deb
-Size: 6001600
-MD5sum: e0665fd63bcb88da147ee10bf238a97a
-SHA1: 09ea08deadfb337e97e7097b5bb4ddef46a3e065
-SHA256: 707a8abcdc28c3aab0a1ebd1fb6dbf6dbbf82953b33036069d599f03b6544f9a
-SHA512: d38c6f56e3b10456ffb394c99ec85929693b7877de2bd2e0e971bc324397837847c5709be71804065a9cdcf79e060f4302b79e0b87b5028a4734970158305ede
-Description: Voice dictation for Linux desktops (Cloud or Local)
- Voisu turns a bounded Recording into a validated Transcript and performs
- Delivery into the focused application, with clipboard preservation as the
- fallback. The daemon and CLI stay usable without GTK; the optional Overlay adds
- a separate on-screen status surface that reflects daemon state. The Trigger Key
- and Delivery use desktop portals.
-
-Package: voisu
-Architecture: amd64
 Version: 0.73.0-1
 Priority: optional
 Section: utils
@@ -57,6 +35,28 @@ MD5sum: 39299b906d9b9f219563e0d977800213
 SHA1: 99c570a616acff88e604fc4a231afca702ce0fd1
 SHA256: aa4cc960c2866dff5eb2b829d701a6cd9976869c226b25ff578e3d37086affda
 SHA512: ca1fc8da97c3c1de8ab66be416ecd03841cbde70879b6bb5c0444ad4cdff83595b489a6c710d094c456fa2ea0482407c9aa9870ca5c0fc4bd52cac8581034819
+Description: Voice dictation for Linux desktops (Cloud or Local)
+ Voisu turns a bounded Recording into a validated Transcript and performs
+ Delivery into the focused application, with clipboard preservation as the
+ fallback. The daemon and CLI stay usable without GTK; the optional Overlay adds
+ a separate on-screen status surface that reflects daemon state. The Trigger Key
+ and Delivery use desktop portals.
+
+Package: voisu
+Architecture: amd64
+Version: 0.74.1-1
+Priority: optional
+Section: utils
+Maintainer: Anuraj Jit Saikia <rajasaikia1644@gmail.com>
+Installed-Size: 23181
+Depends: curl, gnome-shell (<< 51), gnome-shell (>= 50), libc6 (>= 2.39), libc6 (>= 2.43), libcairo2 (>= 1.10.0), libglib2.0-0t64 (>= 2.54.0), libgtk-4-1 (>= 4.0.0), libgtk4-layer-shell0 (>= 1.0.2), libsecret-tools, libxkbcommon0 (>= 0.5.0), pipewire-bin, wireplumber, wl-clipboard | xclip, xdg-desktop-portal
+Recommends: libei1
+Filename: pool/main/v/voisu/voisu_0.74.1-1_amd64.deb
+Size: 6072244
+MD5sum: 85c1c35a951cef9899c233c5e60e92ab
+SHA1: 59e624471b8125e93de1fa077fdeed922d1113db
+SHA256: 0edcbb5ffa79bdc52c5d43c11118b1572977ad24eedb1144baf71e5f1eaa524d
+SHA512: 5718206f5be972492bed7738769343ee08fe2c80cc1954985e388273e327500bbb39547307c8b01ef90799e46f22484ab6628aee9dfd3c705ecb8fab998482ff
 Description: Voice dictation for Linux desktops (Cloud or Local)
  Voisu turns a bounded Recording into a validated Transcript and performs
  Delivery into the focused application, with clipboard preservation as the
