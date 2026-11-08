@@ -3397,6 +3397,94 @@ fn sanitize_source_transcripts_clears_outro_only_providers() {
     assert!(sanitized.iter().all(|source| source.text.is_empty()));
 }
 
+fn deepgram_and_groq(deepgram: &str, groq: &str) -> Vec<SourceTranscript> {
+    vec![
+        SourceTranscript {
+            provider: Provider::Deepgram,
+            text: deepgram.to_owned(),
+        },
+        SourceTranscript {
+            provider: Provider::Groq,
+            text: groq.to_owned(),
+        },
+    ]
+}
+
+// Real Recordings rec-1782-7 and rec-1830-4: a silent tap where Deepgram
+// heard nothing and Groq Whisper invented "Thank you." It was pasted.
+#[tokio::test]
+async fn bare_thank_you_over_silence_refuses_without_model_and_without_delivery() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut pipeline = TranscriptDecisionPipeline::new(
+        CountingModel {
+            calls: Arc::clone(&calls),
+        },
+        Duration::from_millis(50),
+    );
+
+    let error = pipeline
+        .decide(deepgram_and_groq("", "Thank you."))
+        .await
+        .expect_err("Whisper's silence phrase must not Deliver");
+
+    assert_eq!(error.kind(), BoundaryKind::SilentRecording);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn whisper_silence_phrases_clear_when_deepgram_heard_nothing() {
+    for phrase in [
+        "Thank you.",
+        "thank you",
+        "Thanks!",
+        "Thank you very much.",
+        "Thank you so much.",
+        "Thanks for listening.",
+        "You",
+        "Bye.",
+        "Bye-bye.",
+        "  Thank you.  ",
+        "'Thank you.'",
+        "\"Thanks.\"",
+    ] {
+        let sanitized = sanitize_source_transcripts(deepgram_and_groq("", phrase));
+        assert!(
+            sanitized.iter().all(|source| source.text.is_empty()),
+            "{phrase:?} over Deepgram silence must clear: {sanitized:?}"
+        );
+    }
+}
+
+#[test]
+fn whisper_silence_phrases_stay_when_deepgram_also_heard_them() {
+    let sanitized = sanitize_source_transcripts(deepgram_and_groq("Thank you.", "Thank you."));
+    assert_eq!(sanitized[0].text, "Thank you.");
+    assert_eq!(sanitized[1].text, "Thank you.");
+}
+
+#[test]
+fn whisper_silence_phrases_stay_when_deepgram_gave_no_answer() {
+    // A failed or disabled Deepgram leaves no source at all: no evidence of
+    // silence, so a spoken "Thank you." must still Deliver.
+    let sanitized = sanitize_source_transcripts(vec![SourceTranscript {
+        provider: Provider::Groq,
+        text: "Thank you.".to_owned(),
+    }]);
+    assert_eq!(sanitized[0].text, "Thank you.");
+}
+
+#[test]
+fn speech_that_merely_contains_thank_you_stays_over_deepgram_silence() {
+    for text in [
+        "Thank you, see you tomorrow.",
+        "Send the report now. Thank you.",
+        "Thank you Raja",
+    ] {
+        let sanitized = sanitize_source_transcripts(deepgram_and_groq("", text));
+        assert_eq!(sanitized[1].text, text, "{text:?} is real speech");
+    }
+}
+
 #[test]
 fn sanitize_source_transcripts_clears_trivial_prefix_outros() {
     let sanitized = sanitize_source_transcripts(vec![

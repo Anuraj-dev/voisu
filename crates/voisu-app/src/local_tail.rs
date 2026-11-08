@@ -130,7 +130,7 @@ pub fn decide_transcript(
                     reason: "no words heard".to_owned(),
                 });
             }
-            if is_whole_silence_phrase(&sanitized) {
+            if voisu_core::is_whisper_silence_phrase(&sanitized) {
                 return Ok(TerminalDecision::NoText {
                     reason: "no words heard".to_owned(),
                 });
@@ -172,37 +172,6 @@ pub fn decide_replay(
         return Err(TailError::UnauthorizedDelivery);
     }
     Ok(decision)
-}
-
-/// Phrases local Whisper emits for near-silent audio. Matched only against the
-/// WHOLE transcript, so a real sign-off after speech ("... Thank you.") is kept.
-const WHISPER_SILENCE_PHRASES: [&str; 8] = [
-    "thank you",
-    "thanks",
-    "thank you very much",
-    "thank you so much",
-    "thanks for listening",
-    "you",
-    "bye",
-    "bye bye",
-];
-
-/// Lowercase, treat punctuation as a word break, collapse whitespace, then
-/// compare to the closed silence-phrase set.
-fn is_whole_silence_phrase(text: &str) -> bool {
-    let spaced: String = text
-        .chars()
-        .map(|character| {
-            if character.is_alphanumeric() {
-                character
-            } else {
-                ' '
-            }
-        })
-        .collect::<String>()
-        .to_lowercase();
-    let normalized = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
-    WHISPER_SILENCE_PHRASES.contains(&normalized.as_str())
 }
 
 /// User-vocabulary replacements via the Cloud span-aware matcher, ungated.
