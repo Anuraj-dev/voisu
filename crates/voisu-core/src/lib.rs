@@ -1230,17 +1230,56 @@ pub fn sanitize_source_transcript_text(text: &str) -> String {
 /// Clear pure-outro sources and strip only anchored final outros from each
 /// Source Transcript. Empty strings after sanitization mean the source carried
 /// no usable speech.
+///
+/// Also clears a source whose whole text is a Whisper silence phrase ("Thank
+/// you.") when Deepgram answered and heard nothing. Text alone cannot tell
+/// that phrase from real dictation; an empty Deepgram answer is the evidence
+/// of silence. A failed or disabled Deepgram leaves no source, so it never
+/// counts as silence.
 #[must_use]
 pub fn sanitize_source_transcripts(
     sources: impl IntoIterator<Item = SourceTranscript>,
 ) -> Vec<SourceTranscript> {
-    sources
+    let mut sanitized: Vec<SourceTranscript> = sources
         .into_iter()
         .map(|source| SourceTranscript {
             provider: source.provider,
             text: sanitize_source_transcript_text(&source.text),
         })
-        .collect()
+        .collect();
+    let deepgram_heard_nothing = sanitized
+        .iter()
+        .any(|source| source.provider == Provider::Deepgram && source.text.is_empty());
+    if deepgram_heard_nothing {
+        for source in &mut sanitized {
+            if is_whisper_silence_phrase(&source.text) {
+                source.text.clear();
+            }
+        }
+    }
+    sanitized
+}
+
+/// Whole-transcript phrases Whisper invents over silence. Matched only
+/// against the entire text, so "Send it now. Thank you." is never touched.
+const WHISPER_SILENCE_PHRASES: [&str; 8] = [
+    "thank you",
+    "thanks",
+    "thank you very much",
+    "thank you so much",
+    "thanks for listening",
+    "you",
+    "bye",
+    "bye bye",
+];
+
+fn is_whisper_silence_phrase(text: &str) -> bool {
+    let words: Vec<String> = text
+        .split(|character: char| !(character.is_alphanumeric() || character == '\''))
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    !words.is_empty() && WHISPER_SILENCE_PHRASES.contains(&words.join(" ").as_str())
 }
 
 #[derive(Debug)]
