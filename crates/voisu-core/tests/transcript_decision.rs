@@ -238,6 +238,285 @@ async fn intent_reconstruction_failures_keep_typed_evidence_and_safe_fallback() 
     }
 }
 
+#[tokio::test]
+async fn a_reconstruction_that_drops_most_of_the_fallback_is_rejected() {
+    // Recording 20 shape: a truncated provider and a model that followed it,
+    // discarding the fuller transcript. The second source is ~60% as long, so
+    // it is not a skippable fragment and the length guard is what catches it.
+    let full = "Okay. My is, can we make it more seamless? Like, currently, the and all kinds of things, like, I have to type. Can we make it seamless or we are over editing it? Because current one is, like, enough for most of the people. That are out there.";
+    let sources = vec![
+        SourceTranscript {
+            provider: Provider::Deepgram,
+            text: full.to_owned(),
+        },
+        SourceTranscript {
+            provider: Provider::Groq,
+            text: "Okay. My is, can we make it more seamless? Like, currently, the and all kinds of things, like, I have to type. Can we make it seamless or".to_owned(),
+        },
+    ];
+    let mut pipeline = TranscriptDecisionPipeline::with_intent_reconstruction(
+        IntentModel {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            result: "Can we make it more seamless?".to_owned(),
+            fail: false,
+        },
+        Duration::from_secs(5),
+        Vec::new(),
+    );
+    let PreparedTranscriptDecision::Reconstruct(attempt) = pipeline.prepare(sources).await.unwrap()
+    else {
+        panic!("material disagreement must reconstruct");
+    };
+    let decision = pipeline.reconstruct(attempt).await.unwrap();
+    assert_eq!(decision.selection, TranscriptSelection::SourceDeepgram);
+    assert!(decision.transcript.0.contains("over editing it"));
+    assert_eq!(
+        decision.intent_reconstruction.unwrap().outcome,
+        IntentReconstructionOutcome::Rejected
+    );
+    assert!(decision.validation_reason.contains("dropped too much"));
+}
+
+#[tokio::test]
+async fn a_fragment_source_skips_the_model_and_keeps_the_fuller_transcript() {
+    // Recording 20: Groq returned 7 words against Deepgram's 48.
+    let full = "Okay. My is, can we make it more seamless? Like, currently, the and all kinds of things, like, I have to type. Can we make it seamless or we are over editing it? Because current one is, like, enough for most of the people. That are out there.";
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut pipeline = TranscriptDecisionPipeline::with_intent_reconstruction(
+        IntentModel {
+            requests: Arc::clone(&requests),
+            result: "Can we make it more seamless?".to_owned(),
+            fail: false,
+        },
+        Duration::from_secs(5),
+        Vec::new(),
+    );
+    let sources = vec![
+        SourceTranscript {
+            provider: Provider::Deepgram,
+            text: full.to_owned(),
+        },
+        SourceTranscript {
+            provider: Provider::Groq,
+            text: "Q. Can we make it more seamless?".to_owned(),
+        },
+    ];
+    let PreparedTranscriptDecision::Ready(decision) = pipeline.prepare(sources).await.unwrap()
+    else {
+        panic!("a fragment pair must not reach the model");
+    };
+    assert_eq!(decision.selection, TranscriptSelection::SourceDeepgram);
+    assert!(decision.transcript.0.contains("over editing it"));
+    let evidence = decision.intent_reconstruction.unwrap();
+    assert_eq!(evidence.outcome, IntentReconstructionOutcome::Skipped);
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+async fn assert_pair_reaches_model(deepgram: &str, groq: &str) {
+    let mut pipeline = TranscriptDecisionPipeline::with_intent_reconstruction(
+        IntentModel {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            result: "unused".to_owned(),
+            fail: false,
+        },
+        Duration::from_secs(5),
+        Vec::new(),
+    );
+    let sources = vec![
+        SourceTranscript {
+            provider: Provider::Deepgram,
+            text: deepgram.to_owned(),
+        },
+        SourceTranscript {
+            provider: Provider::Groq,
+            text: groq.to_owned(),
+        },
+    ];
+    assert!(matches!(
+        pipeline.prepare(sources).await.unwrap(),
+        PreparedTranscriptDecision::Reconstruct(_)
+    ));
+}
+
+#[tokio::test]
+async fn a_short_or_different_speech_pair_still_reaches_the_model() {
+    // Under 10 words the length ratio is noise.
+    assert_pair_reaches_model("Okay, ship the cache fix now.", "Ok").await;
+    // The short source covers different speech (the tail), so it is not a
+    // fragment of the fuller one and the model must merge them.
+    assert_pair_reaches_model(
+        "Schedule the cache migration before Friday and tell the platform team about the rollout plan so nobody is surprised.",
+        "Cancel meeting Thursday.",
+    )
+    .await;
+    // Ratio above the fragment floor: the model merges.
+    assert_pair_reaches_model(
+        "Hey I want you to read the new update it lets us run a similar feature like an app that is available right now in the editor I want you to see it okay I forgot the name of this",
+        "hey I want you to read the new update it lets us run a similar feature like an app that is available right now in the editor I want you to see it okay I forgot the name of this but it lets us do remote control sorry about that and also check the second part",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_reconstruction_that_invents_text_is_rejected() {
+    let mut pipeline = TranscriptDecisionPipeline::with_intent_reconstruction(
+        IntentModel {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            result: "Schedule the cache migration before Friday and also notify every customer about the outage tomorrow morning at nine, then page the on-call engineer, update the status page, and write a full incident report for the leadership team by the end of the week.".to_owned(),
+            fail: false,
+        },
+        Duration::from_secs(5),
+        Vec::new(),
+    );
+    let PreparedTranscriptDecision::Reconstruct(attempt) =
+        pipeline.prepare(divergent_sources()).await.unwrap()
+    else {
+        panic!("material disagreement must reconstruct");
+    };
+    let decision = pipeline.reconstruct(attempt).await.unwrap();
+    assert_ne!(decision.selection, TranscriptSelection::IntentReconstructed);
+    assert_eq!(
+        decision.intent_reconstruction.unwrap().outcome,
+        IntentReconstructionOutcome::Rejected
+    );
+    assert!(decision.validation_reason.contains("added text"));
+}
+
+#[tokio::test]
+async fn joining_spelled_out_letters_is_not_rejected_as_dropped_speech() {
+    let sources = vec![
+        SourceTranscript {
+            provider: Provider::Deepgram,
+            text: "deploy a n t i g r a v i t y today".to_owned(),
+        },
+        SourceTranscript {
+            provider: Provider::Groq,
+            text: "deploy anti gravity today".to_owned(),
+        },
+    ];
+    let mut pipeline = TranscriptDecisionPipeline::with_intent_reconstruction(
+        IntentModel {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            result: "Deploy Antigravity today.".to_owned(),
+            fail: false,
+        },
+        Duration::from_secs(5),
+        Vec::new(),
+    );
+    let PreparedTranscriptDecision::Reconstruct(attempt) = pipeline.prepare(sources).await.unwrap()
+    else {
+        panic!("material disagreement must reconstruct");
+    };
+    let decision = pipeline.reconstruct(attempt).await.unwrap();
+    assert_eq!(decision.selection, TranscriptSelection::IntentReconstructed);
+    assert_eq!(decision.transcript.0, "Deploy Antigravity today.");
+}
+
+#[tokio::test]
+async fn short_abbreviation_rewrites_are_not_treated_as_dropped_speech() {
+    let mut pipeline = TranscriptDecisionPipeline::with_intent_reconstruction(
+        IntentModel {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            result: "TTYL".to_owned(),
+            fail: false,
+        },
+        Duration::from_secs(5),
+        Vec::new(),
+    );
+    let sources = vec![
+        SourceTranscript {
+            provider: Provider::Deepgram,
+            text: "Doctor later.".to_owned(),
+        },
+        SourceTranscript {
+            provider: Provider::Groq,
+            text: "Talk to you later.".to_owned(),
+        },
+    ];
+    let PreparedTranscriptDecision::Reconstruct(attempt) = pipeline.prepare(sources).await.unwrap()
+    else {
+        panic!("material disagreement must reconstruct");
+    };
+    let decision = pipeline.reconstruct(attempt).await.unwrap();
+    assert_eq!(decision.selection, TranscriptSelection::IntentReconstructed);
+    assert_eq!(decision.transcript.0, "TTYL");
+}
+
+#[tokio::test]
+async fn common_shared_words_do_not_make_different_speech_a_fragment() {
+    // 11 of the tail's words are mostly common words the fuller source also
+    // contains, but not in order: "ship it ... Friday" is new speech.
+    assert_pair_reaches_model(
+        "I think we should move the release to next week because the build is still failing on the integration tests and we need more time to fix it so let us talk to the team",
+        "and then we can ship it to the team on Friday",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_fragment_skip_applies_the_user_vocabulary() {
+    let mut pipeline = TranscriptDecisionPipeline::with_intent_reconstruction(
+        IntentModel {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            result: "unused".to_owned(),
+            fail: false,
+        },
+        Duration::from_secs(5),
+        Vec::new(),
+    );
+    pipeline.set_user_vocabulary(vec!["Rust".to_owned()]);
+    let sources = vec![
+        SourceTranscript {
+            provider: Provider::Deepgram,
+            text: "Please deploy the rUst service today because the release is blocked and the team is waiting for it.".to_owned(),
+        },
+        SourceTranscript {
+            provider: Provider::Groq,
+            text: "Please deploy the".to_owned(),
+        },
+    ];
+    let PreparedTranscriptDecision::Ready(decision) = pipeline.prepare(sources).await.unwrap()
+    else {
+        panic!("a fragment pair must not reach the model");
+    };
+    assert_eq!(decision.selection, TranscriptSelection::SourceDeepgram);
+    assert!(decision.transcript.0.contains("Rust service"));
+    assert!(decision.fallback_reason.is_none());
+}
+
+#[tokio::test]
+async fn merging_two_partial_sources_is_not_rejected_as_invented_text() {
+    // Deepgram lost the first half, Groq the second: the merge holds both and
+    // is far longer than either, yet every word is real speech.
+    let first = "Please open the settings window and switch the trigger key to the new shortcut then close it";
+    let second = "after that restart the daemon and check the journal for any portal errors before you continue";
+    let mut pipeline = TranscriptDecisionPipeline::with_intent_reconstruction(
+        IntentModel {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            result: format!("{first}, {second}."),
+            fail: false,
+        },
+        Duration::from_secs(5),
+        Vec::new(),
+    );
+    let sources = vec![
+        SourceTranscript {
+            provider: Provider::Deepgram,
+            text: format!("{second}."),
+        },
+        SourceTranscript {
+            provider: Provider::Groq,
+            text: format!("{first}."),
+        },
+    ];
+    let PreparedTranscriptDecision::Reconstruct(attempt) = pipeline.prepare(sources).await.unwrap()
+    else {
+        panic!("disjoint sources must reconstruct");
+    };
+    let decision = pipeline.reconstruct(attempt).await.unwrap();
+    assert_eq!(decision.selection, TranscriptSelection::IntentReconstructed);
+}
+
 struct CountingModel {
     calls: Arc<AtomicUsize>,
 }
