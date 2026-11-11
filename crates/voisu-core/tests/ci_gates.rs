@@ -66,6 +66,8 @@ fn rust_toolchain_toml_pins_the_default_ci_channel() {
 }
 
 /// The `run: |` script of the step named `step` inside job `job`, dedented.
+// The release step is a bash script, so this check runs on Unix only.
+#[cfg(unix)]
 fn workflow_step_script(workflow: &str, job: &str, step: &str) -> String {
     let job_start = workflow
         .find(&format!("\n  {job}:\n"))
@@ -88,6 +90,7 @@ fn workflow_step_script(workflow: &str, job: &str, step: &str) -> String {
         .join("\n")
 }
 
+#[cfg(unix)]
 #[test]
 fn every_release_attaches_the_linux_version_file() {
     let workflow = fs::read_to_string(workspace_root().join(".github/workflows/release.yml"))
