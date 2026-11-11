@@ -31,3 +31,9 @@ http-body = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tungstenite = "0.24"
+
+# Developer benchmark helper (tools/local-asr/llm_bench.py). `test = true` runs
+# the example's own tests under `cargo test -p voisu-cloud`.
+[[example]]
+name = "dump_llm_request"
+test = true

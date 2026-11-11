@@ -120,7 +120,10 @@ impl MinimalGrammarAdapter {
     }
 }
 
-fn build_request(validated_transcript: &str, baseline: &FormattingBaseline) -> Value {
+/// The exact production request body. Public (hidden) only so the developer
+/// benchmark (`examples/dump_llm_request.rs`) emits it instead of keeping a copy.
+#[doc(hidden)]
+pub fn build_request(validated_transcript: &str, baseline: &FormattingBaseline) -> Value {
     let user_content = json!({
         "validated_transcript": validated_transcript,
         "base_version": baseline.base_version(),
@@ -180,7 +183,9 @@ fn candidate_schema() -> Value {
     })
 }
 
-fn extract_candidate(body: &[u8]) -> Result<Vec<u8>, MinimalGrammarError> {
+/// Provider-envelope validation shared with the developer benchmark.
+#[doc(hidden)]
+pub fn extract_candidate(body: &[u8]) -> Result<Vec<u8>, MinimalGrammarError> {
     if body.len() > MAX_GRAMMAR_RESPONSE_BYTES {
         return Err(MinimalGrammarError::InvalidProviderEnvelope);
     }

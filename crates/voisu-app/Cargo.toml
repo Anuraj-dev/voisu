@@ -130,3 +130,8 @@ tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tungstenite = "0.24"
 zbus = { version = "5.13.2", default-features = false, features = ["tokio"] }
+
+# Developer benchmark helper (tools/local-asr/llm_bench.py --task grammar).
+[[example]]
+name = "dump_llm_request"
+test = true
