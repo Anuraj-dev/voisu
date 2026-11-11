@@ -2,7 +2,7 @@ name: macOS app
 
 on:
   push:
-    branches: [main, feat/macos-port]
+    branches: [main]
     paths:
       - apps/windows/**
       - crates/voisu-core/**
@@ -17,6 +17,15 @@ on:
       - Cargo.toml
       - .github/workflows/macos-app.yml
   workflow_dispatch:
+  # release.yml calls this with the tag's version. A release build also
+  # refuses an app version that disagrees with the tag and signs the
+  # .app.tar.gz for the in-app updater.
+  workflow_call:
+    inputs:
+      version:
+        description: Release version (no leading v); empty for a plain CI build
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -38,6 +47,22 @@ jobs:
       BUNDLE_ID: app.voisu.desktop
     steps:
       - uses: actions/checkout@v4
+      - name: Refuse a release whose app version disagrees with the tag
+        if: inputs.version != ''
+        env:
+          VERSION: ${{ inputs.version }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            echo "::error::secret TAURI_SIGNING_PRIVATE_KEY is not set; the updater could not verify this build" >&2
+            exit 1
+          fi
+          app=$(grep -m1 -E '^version = ' src-tauri/Cargo.toml | cut -d'"' -f2)
+          if [ "$app" != "$VERSION" ]; then
+            echo "::error::apps/windows/src-tauri/Cargo.toml is $app but the tag is v$VERSION" >&2
+            exit 1
+          fi
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -174,12 +199,22 @@ jobs:
           COPYFILE_DISABLE=1 tar -C "$(dirname "$APP_PATH")" -czf out/Voisu-macOS-arm64.app.tar.gz Voisu.app
           ls -l out
 
+      # Writes out/Voisu-macOS-arm64.app.tar.gz.sig, the signature latest.json
+      # carries. The tarball holds Voisu.app at its root, as the updater expects.
+      - name: Sign the tarball for the updater
+        if: inputs.version != ''
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          npx --no-install tauri signer sign out/Voisu-macOS-arm64.app.tar.gz
+          test -s out/Voisu-macOS-arm64.app.tar.gz.sig
+
       - uses: actions/upload-artifact@v4
         with:
           name: Voisu-macOS-arm64
-          path: |
-            apps/windows/out/Voisu-macOS-arm64.dmg
-            apps/windows/out/Voisu-macOS-arm64.app.tar.gz
+          path: apps/windows/out/
           if-no-files-found: error
 
       - name: Delete temporary keychain

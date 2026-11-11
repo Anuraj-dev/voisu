@@ -105,8 +105,9 @@ async fn check(app: &AppHandle) -> bool {
             tracing::info!("up to date");
             return true;
         }
-        // Releases carry no macOS build yet, so a Mac finds no entry for
-        // itself: that is "no update", not a failure worth retrying.
+        // A release whose Mac build failed lists no darwin entry, so a Mac
+        // finds none for itself: that is "no update", not a failure worth
+        // retrying.
         Err(
             tauri_plugin_updater::Error::TargetNotFound(_)
             | tauri_plugin_updater::Error::TargetsNotFound(_),
