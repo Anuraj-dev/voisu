@@ -61,8 +61,8 @@
 
   let starError = $state('');
 
-  // Either answer hides the banner for good; the backend's state-changed
-  // event rereads it.
+  // Starring ends the banner for good; × hides it for 30 days the first time
+  // and for good the second. The backend's state-changed event rereads it.
   async function answerStar(command, args) {
     starError = '';
     try {
@@ -110,13 +110,13 @@
       {#if ui.app.showStar}
         <div class="update" role="status">
           <span class="update-text">
-            <span>Enjoying Voisu? A GitHub star helps other people find it.</span>
+            <strong>Enjoying Voisu?</strong>
             {#if starError}<span class="update-error" role="alert">{starError}</span>{/if}
           </span>
           <span class="star-actions">
             <button type="button" class="pill" onclick={() => answerStar('star_on_github')}>Star on GitHub</button>
-            <button type="button" class="link" onclick={() => answerStar('set_star_prompt', { enabled: false })}>
-              Don't ask again
+            <button type="button" class="close" aria-label="Close" title="Close" onclick={() => answerStar('close_star_banner')}>
+              <span aria-hidden="true">×</span>
             </button>
           </span>
         </div>
@@ -182,6 +182,19 @@
     display: flex;
     align-items: center;
     gap: 8px;
+  }
+  .close {
+    background: none;
+    border: 0;
+    padding: 0 4px;
+    margin-right: -10px;
+    font-size: 18px;
+    line-height: 1;
+    color: var(--text-2);
+    border-radius: 4px;
+  }
+  .close:hover {
+    color: var(--text);
   }
   .update-error {
     color: var(--failure);

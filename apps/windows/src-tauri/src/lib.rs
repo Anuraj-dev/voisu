@@ -129,7 +129,9 @@ struct UiState {
     update_version: Option<String>,
     /// The Star prompt switch in Settings.
     star_prompt: bool,
-    /// Whether the window shows the "Enjoying Voisu?" banner.
+    /// Whether the window shows the "Enjoying Voisu?" banner, judged on
+    /// today's local date so a closed banner returns after 30 days without
+    /// waiting for a dictation.
     show_star: bool,
     /// The dictation under way, if any; later changes arrive as
     /// `recording-state` events.
@@ -245,7 +247,7 @@ fn get_state(app: AppHandle) -> UiState {
             .star
             .lock()
             .unwrap()
-            .show(settings.star_prompt),
+            .show(local_today(), settings.star_prompt),
         phase: engine::current_phase(&app),
     }
 }
@@ -317,7 +319,12 @@ fn set_tone(app: AppHandle, tone: Tone) -> Tone {
     update_settings(&app, |settings| settings.tone = tone).tone
 }
 
-/// The Settings switch and the banner's "Don't ask again".
+fn local_today() -> chrono::NaiveDate {
+    chrono::Local::now().date_naive()
+}
+
+/// The Settings switch: off hides the banner and the notification, not the
+/// Settings card.
 #[tauri::command]
 fn set_star_prompt(app: AppHandle, enabled: bool) -> bool {
     tracing::info!(enabled, "star prompt");
@@ -328,8 +335,8 @@ fn set_star_prompt(app: AppHandle, enabled: bool) -> bool {
 
 const REPO_URL: &str = "https://github.com/Anuraj-dev/voisu";
 
-/// The banner's "Star on GitHub": opens the repository page and records the
-/// answer, so the prompt never returns. Nothing checks whether a star was
+/// "Star on GitHub" on the banner or the Settings card: opens the repository
+/// page and records the answer, so the banner never returns. Nothing checks whether a star was
 /// given. The answer is kept even if the browser does not open.
 #[tauri::command]
 fn star_on_github(app: AppHandle) -> Result<(), String> {
@@ -348,17 +355,33 @@ fn star_on_github(app: AppHandle) -> Result<(), String> {
         .map_err(|_| "Couldn't open the browser.".to_owned())
 }
 
+/// The banner's ×: hides it for 30 days the first time, for good the
+/// second.
+#[tauri::command]
+fn close_star_banner(app: AppHandle) {
+    {
+        let state = app.state::<AppState>();
+        let mut star = state.star.lock().unwrap();
+        star.close(local_today());
+        tracing::info!("star banner closed");
+        if let Err(error) = star.save(&paths::star_prompt_file()) {
+            tracing::warn!(%error, "star prompt save failed");
+        }
+    }
+    let _ = app.emit(STATE_CHANGED, ());
+}
+
 /// Called by the engine after a Transcript was delivered. Counts it toward
 /// the star prompt and, for the dictation that crosses the threshold, shows
 /// the banner and sends the one notification.
 pub(crate) fn dictation_delivered(app: &AppHandle) {
     let enabled = app.state::<AppState>().settings.lock().unwrap().star_prompt;
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let today = local_today();
     let notify = {
         let state = app.state::<AppState>();
         let mut star = state.star.lock().unwrap();
         let before = star.clone();
-        let notify = star.record(&today, enabled);
+        let notify = star.record(today, enabled);
         if *star != before
             && let Err(error) = star.save(&paths::star_prompt_file())
         {
@@ -632,6 +655,7 @@ pub fn run() {
             install_update,
             set_star_prompt,
             star_on_github,
+            close_star_banner,
             engine::last_transcript
         ])
         .setup(|app| {

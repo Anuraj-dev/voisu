@@ -18,9 +18,9 @@ name = "voisu_windows"
 tauri-build = { version = "2.7", features = [] }
 
 [dependencies]
-# The local calendar date for the star prompt's day count; already in the
-# tree through Tauri.
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Local calendar dates for the star prompt's day count and its 30-day
+# second chance; already in the tree through Tauri.
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 # WASAPI shared-mode capture on Windows (ALSA off Windows, for local checks).
 cpal = "0.18"
 dirs = "6"

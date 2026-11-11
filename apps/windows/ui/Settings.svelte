@@ -185,6 +185,13 @@
     }
   }
 
+  // Always offered, whatever the banner and the Star prompt switch say.
+  // Starring here also ends the banner for good.
+  function star() {
+    errors.support = '';
+    invoke('star_on_github').catch((e) => fail('support', typeof e === 'string' ? e : 'Could not open the browser.'));
+  }
+
   function open(command) {
     errors.about = '';
     command().catch((e) => fail('about', typeof e === 'string' ? e : 'Could not open it.'));
@@ -389,6 +396,17 @@
     {/each}
     {@render problem('keys')}
     <p class="hint">{keyStoreHint()}</p>
+  </div>
+</section>
+
+<section aria-labelledby="support-title">
+  <h2 id="support-title">Support Voisu</h2>
+  <div class="card">
+    <div class="row">
+      <span class="row-text">Voisu is free and built by one student. A star helps others find it.</span>
+      <button type="button" class="pill" onclick={star}>Star on GitHub</button>
+    </div>
+    {@render problem('support')}
   </div>
 </section>
 

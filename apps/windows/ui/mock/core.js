@@ -19,6 +19,7 @@ const SCREENS = [
   'hook-down',
   'update',
   'star',
+  'star-closed',
   'settings',
   'replace-key',
 ];
@@ -60,7 +61,9 @@ const state = {
     : null,
   updateVersion: screen === 'update' ? '0.74.0' : null,
   starPrompt: true,
-  showStar: screen === 'star',
+  // `star` shows the banner; `star-closed` is after its × (Settings still
+  // carries the Support card, as on every screen).
+  showStar: screen === 'star' || screen === 'star-closed',
   // Twelve seconds in, so the timer reads 0:12.
   phase: screen === 'recording' ? { state: 'recording', elapsedMs: 12_000 } : null,
 };
@@ -109,6 +112,11 @@ const COMMANDS = {
     emit('state-changed', null);
     return enabled;
   },
+  close_star_banner: () => {
+    console.info('mock: star banner closed');
+    state.showStar = false;
+    emit('state-changed', null);
+  },
   star_on_github: () => {
     console.info('mock: open https://github.com/Anuraj-dev/voisu');
     state.showStar = false;
@@ -156,6 +164,9 @@ async function drive() {
       emit('recording-state', { state: 'recording' });
       emit('recording-state', { state: 'processing' });
     }
+  } else if (screen === 'star-closed') {
+    (await until(() => $('button[aria-label="Close"]'))).click();
+    (await until(() => !$('button[aria-label="Close"]') && $('#tab-settings'))).click();
   } else if (screen === 'settings' || screen === 'replace-key') {
     (await until(() => $('#tab-settings'))).click();
     if (screen === 'replace-key') (await until(() => $('button[aria-label="Replace Groq key"]'))).click();
