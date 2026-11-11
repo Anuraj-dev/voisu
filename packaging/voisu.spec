@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.76.0
+Version:        0.77.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -167,6 +167,9 @@ install -D -m 0644 packaging/icons/voisu.svg %{buildroot}%{_datadir}/icons/hicol
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Wed Nov 11 2026 Voisu maintainers <voisu@example.invalid> - 0.77.0-1
+- feat(windows): ask for a GitHub star after steady use, with a permanent Settings card (#319)
+
 * Wed Nov 11 2026 Voisu maintainers <voisu@example.invalid> - 0.76.0-1
 - feat(update): check for updates once a day from the daemon and show it on Home (#318)
 - ci(release): skip tests and debuginfo in the Fedora install-smoke (#316)
