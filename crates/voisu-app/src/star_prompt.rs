@@ -229,20 +229,63 @@ pub fn star(
     opened
 }
 
-/// Opens `url` in the default browser through `xdg-open`.
+/// How long [`open_in_browser`] waits to learn whether the launcher failed.
+const OPEN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Opens `url` in the default browser through `xdg-open`. It waits only
+/// half a second: on some desktops `xdg-open` stays alive as long as the
+/// browser it started. `systemd-run --scope` moves the browser out of the
+/// caller's cgroup, so restarting the daemon does not close it; where that
+/// is unavailable or fails, `xdg-open` runs directly.
 pub fn open_in_browser(url: &str) -> Result<(), String> {
-    let status = std::process::Command::new("xdg-open")
+    let scoped = detached("systemd-run")
+        .args(["--user", "--scope", "--quiet", "--collect", "xdg-open", url])
+        .spawn();
+    if scoped.is_ok_and(launched) {
+        return Ok(());
+    }
+    let direct = detached("xdg-open")
         .arg(url)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+        .spawn()
         .map_err(|_| "xdg-open is unavailable".to_owned())?;
-    if status.success() {
+    if launched(direct) {
         Ok(())
     } else {
         Err("xdg-open could not open the browser".to_owned())
     }
+}
+
+/// A command with no terminal attached, in its own process group.
+fn detached(program: &str) -> std::process::Command {
+    use std::os::unix::process::CommandExt as _;
+    let mut command = std::process::Command::new(program);
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0);
+    command
+}
+
+/// Whether `child` succeeded or is still running after [`OPEN_GRACE`]. A
+/// child that is still running is waited for on its own thread, so it never
+/// becomes a zombie and never holds the caller.
+fn launched(mut child: std::process::Child) -> bool {
+    let deadline = std::time::Instant::now() + OPEN_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Err(_) => return false,
+            Ok(None) if std::time::Instant::now() >= deadline => break,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    }
+    let _ = std::thread::Builder::new()
+        .name("voisu-open-url".to_owned())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+    true
 }
 
 /// Today's local calendar date, `YYYY-MM-DD`.

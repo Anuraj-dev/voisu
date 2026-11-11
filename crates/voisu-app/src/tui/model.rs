@@ -115,7 +115,7 @@ pub struct SettingsSnapshot {
     pub update_check: bool,
     pub star_prompt: bool,
     /// The star prompt line shows on Home: threshold met, setting on, not
-    /// answered.
+    /// answered, and not hidden by a close.
     pub star_line: bool,
 }
 

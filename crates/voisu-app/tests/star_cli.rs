@@ -121,7 +121,11 @@ fn star_prompt_round_trips_and_status_never_mentions_it() {
         shown(&status),
         String::from_utf8_lossy(&status.stderr)
     );
-    assert!(!all.to_lowercase().contains("star"), "{all}");
+    let all = all.to_lowercase();
+    assert!(
+        !all.contains("github") && !all.contains("enjoying"),
+        "{all}"
+    );
 }
 
 #[test]

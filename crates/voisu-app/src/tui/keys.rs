@@ -31,7 +31,7 @@ pub enum Context {
         checks: bool,
         /// `r` restarts Voisu: nothing else is starting or restarting it.
         restart: bool,
-        /// The star prompt line shows: `s` stars, `x` dismisses it for good.
+        /// The star prompt line shows: `s` stars, `x` closes it.
         star: bool,
     },
     History {
