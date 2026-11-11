@@ -102,8 +102,12 @@ impl StarPrompt {
     }
 
     /// The banner's ×: the first close hides it until 30 days after
-    /// `today`, the second for good.
+    /// `today`, the second for good. A close while the banner is already
+    /// hidden (a double-click on ×) is not counted.
     pub fn close(&mut self, today: NaiveDate) {
+        if self.returns_on.is_some_and(|returns| today < returns) {
+            return;
+        }
         self.closes = (self.closes + 1).min(CLOSES_FOR_GOOD);
         if self.closes == 1 {
             self.returns_on = today.checked_add_days(SECOND_CHANCE_AFTER);
@@ -264,6 +268,16 @@ mod tests {
         assert!(StarPrompt::load(&path).show(day(33), ON));
         fs::write(&path, b"{not json").unwrap();
         assert_eq!(StarPrompt::load(&path), StarPrompt::default());
+    }
+
+    #[test]
+    fn a_double_click_on_close_still_leaves_the_second_chance() {
+        let mut prompt = StarPrompt::default();
+        prompt.close(day(3));
+        prompt.close(day(3));
+        assert_eq!(prompt.closes, 1);
+        prompt.close(day(33));
+        assert_eq!(prompt.closes, 2);
     }
 
     #[test]

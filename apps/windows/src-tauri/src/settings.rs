@@ -59,7 +59,7 @@ pub struct Settings {
     #[serde(deserialize_with = "lenient")]
     pub tone: Tone,
     /// Ask once for a GitHub star after steady use (see `star_prompt`).
-    /// "Don't ask again" turns it off.
+    /// Off stops the banner and the notification, never the Settings card.
     #[serde(deserialize_with = "lenient_on")]
     pub star_prompt: bool,
 }

@@ -337,9 +337,14 @@ const REPO_URL: &str = "https://github.com/Anuraj-dev/voisu";
 
 /// "Star on GitHub" on the banner or the Settings card: opens the repository
 /// page and records the answer, so the banner never returns. Nothing checks whether a star was
-/// given. The answer is kept even if the browser does not open.
+/// given. If the browser does not open, nothing is recorded.
 #[tauri::command]
 fn star_on_github(app: AppHandle) -> Result<(), String> {
+    // Open first: if the browser does not open, the banner stays so the
+    // error is seen and the user can try again.
+    app.opener()
+        .open_url(REPO_URL, None::<&str>)
+        .map_err(|_| "Couldn't open the browser.".to_owned())?;
     tracing::info!("star prompt answered");
     {
         let state = app.state::<AppState>();
@@ -350,9 +355,7 @@ fn star_on_github(app: AppHandle) -> Result<(), String> {
         }
     }
     let _ = app.emit(STATE_CHANGED, ());
-    app.opener()
-        .open_url(REPO_URL, None::<&str>)
-        .map_err(|_| "Couldn't open the browser.".to_owned())
+    Ok(())
 }
 
 /// The banner's ×: hides it for 30 days the first time, for good the
