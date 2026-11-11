@@ -5,6 +5,13 @@ set -euo pipefail
 # RPMs via rpmbuild -ba from a Cargo.lock-pinned, byte-reproducible vendored
 # source archive. Shares the version derivation, unified Release policy, and
 # vendor+verify logic with the COPR path via packaging/rpm-lib.sh.
+#
+# Opt-in fast path for the release install-smoke (packaging/ci/smoke-fedora.sh),
+# which only needs an installable RPM. Both default off; a dev build is unchanged.
+#   VOISU_RPM_SKIP_PRECHECK=1  skip the cargo test/build/check pre-checks below
+#                              (ci.yml already gates the tests on every PR).
+#   VOISU_RPM_FAST=1           rpmbuild --nocheck and no debuginfo/debugsource
+#                              subpackages. The spec's %check stays; COPR runs it.
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=packaging/rpm-lib.sh
@@ -41,10 +48,14 @@ else
 fi
 voisu_assert_release_ordering "$version"
 
-printf 'Testing exact Voisu commit: %s (Release %s)\n' "$commit" "$voisu_release"
-cargo test --locked --workspace
-cargo build --locked --release --workspace
-cargo check --locked -p voisu-app --features overlay
+if test "${VOISU_RPM_SKIP_PRECHECK:-0}" = 1; then
+    printf 'Packaging exact Voisu commit: %s (Release %s); pre-checks skipped\n' "$commit" "$voisu_release"
+else
+    printf 'Testing exact Voisu commit: %s (Release %s)\n' "$commit" "$voisu_release"
+    cargo test --locked --workspace
+    cargo build --locked --release --workspace
+    cargo check --locked -p voisu-app --features overlay
+fi
 
 topdir=$(mktemp -d "${TMPDIR:-/tmp}/voisu-rpmbuild.XXXXXX")
 cleanup() { rm -rf "$topdir"; }
@@ -73,7 +84,11 @@ voisu_vendor_and_verify "$src" "$version" "$commit_epoch" "$topdir/scratch" \
     cat "$src/packaging/voisu.spec"
 } > "$topdir/SPECS/voisu.spec"
 
-rpmbuild -ba --define "_topdir $topdir" "$topdir/SPECS/voisu.spec"
+rpmbuild_args=(-ba --define "_topdir $topdir")
+if test "${VOISU_RPM_FAST:-0}" = 1; then
+    rpmbuild_args+=(--nocheck --define 'debug_package %{nil}')
+fi
+rpmbuild "${rpmbuild_args[@]}" "$topdir/SPECS/voisu.spec"
 
 rm -rf "$output_dir"
 mkdir -p "$output_dir"

@@ -133,12 +133,15 @@ installs them directly from `$srcdir` with no versioned subdir.
   why the fedora leg does **not** run the full `packaging/fedora-smoke.sh`
   `voisu service install` flow (it calls `systemctl --user daemon-reload`, which
   needs a session); it reuses only that harness's session-free assertions.
-- **fedora is the long-pole job.** `build-rpm.sh` runs the workspace test suite, and
-  rpmbuild's `%check` runs it again — there is no built-in `%check` switch to pass
-  through, so the redundant run is accepted rather than engineered around. Run as a
-  non-root `builder` with `TMPDIR=/var/tmp RUST_TEST_THREADS=4` (the tests spawn
-  dbus-daemon/python/curl and a size-capped `/tmp` tmpfs would overflow). If this
-  ever dominates release time, add an opt-in skip to `build-rpm.sh` and set it here.
+- **fedora runs no tests.** The leg only proves the RPM builds and installs. It sets
+  `VOISU_RPM_SKIP_PRECHECK=1` (skip `build-rpm.sh`'s `cargo test`/`build`/`check`
+  pre-checks) and `VOISU_RPM_FAST=1` (`rpmbuild --nocheck`, no debuginfo/debugsource
+  subpackages); `ci.yml` gates the tests on every PR and COPR still runs the spec's
+  `%check`. That should cut the job from about 30 to about 10 minutes (v0.75.0 spent ~8 min
+  in pre-checks, ~8 min in `%check`, ~3 min in debuginfo). The installed main +
+  Overlay package is unchanged. Both switches default off, so a dev `build-rpm.sh`
+  still tests. The build runs as a non-root `builder` with `TMPDIR=/var/tmp` (a
+  size-capped `/tmp` tmpfs would overflow).
 - **arch runs no tests.** The source PKGBUILD has no `check()`: the workspace test
   suite is already gated on every push/PR by `ci.yml`, and running it again would
   only slow every user's AUR build and this release gate. This is the one leg that

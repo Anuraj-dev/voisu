@@ -8,12 +8,13 @@ set -euo pipefail
 # shipped user units verify. Publishing is gated on this job, so it exercises
 # the real Fedora package path end-to-end before the COPR channel rebuilds.
 #
-# NON-ROOT + %check: build-rpm.sh runs the workspace test suite (and rpmbuild's
-# %check runs it again), so the build runs as a non-root `builder` user with
-# TMPDIR=/var/tmp RUST_TEST_THREADS=4 (the tests spawn dbus-daemon/python/curl,
-# and a size-capped /tmp tmpfs would overflow). This makes Fedora the long-pole
-# smoke job. build-rpm.sh has no built-in %check switch, so the redundant test
-# run is accepted rather than engineered around; see packaging/RELEASING.md.
+# PACKAGE ONLY, NO TESTS: this job proves the RPM builds and installs, not the
+# test suite (ci.yml gates that on every PR, and COPR runs the spec's %check).
+# VOISU_RPM_SKIP_PRECHECK=1 skips build-rpm.sh's cargo test/build/check, and
+# VOISU_RPM_FAST=1 passes rpmbuild --nocheck and drops the debuginfo/debugsource
+# subpackages. What gets installed is the same main + Overlay package. The build
+# still runs as a non-root `builder` with TMPDIR=/var/tmp (a size-capped /tmp
+# tmpfs would overflow); see packaging/RELEASING.md.
 #
 # DEGRADED IN A CONTAINER: there is no systemd user session, so the full
 # `voisu service install`/enable flow in packaging/fedora-smoke.sh cannot run
@@ -31,16 +32,17 @@ dnf -y install \
     dbus-daemon python3 curl \
     gtk4-devel gtk4-layer-shell-devel libxkbcommon-devel
 
-# makepkg-style hygiene: build the RPM (which runs tests) as a non-root user.
+# makepkg-style hygiene: build the RPM as a non-root user.
 useradd -m builder 2>/dev/null || true
 chown -R builder:builder "$repo_root"
 
-echo "== build the RPM via packaging/build-rpm.sh (non-root, tests run) =="
+echo "== build the RPM via packaging/build-rpm.sh (non-root, no tests, no debuginfo) =="
 su builder -c "
     set -euo pipefail
     cd '$repo_root'
     git config --global --add safe.directory '$repo_root'
-    export TMPDIR=/var/tmp RUST_TEST_THREADS=4 VOISU_RPM_OUTPUT_DIR='$repo_root/dist/rpm'
+    export TMPDIR=/var/tmp VOISU_RPM_OUTPUT_DIR='$repo_root/dist/rpm'
+    export VOISU_RPM_SKIP_PRECHECK=1 VOISU_RPM_FAST=1
     packaging/build-rpm.sh
 "
 
