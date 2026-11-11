@@ -553,7 +553,7 @@ pub(crate) fn set_switch_at(path: &Path, switch: Switch, on: bool) -> Result<Pat
 }
 
 /// The root-scope `key`: `"on"`/`"off"` in either quote style, or a bare
-/// `true`/`false`. `None` when missing or unrecognised.
+/// `true`/`false`, in any letter case. `None` when missing or unrecognised.
 fn parse_switch(contents: &str, key: &str) -> Option<bool> {
     for line in contents.lines() {
         let line = strip_comment(line).trim();
@@ -566,7 +566,11 @@ fn parse_switch(contents: &str, key: &str) -> Option<bool> {
         if name.trim() != key {
             continue;
         }
-        return match value.trim().trim_matches(|c| c == '"' || c == '\'') {
+        let value = value
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'')
+            .to_ascii_lowercase();
+        return match value.as_str() {
             "on" | "true" => Some(true),
             "off" | "false" => Some(false),
             _ => None,
@@ -2328,6 +2332,8 @@ other_key = 5
             ("update_check = \"off\"", Some(false)),
             ("update_check = 'on'", Some(true)),
             ("update_check = false # off", Some(false)),
+            ("update_check = \"Off\"", Some(false)),
+            ("update_check = False", Some(false)),
             ("update_check = \"maybe\"", None),
             ("[t]\nupdate_check = \"off\"", None),
         ] {

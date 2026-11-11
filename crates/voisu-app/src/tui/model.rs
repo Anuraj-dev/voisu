@@ -550,7 +550,7 @@ impl SettingsRow {
                 "The shortcut that starts and stops a Recording. You can't change it here."
             }
             SettingsRow::UpdateCheck => {
-                "Once a day, reads the newest version number from GitHub. Nothing about you is sent."
+                "Once a day, reads the newest version number from GitHub. No identifier or usage is sent."
             }
             SettingsRow::RunSetup => {
                 "Walks through your keys, Engine and Trigger Key again. Safe to re-run."

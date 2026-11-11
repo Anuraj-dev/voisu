@@ -195,14 +195,25 @@ pub fn spawn_daemon_check() {
         .name("voisu-update-check".to_owned())
         .spawn(move || {
             std::thread::sleep(DAEMON_FIRST_CHECK);
+            // Kept in memory as well, so a cache that cannot be written
+            // (full disk, read-only home) still means one fetch a day.
+            let mut fetched_at: Option<u64> = None;
             loop {
-                daemon_tick(
-                    cache_path().as_deref(),
-                    crate::config::switch(crate::config::Switch::UpdateCheck),
-                    unix_now(),
-                    idle,
-                    crate::update::latest_release_version,
-                );
+                let now = unix_now();
+                let fetched_today =
+                    fetched_at.is_some_and(|at| now >= at && now - at < CHECK_INTERVAL_SECS);
+                if !fetched_today {
+                    let tick = daemon_tick(
+                        cache_path().as_deref(),
+                        crate::config::switch(crate::config::Switch::UpdateCheck),
+                        now,
+                        idle,
+                        crate::update::latest_release_version,
+                    );
+                    if tick == Tick::Checked {
+                        fetched_at = Some(now);
+                    }
+                }
                 std::thread::sleep(DAEMON_TICK);
             }
         });

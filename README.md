@@ -169,7 +169,7 @@ A binary no package owns (for example a `cargo` build) is not updated.
 
 ### Update check
 
-Once a day Voisu downloads a small version file, `latest-linux.json`, from GitHub Releases, so it can show *Update available* on the interface's Home screen and in `voisu status`. Nothing about you is sent: no identifier, no settings, no usage. The request carries only Voisu's version in its user agent. GitHub publicly counts downloads of each release file, and that count is how Voisu estimates how many installs are active. `voisu status` never contacts the network; it reads the last answer.
+Once a day Voisu downloads a small version file, `latest-linux.json`, from GitHub Releases, so it can show *Update available* on the interface's Home screen and in `voisu status`. Voisu sends no identifier, no settings and no usage; the request carries only Voisu's version in its user agent. GitHub sees it like any other download, with your IP address and the time. GitHub publicly counts downloads of each release file, and that count is how Voisu estimates how many installs are active. `voisu status` never contacts the network; it reads the last answer.
 
 Turn it off with `voisu update-check off`, or *Settings → Update check* in the interface. Voisu then never checks by itself. `voisu update --check` still works when you ask.
 
