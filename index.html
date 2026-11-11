@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Voisu: voice dictation for Linux and Windows</title>
-<meta name="description" content="Voisu is voice dictation for Linux and Windows. Press your key, speak, and your words land in the app you're typing in. Install on Fedora, Arch or Debian/Ubuntu, or download the Windows installer.">
+<title>Voisu: voice dictation for Linux, Windows and macOS</title>
+<meta name="description" content="Voisu is voice dictation for Linux, Windows and macOS. Press your key, speak, and your words land in the app you're typing in. Install on Fedora, Arch or Debian/Ubuntu, or download the Windows or Mac app.">
 <link rel="canonical" href="https://anuraj-dev.github.io/voisu/">
 <meta name="color-scheme" content="light dark">
 <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#17191d">
@@ -14,7 +14,7 @@
 <link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="Voisu">
-<meta property="og:title" content="Voisu: voice dictation for Linux and Windows">
+<meta property="og:title" content="Voisu: voice dictation for Linux, Windows and macOS">
 <meta property="og:description" content="Press your key, speak, and your words land where you're typing.">
 <meta property="og:url" content="https://anuraj-dev.github.io/voisu/">
 <meta property="og:image" content="https://anuraj-dev.github.io/voisu/assets/og.png">
@@ -55,7 +55,7 @@
     <div class="wrap">
       <div>
         <h1 id="hero-title">Hold a key, speak <span class="land">Your words land where you're typing</span></h1>
-        <p class="lede">Voisu is voice dictation for Linux and Windows. It turns speech into clean text and puts it in the app you were already using: a reply, a doc, a terminal. On Windows you hold <kbd>Ctrl</kbd>&nbsp;<kbd>Win</kbd> while you talk. On Linux you press your Trigger Key to start and again to stop.</p>
+        <p class="lede">Voisu is voice dictation for Linux, Windows and macOS. It turns speech into clean text and puts it in the app you were already using: a reply, a doc, a terminal. On Windows you hold <kbd>Ctrl</kbd>&nbsp;<kbd>Win</kbd> while you talk, on a Mac <kbd>Control</kbd>&nbsp;<kbd>Option</kbd>. On Linux you press your Trigger Key to start and again to stop.</p>
         <div class="cta-row">
           <a class="btn primary" data-cta="windows" href="#install-windows">
             <svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M0 2.2 6.5 1.3v6.2H0zm7.3-1L16 0v7.5H7.3zM0 8.3h6.5v6.3L0 13.7zm7.3 0H16V16l-8.7-1.2z"/></svg>
@@ -184,7 +184,7 @@
     <div class="wrap install">
       <div class="section-head">
         <h2 id="install-title">Pick your system</h2>
-        <p>Every channel installs the same Voisu. After installing, <code>voisu setup</code> (Linux) or the settings window (Windows) asks for your API keys and you're ready.</p>
+        <p>Every channel installs the same Voisu. After installing, <code>voisu setup</code> (Linux) or the settings window (Windows and Mac) asks for your API keys and you're ready.</p>
       </div>
 
       <div class="tabs" data-tabs>
@@ -193,6 +193,7 @@
           <button type="button" role="tab" id="tab-arch" aria-controls="install-arch" data-os="arch" aria-selected="false" tabindex="-1"><span class="os">Arch</span><span class="via">AUR</span></button>
           <button type="button" role="tab" id="tab-debian" aria-controls="install-debian" data-os="debian" aria-selected="false" tabindex="-1"><span class="os">Debian / Ubuntu</span><span class="via">apt</span></button>
           <button type="button" role="tab" id="tab-windows" aria-controls="install-windows" data-os="windows" aria-selected="false" tabindex="-1"><span class="os">Windows</span><span class="via">Installer</span></button>
+          <button type="button" role="tab" id="tab-macos" aria-controls="install-macos" data-os="macos" aria-selected="false" tabindex="-1"><span class="os">macOS</span><span class="via">Apple Silicon</span></button>
         </div>
 
         <div class="tabpanel" role="tabpanel" id="install-fedora" aria-labelledby="tab-fedora" tabindex="0">
@@ -293,6 +294,33 @@
           </div>
           </div>
         </div>
+
+        <div class="tabpanel" role="tabpanel" id="install-macos" aria-labelledby="tab-macos" tabindex="0">
+          <h3 class="panel-title">macOS</h3>
+          <p class="meta">Apple Silicon (M1 or newer) · macOS 13 Ventura or newer · lives in the menu bar</p>
+          <div class="procedure">
+          <div class="step">
+          <p class="step-label"><span class="n">1</span>Install</p>
+          <div class="dl-card">
+            <a class="btn primary" href="https://github.com/Anuraj-dev/voisu/releases/latest/download/Voisu-macOS-arm64.dmg">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" d="M8 2v8.5M4.5 7 8 10.5 11.5 7M3 13.5h10"/></svg>
+              <span>Download for Mac <small>Voisu-macOS-arm64.dmg</small></span>
+            </a>
+          </div>
+          <p class="small">Drag Voisu into Applications and open it.</p>
+          </div>
+          <div class="step">
+          <p class="step-label"><span class="n">2</span>Let macOS open it</p>
+          <div class="callout">
+            <p>The app isn't notarized yet, so macOS blocks the first open. Choose <strong>Done</strong> (not <em>Move to Trash</em>), then go to <strong>System Settings → Privacy &amp; Security</strong> and choose <strong>Open Anyway</strong>. You do this once.</p>
+          </div>
+          </div>
+          <div class="step">
+          <p class="step-label"><span class="n">3</span>Finish setup</p>
+          <p class="small">Allow <strong>Microphone</strong>, <strong>Accessibility</strong> (so Voisu can paste) and <strong>Input Monitoring</strong> (for the Trigger Key), and paste your Groq and Deepgram API keys. Then hold <kbd>Control</kbd>&nbsp;<kbd>Option</kbd>, speak, and let go. <a href="docs/macos-setup.html">Full Mac guide</a>.</p>
+          </div>
+          </div>
+        </div>
       </div>
 
       <div class="agent-install">
@@ -336,7 +364,7 @@
     <div class="foot-grid">
       <div class="foot-brand">
         <a class="brand" href="./"><img class="mark" src="assets/logo.svg" alt="" width="32" height="32"><span>voisu</span></a>
-        <p>Voice dictation for Linux and Windows. MIT licensed. © 2026 Anuraj Jit Saikia.</p>
+        <p>Voice dictation for Linux, Windows and macOS. MIT licensed. © 2026 Anuraj Jit Saikia.</p>
       </div>
       <div>
         <h2>Docs</h2>

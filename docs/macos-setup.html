@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Set up Voisu on a Mac | Voisu docs</title>
+<meta name="description" content="Step by step: install Voisu on an Apple Silicon Mac, let macOS open it, allow its permissions, add two free API keys, and make your first Recording.">
+<link rel="canonical" href="https://anuraj-dev.github.io/voisu/docs/macos-setup.html">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#17191d">
+<meta name="theme-color" media="(prefers-color-scheme: light)" content="#e8eae5">
+<link rel="icon" type="image/png" sizes="32x32" href="../assets/favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="../assets/favicon-16.png">
+<link rel="apple-touch-icon" href="../assets/apple-touch-icon.png">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Voisu">
+<meta property="og:title" content="Set up Voisu on a Mac | Voisu docs">
+<meta property="og:description" content="Step by step: install Voisu on an Apple Silicon Mac, let macOS open it, allow its permissions, add two free API keys, and make your first Recording.">
+<meta property="og:url" content="https://anuraj-dev.github.io/voisu/docs/macos-setup.html">
+<meta property="og:image" content="https://anuraj-dev.github.io/voisu/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Voisu: Hold a key, speak. Your words land where you're typing.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,100..900&amp;family=Martian+Mono:wdth,wght@75..112.5,100..800&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<script>document.documentElement.classList.add("js")</script>
+<script src="../assets/site.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../" aria-label="Voisu home">
+      <img class="mark" src="../assets/logo.svg" alt="" width="32" height="32">
+      <span>voisu</span>
+    </a>
+    <nav aria-label="Main">
+      <ul class="site-nav">
+        <li><a href="../#install">Install</a></li>
+        <li><a href="./" aria-current="page">Docs</a></li>
+        <li><a class="gh" href="https://github.com/Anuraj-dev/voisu"><svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg><span>GitHub</span></a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap docs">
+  <nav class="docs-nav" aria-label="Docs">
+    <h2>Start here</h2>
+    <ul>
+        <li><a href="./">Overview</a></li>
+        <li><a href="getting-started.html">Getting started</a></li>
+        <li><a href="windows-setup.html">Set up on Windows</a></li>
+        <li><a href="macos-setup.html" aria-current="page">Set up on Mac</a></li>
+        <li><a href="agents.html">Install with an agent</a></li>
+    </ul>
+    <h2>Guides</h2>
+    <ul>
+        <li><a href="using.html">Dictating</a></li>
+        <li><a href="providers.html">Providers &amp; API keys</a></li>
+        <li><a href="updating.html">Updating &amp; uninstalling</a></li>
+    </ul>
+    <h2>Reference</h2>
+    <ul>
+        <li><a href="settings.html">Settings &amp; commands</a></li>
+        <li><a href="privacy.html">Privacy</a></li>
+    </ul>
+    <h2>Help</h2>
+    <ul>
+        <li><a href="troubleshooting.html">Troubleshooting</a></li>
+    </ul>
+  </nav>
+
+  <main id="main" class="doc">
+<h1>Set up Voisu on a Mac</h1>
+<p class="lead">About five minutes. You install Voisu, let macOS open it once, allow three permissions, paste two free API keys, and hold <kbd>Control</kbd>&nbsp;<kbd>Option</kbd> to dictate anywhere you type.</p>
+
+<div class="callout">
+  <p><strong>Apple Silicon only, macOS 13 Ventura or newer.</strong> To check, open the Apple menu and choose <strong>About This Mac</strong>. The <em>Chip</em> line should say Apple M1, M2, M3, M4 or newer. Intel Macs aren't supported.</p>
+</div>
+
+<nav class="toc" aria-label="On this page">
+  <a href="#install">1. Install</a>
+  <a href="#open">2. Open it the first time</a>
+  <a href="#permissions">3. Permissions</a>
+  <a href="#keys">4. API keys</a>
+  <a href="#dictate">5. Dictate</a>
+  <a href="#updates">Updates</a>
+  <a href="#help">If something's wrong</a>
+</nav>
+
+<h2 id="install">1. Install Voisu</h2>
+<ol class="steps">
+  <li>
+    <p><strong>Download the disk image.</strong></p>
+    <p><a class="btn primary" href="https://github.com/Anuraj-dev/voisu/releases/latest/download/Voisu-macOS-arm64.dmg"><svg viewBox="0 0 16 16" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" d="M8 2v8.5M4.5 7 8 10.5 11.5 7M3 13.5h10"/></svg><span>Download for Mac <small>Voisu-macOS-arm64.dmg</small></span></a></p>
+  </li>
+  <li><p><strong>Open it</strong> and drag <strong>Voisu</strong> onto the <strong>Applications</strong> folder.</p></li>
+  <li><p>Eject the disk image. From now on, open Voisu from Applications, not from the disk image.</p></li>
+</ol>
+
+<h2 id="open">2. Open it the first time</h2>
+<p>Voisu isn't from the App Store and isn't notarized by Apple yet, so macOS blocks it the first time. You let it through once.</p>
+<ol class="steps">
+  <li><p>Open <strong>Voisu</strong> from Applications. macOS says it can't check Voisu for malicious software.</p></li>
+  <li><p><strong>Choose Done.</strong> Don't choose <em>Move to Trash</em>; that deletes the app.</p></li>
+  <li><p>Open <strong>System Settings → Privacy &amp; Security</strong> and scroll down to <em>Security</em>. You'll see a line saying Voisu was blocked.</p></li>
+  <li><p>Choose <strong>Open Anyway</strong>, then <strong>Open Anyway</strong> again in the dialog, and enter your Mac password if asked.</p></li>
+</ol>
+<p>That's a one-time step. After it, Voisu opens normally, starts at login, and updates itself without asking again.</p>
+
+<h2 id="permissions">3. Allow the permissions</h2>
+<p>Voisu needs three permissions in <strong>System Settings → Privacy &amp; Security</strong>. Its window lists any that are still missing, each with an <strong>Open System Settings</strong> button that takes you to the right list. Turn <strong>Voisu</strong> on in each.</p>
+<div class="table-scroll">
+<table>
+  <thead><tr><th>Permission</th><th>Why Voisu needs it</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Microphone</strong></td><td>To hear you. macOS asks the first time you dictate; choose <strong>Allow</strong>.</td></tr>
+    <tr><td><strong>Accessibility</strong></td><td>To paste the text into the app you're typing in. macOS doesn't let apps paste for you without it. Without it, Voisu only copies the text and you press <kbd>⌘</kbd>&nbsp;<kbd>V</kbd> yourself.</td></tr>
+    <tr><td><strong>Input Monitoring</strong></td><td>To notice when you hold the Trigger Key. Voisu only listens for that key; it never reads or changes what you type.</td></tr>
+  </tbody>
+</table>
+</div>
+<p>If Voisu isn't in a list, click <strong>+</strong>, pick <strong>Voisu</strong> from Applications and turn it on.</p>
+<div class="callout tip">
+  <p><strong>Quit and reopen once.</strong> macOS often applies Accessibility and Input Monitoring only after the app restarts. Choose <strong>Quit Voisu</strong> from its menu bar icon, then open it again from Applications.</p>
+</div>
+
+<h2 id="keys">4. Add your API keys</h2>
+<p>The setup window asks for two keys, one from Groq and one from Deepgram. Both have free allowances that cover everyday dictation.</p>
+<ol class="steps">
+  <li><p><strong>Groq:</strong> on the <strong>1. Groq</strong> card choose <strong>Get a free API key</strong>, sign in, choose <strong>Create API Key</strong>, and copy the key (it starts with <code>gsk_</code> and is shown only once). Paste it into the Groq box.</p></li>
+  <li><p><strong>Deepgram:</strong> on the <strong>2. Deepgram</strong> card choose <strong>Get a free API key</strong>, sign in, open <em>API Keys</em>, choose <strong>Create a New API Key</strong>, and paste it into the Deepgram box.</p></li>
+  <li><p>Leave <strong>Start Voisu when I sign in</strong> on, then choose <strong>Save and start</strong>. Voisu checks each key and says <strong>You're set</strong> when both pass.</p></li>
+</ol>
+<p>The <a href="windows-setup.html#groq">Windows guide</a> walks through both consoles with pictures; the Mac window is the same.</p>
+<div class="callout tip">
+  <p><strong>Your keys stay on your Mac.</strong> They're stored in the macOS Keychain and sent only to the provider they belong to.</p>
+</div>
+
+<h2 id="dictate">5. Dictate</h2>
+<ol class="steps">
+  <li><p>Click into any text box: a chat, an email, a document.</p></li>
+  <li><p><strong>Hold <kbd>Control</kbd>&nbsp;<kbd>Option</kbd></strong> and speak. A capsule at the bottom of the screen shows your voice.</p></li>
+  <li><p><strong>Let go.</strong> Your words are pasted where you were typing and a green ✓ flashes.</p></li>
+</ol>
+<p>For long dictation, double-tap the Trigger Key for hands-free, then press it once more to finish. <kbd>Esc</kbd> cancels. If Voisu can't paste, it copies the text and shows an amber <strong>Copied · ⌘V</strong>: press <kbd>⌘</kbd>&nbsp;<kbd>V</kbd> to paste it yourself.</p>
+<p>Voisu lives in the menu bar, not the Dock. Its menu bar icon reopens the settings window, where you can change the Trigger Key, Informal tone, Boost words, Overlay size, Start at login and your API keys.</p>
+
+<h2 id="updates">Updates</h2>
+<p>When a new version is ready, a banner appears at the top of the window: <strong>Update available</strong>. Choose <strong>Restart to update</strong>; Voisu replaces itself and opens again. Your permissions carry over, so you won't be asked again.</p>
+
+<h2 id="help">If something's wrong</h2>
+<ul>
+  <li><strong>“Voisu can't be opened” or “is damaged”.</strong> Do <a href="#open">step 2</a> again: <strong>Done</strong>, then <strong>Open Anyway</strong> in Privacy &amp; Security. Open Voisu from Applications, not from the disk image.</li>
+  <li><strong>Holding <kbd>Control</kbd>&nbsp;<kbd>Option</kbd> does nothing.</strong> Check that Voisu is on under <strong>Input Monitoring</strong>, then quit and reopen Voisu.</li>
+  <li><strong>An amber “Copied · allow Accessibility”.</strong> Voisu can't paste without Accessibility, so it only copied the text. Turn Voisu on under <strong>Accessibility</strong>, then quit and reopen Voisu.</li>
+  <li><strong>Nothing gets heard.</strong> Check <strong>Microphone</strong> in Privacy &amp; Security, and that the right microphone is picked under System Settings → Sound → Input.</li>
+  <li><strong>To remove Voisu.</strong> Quit it from the menu bar, then drag Voisu from Applications to the Trash. To remove its settings and logs too, delete <code>~/Library/Application Support/Voisu</code>.</li>
+</ul>
+<p>Logs stay on your Mac, in <code>~/Library/Application Support/Voisu/logs</code>. <strong>Open logs folder</strong> in Settings takes you there if you want to attach them to a <a href="https://github.com/Anuraj-dev/voisu/issues">bug report</a>.</p>
+
+    <nav class="pager" aria-label="Docs pages">
+      <a class="prev" href="windows-setup.html"><small>Previous</small>Set up on Windows</a><a class="next" href="agents.html"><small>Next</small>Install with an agent</a>
+    </nav>
+  </main>
+</div>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="foot-grid">
+      <div class="foot-brand">
+        <a class="brand" href="../"><img class="mark" src="../assets/logo.svg" alt="" width="32" height="32"><span>voisu</span></a>
+        <p>Voice dictation for Linux, Windows and macOS. MIT licensed. © 2026 Anuraj Jit Saikia.</p>
+      </div>
+      <div>
+        <h2>Docs</h2>
+        <ul>
+          <li><a href="getting-started.html">Getting started</a></li>
+          <li><a href="agents.html">Install with an agent</a></li>
+          <li><a href="using.html">Dictating</a></li>
+          <li><a href="settings.html">Settings &amp; commands</a></li>
+          <li><a href="troubleshooting.html">Troubleshooting</a></li>
+          <li><a href="privacy.html">Privacy</a></li>
+        </ul>
+      </div>
+      <div>
+        <h2>Project</h2>
+        <ul>
+          <li><a href="https://github.com/Anuraj-dev/voisu">Source on GitHub</a></li>
+          <li><a href="https://github.com/Anuraj-dev/voisu/releases">Releases</a></li>
+          <li><a href="https://github.com/Anuraj-dev/voisu/issues">Report a problem</a></li>
+          <li><a href="https://github.com/Anuraj-dev/voisu/blob/main/LICENSE">MIT License</a></li>
+        </ul>
+      </div>
+    </div>
+    <p class="foot-key">apt signing key · 4149 EE38 68B3 6B60 0759 2966 D08B CFDC 3412 5B28</p>
+  </div>
+</footer>
+</body>
+</html>

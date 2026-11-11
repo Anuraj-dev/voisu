@@ -11,6 +11,7 @@
   var platform = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || "";
   var isWindows = /Win/i.test(platform) || /Windows/i.test(ua);
   var isLinux = !isWindows && /Linux|X11/i.test(platform + " " + ua) && !/Android/i.test(ua);
+  var isMac = !isWindows && /Mac/i.test(platform) && !/iPhone|iPad/i.test(ua);
   var distro = /Ubuntu|Debian/i.test(ua) ? "debian" : /Fedora/i.test(ua) ? "fedora" : /Arch/i.test(ua) ? "arch" : "";
 
   // ---- Tabs (WAI-ARIA tabs pattern, automatic activation) ----
@@ -58,7 +59,7 @@
       if (hash && t.getAttribute("aria-controls") === hash) want = i;
     });
     if (want < 0) {
-      var key = isWindows ? "windows" : distro;
+      var key = isWindows ? "windows" : isMac ? "macos" : distro;
       tabs.forEach(function (t, i) {
         if (key && t.dataset.os === key) want = i;
       });
