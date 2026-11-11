@@ -78,12 +78,16 @@
 
   // ---- Lead with the visitor's platform on the landing page ----
   var ctaWin = document.querySelector("[data-cta=windows]");
-  var ctaLinux = document.querySelector("[data-cta=linux]");
-  if (ctaWin && ctaLinux && isLinux) {
+  var lead = isLinux ? document.querySelector("[data-cta=linux]")
+    : isMac ? document.querySelector("[data-cta=mac]") : null;
+  if (ctaWin && lead) {
     ctaWin.classList.remove("primary");
-    ctaLinux.classList.add("primary");
-    ctaLinux.parentNode.insertBefore(ctaLinux, ctaWin);
+    lead.classList.add("primary");
+    lead.parentNode.insertBefore(lead, ctaWin);
   }
+  // The demo's keycaps show the Mac chord to Mac visitors.
+  var demoKeys = document.querySelector("[data-keys]");
+  if (demoKeys && isMac) demoKeys.innerHTML = "<kbd>Control</kbd><kbd>Option</kbd>";
 
   // ---- Copy buttons ----
   document.querySelectorAll(".code").forEach(function (block) {

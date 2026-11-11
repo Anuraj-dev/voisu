@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Updating &amp; uninstalling | Voisu docs</title>
-<meta name="description" content="Keep Voisu up to date on Windows and Linux, or remove it and its keys cleanly.">
+<meta name="description" content="Keep Voisu up to date on Windows, Mac and Linux, or remove it and its keys cleanly.">
 <link rel="canonical" href="https://anuraj-dev.github.io/voisu/docs/updating.html">
 <meta name="color-scheme" content="light dark">
 <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#17191d">
@@ -15,7 +15,7 @@
 <meta property="og:type" content="article">
 <meta property="og:site_name" content="Voisu">
 <meta property="og:title" content="Updating &amp; uninstalling | Voisu docs">
-<meta property="og:description" content="Keep Voisu up to date on Windows and Linux, or remove it and its keys cleanly.">
+<meta property="og:description" content="Keep Voisu up to date on Windows, Mac and Linux, or remove it and its keys cleanly.">
 <meta property="og:url" content="https://anuraj-dev.github.io/voisu/docs/updating.html">
 <meta property="og:image" content="https://anuraj-dev.github.io/voisu/assets/og.png">
 <meta property="og:image:width" content="1200">
@@ -77,7 +77,7 @@
 
   <main id="main" class="doc">
 <h1>Updating &amp; uninstalling</h1>
-<p class="lead">Windows updates itself. On Linux, Voisu updates with the rest of your system through the package manager you installed it from.</p>
+<p class="lead">Windows and Mac update themselves. On Linux, Voisu updates with the rest of your system through the package manager you installed it from.</p>
 
 <h2 id="windows">Updating on Windows</h2>
 <p>Voisu checks GitHub for a new release when it starts and every 6 hours after that. When it finds one, it downloads the installer in the background and checks its signature. Then the tray icon gets a dot and the menu shows <strong>Update to v…</strong>.</p>
@@ -86,6 +86,9 @@
   <li>Or carry on and choose <strong>Quit Voisu</strong> later. The update installs as Voisu quits.</li>
 </ul>
 <p>You can always download the latest installer yourself and run it over the top: <a href="https://github.com/Anuraj-dev/voisu/releases/latest/download/Voisu-Setup-x64.exe">Voisu-Setup-x64.exe</a>. Your keys and settings are kept.</p>
+
+<h2 id="mac">Updating on Mac</h2>
+<p>Voisu checks for a new release the same way. When one is ready, its window shows <strong>Update available</strong>; choose <strong>Restart to update</strong> and Voisu replaces itself and opens again. Your permissions carry over. You can also download the latest <a href="https://github.com/Anuraj-dev/voisu/releases/latest/download/Voisu-macOS-arm64.dmg">Voisu-macOS-arm64.dmg</a> and drag it over the old copy in Applications.</p>
 
 <h2 id="linux">Updating on Linux</h2>
 <h3 id="update-fedora">Fedora</h3>
@@ -106,6 +109,14 @@
   <li><p>Open <em>Settings → Apps → Installed apps</em>, find <strong>Voisu</strong>, and choose <strong>Uninstall</strong>.</p></li>
   <li><p>To remove your API keys too, open <em>Credential Manager</em> from the Start menu, choose <em>Windows Credentials</em>, and remove <code>groq-api-key.Voisu</code> and <code>deepgram-api-key.Voisu</code>.</p></li>
   <li><p>To remove settings and logs, delete <code>%APPDATA%\Voisu</code> and <code>%LOCALAPPDATA%\Voisu</code> if they're still there.</p></li>
+</ol>
+
+<h3 id="uninstall-mac">Mac</h3>
+<ol class="steps">
+  <li><p>Choose <strong>Quit Voisu</strong> from its menu bar icon.</p></li>
+  <li><p>Drag <strong>Voisu</strong> from Applications to the Trash.</p></li>
+  <li><p>To remove your API keys too, open <em>Keychain Access</em>, search for <code>Voisu</code>, and delete <code>groq-api-key</code> and <code>deepgram-api-key</code>.</p></li>
+  <li><p>To remove settings and logs, delete <code>~/Library/Application Support/Voisu</code>.</p></li>
 </ol>
 
 <h3 id="uninstall-linux">Linux</h3>

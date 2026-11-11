@@ -1,6 +1,6 @@
 # Install Voisu: guide for AI agents
 
-> Voisu is free, MIT-licensed voice dictation for Linux and Windows. The user presses a key, speaks, and the Transcript is pasted where they were typing. It uses the user's own Deepgram and Groq API keys. This file tells a terminal agent (Claude Code, Codex, Cursor or similar) how to install and set up Voisu for the user. The human version is https://anuraj-dev.github.io/voisu/docs/getting-started.html
+> Voisu is free, MIT-licensed voice dictation for Linux, Windows and macOS. The user presses a key, speaks, and the Transcript is pasted where they were typing. It uses the user's own Deepgram and Groq API keys. This file tells a terminal agent (Claude Code, Codex, Cursor or similar) how to install and set up Voisu for the user. The human version is https://anuraj-dev.github.io/voisu/docs/getting-started.html
 
 ## Objective
 
@@ -8,7 +8,7 @@ Install Voisu on the user's computer, start it, and hand over to the user at the
 
 ## Rules for the agent
 
-1. **Never ask for API keys in the chat.** Do not request, accept, read, print, log, or store the user's Deepgram or Groq keys. Do not pass them as command arguments, environment variables or files. The user types them into Voisu's own prompt: `voisu setup` in their own terminal on Linux, or the Voisu settings window on Windows. If the user pastes a key into the chat anyway, don't use it. Tell them to revoke it in the provider's console and create a new one.
+1. **Never ask for API keys in the chat.** Do not request, accept, read, print, log, or store the user's Deepgram or Groq keys. Do not pass them as command arguments, environment variables or files. The user types them into Voisu's own prompt: `voisu setup` in their own terminal on Linux, or the Voisu settings window on Windows and Mac. If the user pastes a key into the chat anyway, don't use it. Tell them to revoke it in the provider's console and create a new one.
 2. **Don't run `voisu setup` yourself.** It opens full-screen setup screens that need a real terminal for hidden key entry. Ask the user to run it in a terminal window of their own, not through you.
 3. **Show before you run.** Before each `sudo` command, show it and say why it's needed. If `sudo` can't prompt for a password in your shell, ask the user to run that exact command in their own terminal, then carry on.
 4. **Stop at every "HUMAN" step.** Tell the user exactly what to do, wait until they say it's done, then verify.
@@ -19,6 +19,7 @@ Install Voisu on the user's computer, start it, and hand over to the user at the
 
 - **Linux:** `voisu --version` prints a version. `systemctl --user is-active voisu.service` prints `active`. `voisu auth verify groq` and `voisu auth verify deepgram` each print `authentication verified`. The user has made one Recording and its Transcript appeared at their cursor.
 - **Windows:** Voisu is installed and in the tray. The user has saved both keys with **Validate & save**, and has made one Recording by holding Ctrl+Win.
+- **macOS:** Voisu is in `/Applications` and in the menu bar. The user has allowed Microphone, Accessibility and Input Monitoring, saved both keys, and made one Recording by holding Control+Option.
 
 ## Step 1: Detect the platform
 
@@ -42,7 +43,18 @@ On Windows, in PowerShell:
 $env:PROCESSOR_ARCHITECTURE
 ```
 
-Windows 10 or 11 on `AMD64` is supported: follow **Windows**. Other platforms (macOS, ARM Linux, other distributions) are not supported. Tell the user, and stop.
+Windows 10 or 11 on `AMD64` is supported: follow **Windows**.
+
+On macOS:
+
+```sh
+sw_vers -productVersion
+uname -m
+```
+
+macOS 13 or newer on `arm64` (Apple Silicon) is supported: follow **macOS**. Intel Macs are not.
+
+Other platforms (Intel Macs, ARM Linux, other distributions) are not supported. Tell the user, and stop.
 
 ## Fedora
 
@@ -153,13 +165,42 @@ Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' |
 
 **HUMAN: first Recording.** Ask the user to click into a text field, hold Ctrl+Win, speak, and release. The Transcript is pasted where the cursor was. If nothing lands, the tray's **Test paste (in 3 s)** item checks Delivery into one app.
 
+## macOS
+
+macOS 13 or newer on Apple Silicon. Installs to `/Applications`; no admin rights needed beyond the user's own login.
+
+```sh
+curl -fL -o /tmp/Voisu-macOS-arm64.dmg https://github.com/Anuraj-dev/voisu/releases/latest/download/Voisu-macOS-arm64.dmg
+hdiutil attach -nobrowse /tmp/Voisu-macOS-arm64.dmg
+cp -R /Volumes/Voisu/Voisu.app /Applications/
+hdiutil detach /Volumes/Voisu
+open /Applications/Voisu.app
+```
+
+If `hdiutil attach` mounts somewhere other than `/Volumes/Voisu`, use the mount point it prints. Do not remove the quarantine attribute or otherwise bypass Gatekeeper; the user approves the app themselves.
+
+**HUMAN: Open Anyway.** Voisu is self-signed and not notarized, so macOS blocks the first open. Tell the user to choose **Done** (never *Move to Trash*), open **System Settings → Privacy & Security**, choose **Open Anyway**, confirm, and enter their Mac password if asked.
+
+**HUMAN: permissions.** The user turns on Voisu under **Microphone**, **Accessibility** (needed to paste) and **Input Monitoring** (needed for the Trigger Key) in **Privacy & Security**, then quits Voisu from the menu bar and opens it again. Voisu's window lists any permission still missing.
+
+**HUMAN: add API keys.** The user pastes their Groq and Deepgram keys into Voisu's setup window, not into this chat, and chooses **Save and start**. They are stored in the macOS Keychain.
+
+Check that it's installed:
+
+```sh
+defaults read /Applications/Voisu.app/Contents/Info.plist CFBundleShortVersionString
+pgrep -fl /Applications/Voisu.app/Contents/MacOS/
+```
+
+**HUMAN: first Recording.** Ask the user to click into a text field, hold Control+Option, speak, and release. If the text is only copied (amber **Copied · ⌘V**), Accessibility is not yet allowed.
+
 ## After setup
 
 Tell the user:
 
-- **Gestures:** on Windows, hold Ctrl+Win to dictate and double-tap for hands-free. On Linux, press the Trigger Key to start and press it again to stop. Esc cancels on Windows.
-- **Keys:** they can be changed later with `voisu auth set groq` / `voisu auth set deepgram` on Linux (these read the key from standard input), or in the settings window on Windows.
-- **Updates:** Windows updates itself. On Linux, Voisu updates through the package manager.
+- **Gestures:** on Windows, hold Ctrl+Win to dictate and double-tap for hands-free. On a Mac, the same with Control+Option. On Linux, press the Trigger Key to start and press it again to stop. Esc cancels on Windows and Mac.
+- **Keys:** they can be changed later with `voisu auth set groq` / `voisu auth set deepgram` on Linux (these read the key from standard input), or in the settings window on Windows and Mac.
+- **Updates:** Windows and Mac update themselves. On Linux, Voisu updates through the package manager.
 - **Docs:** https://anuraj-dev.github.io/voisu/docs/
 
 ## Links

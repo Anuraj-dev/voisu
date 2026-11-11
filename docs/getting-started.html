@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Getting started | Voisu docs</title>
-<meta name="description" content="Install Voisu on Windows, Fedora, Arch or Debian/Ubuntu, add your API keys and make your first Recording.">
+<meta name="description" content="Install Voisu on Windows, macOS, Fedora, Arch or Debian/Ubuntu, add your API keys and make your first Recording.">
 <link rel="canonical" href="https://anuraj-dev.github.io/voisu/docs/getting-started.html">
 <meta name="color-scheme" content="light dark">
 <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#17191d">
@@ -15,7 +15,7 @@
 <meta property="og:type" content="article">
 <meta property="og:site_name" content="Voisu">
 <meta property="og:title" content="Getting started | Voisu docs">
-<meta property="og:description" content="Install Voisu on Windows, Fedora, Arch or Debian/Ubuntu, add your API keys and make your first Recording.">
+<meta property="og:description" content="Install Voisu on Windows, macOS, Fedora, Arch or Debian/Ubuntu, add your API keys and make your first Recording.">
 <meta property="og:url" content="https://anuraj-dev.github.io/voisu/docs/getting-started.html">
 <meta property="og:image" content="https://anuraj-dev.github.io/voisu/assets/og.png">
 <meta property="og:image:width" content="1200">
@@ -102,6 +102,7 @@
 <div class="tabs" data-tabs>
   <div class="tablist" role="tablist" aria-label="Choose your system">
     <button type="button" role="tab" id="tab-windows" aria-controls="windows" data-os="windows" aria-selected="true">Windows</button>
+    <button type="button" role="tab" id="tab-macos" aria-controls="macos" data-os="macos" aria-selected="false" tabindex="-1">macOS</button>
     <button type="button" role="tab" id="tab-fedora" aria-controls="fedora" data-os="fedora" aria-selected="false" tabindex="-1">Fedora</button>
     <button type="button" role="tab" id="tab-arch" aria-controls="arch" data-os="arch" aria-selected="false" tabindex="-1">Arch</button>
     <button type="button" role="tab" id="tab-debian" aria-controls="debian" data-os="debian" aria-selected="false" tabindex="-1">Debian / Ubuntu</button>
@@ -120,6 +121,21 @@
       <li><p><strong>Add your keys.</strong> Voisu opens its setup screen on first launch. Choose <strong>Get a free API key</strong> on each card, paste your Groq and Deepgram keys, and choose <strong>Save and start</strong>. Voisu checks each key with its provider before saving it. Both keys are required. The <a href="windows-setup.html">step-by-step Windows guide</a> walks through it with screenshots.</p></li>
     </ol>
     <p>Voisu now lives in the tray and turns on <strong>Start at login</strong> after your first successful setup. You can close the settings window; it reopens from the tray's <strong>Settings…</strong> item.</p>
+  </div>
+
+  <div class="tabpanel" role="tabpanel" id="macos" aria-labelledby="tab-macos" tabindex="0">
+    <h3 class="panel-title">macOS</h3>
+    <p class="meta">Apple Silicon (M1 or newer) · macOS 13 Ventura or newer · lives in the menu bar</p>
+    <ol class="steps">
+      <li>
+        <p><strong>Download the disk image</strong>, open it and drag Voisu onto Applications.</p>
+        <p><a class="btn primary" href="https://github.com/Anuraj-dev/voisu/releases/latest/download/Voisu-macOS-arm64.dmg"><svg viewBox="0 0 16 16" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" d="M8 2v8.5M4.5 7 8 10.5 11.5 7M3 13.5h10"/></svg><span>Download for Mac <small>Voisu-macOS-arm64.dmg</small></span></a></p>
+      </li>
+      <li><p><strong>Let macOS open it.</strong> Voisu isn't notarized yet, so the first open is blocked. Choose <strong>Done</strong> (not <em>Move to Trash</em>), then <strong>System Settings → Privacy &amp; Security → Open Anyway</strong>.</p></li>
+      <li><p><strong>Allow the permissions:</strong> <strong>Microphone</strong>, <strong>Accessibility</strong> (so Voisu can paste) and <strong>Input Monitoring</strong> (for the Trigger Key). Quit and reopen Voisu once after granting them.</p></li>
+      <li><p><strong>Add your keys.</strong> Paste your Groq and Deepgram keys into the setup window and choose <strong>Save and start</strong>. They're stored in the macOS Keychain.</p></li>
+    </ol>
+    <p>Then hold <kbd>Control</kbd>&nbsp;<kbd>Option</kbd>, speak and let go. The <a href="macos-setup.html">step-by-step Mac guide</a> covers each screen.</p>
   </div>
 
   <div class="tabpanel" role="tabpanel" id="fedora" aria-labelledby="tab-fedora" tabindex="0">
@@ -213,8 +229,8 @@
 <h2 id="first">Your first Recording</h2>
 <ol class="steps">
   <li><p>Click into a text field: an editor, a chat box, a browser address bar.</p></li>
-  <li><p><strong>Windows:</strong> hold <kbd>Ctrl</kbd>&nbsp;<kbd>Win</kbd> and speak. <strong>Linux:</strong> press your Trigger Key once and speak. The capsule appears and shows your voice.</p></li>
-  <li><p><strong>Windows:</strong> release the keys. <strong>Linux:</strong> press the Trigger Key again.</p></li>
+  <li><p><strong>Windows:</strong> hold <kbd>Ctrl</kbd>&nbsp;<kbd>Win</kbd> and speak. <strong>Mac:</strong> hold <kbd>Control</kbd>&nbsp;<kbd>Option</kbd> and speak. <strong>Linux:</strong> press your Trigger Key once and speak. The capsule appears and shows your voice.</p></li>
+  <li><p><strong>Windows and Mac:</strong> release the keys. <strong>Linux:</strong> press the Trigger Key again.</p></li>
   <li><p>The capsule switches to Processing, then the Transcript lands at your cursor.</p></li>
 </ol>
 <div class="callout tip">
