@@ -105,7 +105,10 @@ class Call:
 
     def request(self, method: str, url: str, headers: Mapping[str, str], body: bytes | None = None) -> bytes:
         for attempt in range(1, MAX_RETRIES + 2):
-            req = urllib.request.Request(url, data=body, method=method, headers=dict(headers))
+            # Groq's edge rejects the default Python-urllib agent with HTTP 403 (error 1010).
+            req = urllib.request.Request(
+                url, data=body, method=method, headers={"User-Agent": "voisu-cloud-bench/1", **headers}
+            )
             started = time.monotonic()
             status, payload, response_headers = self._send(req)
             elapsed = time.monotonic() - started
