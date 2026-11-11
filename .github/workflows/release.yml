@@ -279,14 +279,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.validate.outputs.version }}
         run: |
           set -euo pipefail
           cd dist/release
+          # The Linux daily update check downloads this file (never the GitHub
+          # API); its public download count is how active installs are
+          # estimated. This job needs only the Linux build, so the file is on
+          # every release even when the Windows or macOS builds fail.
+          printf '{"version":"%s"}\n' "$VERSION" > latest-linux.json
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --title "$TAG" \
             --generate-notes \
-            voisu_*_amd64.deb voisu-*-x86_64.tar.gz SHA256SUMS
+            voisu_*_amd64.deb voisu-*-x86_64.tar.gz SHA256SUMS latest-linux.json
 
   # --- publish: AUR voisu + voisu-bin ----------------------------------------
   # Runs AFTER the Release exists so voisu-bin's source asset URL resolves for

@@ -112,6 +112,7 @@ pub struct SettingsSnapshot {
     pub rendering: RenderingPolicy,
     pub tone: WritingTone,
     pub deepgram: bool,
+    pub update_check: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -192,6 +193,7 @@ pub enum Job {
     SetRendering(RenderingPolicy),
     SetTone(WritingTone),
     SetDeepgram(bool),
+    SetUpdateCheck(bool),
     SetEngine {
         mode: AsrMode,
         /// The daemon's own word that Local is Ready.
@@ -229,6 +231,7 @@ impl fmt::Debug for Job {
             Job::SetRendering(policy) => write!(f, "SetRendering({policy:?})"),
             Job::SetTone(tone) => write!(f, "SetTone({tone:?})"),
             Job::SetDeepgram(enabled) => write!(f, "SetDeepgram({enabled})"),
+            Job::SetUpdateCheck(on) => write!(f, "SetUpdateCheck({on})"),
             Job::SetEngine { mode, local_ready } => write!(f, "SetEngine({mode:?}, {local_ready})"),
             Job::AddTerm(term) => write!(f, "AddTerm({term:?})"),
             Job::RemoveTerm(term) => write!(f, "RemoveTerm({term:?})"),
@@ -468,11 +471,12 @@ pub enum SettingsRow {
     GroqKey,
     DeepgramKey,
     TriggerKey,
+    UpdateCheck,
     RunSetup,
 }
 
 impl SettingsRow {
-    pub const ALL: [SettingsRow; 10] = [
+    pub const ALL: [SettingsRow; 11] = [
         SettingsRow::Engine,
         SettingsRow::Delivery,
         SettingsRow::Writing,
@@ -482,6 +486,7 @@ impl SettingsRow {
         SettingsRow::GroqKey,
         SettingsRow::DeepgramKey,
         SettingsRow::TriggerKey,
+        SettingsRow::UpdateCheck,
         SettingsRow::RunSetup,
     ];
 
@@ -496,6 +501,7 @@ impl SettingsRow {
             SettingsRow::GroqKey => "Groq key",
             SettingsRow::DeepgramKey => "Deepgram key",
             SettingsRow::TriggerKey => "Trigger Key",
+            SettingsRow::UpdateCheck => "Update check",
             SettingsRow::RunSetup => "Run setup",
         }
     }
@@ -542,6 +548,9 @@ impl SettingsRow {
             }
             SettingsRow::TriggerKey => {
                 "The shortcut that starts and stops a Recording. You can't change it here."
+            }
+            SettingsRow::UpdateCheck => {
+                "Once a day, reads the newest version number from GitHub. Nothing about you is sent."
             }
             SettingsRow::RunSetup => {
                 "Walks through your keys, Engine and Trigger Key again. Safe to re-run."
@@ -918,6 +927,9 @@ impl App {
             }),
             SettingsRow::Deepgram => self.settings.map_or_else(loading, |settings| {
                 plain(if settings.deepgram { "On" } else { "Off" }.to_owned())
+            }),
+            SettingsRow::UpdateCheck => self.settings.map_or_else(loading, |settings| {
+                plain(if settings.update_check { "On" } else { "Off" }.to_owned())
             }),
             SettingsRow::GroqKey => self.key_value(Provider::Groq),
             SettingsRow::DeepgramKey => self.key_value(Provider::Deepgram),
@@ -1365,6 +1377,12 @@ impl App {
                     effects.push(Effect::Job(Job::SetDeepgram(settings.deepgram)));
                 }
             }
+            SettingsRow::UpdateCheck => {
+                if let Some(settings) = &mut self.settings {
+                    settings.update_check = !settings.update_check;
+                    effects.push(Effect::Job(Job::SetUpdateCheck(settings.update_check)));
+                }
+            }
             SettingsRow::GroqKey => {
                 self.prompt = Some(Prompt::Key(Provider::Groq, PromptText::default()));
             }
@@ -1717,6 +1735,7 @@ pub(super) mod test_support {
             rendering: RenderingPolicy::Adaptive,
             tone: WritingTone::Formal,
             deepgram: true,
+            update_check: true,
         }
     }
 
@@ -2018,6 +2037,36 @@ mod tests {
             }),
             at(0),
         );
+    }
+
+    #[test]
+    fn the_update_check_row_flips_on_enter_and_needs_no_restart() {
+        let mut app = ready_app();
+        app.tab = Tab::Settings;
+        app.settings_selected = SettingsRow::ALL
+            .iter()
+            .position(|row| *row == SettingsRow::UpdateCheck)
+            .unwrap();
+        assert_eq!(app.setting_value(SettingsRow::UpdateCheck).0, "On");
+        let effects = press(&mut app, KeyCode::Enter, 0);
+        assert!(matches!(
+            &effects[..],
+            [Effect::Job(Job::SetUpdateCheck(false))]
+        ));
+        let _ = update(
+            &mut app,
+            Msg::Reply(Reply::Applied {
+                kind: Tone::Success,
+                text: "Update check turned off. Voisu won't check by itself.".to_owned(),
+                refresh: &[Refresh::Settings],
+            }),
+            at(0),
+        );
+        assert_eq!(
+            app.setting_value(SettingsRow::UpdateCheck),
+            ("Off".to_owned(), Tone::Plain)
+        );
+        assert!(app.restart_pending.is_empty());
     }
 
     #[test]
@@ -2764,7 +2813,7 @@ mod tests {
     fn run_setup_row_hands_off_to_the_wizard() {
         let mut app = ready_app();
         app.tab = Tab::Settings;
-        app.settings_selected = 9;
+        app.settings_selected = 10;
         let effects = press(&mut app, KeyCode::Enter, 0);
         assert!(matches!(effects.as_slice(), [Effect::StartSetup]));
         assert!(app.setup.is_some());

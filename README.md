@@ -165,7 +165,13 @@ voisu update --dry-run   # print the commands without running them
 voisu update
 ```
 
-A binary no package owns (for example a `cargo` build) is not updated. Only `voisu update --check` contacts the network itself, through GitHub's release API.
+A binary no package owns (for example a `cargo` build) is not updated.
+
+### Update check
+
+Once a day Voisu downloads a small version file, `latest-linux.json`, from GitHub Releases, so it can show *Update available* on the interface's Home screen and in `voisu status`. Nothing about you is sent: no identifier, no settings, no usage. The request carries only Voisu's version in its user agent. GitHub publicly counts downloads of each release file, and that count is how Voisu estimates how many installs are active. `voisu status` never contacts the network; it reads the last answer.
+
+Turn it off with `voisu update-check off`, or *Settings → Update check* in the interface. Voisu then never checks by itself. `voisu update --check` still works when you ask.
 
 ### Trigger Key by desktop
 
@@ -235,6 +241,7 @@ Remove it with `voisu local remove`, or `voisu local remove --yes` without a ter
 | `voisu doctor [--verbose]` | Host readiness diagnostics |
 | `voisu service install` / `start` / `stop` / `restart` / `status` / `uninstall` | Manage the user services |
 | `voisu update [--check\|--dry-run] [--switch-to-bin]` | Update Voisu through its package manager (Linux, see [Update](#update)) |
+| `voisu update-check [on\|off]` | Turn the daily update check on or off (Linux, see [Update check](#update-check)) |
 
 ---
 

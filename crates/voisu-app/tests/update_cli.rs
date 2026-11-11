@@ -243,7 +243,10 @@ fn check_compares_the_installed_version_with_the_latest_release() {
     host.pacman_owner("voisu-bin");
     host.tool(
         "curl",
-        "printf '%s' '{\"tag_name\":\"v99.0.0\",\"html_url\":\"https://example.invalid/v99.0.0\"}'",
+        &format!(
+            "echo \"curl $*\" >> '{}'\nprintf '%s' '{{\"version\":\"99.0.0\"}}'",
+            host.log.display()
+        ),
     );
     host.logging_tool("yay", 0);
 
@@ -257,17 +260,52 @@ fn check_compares_the_installed_version_with_the_latest_release() {
     );
     assert!(out.contains("Latest release: 99.0.0"), "{out}");
     assert!(out.contains("Update available"), "{out}");
-    assert!(!host.calls().contains("yay"), "check ran yay");
+    let calls = host.calls();
+    assert!(!calls.contains("yay"), "check ran yay");
+    // The one request is a plain download of the release's version file.
+    assert!(
+        calls.contains(
+            "https://github.com/Anuraj-dev/voisu/releases/latest/download/latest-linux.json"
+        ),
+        "{calls}"
+    );
+    assert!(!calls.contains("api.github.com"), "{calls}");
+}
+
+#[test]
+fn check_still_works_with_the_daily_check_turned_off() {
+    let host = FakeHost::new();
+    host.pacman_owner("voisu-bin");
+    host.tool("curl", "printf '%s' '{\"version\":\"99.0.0\"}'");
+    assert!(host.voisu(&["update-check", "off"]).status.success());
+
+    let output = host.voisu(&["update", "--check"]);
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        stdout(&output).contains("Latest release: 99.0.0"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn a_missing_or_junk_version_file_is_reported_not_trusted() {
+    let host = FakeHost::new();
+    host.pacman_owner("voisu-bin");
+    host.tool("curl", "printf '%s' '<html>Not Found</html>'");
+
+    let output = host.voisu(&["update", "--check"]);
+
+    assert!(!output.status.success(), "{output:?}");
+    assert!(!stdout(&output).contains("Update available"), "{output:?}");
+    assert!(!stdout(&output).contains("Latest release"), "{output:?}");
 }
 
 #[test]
 fn check_points_the_source_package_at_the_prebuilt_switch() {
     let host = FakeHost::new();
     host.pacman_owner("voisu");
-    host.tool(
-        "curl",
-        "printf '%s' '{\"tag_name\":\"v99.0.0\",\"html_url\":\"https://example.invalid/v99.0.0\"}'",
-    );
+    host.tool("curl", "printf '%s' '{\"version\":\"99.0.0\"}'");
 
     let output = host.voisu(&["update", "--check"]);
 
@@ -280,7 +318,7 @@ fn check_points_the_source_package_at_the_prebuilt_switch() {
 fn a_check_feeds_the_update_line_in_status_without_another_request() {
     let host = FakeHost::new();
     host.pacman_owner("voisu-bin");
-    host.tool("curl", "printf '%s' '{\"tag_name\":\"v99.0.0\"}'");
+    host.tool("curl", "printf '%s' '{\"version\":\"99.0.0\"}'");
     assert!(host.voisu(&["update", "--check"]).status.success());
     // Any request from `status` would now fail loudly in the log.
     host.tool(

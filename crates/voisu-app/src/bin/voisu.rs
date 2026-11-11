@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 use std::process::ExitCode;
 
-use voisu_app::config::{DeliveryMode, RenderingPolicy, StoredDelivery, Tone, WritingMode};
+use voisu_app::config::{DeliveryMode, RenderingPolicy, StoredDelivery, Switch, Tone, WritingMode};
 use voisu_app::doctor::DoctorRow;
 use voisu_app::service::{UserServiceAction, manage_user_service};
 use voisu_app::system::{ProviderHttpClient, SecretToolStore};
@@ -19,6 +19,7 @@ enum CliAction {
     KeySet(Provider),
     KeyCheck(Provider),
     SetDeepgram(bool),
+    Switch(Switch, Option<bool>),
     SetAsrMode(AsrMode),
     Delivery(Option<DeliveryMode>),
     Writing(Option<WritingMode>),
@@ -51,6 +52,7 @@ fn main() -> ExitCode {
         },
         Ok(CliAction::KeyCheck(provider)) => key_check(provider),
         Ok(CliAction::SetDeepgram(enabled)) => set_deepgram(enabled),
+        Ok(CliAction::Switch(switch, state)) => switch_command(switch, state),
         Ok(CliAction::SetAsrMode(mode)) => set_asr_mode(mode),
         Ok(CliAction::Delivery(mode)) => delivery(mode),
         Ok(CliAction::Writing(mode)) => writing(mode),
@@ -370,6 +372,51 @@ fn set_deepgram(enabled: bool) -> ExitCode {
     }
 }
 
+/// Reads or persists an On/Off setting. Each is read where it is used, so a
+/// change applies without a restart.
+fn switch_command(switch: Switch, state: Option<bool>) -> ExitCode {
+    let word = |on: bool| if on { "on" } else { "off" };
+    let Some(on) = state else {
+        let on = voisu_app::config::switch(switch);
+        println!(
+            "{}: {} ({})",
+            switch_label(switch),
+            word(on),
+            switch_meaning(switch, on)
+        );
+        return ExitCode::SUCCESS;
+    };
+    match voisu_app::config::set_switch(switch, on) {
+        Ok(_) => {
+            println!(
+                "{} turned {} ({}).",
+                switch_label(switch),
+                word(on),
+                switch_meaning(switch, on)
+            );
+            ExitCode::SUCCESS
+        }
+        Err(message) => fail(4, &message),
+    }
+}
+
+fn switch_label(switch: Switch) -> &'static str {
+    match switch {
+        Switch::UpdateCheck => "Update check",
+    }
+}
+
+fn switch_meaning(switch: Switch, on: bool) -> &'static str {
+    match (switch, on) {
+        (Switch::UpdateCheck, true) => {
+            "once a day Voisu downloads a small version file from GitHub Releases"
+        }
+        (Switch::UpdateCheck, false) => {
+            "Voisu never checks by itself; voisu update --check still does"
+        }
+    }
+}
+
 /// Reads or persists the Delivery mode. A running daemon resolves configuration
 /// only at start, so writes apply after the next restart.
 ///
@@ -641,6 +688,11 @@ fn parse_command() -> Result<CliAction, String> {
         [command, state] if command == "deepgram" => {
             Ok(CliAction::SetDeepgram(parse_toggle(state)?))
         }
+        [command] if command == "update-check" => Ok(CliAction::Switch(Switch::UpdateCheck, None)),
+        [command, state] if command == "update-check" => Ok(CliAction::Switch(
+            Switch::UpdateCheck,
+            Some(parse_on_off(state, "update-check")?),
+        )),
         [command, engine] if command == "engine" => {
             Ok(CliAction::SetAsrMode(parse_asr_mode(engine)?))
         }
@@ -715,6 +767,14 @@ fn parse_toggle(value: &str) -> Result<bool, String> {
     }
 }
 
+fn parse_on_off(value: &str, command: &str) -> Result<bool, String> {
+    match value {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => Err(format!("{command} must be on or off")),
+    }
+}
+
 fn parse_delivery_mode(value: &str) -> Result<DeliveryMode, String> {
     match value {
         "paste" => Ok(DeliveryMode::Paste),
@@ -778,6 +838,7 @@ commands:
   local remove [--yes]          delete the Local model
   update [--check|--dry-run] [--switch-to-bin]
                                 update Voisu
+  update-check [on|off]         check once a day for a newer version
 
 options:
   -h, --help, help              show this help

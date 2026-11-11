@@ -173,6 +173,16 @@ pub fn execute(job: Job, replies: &Sender<Reply>) {
                 Refresh::PendingRestart(SettingsRow::Deepgram),
             ],
         )),
+        Job::SetUpdateCheck(on) => send(applied_setting(
+            config::set_switch(config::Switch::UpdateCheck, on),
+            format!("Update check turned {}.", if on { "on" } else { "off" }),
+            if on {
+                "Voisu checks once a day."
+            } else {
+                "Voisu won't check by itself."
+            },
+            &[Refresh::Settings],
+        )),
         Job::SetEngine { mode, local_ready } => send(set_engine(mode, local_ready)),
         Job::AddTerm(term) => send(dictionary_result(
             crate::dictionary::add_user_term(&term),
@@ -223,6 +233,7 @@ fn load_settings() -> SettingsSnapshot {
         rendering: config::rendering_policy(),
         tone: config::tone(),
         deepgram: config::deepgram_enabled(),
+        update_check: config::switch(config::Switch::UpdateCheck),
     }
 }
 
