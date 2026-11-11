@@ -431,9 +431,54 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # --- macOS: self-signed Apple Silicon app ----------------------------------
+  # The same workflow CI runs on every PR, in release mode: it refuses a
+  # version mismatch and signs the .app.tar.gz for the updater. Like Windows,
+  # it never blocks the Linux jobs.
+  build-macos:
+    name: Build macOS app
+    needs: validate
+    uses: ./.github/workflows/macos-app.yml
+    with:
+      version: ${{ needs.validate.outputs.version }}
+    secrets: inherit
+
+  publish-macos:
+    name: Attach macOS app to the Release
+    needs: [validate, build-macos, publish-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Voisu-macOS-arm64
+          path: dist/macos
+      - name: Upload the dmg and tarball
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd dist/macos
+          # Stable names for the website's releases/latest/download links; the
+          # versioned tarball is what latest.json points at.
+          versioned="Voisu-${VERSION}-macOS-arm64.app.tar.gz"
+          cp Voisu-macOS-arm64.app.tar.gz "$versioned"
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            Voisu-macOS-arm64.dmg Voisu-macOS-arm64.app.tar.gz "$versioned"
+
+  # latest.json waits for the Mac build so it can list both platforms, but a
+  # failed Mac build only drops the darwin entry; Windows updates still ship.
   publish-windows:
     name: Attach Windows installer + latest.json to the Release
-    needs: [validate, build-windows, publish-release]
+    needs: [validate, build-windows, build-macos, publish-release, publish-macos]
+    if: >-
+      ${{ always() && needs.validate.result == 'success'
+          && needs.build-windows.result == 'success'
+          && needs.publish-release.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -443,6 +488,11 @@ jobs:
         with:
           name: windows-release
           path: dist/windows
+      - uses: actions/download-artifact@v4
+        if: ${{ needs.publish-macos.result == 'success' }}
+        with:
+          name: Voisu-macOS-arm64
+          path: dist/macos
       - name: Write latest.json and upload
         env:
           GH_TOKEN: ${{ github.token }}
@@ -465,5 +515,15 @@ jobs:
             '{version: $version, notes: $notes, pub_date: $date,
               platforms: {"windows-x86_64": {signature: $signature, url: $url}}}' \
             > latest.json
+          mac_sig=../macos/Voisu-macOS-arm64.app.tar.gz.sig
+          if [ -s "$mac_sig" ]; then
+            jq --arg signature "$(cat "$mac_sig")" \
+               --arg url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/Voisu-${VERSION}-macOS-arm64.app.tar.gz" \
+               '.platforms["darwin-aarch64"] = {signature: $signature, url: $url}' \
+               latest.json > latest.tmp && mv latest.tmp latest.json
+          else
+            echo "::warning::no macOS build; latest.json lists Windows only"
+          fi
+          cat latest.json
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
             Voisu-Setup-x64.exe "$versioned" latest.json

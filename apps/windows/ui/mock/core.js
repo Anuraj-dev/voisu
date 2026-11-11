@@ -1,8 +1,12 @@
 // Mock of @tauri-apps/api/core for `npm run dev:mock`: fake state for
-// screenshots, chosen by `?screen=`. See SCREENS below.
+// screenshots, chosen by `?screen=`. See SCREENS below. `&platform=mac` shows
+// the macOS build: its Trigger Keys, wording and missing permissions.
 import { emit, hasListener } from './event.js';
 
-const screen = new URLSearchParams(location.search).get('screen') ?? 'overview';
+const params = new URLSearchParams(location.search);
+const screen = params.get('screen') ?? 'overview';
+const mac = params.get('platform') === 'mac';
+const DEFAULT_KEY = mac ? 'Ctrl+Alt' : 'Ctrl+Win';
 
 const SCREENS = [
   'setup',
@@ -29,15 +33,30 @@ const state = {
   overlaySize: 'medium',
   boostWords: ['Voisu', 'Deepgram'],
   tone: 'formal',
-  trigger: { key: 'Ctrl+Win', label: 'Ctrl+Win', warnings: [], isDefault: true },
-  triggerPresets: [
-    { key: 'Ctrl+Win', name: 'Ctrl+Win' },
-    { key: 'Ctrl+`', name: 'Ctrl+`' },
-    { key: 'Right Ctrl', name: 'Right Ctrl' },
-    { key: 'CapsLock', name: 'Caps Lock' },
-    { key: 'Ctrl+Shift+Space', name: 'Ctrl+Shift+Space' },
-  ],
+  trigger: { key: DEFAULT_KEY, label: mac ? 'Ctrl+Option' : 'Ctrl+Win', warnings: [], isDefault: true },
+  triggerPresets: mac
+    ? [
+        { key: 'Ctrl+Alt', name: 'Ctrl+Option' },
+        { key: 'Alt+Win', name: 'Option+Cmd' },
+        { key: 'Right Win', name: 'Right Cmd' },
+      ]
+    : [
+        { key: 'Ctrl+Win', name: 'Ctrl+Win' },
+        { key: 'Ctrl+`', name: 'Ctrl+`' },
+        { key: 'Right Ctrl', name: 'Right Ctrl' },
+        { key: 'CapsLock', name: 'Caps Lock' },
+        { key: 'Ctrl+Shift+Space', name: 'Ctrl+Shift+Space' },
+      ],
   hookOk: screen !== 'hook-down',
+  platform: mac ? 'mac' : 'windows',
+  // On `hook-down` everything is missing; elsewhere only Accessibility.
+  permissions: mac
+    ? {
+        microphone: screen === 'hook-down' ? 'denied' : 'granted',
+        accessibility: false,
+        inputMonitoring: screen !== 'hook-down',
+      }
+    : null,
   updateVersion: screen === 'update' ? '0.74.0' : null,
   // Twelve seconds in, so the timer reads 0:12.
   phase: screen === 'recording' ? { state: 'recording', elapsedMs: 12_000 } : null,
@@ -59,7 +78,7 @@ const COMMANDS = {
   last_transcript: () => transcript,
   set_trigger_key: ({ key }) => {
     const label = state.triggerPresets.find((p) => p.key === key)?.name ?? key;
-    state.trigger = { key, label, warnings: [], isDefault: key === 'Ctrl+Win' };
+    state.trigger = { key, label, warnings: [], isDefault: key === DEFAULT_KEY };
     return state.trigger;
   },
   set_auto_paste: ({ enabled }) => (state.autoPaste = enabled),
@@ -81,6 +100,13 @@ const COMMANDS = {
   open_guide: () => console.info('mock: open guide'),
   open_logs: () => console.info('mock: open logs'),
   install_update: () => console.info('mock: install update'),
+  open_permission_settings: ({ pane }) => {
+    console.info('mock: open System Settings', pane);
+    // As if the user turned it on.
+    state.permissions[pane] = pane === 'microphone' ? 'granted' : true;
+    if (pane === 'inputMonitoring') state.hookOk = true;
+    emit('state-changed', null);
+  },
 };
 
 export async function invoke(cmd, args = {}) {

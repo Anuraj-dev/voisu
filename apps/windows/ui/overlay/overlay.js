@@ -1,8 +1,8 @@
 // The recording Overlay page. It only listens: `recording-state` and
 // `audio-level` come from the Recording engine (or the tray's "Preview
 // overlay"), and nothing is sent back. Drawing stops whenever the capsule is
-// idle or showing the check mark or an error, so a hidden overlay costs no
-// frames.
+// idle or showing the check mark, Copied or an error, so a hidden overlay
+// costs no frames.
 import { listen } from '@tauri-apps/api/event';
 
 // Geometry and motion from the Linux overlay (voisu-overlay.rs).
@@ -24,6 +24,10 @@ const ERROR_HOLD_MS = 3500;
 // The Delivered check mark clears with the window (overlay.rs DONE_DISPLAY,
 // 600 ms): it confirms a paste that already landed, so it stays brief.
 const DONE_HOLD_MS = 600;
+// Copied (macOS could only put the Transcript on the clipboard): the native
+// side hides it after 2 s (overlay.rs COPIED_DISPLAY); like an error, the
+// page holds it a little longer so the text never blanks first.
+const COPIED_HOLD_MS = 2500;
 // Hands-free shows a Recording-green dot in place of the leftmost bars, so the
 // state is told by shape and position, not colour alone.
 const HANDS_FREE_RGB = '101, 214, 160';
@@ -44,6 +48,7 @@ const capsule = document.getElementById('capsule');
 const canvas = document.getElementById('meter');
 const message = document.getElementById('message');
 const messageText = document.getElementById('message-text');
+const copied = document.getElementById('copied');
 const check = document.getElementById('check');
 const ctx = canvas.getContext('2d');
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
@@ -158,8 +163,9 @@ function stopDrawing() {
 }
 
 function setState(next, text) {
-  // `done` and `error` hold until their own timer, even if `idle` follows.
-  if (next === 'idle' && (state === 'error' || state === 'done')) return;
+  // `done`, `copied` and `error` hold until their own timer, even if `idle`
+  // follows.
+  if (next === 'idle' && (state === 'error' || state === 'done' || state === 'copied')) return;
   clearTimeout(holdTimer);
   const wasMetering = state === 'recording' || state === 'handsFree';
   const metering = next === 'recording' || next === 'handsFree';
@@ -179,12 +185,21 @@ function setState(next, text) {
     messageText.textContent = text || 'Something went wrong';
     message.hidden = false;
     check.hidden = true;
+    copied.hidden = true;
     capsule.setAttribute('aria-label', `Error: ${messageText.textContent}`);
     holdTimer = setTimeout(clear, ERROR_HOLD_MS);
     return;
   }
   message.hidden = true;
   check.hidden = next !== 'done';
+  copied.hidden = next !== 'copied';
+  if (next === 'copied') {
+    stopDrawing();
+    copied.textContent = text || 'Copied';
+    capsule.setAttribute('aria-label', copied.textContent);
+    holdTimer = setTimeout(clear, COPIED_HOLD_MS);
+    return;
+  }
   if (next === 'done') {
     stopDrawing();
     capsule.setAttribute('aria-label', text || LABELS.done);

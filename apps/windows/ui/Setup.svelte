@@ -1,6 +1,7 @@
 <script>
   import { invoke } from '@tauri-apps/api/core';
-  import { ui, refresh } from './state.svelte.js';
+  import { ui, refresh, keyStoreHint } from './state.svelte.js';
+  import Permissions from './Permissions.svelte';
   import { PROVIDERS, GLYPH, resultClass, openKeyPage, openGuide } from './keys.js';
 
   // True while this screen must stay up although both keys may be saved:
@@ -131,6 +132,8 @@
     </label>
   {/if}
 
+  <Permissions />
+
   {#if done}
     <p class="done ok" role="status">
       <span aria-hidden="true">✓</span> You're set. Hold <kbd>{ui.app.trigger.label}</kbd> and speak.
@@ -145,7 +148,7 @@
 
 <footer>
   <button type="button" class="link" onclick={() => openGuide().catch(showError)}>How to set up (step-by-step guide)</button>
-  <p class="hint">Keys stay on this PC, in Windows Credential Manager.</p>
+  <p class="hint">{keyStoreHint()}</p>
 </footer>
 
 <style>

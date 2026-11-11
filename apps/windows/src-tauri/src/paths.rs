@@ -1,7 +1,8 @@
-//! Where Voisu keeps its files on Windows. Settings roam with the profile
+//! Where Voisu keeps its files. On Windows settings roam with the profile
 //! (`%APPDATA%\Voisu`); logs stay on this machine
-//! (`%LOCALAPPDATA%\Voisu\logs`) and never leave it unless the user exports
-//! them (ADR 0006).
+//! (`%LOCALAPPDATA%\Voisu\logs`). On macOS both live under
+//! `~/Library/Application Support/Voisu`. Logs never leave the machine
+//! unless the user exports them (ADR 0006).
 
 use std::path::PathBuf;
 

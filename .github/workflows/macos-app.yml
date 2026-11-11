@@ -1,0 +1,227 @@
+name: macOS app
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - apps/windows/**
+      - crates/voisu-core/**
+      - crates/voisu-cloud/**
+      - Cargo.toml
+      - .github/workflows/macos-app.yml
+  pull_request:
+    paths:
+      - apps/windows/**
+      - crates/voisu-core/**
+      - crates/voisu-cloud/**
+      - Cargo.toml
+      - .github/workflows/macos-app.yml
+  workflow_dispatch:
+  # release.yml calls this with the tag's version. A release build also
+  # refuses an app version that disagrees with the tag and signs the
+  # .app.tar.gz for the in-app updater.
+  workflow_call:
+    inputs:
+      version:
+        description: Release version (no leading v); empty for a plain CI build
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  app:
+    name: macOS app (Apple Silicon)
+    # macos-latest is arm64; the build is Apple-Silicon only.
+    runs-on: macos-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: apps/windows
+    env:
+      APP_PATH: src-tauri/target/release/bundle/macos/Voisu.app
+      BUNDLE_ID: app.voisu.desktop
+    steps:
+      - uses: actions/checkout@v4
+      - name: Refuse a release whose app version disagrees with the tag
+        if: inputs.version != ''
+        env:
+          VERSION: ${{ inputs.version }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            echo "::error::secret TAURI_SIGNING_PRIVATE_KEY is not set; the updater could not verify this build" >&2
+            exit 1
+          fi
+          app=$(grep -m1 -E '^version = ' src-tauri/Cargo.toml | cut -d'"' -f2)
+          if [ "$app" != "$VERSION" ]; then
+            echo "::error::apps/windows/src-tauri/Cargo.toml is $app but the tag is v$VERSION" >&2
+            exit 1
+          fi
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/windows/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/windows/src-tauri
+      - name: Install UI dependencies
+        run: npm ci
+      # generate_context! embeds ../dist, so the UI must exist before clippy.
+      - name: Build UI
+        run: npm run build
+      - name: Clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+      # No APPLE_* signing env is set, so Tauri leaves signing to the steps below.
+      - name: Build app bundle
+        run: npx tauri build --bundles app -- --locked
+      - name: Check the bundle exists
+        run: |
+          test -d "$APP_PATH" || { echo "::error::missing $APP_PATH"; ls -R src-tauri/target/release/bundle || true; exit 1; }
+
+      # Self-signed identity: a stable designated requirement pinned to the
+      # certificate keeps macOS privacy grants (Microphone, Accessibility,
+      # Input Monitoring) across updates, which an ad-hoc cdhash would not.
+      - name: Import signing certificate
+        id: cert
+        env:
+          CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CERT_P12_BASE64:-}" ] || [ -z "${CERT_PASSWORD:-}" ]; then
+            echo "::warning::Signing secrets absent (fork PR?); the app will be ad-hoc signed."
+            printf 'identity=-\nsigned=false\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          keychain="$RUNNER_TEMP/voisu-signing.keychain-db"
+          keychain_password="$(uuidgen)"
+          p12="$RUNNER_TEMP/voisu-cert.p12"
+          echo "$CERT_P12_BASE64" | base64 --decode > "$p12"
+
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$p12" -k "$keychain" -P "$CERT_PASSWORD" -f pkcs12 -T /usr/bin/codesign
+          rm -f "$p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" > /dev/null
+          # Put the temporary keychain on the search list so codesign finds the key.
+          existing="$(security list-keychains -d user | sed -e 's/^ *"//' -e 's/" *$//')"
+          # shellcheck disable=SC2086
+          security list-keychains -d user -s "$keychain" $existing
+
+          # Checked first: under `set -e` a missing certificate would
+          # otherwise stop the step at find-certificate, before this message.
+          echo "Identities in the temporary keychain:"
+          identities="$(security find-identity -p codesigning "$keychain" || true)"
+          echo "$identities"
+          hash="$(awk '/"Voisu Self-Signed"/ { print $2; exit }' <<<"$identities")"
+          if [ -z "$hash" ]; then
+            echo "::error::No 'Voisu Self-Signed' codesigning identity in the imported certificate."
+            exit 1
+          fi
+
+          # Trust the self-signed root for code signing. Best effort: signing by
+          # SHA-1 hash below works with an untrusted certificate too.
+          cert_pem="$RUNNER_TEMP/voisu-cert.pem"
+          if security find-certificate -c "Voisu Self-Signed" -p "$keychain" > "$cert_pem" \
+            && sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$cert_pem"; then
+            echo "Certificate trusted for code signing."
+          else
+            echo "::warning::Could not trust the certificate; signing by hash with an untrusted certificate."
+          fi
+          echo "Signing identity SHA-1: $hash"
+          {
+            echo "identity=$hash"
+            echo "signed=true"
+            echo "keychain=$keychain"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Sign the app
+        env:
+          IDENTITY: ${{ steps.cert.outputs.identity }}
+          SIGNED: ${{ steps.cert.outputs.signed }}
+          KEYCHAIN: ${{ steps.cert.outputs.keychain }}
+        run: |
+          set -euo pipefail
+          # The bundle holds no nested code, so it is signed without the
+          # deprecated --deep; the --deep --strict verify below fails if that
+          # ever changes.
+          if [ "$SIGNED" = "true" ]; then
+            codesign --force --keychain "$KEYCHAIN" --sign "$IDENTITY" --identifier "$BUNDLE_ID" "$APP_PATH"
+          else
+            codesign --force --sign - --identifier "$BUNDLE_ID" "$APP_PATH"
+          fi
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          echo "--- codesign -dv --verbose=4"
+          codesign -dv --verbose=4 "$APP_PATH" 2>&1
+          echo "--- designated requirement"
+          requirement="$(codesign -d -r- "$APP_PATH" 2>&1)"
+          echo "$requirement"
+          if [ "$SIGNED" = "true" ]; then
+            details="$(codesign -dv --verbose=4 "$APP_PATH" 2>&1)"
+            # Here-strings, not pipes: with pipefail an early `grep -q` exit
+            # can fail the echo and report a match as a miss.
+            grep -q '^Authority=Voisu Self-Signed' <<<"$details" \
+              || { echo "::error::app is not signed by Voisu Self-Signed"; exit 1; }
+            grep -q '^Identifier=app.voisu.desktop$' <<<"$details" \
+              || { echo "::error::signing identifier is not $BUNDLE_ID"; exit 1; }
+            grep -q 'certificate' <<<"$requirement" \
+              || { echo "::error::designated requirement does not pin the certificate"; exit 1; }
+            if grep -q 'cdhash' <<<"$requirement"; then
+              echo "::error::designated requirement is a cdhash, not the certificate"
+              exit 1
+            fi
+          fi
+
+      - name: Package dmg and tarball
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          stage="$RUNNER_TEMP/dmg-stage"
+          rm -rf "$stage"
+          mkdir -p "$stage"
+          ditto "$APP_PATH" "$stage/Voisu.app"
+          ln -s /Applications "$stage/Applications"
+          hdiutil create -volname Voisu -srcfolder "$stage" -ov -format UDZO out/Voisu-macOS-arm64.dmg
+          # COPYFILE_DISABLE keeps AppleDouble ._ files out of the archive.
+          COPYFILE_DISABLE=1 tar -C "$(dirname "$APP_PATH")" -czf out/Voisu-macOS-arm64.app.tar.gz Voisu.app
+          ls -l out
+
+      # Writes out/Voisu-macOS-arm64.app.tar.gz.sig, the signature latest.json
+      # carries. The tarball holds Voisu.app at its root, as the updater expects.
+      - name: Sign the tarball for the updater
+        if: inputs.version != ''
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          npx --no-install tauri signer sign out/Voisu-macOS-arm64.app.tar.gz
+          test -s out/Voisu-macOS-arm64.app.tar.gz.sig
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Voisu-macOS-arm64
+          path: apps/windows/out/
+          if-no-files-found: error
+
+      - name: Delete temporary keychain
+        if: always()
+        env:
+          KEYCHAIN: ${{ steps.cert.outputs.keychain }}
+        run: |
+          if [ -n "${KEYCHAIN:-}" ] && [ -f "$KEYCHAIN" ]; then
+            security delete-keychain "$KEYCHAIN"
+          fi

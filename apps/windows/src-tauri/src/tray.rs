@@ -88,9 +88,8 @@ impl TrayHandles {
         if let Err(error) = self.icon.set_tooltip(Some(tooltip)) {
             tracing::warn!(%error, "tray tooltip update failed");
         }
-        let app = self.icon.app_handle();
-        if let Some(icon) = app.default_window_icon() {
-            let dotted = with_dot(icon.rgba(), icon.width(), icon.height());
+        if let Some(icon) = tray_image(self.icon.app_handle()) {
+            let dotted = with_dot(icon.rgba(), icon.width(), icon.height(), TEMPLATE);
             let image = Image::new_owned(dotted, icon.width(), icon.height());
             if let Err(error) = self.icon.set_icon(Some(image)) {
                 tracing::warn!(%error, "tray icon update failed");
@@ -108,8 +107,10 @@ const DOT: [u8; 3] = [0xf0, 0xb4, 0x29];
 /// Dark ring that keeps the dot visible on light and dark taskbars.
 const RING: [u8; 3] = [0x0d, 0x0f, 0x12];
 
-/// Paints an update dot into the top-right corner of an RGBA icon.
-fn with_dot(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
+/// Paints an update dot into the top-right corner of an RGBA icon. On a
+/// `template` (macOS) icon only alpha counts, so the dot is solid and the
+/// ring is a transparent gap that parts it from the bars.
+fn with_dot(rgba: &[u8], width: u32, height: u32, template: bool) -> Vec<u8> {
     let mut out = rgba.to_vec();
     let size = width.min(height) as f32;
     let radius = size * 0.2;
@@ -129,6 +130,11 @@ fn with_dot(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
             // Straight-alpha "over": a soft edge over a transparent pixel
             // keeps the dot's colour instead of fading towards black.
             let below = out[i + 3] as f32 / 255.0 * (1.0 - in_outer);
+            if template {
+                out[i..i + 3].fill(0);
+                out[i + 3] = ((in_dot + below) * 255.0).round() as u8;
+                continue;
+            }
             let alpha = in_outer + below;
             for c in 0..3 {
                 let colour = RING[c] as f32 * (1.0 - in_dot) + DOT[c] as f32 * in_dot;
@@ -139,6 +145,38 @@ fn with_dot(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
         }
     }
     out
+}
+
+const MENU_ON_CLICK: bool = cfg!(target_os = "macos");
+/// macOS draws a menu bar icon as a template: only its alpha counts, tinted
+/// to suit a light or dark bar.
+const TEMPLATE: bool = cfg!(target_os = "macos");
+
+/// The tray icon: the app icon on Windows, its template on macOS.
+fn tray_image(app: &AppHandle) -> Option<Image<'static>> {
+    let icon = app.default_window_icon()?;
+    let rgba = if TEMPLATE {
+        template(icon.rgba())
+    } else {
+        icon.rgba().to_vec()
+    };
+    Some(Image::new_owned(rgba, icon.width(), icon.height()))
+}
+
+/// Keeps only the app icon's green bars, in black; the dark tile they sit
+/// on drops out. How much greener than red a pixel is says how much of it is
+/// bar, so the bars' anti-aliased edges stay soft.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn template(rgba: &[u8]) -> Vec<u8> {
+    rgba.as_chunks::<4>()
+        .0
+        .iter()
+        .flat_map(|px| {
+            let green = f32::from(px[1].saturating_sub(px[0]));
+            let mark = ((green - 16.0) / 80.0).clamp(0.0, 1.0);
+            [0, 0, 0, (f32::from(px[3]) * mark).round() as u8]
+        })
+        .collect()
 }
 
 pub fn build(
@@ -196,7 +234,10 @@ pub fn build(
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .tooltip("Voisu")
         .menu(&menu)
-        .show_menu_on_left_click(false)
+        // A Mac menu bar item opens its menu on a click; on Windows a left
+        // click opens the window and the right click the menu.
+        .show_menu_on_left_click(MENU_ON_CLICK)
+        .icon_as_template(TEMPLATE)
         .on_menu_event(|app, event| match event.id().as_ref() {
             MENU_SETTINGS => crate::show_settings(app),
             MENU_PREVIEW_OVERLAY => crate::overlay::preview(app),
@@ -229,12 +270,13 @@ pub fn build(
                 button_state: MouseButtonState::Up,
                 ..
             } = event
+                && !MENU_ON_CLICK
             {
                 crate::show_settings(tray.app_handle());
             }
         });
-    if let Some(icon) = app.default_window_icon() {
-        builder = builder.icon(icon.clone());
+    if let Some(icon) = tray_image(app) {
+        builder = builder.icon(icon);
     }
     let icon = builder.build(app)?;
     Ok(TrayHandles {
@@ -251,6 +293,19 @@ pub fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_mac_template_keeps_the_bars_and_drops_the_tile() {
+        let bar = [104, 222, 165, 255];
+        let tile = [24, 26, 30, 255];
+        let clear = [0, 0, 0, 0];
+        let half_bar = [104, 222, 165, 128];
+        let pixels = [bar, tile, clear, half_bar].concat();
+        assert_eq!(
+            template(&pixels),
+            [[0, 0, 0, 255], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 128]].concat()
+        );
+    }
 
     #[test]
     fn status_line_tells_ready_from_setup_needed() {
@@ -276,7 +331,7 @@ mod tests {
     fn the_dot_sits_top_right_and_leaves_the_rest_alone() {
         let (w, h) = (32u32, 32u32);
         let clear = vec![0u8; (w * h * 4) as usize];
-        let dotted = with_dot(&clear, w, h);
+        let dotted = with_dot(&clear, w, h, false);
         assert_eq!(dotted.len(), clear.len());
         let pixel = |x: u32, y: u32| {
             let i = ((y * w + x) * 4) as usize;
@@ -295,5 +350,23 @@ mod tests {
                 assert!(px[c] >= RING[c].min(DOT[c]), "edge darkened: {px:?}");
             }
         }
+    }
+
+    #[test]
+    fn the_mac_dot_is_solid_with_a_transparent_gap_around_it() {
+        let (w, h) = (32u32, 32u32);
+        let filled = [0, 0, 0, 255].repeat((w * h) as usize);
+        let dotted = with_dot(&filled, w, h, true);
+        let alpha = |x: u32, y: u32| dotted[((y * w + x) * 4 + 3) as usize];
+        let radius = 32.0 * 0.2;
+        let outer = radius + 32.0 * 0.06;
+        let (cx, cy) = (32.0 - outer, outer);
+        // The dot's centre stays opaque; the ring between dot and bars is cut.
+        assert_eq!(alpha(cx as u32, cy as u32), 255);
+        let gap = (radius + outer) / 2.0;
+        assert_eq!(alpha((cx - gap) as u32, cy as u32), 0);
+        // The rest of the icon is untouched, and everything stays black.
+        assert_eq!(alpha(0, h - 1), 255);
+        assert!(dotted.chunks(4).all(|px| px[..3] == [0, 0, 0]));
     }
 }

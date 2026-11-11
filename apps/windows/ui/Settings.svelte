@@ -1,6 +1,6 @@
 <script>
   import { invoke } from '@tauri-apps/api/core';
-  import { ui, DEFAULT_TRIGGER, refresh } from './state.svelte.js';
+  import { ui, refresh, keyStoreHint } from './state.svelte.js';
   import { PROVIDERS, GLYPH, resultClass, openGuide } from './keys.js';
 
   const SIZES = [
@@ -114,7 +114,7 @@
     } catch (e) {
       fail('system', 'Could not change Start at login.');
     } finally {
-      // Render what Windows reports, not the requested value.
+      // Render what the system reports, not the requested value.
       box.checked = ui.app.autostart;
       autostartBusy = false;
     }
@@ -221,9 +221,9 @@
         <p class="hint warn"><span aria-hidden="true">!</span> {warning}</p>
       {/each}
       {@render problem('trigger')}
-      {#if !app.trigger.isDefault}
-        <button type="button" class="link" disabled={triggerBusy} onclick={() => chooseTrigger(DEFAULT_TRIGGER)}>
-          Reset to Ctrl+Win
+      {#if !app.trigger.isDefault && app.triggerPresets.length}
+        <button type="button" class="link" disabled={triggerBusy} onclick={() => chooseTrigger(app.triggerPresets[0].key)}>
+          Reset to {app.triggerPresets[0].name}
         </button>
       {/if}
     </div>
@@ -365,7 +365,7 @@
       </div>
     {/each}
     {@render problem('keys')}
-    <p class="hint">Keys stay on this PC, in Windows Credential Manager.</p>
+    <p class="hint">{keyStoreHint()}</p>
   </div>
 </section>
 

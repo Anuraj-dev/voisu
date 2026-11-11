@@ -50,9 +50,6 @@ const CLEANUP_DRAIN: Duration = Duration::from_secs(2);
 const LANGUAGE: &str = "en";
 
 const KEYS_MISSING: &str = "Add your Groq and Deepgram keys to start dictating.";
-/// Accessible label for `done` when auto-paste is off and nothing was pasted.
-const COPIED: &str = "Transcript copied to the clipboard";
-
 /// Tells the trigger that the engine finished or refused a Recording.
 pub type EndedSink = Arc<dyn Fn(u64) + Send + Sync>;
 
@@ -140,7 +137,7 @@ fn next_phase(
     now: Instant,
 ) -> Option<(Phase, Instant)> {
     match state {
-        Phase::Idle | Phase::Done | Phase::Error => None,
+        Phase::Idle | Phase::Done | Phase::Copied | Phase::Error => None,
         Phase::Recording => Some((state, now)),
         Phase::HandsFree | Phase::Processing => Some((state, prev.map_or(now, |(_, since)| since))),
     }
@@ -360,7 +357,9 @@ impl Engine {
         if !self.settings().auto_paste {
             let copied = tokio::task::spawn_blocking(move || delivery::copy(&text)).await;
             let message = match copied {
-                Ok(Ok(())) => return self.emit_state(Phase::Done, Some(COPIED.to_owned())),
+                Ok(Ok(())) => {
+                    return self.emit_state(Phase::Done, Some(delivery::COPIED.to_owned()));
+                }
                 Ok(Err(error)) => {
                     tracing::warn!(id, %error, "copy failed");
                     Some(error.to_string())
@@ -375,14 +374,16 @@ impl Engine {
                 let _ = settled.send(result);
             });
         });
-        let message = match result.await {
-            Ok(result) => delivery::notice(&result),
+        match result.await {
+            Ok(result) => {
+                let (state, message) = delivery::overlay_state(&result);
+                self.emit_state(state, message);
+            }
             Err(_) => {
                 tracing::warn!(id, "delivery task ended without a result");
-                Some("Couldn't paste the Transcript".to_owned())
+                self.delivered(Some("Couldn't paste the Transcript".to_owned()));
             }
-        };
-        self.delivered(message);
+        }
     }
 
     /// Success unless there is something to tell the user.
@@ -551,7 +552,9 @@ impl Engine {
             match state {
                 Phase::Recording | Phase::HandsFree => tray.set_status("Voisu: recording…"),
                 Phase::Processing => tray.set_status("Voisu: transcribing…"),
-                Phase::Idle | Phase::Done | Phase::Error => tray.set_ready(crate::keys_ready()),
+                Phase::Idle | Phase::Done | Phase::Copied | Phase::Error => {
+                    tray.set_ready(crate::keys_ready())
+                }
             }
         }
         let _ = self
@@ -635,7 +638,7 @@ mod tests {
         assert_eq!(hands_free, Some((Phase::HandsFree, start)));
         let processing = next_phase(hands_free, Phase::Processing, later);
         assert_eq!(processing, Some((Phase::Processing, start)));
-        for end in [Phase::Idle, Phase::Done, Phase::Error] {
+        for end in [Phase::Idle, Phase::Done, Phase::Copied, Phase::Error] {
             assert_eq!(next_phase(processing, end, later), None);
         }
         // The next Recording starts its own clock.

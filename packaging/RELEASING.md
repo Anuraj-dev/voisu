@@ -72,14 +72,29 @@ push tag vX.Y.Z
      ├─ publish-aur      (after publish-release) bump + push AUR voisu & voisu-bin
      └─ publish-windows  (after publish-release) attach Voisu-Setup-x64.exe,
                          Voisu-<ver>-Setup-x64.exe and the signed latest.json
+                         (windows-x86_64, plus darwin-aarch64 when the Mac
+                         build succeeded)
 
   build-windows ─ windows-latest, in parallel from validate: refuses a missing
                   TAURI_SIGNING_PRIVATE_KEY, the placeholder updater pubkey, or an
                   app version ≠ tag; builds the NSIS installer + its .sig.
+  build-macos ─── calls macos-app.yml (macos-latest, Apple Silicon) with the
+                  version: refuses an app version ≠ tag, builds, signs with the
+                  "Voisu Self-Signed" cert, packages the .dmg + .app.tar.gz and
+                  signs the tarball for the updater.
+     └─ publish-macos (after publish-release) attach Voisu-macOS-arm64.dmg,
+                      Voisu-macOS-arm64.app.tar.gz and Voisu-<ver>-macOS-arm64.app.tar.gz
 ```
 
-The Windows jobs never block or change the Linux ones: a red `build-windows` leaves
-the Linux release fully published, minus the Windows assets.
+The Windows and macOS jobs never block or change the Linux ones: a red `build-windows`
+or `build-macos` leaves the Linux release fully published, minus those assets. A red
+Mac build only drops the darwin entry from `latest.json`.
+
+The Mac build needs `MACOS_CERT_P12_BASE64` and `MACOS_CERT_PASSWORD` (the
+self-signed "Voisu Self-Signed" certificate; backup in
+`~/.config/voisu-macos-signing/`). Losing it means every Mac user grants the
+privacy permissions again. The app is not notarized, so users clear Gatekeeper once
+with **Open Anyway** (see the website's Mac setup guide).
 
 COPR is not in this workflow: its Custom-source webhook self-triggers on the same
 tag via `copr-trigger.yml`, self-pins to the highest `v*` tag, and rebuilds from
@@ -146,8 +161,10 @@ installs them directly from `$srcdir` with no versioned subdir.
 | `GPG_PASSPHRASE` | publish-apt, apt-refresh | passphrase for loopback pinentry (written to a temp file, never argv/log) | provisioned in ticket 09 |
 | `COPR_WEBHOOK_URL` | copr-trigger.yml (not this workflow) | COPR Custom-source rebuild webhook | provisioned in ticket 12 |
 | `AUR_SSH_PRIVATE_KEY` | publish-aur | SSH deploy key registered on the AUR account for the `voisu` and `voisu-bin` repos | **MUST be created by Raja** (see below) |
-| `TAURI_SIGNING_PRIVATE_KEY` | build-windows | minisign key that signs the Windows installer for the in-app updater | **MUST be created by Raja** (see below) |
-| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | build-windows | that key's password | **MUST be created by Raja** |
+| `TAURI_SIGNING_PRIVATE_KEY` | build-windows, build-macos | minisign key that signs the Windows installer and the Mac tarball for the in-app updater | **MUST be created by Raja** (see below) |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | build-windows, build-macos | that key's password | **MUST be created by Raja** |
+| `MACOS_CERT_P12_BASE64` | build-macos | the "Voisu Self-Signed" code-signing certificate (.p12, base64) | provisioned 2026-11-08 |
+| `MACOS_CERT_PASSWORD` | build-macos | that .p12's password | provisioned 2026-11-08 |
 
 `GITHUB_TOKEN` (built-in) covers the gh-pages push and `gh release create`; the
 publish jobs request `contents: write` for it.

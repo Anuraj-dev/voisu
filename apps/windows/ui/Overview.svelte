@@ -1,5 +1,6 @@
 <script>
-  import { ui } from './state.svelte.js';
+  import { ui, isMac } from './state.svelte.js';
+  import Permissions from './Permissions.svelte';
 
   let now = $state(Date.now());
   let copiedFor = $state(null);
@@ -23,6 +24,14 @@
 
   // tone: ready | recording | processing | failure
   const hero = $derived.by(() => {
+    if (!ui.app.hookOk && isMac()) {
+      // The event tap starts by itself once the permission is on.
+      return {
+        tone: 'failure',
+        title: 'Allow Input Monitoring',
+        detail: "The Trigger Key isn't working yet. Turn on Voisu in System Settings → Privacy & Security → Input Monitoring.",
+      };
+    }
     if (!ui.app.hookOk) {
       return {
         tone: 'failure',
@@ -76,6 +85,8 @@
     <p class="muted">{hero.detail}</p>
   {/if}
 </section>
+
+<Permissions />
 
 <dl class="rows">
   <div>
