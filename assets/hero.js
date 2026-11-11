@@ -25,13 +25,13 @@
 
   var SCENES = [
     {
-      title: "Re: Thursday — Mail",
+      title: "Re: Thursday · Mail",
       term: false,
       ctx: "Hi Sam,",
       text: "Thursday works for me. I'll bring the draft and we can go through the numbers together."
     },
     {
-      title: "notes.md — Editor",
+      title: "notes.md · Editor",
       term: false,
       ctx: "## Standup",
       text: "Shipped the paste fallback. Next up: tidy the settings window and finish the docs."
