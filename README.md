@@ -1,6 +1,6 @@
 # Voisu
 
-Voice dictation for Linux and Windows, written in Rust.
+Voice dictation for Linux, Windows and macOS, written in Rust.
 
 Hold or press a key, speak, and a clean Transcript lands in the app you were typing in: a reply, a doc, or a terminal. If it can't land there, Voisu keeps it on the clipboard instead of dropping it.
 
@@ -10,19 +10,19 @@ Hold or press a key, speak, and a clean Transcript lands in the app you were typ
 
 ## At a glance
 
-| | Windows | Linux |
-| --- | --- | --- |
-| **Systems** | Windows 10 and 11, x64 | Fedora, Arch, Debian and Ubuntu. KDE Plasma, GNOME, Hyprland and X11 desktops |
-| **Trigger Key** | Hold `Ctrl`+`Win` (or your own key) to talk. Double-tap for hands-free. `Esc` cancels | Press to start, press again to stop |
-| **Transcription** | Cloud (Deepgram and Groq) | Cloud (Deepgram and Groq), or Local on your own GPU or CPU |
-| **Runs as** | Tray app with a settings window | systemd **user** services, the `voisu` terminal interface, and `voisu` commands |
-| **Install** | Per-user installer, self-updating | COPR, AUR, signed apt repository |
+| | Windows | macOS | Linux |
+| --- | --- | --- | --- |
+| **Systems** | Windows 10 and 11, x64 | macOS 13 or newer, Apple Silicon | Fedora, Arch, Debian and Ubuntu. KDE Plasma, GNOME, Hyprland and X11 desktops |
+| **Trigger Key** | Hold `Ctrl`+`Win` (or your own key) to talk. Double-tap for hands-free. `Esc` cancels | Hold `Control`+`Option` (or `Option`+`Cmd`, Right `Cmd`). Double-tap for hands-free. `Esc` cancels | Press to start, press again to stop |
+| **Transcription** | Cloud (Deepgram and Groq) | Cloud (Deepgram and Groq) | Cloud (Deepgram and Groq), or Local on your own GPU or CPU |
+| **Runs as** | Tray app with a settings window | Menu bar app with a settings window | systemd **user** services, the `voisu` terminal interface, and `voisu` commands |
+| **Install** | Per-user installer, self-updating | `.dmg`, self-updating | COPR, AUR, signed apt repository |
 
 Deepgram streams while you talk. Groq transcribes the whole Recording when you stop. Voisu reconciles the two into one Transcript.
 
-You bring your own Groq and Deepgram API keys. Voisu has no account, server or analytics. Keys live in your desktop keyring or Windows Credential Manager, and logs and history stay on your machine.
+You bring your own Groq and Deepgram API keys. Voisu has no account, server or analytics. Keys live in your desktop keyring, Windows Credential Manager or the macOS Keychain, and logs and history stay on your machine.
 
-Spoken punctuation and layout ("new paragraph", "dash dash", "quote … unquote", "first … second …" lists) are formatted locally on both platforms.
+Spoken punctuation and layout ("new paragraph", "dash dash", "quote … unquote", "first … second …" lists) are formatted locally on every platform.
 
 ---
 
@@ -40,6 +40,23 @@ The installer isn't code-signed yet, so SmartScreen may warn on first run. Choos
 - **Delivery**: text is pasted into the window that had focus when you started, even if you clicked away. Your clipboard is restored afterwards. Terminals get their own paste chord.
 
 Windows is Cloud-only for now.
+
+---
+
+## macOS
+
+Apple Silicon (M1 or newer), macOS 13 Ventura or newer.
+
+1. Download **[Voisu-macOS-arm64.dmg](https://github.com/Anuraj-dev/voisu/releases/latest/download/Voisu-macOS-arm64.dmg)**, open it and drag Voisu onto *Applications*.
+2. Open Voisu. It isn't notarized yet, so macOS blocks the first open: choose *Done* (not *Move to Trash*), then *System Settings → Privacy & Security → Open Anyway*. You do this once.
+3. Allow **Microphone**, **Accessibility** (so Voisu can paste) and **Input Monitoring** (for the Trigger Key) in *Privacy & Security*, then quit and reopen Voisu once. Its window lists any permission still missing.
+4. Paste your Groq and Deepgram keys and choose *Save and start*.
+5. Hold `Control`+`Option`, speak, and let go.
+
+- Voisu lives in the menu bar, not the Dock. Keys are stored in the macOS Keychain.
+- Without Accessibility, Voisu copies the text and shows *Copied · ⌘V* so you can paste it yourself.
+- Voisu updates itself from GitHub Releases, and your permissions carry over.
+- macOS is Cloud-only. The full walkthrough is the [Mac setup guide](https://anuraj-dev.github.io/voisu/docs/macos-setup.html).
 
 ---
 
@@ -229,7 +246,7 @@ Remove it with `voisu local remove`, or `voisu local remove --yes` without a ter
 - [Architectural decisions](docs/adr/)
 - [Linux platform research](docs/research/linux-platform.md)
 - [Fedora packaging](docs/packaging-fedora.md)
-- Windows app source: [`apps/windows/`](apps/windows/)
+- Windows and macOS app source: [`apps/windows/`](apps/windows/)
 
 ## License
 
