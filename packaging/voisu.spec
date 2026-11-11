@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.75.0
+Version:        0.75.1
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -167,6 +167,10 @@ install -D -m 0644 packaging/icons/voisu.svg %{buildroot}%{_datadir}/icons/hicol
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Wed Nov 11 2026 Voisu maintainers <voisu@example.invalid> - 0.75.1-1
+- fix(deps): bump rustix to 1.1.6 for RUSTSEC-2026-0486 (#317)
+- docs(readme): add macOS install and platform details (#315)
+
 * Wed Nov 11 2026 Voisu maintainers <voisu@example.invalid> - 0.75.0-1
 - feat(macos): run Voisu on Apple Silicon Macs (#310)
 - docs(readme): remove em dashes and reformat for scanning (#313)
