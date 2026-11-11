@@ -117,7 +117,9 @@ Turn it off with `voisu update-check off`, or *Settings → Update check* in the
 
 ## Star prompt
 
-After 20 dictations spread over at least 3 days, Voisu asks once, in a desktop notification, whether you'd star it on GitHub. The interface's Home screen shows the same line until you answer. The count lives only on this computer and is never sent anywhere. Answer with `voisu star`, which opens the GitHub page, or choose *Don't ask again*. Turn it off with `voisu star-prompt off`, or *Settings → Star prompt* in the interface.
+After 20 dictations spread over at least 3 days, Voisu sends one desktop notification asking whether you'd star it on GitHub, and the interface's Home screen shows *Enjoying Voisu?* with a key to star and a key to close. Closing it hides it for 30 days; it then comes back once, with no second notification, and a second close hides it for good. Closing or ignoring the notification changes nothing. Starring from anywhere ends it for good. The count lives only on this computer and is never sent anywhere.
+
+`voisu star` and *Settings → Star on GitHub* open the GitHub page at any time. Turn the request off with `voisu star-prompt off`, or *Settings → Star prompt* in the interface; the Settings entry stays.
 
 ## Trigger Key by desktop
 

@@ -1,4 +1,4 @@
-//! The one-time GitHub star prompt.
+//! The GitHub star nudge.
 //!
 //! The daemon counts successful dictations (a Recording whose Transcript was
 //! delivered: pasted, or left on the clipboard) and the distinct local dates
@@ -6,12 +6,13 @@
 //! is ever sent anywhere. Counting starts at the upgrade, with no backfill,
 //! and stops once the threshold is met.
 //!
-//! Once 20 dictations on 3 or more dates are counted, with `star_prompt = on`
-//! and no answer yet, the daemon sends one desktop notification after that
-//! Delivery has finished, and the TUI Home screen shows a line until the user
-//! answers. `Star` opens the repository page and marks the prompt answered;
-//! `Don't ask again` turns `star_prompt` off. The notification is sent once,
-//! ever: an ignored or closed one is never repeated.
+//! Once 20 dictations on 3 or more dates are counted, with `star_prompt = on`,
+//! the daemon sends one desktop notification after that Delivery has finished,
+//! and the TUI Home screen shows a line. The notification is sent once, ever:
+//! closing or ignoring it changes nothing. Closing the Home line hides it for
+//! [`RETURN_AFTER_DAYS`] days; it then comes back once, with no second
+//! notification, and a second close hides it for good. `Star`, from anywhere,
+//! opens the repository page and ends the nudge for good.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -32,7 +33,13 @@ pub const BODY: &str = "A GitHub star helps other people find it.";
 pub const PLAIN_BODY: &str =
     "A GitHub star helps other people find it. Run voisu star to open the page.";
 /// The TUI Home line.
-pub const HOME_LINE: &str = "Enjoying Voisu? Star it on GitHub";
+pub const HOME_LINE: &str = "Enjoying Voisu?";
+/// The permanent entry, shown whatever the nudge and the setting say.
+pub const ENTRY: &str = "Voisu is free and built by one student. A star helps others find it.";
+/// Days the nudge stays hidden after its first close.
+pub const RETURN_AFTER_DAYS: i64 = 30;
+/// Closes after which the nudge never shows again.
+const CLOSES: u32 = 2;
 
 /// What the state file holds.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -46,9 +53,15 @@ pub struct State {
     /// The notification went out. It never goes out again.
     #[serde(default)]
     pub notified: bool,
-    /// The user starred, or said they would. The prompt never shows again.
+    /// The user starred. The nudge never shows again.
     #[serde(default)]
     pub answered: bool,
+    /// Times the Home line was closed.
+    #[serde(default)]
+    pub closes: u32,
+    /// The local date (`YYYY-MM-DD`) the nudge may show again after a close.
+    #[serde(default)]
+    pub returns_on: Option<String>,
 }
 
 impl State {
@@ -68,17 +81,65 @@ impl State {
         }
     }
 
-    /// Whether the prompt shows: threshold met, setting on, not answered.
-    pub fn eligible(&self, setting_on: bool) -> bool {
-        setting_on && !self.answered && self.threshold_met()
+    /// Whether the nudge shows on `today`: threshold met, setting on, not
+    /// starred, not closed for good, and past any return date.
+    pub fn shows(&self, setting_on: bool, today: &str) -> bool {
+        setting_on
+            && !self.answered
+            && self.threshold_met()
+            && self.closes < CLOSES
+            && self
+                .returns_on
+                .as_deref()
+                .is_none_or(|returns_on| today >= returns_on)
+    }
+
+    /// Whether the one notification goes out: it would show, it has never
+    /// gone out, and the Home line was never closed.
+    fn notifies(&self, setting_on: bool, today: &str) -> bool {
+        self.shows(setting_on, today) && !self.notified && self.closes == 0
+    }
+
+    /// Closes the Home line on `today`: the first close hides it until
+    /// [`RETURN_AFTER_DAYS`] later, the second for good.
+    pub fn close(&mut self, today: &str) {
+        self.closes = (self.closes + 1).min(CLOSES);
+        if self.closes == 1 {
+            // A date that can't be read can't be counted from; stay hidden.
+            self.returns_on =
+                Some(add_days(today, RETURN_AFTER_DAYS).unwrap_or_else(|| "9999-12-31".to_owned()));
+        }
     }
 }
 
-/// The user's answer to the prompt.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Answer {
-    Star,
-    DontAsk,
+/// `date` (`YYYY-MM-DD`) plus `days`, in the proleptic Gregorian calendar.
+fn add_days(date: &str, days: i64) -> Option<String> {
+    let mut parts = date.splitn(3, '-').map(str::parse::<i64>);
+    let (year, month, day) = (
+        parts.next()?.ok()?,
+        parts.next()?.ok()?,
+        parts.next()?.ok()?,
+    );
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    // Days from civil and back (Howard Hinnant's algorithms).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let z = era * 146_097 + doe - 719_468 + days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    Some(format!("{year:04}-{month:02}-{day:02}"))
 }
 
 pub fn state_path() -> Option<PathBuf> {
@@ -110,10 +171,11 @@ pub fn write(path: &Path, state: &State) -> std::io::Result<()> {
 }
 
 /// Counts one successful dictation on `today` and says whether to send the
-/// notification now. It is sent only when the prompt is eligible, has never
-/// been sent, and `idle` confirms no Recording runs; otherwise a later
-/// Delivery tries again. The file records the notification before it goes
-/// out, so a failure to save never sends it twice.
+/// notification now. It is sent only when the nudge shows, the notification
+/// has never been sent, the Home line was never closed, and `idle` confirms
+/// no Recording runs; otherwise a later Delivery tries again. The file
+/// records the notification before it goes out, so a failure to save never
+/// sends it twice. Callers in one process serialise through [`DAEMON_LOCK`].
 pub fn after_delivery(
     path: &Path,
     today: &str,
@@ -123,7 +185,7 @@ pub fn after_delivery(
     let before = read(path);
     let mut state = before.clone();
     state.record(today);
-    let notify = state.eligible(setting_on) && !state.notified && idle();
+    let notify = state.notifies(setting_on, today) && idle();
     state.notified |= notify;
     if state == before {
         return false;
@@ -131,12 +193,20 @@ pub fn after_delivery(
     write(path, &state).is_ok() && notify
 }
 
-/// Whether the TUI Home line shows.
-pub fn line_shows(path: &Path, setting_on: bool) -> bool {
-    read(path).eligible(setting_on)
+/// Whether the TUI Home line shows on `today`.
+pub fn line_shows(path: &Path, setting_on: bool, today: &str) -> bool {
+    read(path).shows(setting_on, today)
 }
 
-/// Records `Star`: the prompt is answered and never shows again.
+/// Records a close of the Home line on `today` and returns the new state.
+pub fn close(path: &Path, today: &str) -> std::io::Result<State> {
+    let mut state = read(path);
+    state.close(today);
+    write(path, &state)?;
+    Ok(state)
+}
+
+/// Records `Star`: the nudge never shows again.
 pub fn mark_answered(path: &Path) -> std::io::Result<()> {
     let mut state = read(path);
     if state.answered {
@@ -146,26 +216,17 @@ pub fn mark_answered(path: &Path) -> std::io::Result<()> {
     write(path, &state)
 }
 
-/// Applies an answer. `Star` opens the repository through `open` and marks
-/// the prompt answered even when the browser does not open, so it never
-/// returns. `Don't ask again` turns the setting off.
-pub fn apply(
-    answer: Answer,
+/// `Star`: opens the repository through `open` and ends the nudge for good,
+/// even when the browser does not open.
+pub fn star(
     path: Option<&Path>,
     open: impl FnOnce(&str) -> Result<(), String>,
 ) -> Result<(), String> {
-    match answer {
-        Answer::Star => {
-            let opened = open(REPO_URL);
-            if let Some(path) = path {
-                mark_answered(path).map_err(|error| error.to_string())?;
-            }
-            opened
-        }
-        Answer::DontAsk => {
-            crate::config::set_switch(crate::config::Switch::StarPrompt, false).map(|_| ())
-        }
+    let opened = open(REPO_URL);
+    if let Some(path) = path {
+        mark_answered(path).map_err(|error| error.to_string())?;
     }
+    opened
 }
 
 /// Opens `url` in the default browser through `xdg-open`.
@@ -201,9 +262,19 @@ pub fn local_date(unix_secs: u64) -> String {
     )
 }
 
-/// How long the daemon waits for an answer on a notification with actions.
-/// After that it stops listening; the TUI line still offers both answers.
+/// How long the daemon waits for a click on a notification with actions.
+/// After that it stops listening; the TUI still offers `Star`.
 const ANSWER_WAIT: Duration = Duration::from_secs(60 * 60);
+
+/// Serialises the daemon's read-change-write of the state file, so two
+/// Deliveries finishing together cannot lose a count. Other processes (TUI,
+/// CLI) write through an atomic rename and are not covered by it.
+pub static DAEMON_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The notification's actions, as `Notify` takes them: key, then label.
+pub fn notification_actions() -> Vec<String> {
+    vec!["star".to_owned(), "Star on GitHub".to_owned()]
+}
 
 /// Called by the daemon after a successful Delivery. Counts it, and when this
 /// is the Delivery that crosses the threshold, sends the notification and
@@ -221,11 +292,17 @@ pub fn spawn_after_delivery() {
             };
             let today = local_date(crate::update_notice::unix_now());
             let setting_on = crate::config::switch(crate::config::Switch::StarPrompt);
-            if !after_delivery(&path, &today, setting_on, daemon_idle) {
-                return;
-            }
-            if let Some(answer) = notify_and_wait() {
-                let _ = apply(answer, Some(&path), open_in_browser);
+            let notify = {
+                let _held = DAEMON_LOCK
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                after_delivery(&path, &today, setting_on, daemon_idle)
+            };
+            if notify && notify_and_wait() {
+                let _held = DAEMON_LOCK
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                let _ = star(Some(&path), open_in_browser);
             }
         });
 }
@@ -238,21 +315,26 @@ fn daemon_idle() -> bool {
     )
 }
 
-/// Sends the notification and returns the action the user picked, if any.
-fn notify_and_wait() -> Option<Answer> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
+/// Sends the notification and says whether the user clicked `Star on GitHub`.
+fn notify_and_wait() -> bool {
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .ok()?;
+    else {
+        return false;
+    };
     runtime.block_on(async {
         tokio::time::timeout(ANSWER_WAIT, desktop_prompt())
             .await
             .ok()
             .flatten()
+            .unwrap_or(false)
     })
 }
 
-async fn desktop_prompt() -> Option<Answer> {
+/// `Some(true)` when `Star on GitHub` was clicked. Closing or ignoring the
+/// notification is not an answer.
+async fn desktop_prompt() -> Option<bool> {
     use zbus::export::ordered_stream::OrderedStreamExt;
 
     let connection = zbus::Connection::session().await.ok()?;
@@ -283,12 +365,7 @@ async fn desktop_prompt() -> Option<Answer> {
     // Listen before sending, so an instant click is not missed.
     let mut invoked = proxy.receive_signal("ActionInvoked").await.ok()?;
     let mut closed = proxy.receive_signal("NotificationClosed").await.ok()?;
-    let actions = vec![
-        "star".to_owned(),
-        "Star on GitHub".to_owned(),
-        "never".to_owned(),
-        "Don't ask again".to_owned(),
-    ];
+    let actions = notification_actions();
     let id: u32 = proxy
         .call(
             "Notify",
@@ -306,11 +383,7 @@ async fn desktop_prompt() -> Option<Answer> {
                 if from != id {
                     continue;
                 }
-                return match key.as_str() {
-                    "star" => Some(Answer::Star),
-                    "never" => Some(Answer::DontAsk),
-                    _ => None,
-                };
+                return Some(key == "star");
             }
             message = closed.next() => {
                 let message = message?;
@@ -366,19 +439,107 @@ mod tests {
         assert_eq!(counted, met);
     }
 
+    const TODAY: &str = "2026-11-11";
+
     #[test]
     fn answered_and_switched_off_prompts_show_nothing() {
         let met = state(20, &["a", "b", "c"]);
-        assert!(met.eligible(true));
-        assert!(!met.eligible(false));
+        assert!(met.shows(true, TODAY));
+        assert!(!met.shows(false, TODAY));
         assert!(
             !State {
                 answered: true,
                 ..met.clone()
             }
-            .eligible(true)
+            .shows(true, TODAY)
         );
-        assert!(!state(19, &["a", "b", "c"]).eligible(true));
+        assert!(!state(19, &["a", "b", "c"]).shows(true, TODAY));
+    }
+
+    #[test]
+    fn a_first_close_hides_the_line_for_thirty_days_then_it_returns() {
+        let mut met = state(20, &["a", "b", "c"]);
+        met.close("2026-11-11");
+        assert!(!met.shows(true, "2026-11-11"), "first close hides");
+        assert!(!met.shows(true, "2026-12-10"), "day 29 still hidden");
+        assert!(met.shows(true, "2026-12-11"), "day 30 shows again");
+        assert!(met.shows(true, "2027-03-01"), "and stays until answered");
+        assert!(!met.shows(false, "2026-12-11"), "the setting still wins");
+    }
+
+    #[test]
+    fn a_second_close_hides_the_line_for_good() {
+        let mut met = state(20, &["a", "b", "c"]);
+        met.close("2026-11-11");
+        met.close("2026-12-11");
+        assert!(!met.shows(true, "2026-12-11"));
+        assert!(!met.shows(true, "2099-01-01"));
+    }
+
+    #[test]
+    fn starring_after_a_close_ends_the_nudge() {
+        let (_dir, path) = file();
+        write(&path, &state(20, &["a", "b", "c"])).unwrap();
+        close(&path, "2026-11-11").unwrap();
+        star(Some(&path), |_| Ok(())).unwrap();
+        assert!(!line_shows(&path, true, "2026-12-11"));
+        assert!(!line_shows(&path, true, "2099-01-01"));
+    }
+
+    #[test]
+    fn the_return_brings_no_second_notification() {
+        let (_dir, path) = file();
+        for day in ["2026-11-01", "2026-11-02", "2026-11-03"] {
+            for _ in 0..7 {
+                let _ = after_delivery(&path, day, true, || true);
+            }
+        }
+        assert!(read(&path).notified);
+        close(&path, "2026-11-03").unwrap();
+        assert!(line_shows(&path, true, "2026-12-03"));
+        assert!(!after_delivery(&path, "2026-12-03", true, || true));
+
+        // Closed before the notification could go out: it never does.
+        let (_dir, early) = file();
+        for day in ["2026-11-01", "2026-11-02", "2026-11-03"] {
+            for _ in 0..7 {
+                let _ = after_delivery(&early, day, true, || false);
+            }
+        }
+        close(&early, "2026-11-03").unwrap();
+        for day in ["2026-11-04", "2026-12-03", "2026-12-04"] {
+            assert!(!after_delivery(&early, day, true, || true));
+        }
+        assert!(!read(&early).notified);
+    }
+
+    #[test]
+    fn a_state_file_from_before_the_second_chance_loads_with_its_count() {
+        let (_dir, path) = file();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"count":20,"dates":["2026-11-01","2026-11-02","2026-11-03"],"notified":true,"answered":false}"#,
+        )
+        .unwrap();
+        let loaded = read(&path);
+        assert_eq!(loaded.count, 20);
+        assert_eq!(loaded.closes, 0);
+        assert_eq!(loaded.returns_on, None);
+        assert!(line_shows(&path, true, TODAY));
+    }
+
+    #[test]
+    fn the_notification_offers_only_the_star_action() {
+        assert_eq!(notification_actions(), ["star", "Star on GitHub"]);
+    }
+
+    #[test]
+    fn return_dates_cross_months_years_and_leap_days() {
+        assert_eq!(add_days("2026-11-11", 30).as_deref(), Some("2026-12-11"));
+        assert_eq!(add_days("2026-12-15", 30).as_deref(), Some("2027-01-14"));
+        assert_eq!(add_days("2028-02-10", 30).as_deref(), Some("2028-03-11"));
+        assert_eq!(add_days("day-5", 30), None);
     }
 
     #[test]
@@ -395,7 +556,7 @@ mod tests {
         assert!(saved.notified);
         assert!(saved.threshold_met());
         // The line stays until the user answers.
-        assert!(line_shows(&path, true));
+        assert!(line_shows(&path, true, "2026-11-04"));
     }
 
     #[test]
@@ -424,7 +585,7 @@ mod tests {
                 assert!(!after_delivery(&path, day, false, || true));
             }
         }
-        assert!(!line_shows(&path, false));
+        assert!(!line_shows(&path, false, TODAY));
 
         let (_dir, answered) = file();
         mark_answered(&answered).unwrap();
@@ -433,14 +594,14 @@ mod tests {
                 assert!(!after_delivery(&answered, day, true, || true));
             }
         }
-        assert!(!line_shows(&answered, true));
+        assert!(!line_shows(&answered, true, TODAY));
     }
 
     #[test]
     fn star_opens_the_repository_and_answers_even_without_a_browser() {
         let (_dir, path) = file();
         let mut opened = None;
-        let result = apply(Answer::Star, Some(&path), |url| {
+        let result = star(Some(&path), |url| {
             opened = Some(url.to_owned());
             Err("no browser".to_owned())
         });

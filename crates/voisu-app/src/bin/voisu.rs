@@ -417,21 +417,17 @@ fn switch_meaning(switch: Switch, on: bool) -> &'static str {
         (Switch::UpdateCheck, false) => {
             "Voisu never checks by itself; voisu update --check still does"
         }
-        (Switch::StarPrompt, true) => "Voisu may ask once for a GitHub star",
+        (Switch::StarPrompt, true) => "after a few days of use Voisu may ask for a GitHub star",
         (Switch::StarPrompt, false) => "Voisu never asks for a GitHub star",
     }
 }
 
-/// Opens the repository page and records the answer, so the star prompt
-/// never shows again. Without a browser it names the page instead.
+/// Opens the repository page and ends the star nudge for good. It works
+/// whatever the nudge or the setting say. Without a browser it names the page.
 fn star() -> ExitCode {
     use voisu_app::star_prompt;
     let path = star_prompt::state_path();
-    match star_prompt::apply(
-        star_prompt::Answer::Star,
-        path.as_deref(),
-        star_prompt::open_in_browser,
-    ) {
+    match star_prompt::star(path.as_deref(), star_prompt::open_in_browser) {
         Ok(()) => println!("Opening {}. Thank you!", star_prompt::REPO_URL),
         Err(_) => println!(
             "Open {} in your browser to star Voisu. Thank you!",
@@ -870,7 +866,7 @@ commands:
                                 update Voisu
   update-check [on|off]         check once a day for a newer version
   star                          star Voisu on GitHub (opens your browser)
-  star-prompt [on|off]          let Voisu ask once for a GitHub star
+  star-prompt [on|off]          let Voisu ask for a GitHub star
 
 options:
   -h, --help, help              show this help

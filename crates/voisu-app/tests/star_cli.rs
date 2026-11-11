@@ -123,3 +123,23 @@ fn star_prompt_round_trips_and_status_never_mentions_it() {
     );
     assert!(!all.to_lowercase().contains("star"), "{all}");
 }
+
+#[test]
+fn star_works_with_the_prompt_off_and_the_nudge_closed_for_good() {
+    let host = Host::new("");
+    assert!(host.run(&["star-prompt", "off"]).status.success());
+    std::fs::create_dir_all(host.root.path().join("state/voisu")).unwrap();
+    std::fs::write(
+        host.root.path().join("state/voisu/star-prompt.json"),
+        r#"{"count":20,"dates":["a","b","c"],"notified":true,"answered":false,"closes":2,"returns_on":"2026-12-11"}"#,
+    )
+    .unwrap();
+
+    let output = host.run(&["star"]);
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(shown(&output).contains("Thank you"), "{output:?}");
+    let state = host.state();
+    assert!(state.contains("\"answered\":true"), "{state}");
+    assert!(state.contains("\"count\":20"), "{state}");
+}

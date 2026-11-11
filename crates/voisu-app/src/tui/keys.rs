@@ -104,10 +104,10 @@ pub enum Action {
     Keep,
     /// Read a key from the clipboard.
     PasteClipboard,
-    /// Open the repository to star it, and answer the star prompt.
+    /// Open the repository to star it, ending the star nudge.
     Star,
-    /// Never show the star prompt again.
-    DismissStar,
+    /// Close the star nudge: for 30 days the first time, for good the second.
+    CloseStar,
 }
 
 /// One row of the table: how it reads, and which keys do what.
@@ -338,7 +338,7 @@ pub fn bindings(context: &Context) -> Vec<Binding> {
                 });
                 rows.push(Binding {
                     in_footer: false,
-                    ..simple('x', "x", "don't ask for a star again", Action::DismissStar)
+                    ..simple('x', "x", "close the star request", Action::CloseStar)
                 });
             }
             rows.push(help());
