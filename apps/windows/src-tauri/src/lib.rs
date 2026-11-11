@@ -18,6 +18,7 @@ mod paths;
 pub mod platform;
 pub mod settings;
 pub mod setup;
+mod star_prompt;
 mod tray;
 #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 mod trigger;
@@ -30,6 +31,7 @@ use std::sync::{Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, WindowEvent};
 use tauri_plugin_autostart::ManagerExt as _;
+use tauri_plugin_notification::NotificationExt as _;
 use tauri_plugin_opener::OpenerExt as _;
 use voisu_cloud::ProviderHttpClient;
 use voisu_core::{Provider, SecretStore, Tone};
@@ -40,6 +42,7 @@ use platform::permissions::{self, Pane, Permissions};
 use platform::secrets::CredentialManagerStore;
 use settings::{OverlaySize, Settings};
 use setup::{KeyInputs, KeyResult};
+use star_prompt::StarPrompt;
 use trigger_key::TriggerChord;
 
 const SETTINGS_WINDOW: &str = "settings";
@@ -50,6 +53,9 @@ const AUTOSTART_ARG: &str = "--autostart";
 
 pub struct AppState {
     settings: Mutex<Settings>,
+    /// The local dictation count behind the star prompt. Never locked while
+    /// `settings` is held.
+    star: Mutex<StarPrompt>,
     /// Set once at startup and never locked: menu setters called off the main
     /// thread block until the main thread runs them, so holding a lock across
     /// them could deadlock against a main-thread menu or command handler.
@@ -121,6 +127,12 @@ struct UiState {
     permissions: Option<Permissions>,
     /// A downloaded update waiting for "Restart to update".
     update_version: Option<String>,
+    /// The Star prompt switch in Settings.
+    star_prompt: bool,
+    /// Whether the window shows the "Enjoying Voisu?" banner, judged on
+    /// today's local date so a closed banner returns after 30 days without
+    /// waiting for a dictation.
+    show_star: bool,
     /// The dictation under way, if any; later changes arrive as
     /// `recording-state` events.
     phase: Option<engine::PhaseNow>,
@@ -229,6 +241,13 @@ fn get_state(app: AppHandle) -> UiState {
         platform: PLATFORM,
         permissions: permissions::current(),
         update_version: updater::pending_version(&app),
+        star_prompt: settings.star_prompt,
+        show_star: app
+            .state::<AppState>()
+            .star
+            .lock()
+            .unwrap()
+            .show(local_today(), settings.star_prompt),
         phase: engine::current_phase(&app),
     }
 }
@@ -298,6 +317,101 @@ fn set_boost_words(app: AppHandle, words: Vec<String>) -> Vec<String> {
 fn set_tone(app: AppHandle, tone: Tone) -> Tone {
     tracing::info!(tone = tone.as_str(), "tone");
     update_settings(&app, |settings| settings.tone = tone).tone
+}
+
+fn local_today() -> chrono::NaiveDate {
+    chrono::Local::now().date_naive()
+}
+
+/// The Settings switch: off hides the banner and the notification, not the
+/// Settings card.
+#[tauri::command]
+fn set_star_prompt(app: AppHandle, enabled: bool) -> bool {
+    tracing::info!(enabled, "star prompt");
+    let enabled = update_settings(&app, |settings| settings.star_prompt = enabled).star_prompt;
+    let _ = app.emit(STATE_CHANGED, ());
+    enabled
+}
+
+const REPO_URL: &str = "https://github.com/Anuraj-dev/voisu";
+
+/// "Star on GitHub" on the banner or the Settings card: opens the repository
+/// page and records the answer, so the banner never returns. Nothing checks whether a star was
+/// given. If the browser does not open, nothing is recorded.
+#[tauri::command]
+fn star_on_github(app: AppHandle) -> Result<(), String> {
+    // Open first: if the browser does not open, the banner stays so the
+    // error is seen and the user can try again.
+    app.opener()
+        .open_url(REPO_URL, None::<&str>)
+        .map_err(|_| "Couldn't open the browser.".to_owned())?;
+    tracing::info!("star prompt answered");
+    {
+        let state = app.state::<AppState>();
+        let mut star = state.star.lock().unwrap();
+        star.answer();
+        if let Err(error) = star.save(&paths::star_prompt_file()) {
+            tracing::warn!(%error, "star prompt save failed");
+        }
+    }
+    let _ = app.emit(STATE_CHANGED, ());
+    Ok(())
+}
+
+/// The banner's ×: hides it for 30 days the first time, for good the
+/// second.
+#[tauri::command]
+fn close_star_banner(app: AppHandle) {
+    {
+        let state = app.state::<AppState>();
+        let mut star = state.star.lock().unwrap();
+        star.close(local_today());
+        tracing::info!("star banner closed");
+        if let Err(error) = star.save(&paths::star_prompt_file()) {
+            tracing::warn!(%error, "star prompt save failed");
+        }
+    }
+    let _ = app.emit(STATE_CHANGED, ());
+}
+
+/// Called by the engine after a Transcript was delivered. Counts it toward
+/// the star prompt and, for the dictation that crosses the threshold, shows
+/// the banner and sends the one notification.
+pub(crate) fn dictation_delivered(app: &AppHandle) {
+    let enabled = app.state::<AppState>().settings.lock().unwrap().star_prompt;
+    let today = local_today();
+    let notify = {
+        let state = app.state::<AppState>();
+        let mut star = state.star.lock().unwrap();
+        let before = star.clone();
+        let notify = star.record(today, enabled);
+        if *star != before
+            && let Err(error) = star.save(&paths::star_prompt_file())
+        {
+            tracing::warn!(%error, "star prompt save failed");
+        }
+        notify
+    };
+    if notify {
+        tracing::info!("star prompt shown");
+        notify_star(app);
+        let _ = app.emit(STATE_CHANGED, ());
+    }
+}
+
+/// The one star notification, sent once ever. It carries no actions: the
+/// window's banner holds the two answers. A failure only logs; the banner
+/// still shows.
+fn notify_star(app: &AppHandle) {
+    let shown = app
+        .notification()
+        .builder()
+        .title("Enjoying Voisu?")
+        .body("A GitHub star helps other people find it.")
+        .show();
+    if let Err(error) = shown {
+        tracing::warn!(%error, "star notification not shown");
+    }
 }
 
 #[derive(Serialize)]
@@ -520,10 +634,12 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(updater::UpdaterState::default())
         .manage(AppState {
             settings: Mutex::new(Settings::load(&paths::settings_file())),
+            star: Mutex::new(StarPrompt::load(&paths::star_prompt_file())),
             tray: OnceLock::new(),
         })
         .invoke_handler(tauri::generate_handler![
@@ -540,6 +656,9 @@ pub fn run() {
             open_logs,
             open_permission_settings,
             install_update,
+            set_star_prompt,
+            star_on_github,
+            close_star_banner,
             engine::last_transcript
         ])
         .setup(|app| {

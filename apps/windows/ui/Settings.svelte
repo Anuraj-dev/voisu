@@ -15,6 +15,7 @@
   let autoPasteBusy = $state(false);
   let toneBusy = $state(false);
   let autostartBusy = $state(false);
+  let starBusy = $state(false);
   let wordsBusy = $state(false);
   let wordsStatus = $state('');
   // The provider whose key is being replaced, if any. Saved key text is
@@ -120,6 +121,20 @@
     }
   }
 
+  async function toggleStarPrompt(event) {
+    const box = event.currentTarget;
+    starBusy = true;
+    errors.system = '';
+    try {
+      ui.app.starPrompt = await invoke('set_star_prompt', { enabled: box.checked });
+    } catch (e) {
+      fail('system', 'Could not change Star prompt.');
+    } finally {
+      box.checked = ui.app.starPrompt;
+      starBusy = false;
+    }
+  }
+
   function startReplace(provider) {
     replacing = provider;
     newKey = '';
@@ -168,6 +183,13 @@
     } finally {
       updating = false;
     }
+  }
+
+  // Always offered, whatever the banner and the Star prompt switch say.
+  // Starring here also ends the banner for good.
+  function star() {
+    errors.support = '';
+    invoke('star_on_github').catch((e) => fail('support', typeof e === 'string' ? e : 'Could not open the browser.'));
   }
 
   function open(command) {
@@ -298,6 +320,14 @@
   <h2 id="system-title">System</h2>
   <div class="card">
     {@render toggle('autostart', 'Start at login', '', app.autostart, autostartBusy, toggleAutostart)}
+    {@render toggle(
+      'star-prompt',
+      'Star prompt',
+      'After steady use, ask for a GitHub star.',
+      app.starPrompt,
+      starBusy,
+      toggleStarPrompt,
+    )}
     {@render problem('system')}
   </div>
 </section>
@@ -366,6 +396,17 @@
     {/each}
     {@render problem('keys')}
     <p class="hint">{keyStoreHint()}</p>
+  </div>
+</section>
+
+<section aria-labelledby="support-title">
+  <h2 id="support-title">Support Voisu</h2>
+  <div class="card">
+    <div class="row">
+      <span class="row-text">Voisu is free and built by one student. A star helps others find it.</span>
+      <button type="button" class="pill" onclick={star}>Star on GitHub</button>
+    </div>
+    {@render problem('support')}
   </div>
 </section>
 

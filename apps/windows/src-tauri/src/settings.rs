@@ -58,6 +58,10 @@ pub struct Settings {
     /// Recording starts; anything unknown is formal.
     #[serde(deserialize_with = "lenient")]
     pub tone: Tone,
+    /// Ask once for a GitHub star after steady use (see `star_prompt`).
+    /// Off stops the banner and the notification, never the Settings card.
+    #[serde(deserialize_with = "lenient_on")]
+    pub star_prompt: bool,
 }
 
 /// A field with a value this version does not understand (a size a later
@@ -114,6 +118,7 @@ impl Default for Settings {
             overlay_size: OverlaySize::Medium,
             boost_words: vec!["Voisu".to_owned()],
             tone: Tone::Formal,
+            star_prompt: true,
         }
     }
 }
@@ -280,6 +285,26 @@ mod tests {
         assert_eq!(settings.overlay_size.scale(), 1.0);
         assert_eq!(settings.boost_words, ["Voisu"]);
         assert_eq!(settings.tone, Tone::Formal);
+        assert!(settings.star_prompt);
+    }
+
+    #[test]
+    fn the_star_prompt_switch_round_trips_and_a_mistyped_value_is_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let off = Settings {
+            star_prompt: false,
+            ..Settings::default()
+        };
+        off.save(&path).unwrap();
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains(r#""star_prompt": false"#)
+        );
+        assert_eq!(Settings::load(&path), off);
+        fs::write(&path, br#"{"star_prompt": "no"}"#).unwrap();
+        assert!(Settings::load(&path).star_prompt);
     }
 
     #[test]

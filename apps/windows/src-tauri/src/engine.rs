@@ -343,7 +343,10 @@ impl Engine {
                     .lock()
                     .unwrap() = Some(text.clone());
                 let _ = self.app.emit(crate::STATE_CHANGED, ());
-                self.deliver(id, target, text).await;
+                if self.deliver(id, target, text).await {
+                    // After the Delivery has finished, never during one.
+                    crate::dictation_delivered(&self.app);
+                }
             }
             Err(error) => self.fail(id, &error),
         }
@@ -352,13 +355,16 @@ impl Engine {
     /// Pastes the Transcript into `target`, or with auto-paste off only puts
     /// it on the clipboard. Delivery blocks and pumps its own messages, so it
     /// runs on a blocking thread, which may keep the user's clipboard parked
-    /// a little after the result arrives here.
-    async fn deliver(&self, id: u64, target: DeliveryTarget, text: String) {
+    /// a little after the result arrives here. Returns whether the
+    /// Transcript was delivered: pasted, or left on the clipboard for the
+    /// user to paste.
+    async fn deliver(&self, id: u64, target: DeliveryTarget, text: String) -> bool {
         if !self.settings().auto_paste {
             let copied = tokio::task::spawn_blocking(move || delivery::copy(&text)).await;
             let message = match copied {
                 Ok(Ok(())) => {
-                    return self.emit_state(Phase::Done, Some(delivery::COPIED.to_owned()));
+                    self.emit_state(Phase::Done, Some(delivery::COPIED.to_owned()));
+                    return true;
                 }
                 Ok(Err(error)) => {
                     tracing::warn!(id, %error, "copy failed");
@@ -378,19 +384,27 @@ impl Engine {
             Ok(result) => {
                 let (state, message) = delivery::overlay_state(&result);
                 self.emit_state(state, message);
+                matches!(state, Phase::Done | Phase::Copied)
             }
             Err(_) => {
                 tracing::warn!(id, "delivery task ended without a result");
-                self.delivered(Some("Couldn't paste the Transcript".to_owned()));
+                self.delivered(Some("Couldn't paste the Transcript".to_owned()))
             }
         }
     }
 
-    /// Success unless there is something to tell the user.
-    fn delivered(&self, message: Option<String>) {
+    /// Success unless there is something to tell the user; returns whether
+    /// it was a success.
+    fn delivered(&self, message: Option<String>) -> bool {
         match message {
-            None => self.emit_state(Phase::Done, None),
-            Some(message) => self.emit_state(Phase::Error, Some(message)),
+            None => {
+                self.emit_state(Phase::Done, None);
+                true
+            }
+            Some(message) => {
+                self.emit_state(Phase::Error, Some(message));
+                false
+            }
         }
     }
 
