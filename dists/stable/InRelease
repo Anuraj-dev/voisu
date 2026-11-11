@@ -4,29 +4,29 @@ Hash: SHA512
 Architectures: amd64
 Codename: stable
 Components: main
-Date: Mon, 09 Nov 2026 12:58:09 +0000
+Date: Wed, 11 Nov 2026 08:20:32 +0000
 Acquire-By-Hash: yes
-Valid-Until: Wed, 09 Dec 2026 12:58:09 +0000
+Valid-Until: Fri, 11 Dec 2026 08:20:32 +0000
 Description: Voisu apt repository
 Label: Voisu
 Origin: Voisu
 Suite: stable
 MD5Sum:
- 6aec46e5603199b75685f03ab53458d5             3816 main/binary-amd64/Packages
- 03aefec01d7727513ad4214c2dda8f8d             1224 main/binary-amd64/Packages.gz
+ 9354c30937bdbca7e34297d0ae7443d1             3816 main/binary-amd64/Packages
+ 116fdb5c74892bd357c27a8448f6dc08             1227 main/binary-amd64/Packages.gz
 SHA1:
- 1f4eea3a7ad92089152ff8a0abde08b0a56846ab             3816 main/binary-amd64/Packages
- 65dc20b9d3406d953998a0c13ad44306c7b927e9             1224 main/binary-amd64/Packages.gz
+ dc2889519ddb73c3b2978a96d47ccf8e99f21b7f             3816 main/binary-amd64/Packages
+ 8e685c0f5bea75eb45c275791622b1dd8f6de016             1227 main/binary-amd64/Packages.gz
 SHA256:
- 73d7997661934c422a042ecb7bf041d633b720e1e33f2e873239c34d6c21e3c6             3816 main/binary-amd64/Packages
- 51539c3c64974a19d99ebc002bc8ba727bb4e4ed73c5e2251dc04a67829ac4ef             1224 main/binary-amd64/Packages.gz
+ 26488dfc4a5e75f69bd518fe25675a450d905d81fb8a437b349d3cf1302395e7             3816 main/binary-amd64/Packages
+ 6206442a3c2c150f0e3f4a8c8eaac0262b9234373c7af739af72888204e4d976             1227 main/binary-amd64/Packages.gz
 SHA512:
- c38b669e84f07da7afcc93f1c12fdf5662cec2deb8b2700327660c1d0f3ae0d36c3008a60a1575e0aa56df8f7b664b34997a85dd63933c28eda87f1aa3c9ae4e             3816 main/binary-amd64/Packages
- 6615feb0bceeb808a01eef29447a7bc14fe94a60a705feb96e9223e9a8677d2360a7b04625e7328f4976434f816243ffe3fef9f0eae42838cbd09c550141593c             1224 main/binary-amd64/Packages.gz
+ 0ba99cdac6de9df4740b93af85ca22509f125a6b8a3e0e4c6d1160c01e613f5c030f22346b9a19ba735a20677c9931ee395b0c64efec5df0b9de8674d2cdf7b3             3816 main/binary-amd64/Packages
+ 93fd7d0b51f340e8a8d506a5e7ae13882042c2726c05f740a7c341a143c04bbc8ce29c7eb3fbb59e1ae2d1e7cf0fc7575cb70ac1383a40aa88d44184a7c3e1f3             1227 main/binary-amd64/Packages.gz
 -----BEGIN PGP SIGNATURE-----
 
-iHUEARYKAB0WIQRBSe44aLNrYAdZKWbQi8/cNBJbKAUCavHDYQAKCRDQi8/cNBJb
-KMKvAP4mcCmhM9UhDSwOlCASmvu6/1zn/IUReIwX0b+33dvDTQD+Plhdm9DXIIaN
-UvOhzfNWatpLmkJh97ssS5SjXUZ5rwM=
-=ekex
+iHUEARYKAB0WIQRBSe44aLNrYAdZKWbQi8/cNBJbKAUCavQlUAAKCRDQi8/cNBJb
+KGOBAQDahLDMMIbQ6lD/15hp5e7F3lOnfsIEDtUVC1CN7tDsvgD/Q5VYhH8OjVNe
+aBRex5e+j+/EgKcvkENzIYD/elGgzAU=
+=hWUs
 -----END PGP SIGNATURE-----
