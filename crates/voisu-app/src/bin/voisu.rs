@@ -20,6 +20,7 @@ enum CliAction {
     KeyCheck(Provider),
     SetDeepgram(bool),
     Switch(Switch, Option<bool>),
+    Star,
     SetAsrMode(AsrMode),
     Delivery(Option<DeliveryMode>),
     Writing(Option<WritingMode>),
@@ -53,6 +54,7 @@ fn main() -> ExitCode {
         Ok(CliAction::KeyCheck(provider)) => key_check(provider),
         Ok(CliAction::SetDeepgram(enabled)) => set_deepgram(enabled),
         Ok(CliAction::Switch(switch, state)) => switch_command(switch, state),
+        Ok(CliAction::Star) => star(),
         Ok(CliAction::SetAsrMode(mode)) => set_asr_mode(mode),
         Ok(CliAction::Delivery(mode)) => delivery(mode),
         Ok(CliAction::Writing(mode)) => writing(mode),
@@ -403,6 +405,7 @@ fn switch_command(switch: Switch, state: Option<bool>) -> ExitCode {
 fn switch_label(switch: Switch) -> &'static str {
     match switch {
         Switch::UpdateCheck => "Update check",
+        Switch::StarPrompt => "Star prompt",
     }
 }
 
@@ -414,7 +417,28 @@ fn switch_meaning(switch: Switch, on: bool) -> &'static str {
         (Switch::UpdateCheck, false) => {
             "Voisu never checks by itself; voisu update --check still does"
         }
+        (Switch::StarPrompt, true) => "Voisu may ask once for a GitHub star",
+        (Switch::StarPrompt, false) => "Voisu never asks for a GitHub star",
     }
+}
+
+/// Opens the repository page and records the answer, so the star prompt
+/// never shows again. Without a browser it names the page instead.
+fn star() -> ExitCode {
+    use voisu_app::star_prompt;
+    let path = star_prompt::state_path();
+    match star_prompt::apply(
+        star_prompt::Answer::Star,
+        path.as_deref(),
+        star_prompt::open_in_browser,
+    ) {
+        Ok(()) => println!("Opening {}. Thank you!", star_prompt::REPO_URL),
+        Err(_) => println!(
+            "Open {} in your browser to star Voisu. Thank you!",
+            star_prompt::REPO_URL
+        ),
+    }
+    ExitCode::SUCCESS
 }
 
 /// Reads or persists the Delivery mode. A running daemon resolves configuration
@@ -693,6 +717,12 @@ fn parse_command() -> Result<CliAction, String> {
             Switch::UpdateCheck,
             Some(parse_on_off(state, "update-check")?),
         )),
+        [command] if command == "star" => Ok(CliAction::Star),
+        [command] if command == "star-prompt" => Ok(CliAction::Switch(Switch::StarPrompt, None)),
+        [command, state] if command == "star-prompt" => Ok(CliAction::Switch(
+            Switch::StarPrompt,
+            Some(parse_on_off(state, "star-prompt")?),
+        )),
         [command, engine] if command == "engine" => {
             Ok(CliAction::SetAsrMode(parse_asr_mode(engine)?))
         }
@@ -839,6 +869,8 @@ commands:
   update [--check|--dry-run] [--switch-to-bin]
                                 update Voisu
   update-check [on|off]         check once a day for a newer version
+  star                          star Voisu on GitHub (opens your browser)
+  star-prompt [on|off]          let Voisu ask once for a GitHub star
 
 options:
   -h, --help, help              show this help

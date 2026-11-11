@@ -39,8 +39,24 @@ pub(super) fn lines(app: &App, look: &Look, width: usize, height: usize) -> Vec<
                 Tone::Accent,
             ));
         }
+        if app.star_line() {
+            lines.push(Line::default());
+            lines.push(single(look, &star_line(width), Tone::Accent));
+        }
     }
     lines
+}
+
+/// `Enjoying Voisu? Star it on GitHub`, with its two keys when they fit.
+fn star_line(width: usize) -> String {
+    let room = width.saturating_sub(INDENT.len());
+    let line = crate::star_prompt::HOME_LINE;
+    let with_keys = format!("{line}  s star · x dismiss");
+    if text::width(&with_keys) <= room {
+        format!("{INDENT}{with_keys}")
+    } else {
+        format!("{INDENT}{}", text::fit(line, room))
+    }
 }
 
 fn hero_lines(app: &App, look: &Look, width: usize) -> Vec<Line<'static>> {

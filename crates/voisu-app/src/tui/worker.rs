@@ -183,6 +183,17 @@ pub fn execute(job: Job, replies: &Sender<Reply>) {
             },
             &[Refresh::Settings],
         )),
+        Job::SetStarPrompt(on) => send(applied_setting(
+            config::set_switch(config::Switch::StarPrompt, on),
+            format!("Star prompt turned {}.", if on { "on" } else { "off" }),
+            if on {
+                "Voisu may ask once."
+            } else {
+                "Voisu won't ask again."
+            },
+            &[Refresh::Settings],
+        )),
+        Job::Star => send(star()),
         Job::SetEngine { mode, local_ready } => send(set_engine(mode, local_ready)),
         Job::AddTerm(term) => send(dictionary_result(
             crate::dictionary::add_user_term(&term),
@@ -212,6 +223,7 @@ pub fn execute(job: Job, replies: &Sender<Reply>) {
 }
 
 fn load_settings() -> SettingsSnapshot {
+    let star_prompt = config::switch(config::Switch::StarPrompt);
     // A legacy `clipboard` means different things in different sessions, and
     // this terminal may not be in the service's session, so it is never resolved
     // here.
@@ -234,6 +246,28 @@ fn load_settings() -> SettingsSnapshot {
         tone: config::tone(),
         deepgram: config::deepgram_enabled(),
         update_check: config::switch(config::Switch::UpdateCheck),
+        star_prompt,
+        star_line: crate::star_prompt::state_path()
+            .is_some_and(|path| crate::star_prompt::line_shows(&path, star_prompt)),
+    }
+}
+
+/// Opens the repository page and answers the star prompt for good.
+fn star() -> Reply {
+    use crate::star_prompt;
+    let path = star_prompt::state_path();
+    let text = match star_prompt::apply(
+        star_prompt::Answer::Star,
+        path.as_deref(),
+        star_prompt::open_in_browser,
+    ) {
+        Ok(()) => "Opened GitHub. Thank you!".to_owned(),
+        Err(_) => format!("Open {} to star Voisu. Thank you!", star_prompt::REPO_URL),
+    };
+    Reply::Applied {
+        kind: Tone::Success,
+        text,
+        refresh: &[Refresh::Settings],
     }
 }
 

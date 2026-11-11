@@ -506,12 +506,16 @@ pub enum Switch {
     /// `update_check`: the daily automatic check for a newer release. Off
     /// leaves only `voisu update --check`, which the user asks for.
     UpdateCheck,
+    /// `star_prompt`: the one-time GitHub star prompt. Off hides both the
+    /// notification and the TUI Home line.
+    StarPrompt,
 }
 
 impl Switch {
     fn key(self) -> &'static str {
         match self {
             Switch::UpdateCheck => "update_check",
+            Switch::StarPrompt => "star_prompt",
         }
     }
 }

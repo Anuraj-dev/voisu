@@ -1606,6 +1606,9 @@ async fn actor_loop(
                     state = ActorState::Idle;
                     let response = match completed.result {
                         Ok(()) => {
+                            if delivery_method.is_some() {
+                                voisu_app::star_prompt::spawn_after_delivery();
+                            }
                             // The journal is the only diagnostic surface that
                             // outlives the retention ring, so the healthy path
                             // reports its per-stage timings there too — not just

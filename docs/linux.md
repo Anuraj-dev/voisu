@@ -115,6 +115,10 @@ Once a day Voisu downloads a small version file, `latest-linux.json`, from GitHu
 
 Turn it off with `voisu update-check off`, or *Settings → Update check* in the interface. Voisu then never checks by itself. `voisu update --check` still works when you ask.
 
+## Star prompt
+
+After 20 dictations spread over at least 3 days, Voisu asks once, in a desktop notification, whether you'd star it on GitHub. The interface's Home screen shows the same line until you answer. The count lives only on this computer and is never sent anywhere. Answer with `voisu star`, which opens the GitHub page, or choose *Don't ask again*. Turn it off with `voisu star-prompt off`, or *Settings → Star prompt* in the interface.
+
 ## Trigger Key by desktop
 
 - **KDE Plasma and GNOME:** a system dialog appears the first time the daemon starts. Choose a Trigger Key there, and it persists.
