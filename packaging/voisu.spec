@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.74.2
+Version:        0.75.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -167,6 +167,10 @@ install -D -m 0644 packaging/icons/voisu.svg %{buildroot}%{_datadir}/icons/hicol
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Wed Nov 11 2026 Voisu maintainers <voisu@example.invalid> - 0.75.0-1
+- feat(macos): run Voisu on Apple Silicon Macs (#310)
+- docs(readme): remove em dashes and reformat for scanning (#313)
+
 * Sun Nov 08 2026 Voisu maintainers <voisu@example.invalid> - 0.74.2-1
 - fix(core): stop Intent Reconstruction from dropping dictated speech (#312)
 
