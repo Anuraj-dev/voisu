@@ -196,6 +196,7 @@ async fn run() -> Result<(), String> {
     };
     local_recovery::expire_at_startup();
     local_recovery::spawn_hourly_expiry();
+    voisu_app::update_notice::spawn_daemon_check();
 
     // An over-long VOISU_RECORDING_DEADLINE_MS is clamped to the one bounded
     // maximum. Say so once here rather than at the clamp itself, which runs on

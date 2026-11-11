@@ -422,6 +422,49 @@ mod tests {
         );
     }
 
+    fn with_update(version: &str) -> App {
+        let mut app = ready_app();
+        let _ = update(
+            &mut app,
+            Msg::Reply(Reply::UpdateAvailable(Some(version.to_owned()))),
+            at(0),
+        );
+        app
+    }
+
+    #[test]
+    fn home_names_a_newer_release_and_the_command_below_the_rows() {
+        let mut app = with_update("0.75.0");
+        let lines = screen(&mut app, &UNICODE, (80, 24));
+        assert_eq!(lines[12], "   Health     15 passed · 1 warning");
+        assert_eq!(lines[13], "");
+        assert_eq!(lines[14], "   Update available: 0.75.0, run `voisu update`");
+
+        let mut app = ready_app();
+        let lines = screen(&mut app, &UNICODE, (80, 24));
+        assert!(!joined(&lines).contains("Update"), "{}", joined(&lines));
+    }
+
+    #[test]
+    fn the_update_line_fits_the_minimum_size_and_yields_to_the_checks_list() {
+        for look in [UNICODE, NO_COLOR, ASCII] {
+            let mut app = with_update("10.100.1000");
+            let lines = screen(&mut app, &look, (60, 16));
+            assert!(
+                joined(&lines).contains("Update available: 10.100.1000"),
+                "{}",
+                joined(&lines)
+            );
+            for line in &lines {
+                assert!(text::width(line) <= 60, "{line}");
+            }
+        }
+        let mut app = with_update("0.75.0");
+        let _ = press(&mut app, KeyCode::Char('d'), 0);
+        let lines = screen(&mut app, &UNICODE, (80, 24));
+        assert!(!joined(&lines).contains("Update available"));
+    }
+
     #[test]
     fn the_last_row_quotes_and_truncates_the_newest_transcript() {
         let mut app = ready_app();
@@ -451,14 +494,15 @@ mod tests {
         assert_eq!(lines[11], "   Groq key      Works");
         assert_eq!(lines[12], "   Deepgram key  Can't reach it");
         assert_eq!(lines[13], "   Trigger Key   Not bound");
-        assert_eq!(lines[14], "   Run setup");
-        assert_eq!(lines[15], "");
-        assert_eq!(lines[16], "   Where your speech becomes text.");
+        assert_eq!(lines[14], "   Update check  On");
+        assert_eq!(lines[15], "   Run setup");
+        assert_eq!(lines[16], "");
+        assert_eq!(lines[17], "   Where your speech becomes text.");
         assert_eq!(
-            lines[17],
+            lines[18],
             "     ● Cloud  Fast and accurate. Needs internet."
         );
-        assert_eq!(lines[18], "       Local  Private. Stays on this computer.");
+        assert_eq!(lines[19], "       Local  Private. Stays on this computer.");
     }
 
     #[test]
@@ -467,13 +511,13 @@ mod tests {
         app.settings_selected = 4;
         let lines = screen(&mut app, &UNICODE, (80, 24));
         assert_eq!(lines[9], " ▌ Tone          Formal");
-        assert_eq!(lines[16], "   How casual your words read.");
+        assert_eq!(lines[17], "   How casual your words read.");
         assert_eq!(
-            lines[17],
+            lines[18],
             "     ● Formal    Full words and a closing full stop."
         );
         assert_eq!(
-            lines[18],
+            lines[19],
             "       Informal  Abbreviations like btw, no final full stop."
         );
     }
@@ -484,10 +528,10 @@ mod tests {
         let _ = press(&mut app, KeyCode::Down, 0);
         let lines = screen(&mut app, &UNICODE, (80, 24));
         assert_eq!(lines[6], " ▌ Delivery      Paste");
-        assert_eq!(lines[16], "   How your words reach your window.");
-        assert_eq!(lines[17], "     ● Paste  Puts your words into your window.");
-        assert_eq!(lines[18], "       Copy   Copies only; you press Ctrl+V.");
-        assert_eq!(lines[19], "", "Delivery offers exactly two choices");
+        assert_eq!(lines[17], "   How your words reach your window.");
+        assert_eq!(lines[18], "     ● Paste  Puts your words into your window.");
+        assert_eq!(lines[19], "       Copy   Copies only; you press Ctrl+V.");
+        assert_eq!(lines[20], "", "Delivery offers exactly two choices");
     }
 
     #[test]
@@ -498,13 +542,13 @@ mod tests {
         let _ = press(&mut app, KeyCode::Down, 0);
         let lines = screen(&mut app, &UNICODE, (80, 24));
         // `●` stays on the value in effect; `▌` follows the highlight.
-        assert!(lines[17].starts_with("     ● Paste"), "{}", lines[17]);
-        assert!(lines[18].starts_with("   ▌   Copy"), "{}", lines[18]);
+        assert!(lines[18].starts_with("     ● Paste"), "{}", lines[18]);
+        assert!(lines[19].starts_with("   ▌   Copy"), "{}", lines[19]);
         assert_eq!(lines[22], "", "the toast line stays free");
         assert_eq!(lines[23], " ↑↓ pick   ↵ choose   Esc cancel");
         let ascii = screen(&mut app, &ASCII, (80, 24));
-        assert!(ascii[17].starts_with("     * Paste"), "{}", ascii[17]);
-        assert!(ascii[18].starts_with("   >   Copy"), "{}", ascii[18]);
+        assert!(ascii[18].starts_with("     * Paste"), "{}", ascii[18]);
+        assert!(ascii[19].starts_with("   >   Copy"), "{}", ascii[19]);
     }
 
     #[test]
@@ -532,8 +576,9 @@ mod tests {
                 "    Local  Private. Stays on this computer."
             )
         );
-        assert_eq!(lines[14], beside("   Run setup", ""));
-        assert_eq!(lines[15], "", "nothing below the rows");
+        assert_eq!(lines[14], beside("   Update check  On", ""));
+        assert_eq!(lines[15], beside("   Run setup", ""));
+        assert_eq!(lines[16], "", "nothing below the rows");
 
         // Picking happens in the panel, the same lines gaining the highlight.
         let _ = press(&mut app, KeyCode::Enter, 0);

@@ -499,6 +499,115 @@ pub fn set_tone(tone: Tone) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// An On/Off setting stored as a root key, `key = "on"` or `key = "off"`. Each
+/// defaults to on when the key is missing, unreadable or unrecognised.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Switch {
+    /// `update_check`: the daily automatic check for a newer release. Off
+    /// leaves only `voisu update --check`, which the user asks for.
+    UpdateCheck,
+}
+
+impl Switch {
+    fn key(self) -> &'static str {
+        match self {
+            Switch::UpdateCheck => "update_check",
+        }
+    }
+}
+
+/// Whether `switch` is on in the user's config.
+pub fn switch(switch: Switch) -> bool {
+    switch_at(&config_path(), switch)
+}
+
+/// Persists `switch`, keeping every other line, and returns the path written.
+pub fn set_switch(switch: Switch, on: bool) -> Result<PathBuf, String> {
+    set_switch_at(&config_path(), switch, on)
+}
+
+pub(crate) fn switch_at(path: &Path, switch: Switch) -> bool {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => parse_switch(&contents, switch.key()).unwrap_or(true),
+        Err(_) => true,
+    }
+}
+
+pub(crate) fn set_switch_at(path: &Path, switch: Switch, on: bool) -> Result<PathBuf, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("config path has no parent: {}", path.display()))?;
+    let _lock = ConfigLock::acquire(path)?;
+    let existing = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(format!(
+                "cannot read existing config {} before writing: {error}",
+                path.display()
+            ));
+        }
+    };
+    write_atomic(path, parent, &merge_switch(&existing, switch.key(), on))?;
+    Ok(path.to_path_buf())
+}
+
+/// The root-scope `key`: `"on"`/`"off"` in either quote style, or a bare
+/// `true`/`false`, in any letter case. `None` when missing or unrecognised.
+fn parse_switch(contents: &str, key: &str) -> Option<bool> {
+    for line in contents.lines() {
+        let line = strip_comment(line).trim();
+        if line.starts_with('[') {
+            return None;
+        }
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        if name.trim() != key {
+            continue;
+        }
+        let value = value
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'')
+            .to_ascii_lowercase();
+        return match value.as_str() {
+            "on" | "true" => Some(true),
+            "off" | "false" => Some(false),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// `existing` with the root `key` replaced by one `key = "on|off"` line at the
+/// end of the root table. Every other line is kept as it was.
+fn merge_switch(existing: &str, key: &str, on: bool) -> String {
+    let mut lines: Vec<&str> = Vec::new();
+    let mut root_end = None;
+    for line in existing.lines() {
+        let trimmed = strip_comment(line).trim();
+        if root_end.is_none() && trimmed.starts_with('[') {
+            root_end = Some(lines.len());
+        }
+        let is_root_key = root_end.is_none()
+            && trimmed
+                .split_once('=')
+                .is_some_and(|(name, _)| name.trim() == key);
+        if !is_root_key {
+            lines.push(line);
+        }
+    }
+    let mut insert_at = root_end.unwrap_or(lines.len());
+    while insert_at > 0 && lines[insert_at - 1].trim().is_empty() {
+        insert_at -= 1;
+    }
+    let setting = format!("{key} = \"{}\"", if on { "on" } else { "off" });
+    lines.insert(insert_at, &setting);
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
 /// Resolves the effective setting from the env override and the persisted value.
 /// Pure so the precedence rule is testable without touching the process
 /// environment or the filesystem.
@@ -2183,5 +2292,56 @@ other_key = 5
         let contents = std::fs::read_to_string(&path).unwrap();
         assert_eq!(contents.matches("tone =").count(), 1, "{contents}");
         assert_eq!(contents.matches(MANAGED_LINES[2]).count(), 1, "{contents}");
+    }
+
+    #[test]
+    fn a_switch_is_on_until_set_off_and_keeps_every_other_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("voisu").join("config.toml");
+        assert!(switch_at(&path, Switch::UpdateCheck));
+        write_tone(&path, Tone::Informal).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n[other]\nupdate_check = \"on\"\n",
+                std::fs::read_to_string(&path).unwrap()
+            ),
+        )
+        .unwrap();
+
+        set_switch_at(&path, Switch::UpdateCheck, false).unwrap();
+        assert!(!switch_at(&path, Switch::UpdateCheck));
+        set_switch_at(&path, Switch::UpdateCheck, true).unwrap();
+        set_switch_at(&path, Switch::UpdateCheck, false).unwrap();
+        assert!(!switch_at(&path, Switch::UpdateCheck));
+        write_setting(&path, false).unwrap();
+
+        assert!(!switch_at(&path, Switch::UpdateCheck));
+        assert_eq!(read_tone(&path), Some(Tone::Informal));
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents.matches("update_check =").count(), 2, "{contents}");
+        assert!(
+            contents.contains("[other]\nupdate_check = \"on\""),
+            "{contents}"
+        );
+    }
+
+    #[test]
+    fn switch_values_parse_in_both_spellings_and_unknown_is_on() {
+        for (contents, expected) in [
+            ("update_check = \"off\"", Some(false)),
+            ("update_check = 'on'", Some(true)),
+            ("update_check = false # off", Some(false)),
+            ("update_check = \"Off\"", Some(false)),
+            ("update_check = False", Some(false)),
+            ("update_check = \"maybe\"", None),
+            ("[t]\nupdate_check = \"off\"", None),
+        ] {
+            assert_eq!(
+                parse_switch(contents, "update_check"),
+                expected,
+                "{contents}"
+            );
+        }
     }
 }

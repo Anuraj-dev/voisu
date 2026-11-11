@@ -112,6 +112,7 @@ pub struct SettingsSnapshot {
     pub rendering: RenderingPolicy,
     pub tone: WritingTone,
     pub deepgram: bool,
+    pub update_check: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -152,6 +153,9 @@ pub enum Reply {
     Shortcut(Option<String>),
     History(Result<Vec<HistoryItem>, String>),
     Dictionary(Result<Vec<String>, String>),
+    /// The newer release's `X.Y.Z`, or `None` when there is none or the
+    /// check could not say.
+    UpdateAvailable(Option<String>),
     Applied {
         kind: Tone,
         text: String,
@@ -181,11 +185,15 @@ pub enum Job {
     LoadHistory,
     LoadDictionary,
     LoadShortcut,
+    /// The daily release check. It may wait on the network, so the worker
+    /// gives it a thread of its own.
+    CheckUpdate,
     SetDelivery(DeliveryMode),
     SetWriting(WritingMode),
     SetRendering(RenderingPolicy),
     SetTone(WritingTone),
     SetDeepgram(bool),
+    SetUpdateCheck(bool),
     SetEngine {
         mode: AsrMode,
         /// The daemon's own word that Local is Ready.
@@ -217,11 +225,13 @@ impl fmt::Debug for Job {
             Job::LoadHistory => f.write_str("LoadHistory"),
             Job::LoadDictionary => f.write_str("LoadDictionary"),
             Job::LoadShortcut => f.write_str("LoadShortcut"),
+            Job::CheckUpdate => f.write_str("CheckUpdate"),
             Job::SetDelivery(mode) => write!(f, "SetDelivery({mode:?})"),
             Job::SetWriting(mode) => write!(f, "SetWriting({mode:?})"),
             Job::SetRendering(policy) => write!(f, "SetRendering({policy:?})"),
             Job::SetTone(tone) => write!(f, "SetTone({tone:?})"),
             Job::SetDeepgram(enabled) => write!(f, "SetDeepgram({enabled})"),
+            Job::SetUpdateCheck(on) => write!(f, "SetUpdateCheck({on})"),
             Job::SetEngine { mode, local_ready } => write!(f, "SetEngine({mode:?}, {local_ready})"),
             Job::AddTerm(term) => write!(f, "AddTerm({term:?})"),
             Job::RemoveTerm(term) => write!(f, "RemoveTerm({term:?})"),
@@ -461,11 +471,12 @@ pub enum SettingsRow {
     GroqKey,
     DeepgramKey,
     TriggerKey,
+    UpdateCheck,
     RunSetup,
 }
 
 impl SettingsRow {
-    pub const ALL: [SettingsRow; 10] = [
+    pub const ALL: [SettingsRow; 11] = [
         SettingsRow::Engine,
         SettingsRow::Delivery,
         SettingsRow::Writing,
@@ -475,6 +486,7 @@ impl SettingsRow {
         SettingsRow::GroqKey,
         SettingsRow::DeepgramKey,
         SettingsRow::TriggerKey,
+        SettingsRow::UpdateCheck,
         SettingsRow::RunSetup,
     ];
 
@@ -489,6 +501,7 @@ impl SettingsRow {
             SettingsRow::GroqKey => "Groq key",
             SettingsRow::DeepgramKey => "Deepgram key",
             SettingsRow::TriggerKey => "Trigger Key",
+            SettingsRow::UpdateCheck => "Update check",
             SettingsRow::RunSetup => "Run setup",
         }
     }
@@ -536,6 +549,9 @@ impl SettingsRow {
             SettingsRow::TriggerKey => {
                 "The shortcut that starts and stops a Recording. You can't change it here."
             }
+            SettingsRow::UpdateCheck => {
+                "Once a day, reads the newest version number from GitHub. No identifier or usage is sent."
+            }
             SettingsRow::RunSetup => {
                 "Walks through your keys, Engine and Trigger Key again. Safe to re-run."
             }
@@ -554,6 +570,8 @@ pub struct App {
     doctor_stale: bool,
     pub settings: Option<SettingsSnapshot>,
     pub shortcut: Option<String>,
+    /// A newer release's `X.Y.Z`, for the line on Home.
+    pub update_available: Option<String>,
     pub history: Option<Vec<HistoryItem>>,
     pub history_error: Option<String>,
     pub history_selected: usize,
@@ -600,6 +618,7 @@ impl App {
             doctor_stale: false,
             settings: None,
             shortcut: None,
+            update_available: None,
             history: None,
             history_error: None,
             history_selected: 0,
@@ -629,11 +648,13 @@ impl App {
     }
 
     /// The first round of work. History and the Trigger Key wait for the first
-    /// status poll, since both need a daemon.
+    /// status poll, since both need a daemon. The release check runs once per
+    /// session; its cache keeps it to once a day.
     pub fn start(&mut self) -> Vec<Effect> {
         let mut effects = vec![
             Effect::Job(Job::LoadSettings),
             Effect::Job(Job::LoadDictionary),
+            Effect::Job(Job::CheckUpdate),
         ];
         self.request_doctor(&mut effects);
         effects
@@ -907,6 +928,9 @@ impl App {
             SettingsRow::Deepgram => self.settings.map_or_else(loading, |settings| {
                 plain(if settings.deepgram { "On" } else { "Off" }.to_owned())
             }),
+            SettingsRow::UpdateCheck => self.settings.map_or_else(loading, |settings| {
+                plain(if settings.update_check { "On" } else { "Off" }.to_owned())
+            }),
             SettingsRow::GroqKey => self.key_value(Provider::Groq),
             SettingsRow::DeepgramKey => self.key_value(Provider::Deepgram),
             SettingsRow::TriggerKey => match (&self.shortcut, &self.daemon) {
@@ -1101,6 +1125,10 @@ impl App {
             Reply::Shortcut(value) => {
                 self.dirty |= self.shortcut != value;
                 self.shortcut = value;
+            }
+            Reply::UpdateAvailable(version) => {
+                self.dirty |= self.update_available != version;
+                self.update_available = version;
             }
             Reply::History(Ok(items)) => {
                 if self.history.as_ref() != Some(&items) || self.history_error.is_some() {
@@ -1347,6 +1375,12 @@ impl App {
                 if let Some(settings) = &mut self.settings {
                     settings.deepgram = !settings.deepgram;
                     effects.push(Effect::Job(Job::SetDeepgram(settings.deepgram)));
+                }
+            }
+            SettingsRow::UpdateCheck => {
+                if let Some(settings) = &mut self.settings {
+                    settings.update_check = !settings.update_check;
+                    effects.push(Effect::Job(Job::SetUpdateCheck(settings.update_check)));
                 }
             }
             SettingsRow::GroqKey => {
@@ -1701,6 +1735,7 @@ pub(super) mod test_support {
             rendering: RenderingPolicy::Adaptive,
             tone: WritingTone::Formal,
             deepgram: true,
+            update_check: true,
         }
     }
 
@@ -2002,6 +2037,36 @@ mod tests {
             }),
             at(0),
         );
+    }
+
+    #[test]
+    fn the_update_check_row_flips_on_enter_and_needs_no_restart() {
+        let mut app = ready_app();
+        app.tab = Tab::Settings;
+        app.settings_selected = SettingsRow::ALL
+            .iter()
+            .position(|row| *row == SettingsRow::UpdateCheck)
+            .unwrap();
+        assert_eq!(app.setting_value(SettingsRow::UpdateCheck).0, "On");
+        let effects = press(&mut app, KeyCode::Enter, 0);
+        assert!(matches!(
+            &effects[..],
+            [Effect::Job(Job::SetUpdateCheck(false))]
+        ));
+        let _ = update(
+            &mut app,
+            Msg::Reply(Reply::Applied {
+                kind: Tone::Success,
+                text: "Update check turned off. Voisu won't check by itself.".to_owned(),
+                refresh: &[Refresh::Settings],
+            }),
+            at(0),
+        );
+        assert_eq!(
+            app.setting_value(SettingsRow::UpdateCheck),
+            ("Off".to_owned(), Tone::Plain)
+        );
+        assert!(app.restart_pending.is_empty());
     }
 
     #[test]
@@ -2356,6 +2421,48 @@ mod tests {
         assert!(effects.is_empty());
     }
 
+    // --- Update notice ----------------------------------------------------------
+
+    #[test]
+    fn the_update_check_runs_once_per_session_at_start() {
+        let mut app = App::new((80, 24), at(0));
+        let effects = app.start();
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(effect, Effect::Job(Job::CheckUpdate)))
+                .count(),
+            1
+        );
+        let mut app = ready_app();
+        let _ = press(&mut app, KeyCode::Char('2'), 0);
+        let effects = press(&mut app, KeyCode::Char('1'), 0);
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Job(Job::CheckUpdate)))
+        );
+    }
+
+    #[test]
+    fn a_newer_release_is_kept_and_redrawn() {
+        let mut app = ready_app();
+        let _ = app.take_dirty();
+        let _ = update(
+            &mut app,
+            Msg::Reply(Reply::UpdateAvailable(Some("0.75.0".to_owned()))),
+            at(0),
+        );
+        assert_eq!(app.update_available.as_deref(), Some("0.75.0"));
+        assert!(app.take_dirty());
+        let _ = update(
+            &mut app,
+            Msg::Reply(Reply::UpdateAvailable(Some("0.75.0".to_owned()))),
+            at(0),
+        );
+        assert!(!app.take_dirty(), "the same answer redrew");
+    }
+
     #[test]
     fn the_first_poll_does_not_repeat_the_startup_doctor_run() {
         let mut app = App::new((80, 24), at(0));
@@ -2706,7 +2813,7 @@ mod tests {
     fn run_setup_row_hands_off_to_the_wizard() {
         let mut app = ready_app();
         app.tab = Tab::Settings;
-        app.settings_selected = 9;
+        app.settings_selected = 10;
         let effects = press(&mut app, KeyCode::Enter, 0);
         assert!(matches!(effects.as_slice(), [Effect::StartSetup]));
         assert!(app.setup.is_some());

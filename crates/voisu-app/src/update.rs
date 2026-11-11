@@ -5,7 +5,8 @@
 //! `/usr/bin` and never replaces a binary itself; it only decides which
 //! package-manager command fits the install ([`plan_update`], pure) and runs
 //! it ([`run`], a thin executor). The network is touched only by
-//! `voisu update --check`, through the same restricted `curl` subprocess the
+//! `voisu update --check` and the daily check in [`crate::update_notice`]
+//! (daemon and TUI), through the same restricted `curl` subprocess the
 //! provider requests use.
 
 use std::path::{Path, PathBuf};
@@ -19,7 +20,9 @@ pub const UPDATE_USAGE: &str = "usage: voisu update [--check|--dry-run] [--switc
 /// Where `voisu update` sends a build no package owns.
 pub const INSTALL_DOCS_URL: &str = "https://github.com/Anuraj-Dev/voisu#installation";
 
-const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/Anuraj-Dev/voisu/releases/latest";
+/// A release asset, not the GitHub API: GitHub counts each download of it.
+const LATEST_RELEASE_URL: &str =
+    "https://github.com/Anuraj-dev/voisu/releases/latest/download/latest-linux.json";
 
 /// Test and diagnostic seam: the binary whose owning package decides the
 /// plan, in place of the running executable. `voisu update` runs it with
@@ -269,6 +272,13 @@ pub fn compare_release(installed: &str, latest_tag: &str) -> ReleaseComparison {
     }
 }
 
+/// The release's `X.Y.Z` when it is newer than `installed`, rebuilt from the
+/// parsed numbers so an odd tag never reaches a terminal as it came.
+pub fn newer_release(installed: &str, latest_tag: &str) -> Option<String> {
+    let (installed, latest) = (parse_version(installed)?, parse_version(latest_tag)?);
+    (installed < latest).then(|| format!("{}.{}.{}", latest.0, latest.1, latest.2))
+}
+
 fn parse_version(value: &str) -> Option<(u64, u64, u64)> {
     let value = value.trim();
     let value = value.strip_prefix('v').unwrap_or(value);
@@ -378,15 +388,16 @@ fn update_hint(owner: Option<&PackageOwner>) -> &'static str {
 
 fn check(installed: &str, owner: Option<&PackageOwner>) -> u8 {
     println!("Installed: {installed} ({})", install_source(owner));
-    let latest = match latest_release_tag() {
-        Ok(tag) => tag,
+    let latest = match latest_release_version() {
+        Ok(version) => version,
         Err(detail) => {
             eprintln!("cannot read the latest release from GitHub: {detail}");
             return 4;
         }
     };
-    let latest_display = latest.strip_prefix('v').unwrap_or(&latest);
-    println!("Latest release: {latest_display}");
+    // Home and `voisu status` read this, so they agree with the check at once.
+    crate::update_notice::record_release(&latest);
+    println!("Latest release: {latest}");
     match compare_release(installed, &latest) {
         ReleaseComparison::UpToDate => println!("Voisu is up to date."),
         ReleaseComparison::UpdateAvailable => println!("{}", update_hint(owner)),
@@ -518,10 +529,12 @@ fn installed_version(binary: &Path) -> Option<String> {
     (!version.is_empty()).then(|| version.to_owned())
 }
 
-/// The latest GitHub Release tag, fetched through the restricted `curl`
-/// subprocess. The tag sits near the top of the response, well inside the
-/// runner's retained-stdout cap.
-fn latest_release_tag() -> Result<String, String> {
+/// The latest release's `X.Y.Z`, read from the `latest-linux.json` asset every
+/// release carries, through the restricted `curl` subprocess. GitHub counts
+/// each download of that asset, which is how active Linux installs are
+/// estimated; nothing about the user is sent beyond the `voisu/X.Y.Z`
+/// User-Agent.
+pub fn latest_release_version() -> Result<String, String> {
     let user_agent = format!("User-Agent: voisu/{}", env!("CARGO_PKG_VERSION"));
     let outcome = run_restricted_with_deadline(
         "curl",
@@ -533,8 +546,6 @@ fn latest_release_tag() -> Result<String, String> {
             "--location",
             "--max-time",
             "10",
-            "--header",
-            "Accept: application/vnd.github+json",
             "--header",
             &user_agent,
             LATEST_RELEASE_URL,
@@ -553,13 +564,20 @@ fn latest_release_tag() -> Result<String, String> {
             detail
         });
     }
-    let release: serde_json::Value = serde_json::from_slice(&outcome.stdout)
-        .map_err(|_| "GitHub returned an unreadable release".to_owned())?;
-    release
-        .get("tag_name")
+    parse_latest_linux(&outcome.stdout)
+}
+
+/// Reads `{"version": "X.Y.Z"}` and rebuilds the version from its three
+/// parsed numbers, so an odd value never reaches a terminal as it came.
+pub fn parse_latest_linux(body: &[u8]) -> Result<String, String> {
+    let file: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|_| "the release's version file is unreadable".to_owned())?;
+    let (major, minor, patch) = file
+        .get("version")
         .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| "GitHub returned a release without a tag".to_owned())
+        .and_then(parse_version)
+        .ok_or_else(|| "the release's version file has no version".to_owned())?;
+    Ok(format!("{major}.{minor}.{patch}"))
 }
 
 #[cfg(test)]
@@ -756,6 +774,47 @@ mod tests {
             compare_release("0.68.0", "nightly"),
             ReleaseComparison::Unknown
         );
+    }
+
+    #[test]
+    fn only_a_newer_release_yields_a_version_to_show() {
+        assert_eq!(
+            newer_release("0.74.0", "v0.75.0").as_deref(),
+            Some("0.75.0")
+        );
+        assert_eq!(newer_release("0.74.0", "v0.74.0"), None);
+        assert_eq!(newer_release("0.75.0", "v0.74.9"), None);
+        assert_eq!(newer_release("0.74.0", "v1.0.0\u{1b}[2J"), None);
+        assert_eq!(newer_release("dev", "v0.75.0"), None);
+    }
+
+    #[test]
+    fn the_linux_version_file_yields_a_version_rebuilt_from_three_numbers() {
+        assert_eq!(
+            parse_latest_linux(br#"{"version":"0.76.0"}"#).as_deref(),
+            Ok("0.76.0")
+        );
+        assert_eq!(
+            parse_latest_linux(b"{ \"version\": \" v1.2.3 \" }\n").as_deref(),
+            Ok("1.2.3")
+        );
+        for junk in [
+            &b""[..],
+            b"<html>Not Found</html>",
+            b"{}",
+            br#"{"version":1}"#,
+            br#"{"version":"nightly"}"#,
+            br#"{"version":"1.2"}"#,
+            br#"{"version":"1.2.3.4"}"#,
+            br#"{"version":"1.2.3\u001b[2J"}"#,
+            br#"["1.2.3"]"#,
+        ] {
+            assert!(
+                parse_latest_linux(junk).is_err(),
+                "accepted {:?}",
+                String::from_utf8_lossy(junk)
+            );
+        }
     }
 
     #[test]

@@ -34,6 +34,7 @@ const KEY_APPLIES: &str = "Applies within 5 min or on restart.";
 pub struct Workers {
     fast: Sender<Job>,
     slow: Sender<Job>,
+    replies: Sender<Reply>,
 }
 
 impl Workers {
@@ -42,11 +43,23 @@ impl Workers {
         let (slow, slow_jobs) = channel();
         spawn_lane(fast_jobs, replies.clone());
         spawn_lane(slow_jobs, replies.clone());
-        thread::spawn(move || poll_status(&replies));
-        Self { fast, slow }
+        let poll_replies = replies.clone();
+        thread::spawn(move || poll_status(&poll_replies));
+        Self {
+            fast,
+            slow,
+            replies,
+        }
     }
 
     pub fn submit(&self, job: Job) {
+        // Once per session, and it may wait out its whole network deadline:
+        // a thread of its own, so no queued job waits behind it.
+        if matches!(job, Job::CheckUpdate) {
+            let replies = self.replies.clone();
+            thread::spawn(move || execute(job, &replies));
+            return;
+        }
         let lane = if job.is_slow() {
             &self.slow
         } else {
@@ -111,6 +124,9 @@ pub fn execute(job: Job, replies: &Sender<Reply>) {
         Job::LoadHistory => send(Reply::History(load_history())),
         Job::LoadDictionary => send(Reply::Dictionary(crate::dictionary::user_terms())),
         Job::LoadShortcut => send(Reply::Shortcut(load_shortcut())),
+        Job::CheckUpdate => send(Reply::UpdateAvailable(
+            crate::update_notice::check_daily_now(),
+        )),
         // The daemon reads Delivery and Deepgram once at start, Layout and Tone
         // per Recording, and Writing per Recording except Intent
         // Reconstruction, which is chosen at start.
@@ -156,6 +172,16 @@ pub fn execute(job: Job, replies: &Sender<Reply>) {
                 Refresh::Doctor,
                 Refresh::PendingRestart(SettingsRow::Deepgram),
             ],
+        )),
+        Job::SetUpdateCheck(on) => send(applied_setting(
+            config::set_switch(config::Switch::UpdateCheck, on),
+            format!("Update check turned {}.", if on { "on" } else { "off" }),
+            if on {
+                "Voisu checks once a day."
+            } else {
+                "Voisu won't check by itself."
+            },
+            &[Refresh::Settings],
         )),
         Job::SetEngine { mode, local_ready } => send(set_engine(mode, local_ready)),
         Job::AddTerm(term) => send(dictionary_result(
@@ -207,6 +233,7 @@ fn load_settings() -> SettingsSnapshot {
         rendering: config::rendering_policy(),
         tone: config::tone(),
         deepgram: config::deepgram_enabled(),
+        update_check: config::switch(config::Switch::UpdateCheck),
     }
 }
 

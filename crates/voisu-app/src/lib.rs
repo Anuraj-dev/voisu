@@ -39,6 +39,7 @@ pub mod system;
 pub mod tui;
 pub mod ubuntu_gnome;
 pub mod update;
+pub mod update_notice;
 
 // The portable cloud pipeline lives in voisu-cloud; these re-exports keep the
 // existing `voisu_app::dpr_cloud` / `voisu_app::grammar_http` paths working.
