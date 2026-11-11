@@ -1230,17 +1230,62 @@ pub fn sanitize_source_transcript_text(text: &str) -> String {
 /// Clear pure-outro sources and strip only anchored final outros from each
 /// Source Transcript. Empty strings after sanitization mean the source carried
 /// no usable speech.
+///
+/// Also clears a source whose whole text is a Whisper silence phrase ("Thank
+/// you.") when Deepgram answered and heard nothing. Text alone cannot tell
+/// that phrase from real dictation; an empty Deepgram answer is the evidence
+/// of silence. A failed or disabled Deepgram leaves no source, so it never
+/// counts as silence.
 #[must_use]
 pub fn sanitize_source_transcripts(
     sources: impl IntoIterator<Item = SourceTranscript>,
 ) -> Vec<SourceTranscript> {
-    sources
+    let mut sanitized: Vec<SourceTranscript> = sources
         .into_iter()
         .map(|source| SourceTranscript {
             provider: source.provider,
             text: sanitize_source_transcript_text(&source.text),
         })
-        .collect()
+        .collect();
+    let deepgram_heard_nothing = sanitized
+        .iter()
+        .any(|source| source.provider == Provider::Deepgram && source.text.is_empty());
+    if deepgram_heard_nothing {
+        for source in &mut sanitized {
+            if is_whisper_silence_phrase(&source.text) {
+                source.text.clear();
+            }
+        }
+    }
+    sanitized
+}
+
+/// Whole-transcript phrases Whisper invents over silence. Matched only
+/// against the entire text, so "Send it now. Thank you." is never touched.
+/// Shared by the Cloud path here and the Local engine (`local_tail.rs`).
+const WHISPER_SILENCE_PHRASES: [&str; 8] = [
+    "thank you",
+    "thanks",
+    "thank you very much",
+    "thank you so much",
+    "thanks for listening",
+    "you",
+    "bye",
+    "bye bye",
+];
+
+/// True when the WHOLE text is a Whisper silence phrase. Every
+/// non-alphanumeric character is a word break, so case, punctuation, quotes
+/// and "Bye-bye." do not matter.
+#[must_use]
+pub fn is_whisper_silence_phrase(text: &str) -> bool {
+    let normalized = text
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ");
+    WHISPER_SILENCE_PHRASES.contains(&normalized.as_str())
 }
 
 #[derive(Debug)]
@@ -1347,6 +1392,15 @@ pub enum TranscriptSelection {
     IntentReconstructed,
     SourceDeepgram,
     SourceGroq,
+}
+
+impl TranscriptSelection {
+    fn from_provider(provider: Provider) -> Self {
+        match provider {
+            Provider::Deepgram => Self::SourceDeepgram,
+            Provider::Groq => Self::SourceGroq,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1510,6 +1564,26 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                 {
                     decision.source_selection_diagnostic.confidence = Some(confidence);
                 }
+                if eligibility == IntentReconstructionEligibility::MaterialDisagreement
+                    && let Some(fuller) = fragment_pair_fuller_provider(&sources)
+                    && let Ok(decision) = &mut fallback
+                    && decision.selection == TranscriptSelection::from_provider(fuller)
+                {
+                    decision.validation_reason =
+                        "Intent Reconstruction skipped: the other Source Transcript is a fragment"
+                            .to_owned();
+                    decision.fallback_reason = None;
+                    decision.intent_reconstruction =
+                        Some(IntentReconstructionEvidence::skipped(eligibility));
+                    // `safe_source_fallback` builds UNCORRECTED, and this path
+                    // never reaches `reconstruct`, so apply the user's
+                    // vocabulary here exactly as that wrapper would.
+                    return fallback.map(|decision| {
+                        PreparedTranscriptDecision::Ready(
+                            self.apply_user_vocabulary_correction(decision),
+                        )
+                    });
+                }
                 return Ok(PreparedTranscriptDecision::Reconstruct(
                     IntentReconstructionAttempt {
                         request: IntentReconstructionRequest {
@@ -1597,6 +1671,58 @@ impl<M: ReconciliationModel> TranscriptDecisionPipeline<M> {
                 eligibility,
                 IntentReconstructionOutcome::Rejected,
                 "Intent Reconstruction returned empty, oversized, or outro text".to_owned(),
+                bounded_candidate,
+            );
+        }
+        // The model may only reword; it must not drop speech. A candidate far
+        // shorter than the transcript we would paste instead (the safe source
+        // fallback) means speech was lost, e.g. one provider truncated and the
+        // model followed it. Letters are counted, not words, because joining
+        // spelled-out letters ("a n t i g r a v i t y") is a wanted rewrite.
+        // This is a length guard, not a content-coverage check.
+        let safe = quality_safe_sources(&sources);
+        let long_enough = safe
+            .iter()
+            .any(|source| normalized_words(&source.text).len() >= MIN_LENGTH_RULE_WORDS);
+        // Most the candidate may legitimately hold: the longest safe source
+        // plus whatever the other safe sources say that it lacks (a merge of
+        // two partial sources), with headroom, plus a small fixed allowance so
+        // tiny rewrites ("ok" -> "okay") never trip it.
+        let allowed_letters = safe
+            .iter()
+            .map(|longest| {
+                let base = normalized_words(&longest.text);
+                let missing: usize = safe
+                    .iter()
+                    .filter(|other| !std::ptr::eq(**other, *longest))
+                    .map(|other| missing_letters(&base, &normalized_words(&other.text)))
+                    .sum();
+                (letter_count(&longest.text) + missing) * MAX_RECONSTRUCTION_GROWTH_PERCENT / 100
+            })
+            .max()
+            .unwrap_or(0)
+            + RECONSTRUCTION_GROWTH_ALLOWANCE_LETTERS;
+        if !safe.is_empty() && letter_count(wording) > allowed_letters {
+            return intent_fallback(
+                fallback,
+                eligibility,
+                IntentReconstructionOutcome::Rejected,
+                "Intent Reconstruction added text no Source Transcript contains".to_owned(),
+                bounded_candidate,
+            );
+        }
+        let fallback_letters = fallback
+            .as_ref()
+            .ok()
+            .map_or(0, |decision| letter_count(&decision.transcript.0));
+        if long_enough
+            && letter_count(wording) * 100 < fallback_letters * MIN_RECONSTRUCTION_COVERAGE_PERCENT
+        {
+            return intent_fallback(
+                fallback,
+                eligibility,
+                IntentReconstructionOutcome::Rejected,
+                "Intent Reconstruction dropped too much of the fallback Transcript".to_owned(),
                 bounded_candidate,
             );
         }
@@ -2283,6 +2409,101 @@ fn safe_source_fallback(
 }
 
 const MAX_INTENT_RECONSTRUCTION_UTF8_BYTES: usize = 100_000;
+/// Minimum share of the fallback transcript's letters a reconstruction must
+/// keep. Provisional: no corpus calibration yet.
+const MIN_RECONSTRUCTION_COVERAGE_PERCENT: usize = 60;
+/// Headroom (percent) over the longest safe source plus what the other safe
+/// sources add; the model rewords, it never invents. Real recordings peak
+/// near 108% of the longest source.
+const MAX_RECONSTRUCTION_GROWTH_PERCENT: usize = 130;
+/// Fixed letters added to the growth cap so tiny rewrites never trip it.
+const RECONSTRUCTION_GROWTH_ALLOWANCE_LETTERS: usize = 16;
+/// A source under this share (percent) of the other's words is a fragment.
+const FRAGMENT_LENGTH_PERCENT: usize = 34;
+/// A fragment is skipped only when this share (percent) of its words appear,
+/// in order, in the fuller source; otherwise it covers different speech.
+const FRAGMENT_OVERLAP_PERCENT: usize = 80;
+/// Cap on fragment x fuller word pairs compared for the in-order check.
+const FRAGMENT_MAX_LCS_CELLS: usize = 4_000_000;
+/// Below this many words length ratios are noise, and abbreviation rewrites
+/// ("talk to you later" -> "TTYL") are wanted, so the length rules stand down.
+const MIN_LENGTH_RULE_WORDS: usize = 10;
+
+/// The provider of the fuller source when the other is a fragment of it: far
+/// shorter, and made of words the fuller one also contains. Such a pair has
+/// nothing to merge, so the model call is skipped (and cannot drop speech).
+fn fragment_pair_fuller_provider(sources: &[SourceTranscript]) -> Option<Provider> {
+    let [first, second] = sources else {
+        return None;
+    };
+    let (first_words, second_words) = (
+        normalized_words(&first.text),
+        normalized_words(&second.text),
+    );
+    let ((fuller, fuller_words), (_, short_words)) = if first_words.len() >= second_words.len() {
+        ((first, first_words), (second, second_words))
+    } else {
+        ((second, second_words), (first, first_words))
+    };
+    if fuller_words.len() < MIN_LENGTH_RULE_WORDS
+        || short_words.is_empty()
+        || short_words.len() * 100 >= fuller_words.len() * FRAGMENT_LENGTH_PERCENT
+        || quality_safe_sources(std::slice::from_ref(fuller)).is_empty()
+    {
+        return None;
+    }
+    // The fragment must read as a piece of the fuller one, in order; a bag of
+    // shared common words ("the", "to", "we") would let different speech pass.
+    // Bounded so a pathological input cannot make the comparison expensive.
+    if short_words.len().saturating_mul(fuller_words.len()) > FRAGMENT_MAX_LCS_CELLS {
+        return None;
+    }
+    let in_order = longest_common_subsequence(&short_words, &fuller_words);
+    (in_order * 100 >= short_words.len() * FRAGMENT_OVERLAP_PERCENT).then_some(fuller.provider)
+}
+
+/// Letters in `other`'s words that `base` does not account for (multiset).
+fn missing_letters(base: &[String], other: &[String]) -> usize {
+    let mut available: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for word in base {
+        *available.entry(word.as_str()).or_default() += 1;
+    }
+    other
+        .iter()
+        .filter(|word| match available.get_mut(word.as_str()) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+                false
+            }
+            _ => true,
+        })
+        .map(|word| word.chars().count())
+        .sum()
+}
+
+fn longest_common_subsequence(left: &[String], right: &[String]) -> usize {
+    let mut row = vec![0usize; right.len() + 1];
+    for left_word in left {
+        let mut diagonal = 0;
+        for (index, right_word) in right.iter().enumerate() {
+            let above = row[index + 1];
+            row[index + 1] = if left_word == right_word {
+                diagonal + 1
+            } else {
+                row[index + 1].max(row[index])
+            };
+            diagonal = above;
+        }
+    }
+    row[right.len()]
+}
+
+fn letter_count(text: &str) -> usize {
+    normalized_words(text)
+        .iter()
+        .map(|word| word.chars().count())
+        .sum()
+}
 
 fn intent_fallback(
     fallback: Result<TranscriptDecision, BoundaryError>,
