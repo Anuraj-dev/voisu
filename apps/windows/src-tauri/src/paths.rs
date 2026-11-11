@@ -20,6 +20,12 @@ pub fn settings_file() -> PathBuf {
     config_dir().join("settings.json")
 }
 
+/// `%APPDATA%\Voisu\star-prompt.json`: the local dictation count behind
+/// the one-time star prompt.
+pub fn star_prompt_file() -> PathBuf {
+    config_dir().join("star-prompt.json")
+}
+
 /// `%LOCALAPPDATA%\Voisu\logs`.
 pub fn log_dir() -> PathBuf {
     dirs::data_local_dir()

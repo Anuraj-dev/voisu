@@ -24,6 +24,9 @@ export const ui = $state({
     // accessibility, inputMonitoring }; null on Windows.
     permissions: null,
     updateVersion: null,
+    // The Star prompt switch, and whether its banner is due.
+    starPrompt: true,
+    showStar: false,
     // The dictation under way when the window loaded: { state, elapsedMs }.
     phase: null,
   },

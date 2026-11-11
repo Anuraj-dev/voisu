@@ -18,6 +18,7 @@ const SCREENS = [
   'failed',
   'hook-down',
   'update',
+  'star',
   'settings',
   'replace-key',
 ];
@@ -58,6 +59,8 @@ const state = {
       }
     : null,
   updateVersion: screen === 'update' ? '0.74.0' : null,
+  starPrompt: true,
+  showStar: screen === 'star',
   // Twelve seconds in, so the timer reads 0:12.
   phase: screen === 'recording' ? { state: 'recording', elapsedMs: 12_000 } : null,
 };
@@ -100,6 +103,17 @@ const COMMANDS = {
   open_guide: () => console.info('mock: open guide'),
   open_logs: () => console.info('mock: open logs'),
   install_update: () => console.info('mock: install update'),
+  set_star_prompt: ({ enabled }) => {
+    state.starPrompt = enabled;
+    state.showStar = state.showStar && enabled;
+    emit('state-changed', null);
+    return enabled;
+  },
+  star_on_github: () => {
+    console.info('mock: open https://github.com/Anuraj-dev/voisu');
+    state.showStar = false;
+    emit('state-changed', null);
+  },
   open_permission_settings: ({ pane }) => {
     console.info('mock: open System Settings', pane);
     // As if the user turned it on.

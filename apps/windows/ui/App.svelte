@@ -59,6 +59,19 @@
     }
   }
 
+  let starError = $state('');
+
+  // Either answer hides the banner for good; the backend's state-changed
+  // event rereads it.
+  async function answerStar(command, args) {
+    starError = '';
+    try {
+      await invoke(command, args);
+    } catch (e) {
+      starError = typeof e === 'string' ? e : 'Something went wrong.';
+    }
+  }
+
   function onTabKey(event) {
     const i = TABS.findIndex((t) => t.id === tab);
     const next = {
@@ -92,6 +105,20 @@
           <button type="button" class="pill" onclick={installUpdate} disabled={updating}>
             {updating ? 'Restarting…' : 'Restart to update'}
           </button>
+        </div>
+      {/if}
+      {#if ui.app.showStar}
+        <div class="update" role="status">
+          <span class="update-text">
+            <span>Enjoying Voisu? A GitHub star helps other people find it.</span>
+            {#if starError}<span class="update-error" role="alert">{starError}</span>{/if}
+          </span>
+          <span class="star-actions">
+            <button type="button" class="pill" onclick={() => answerStar('star_on_github')}>Star on GitHub</button>
+            <button type="button" class="link" onclick={() => answerStar('set_star_prompt', { enabled: false })}>
+              Don't ask again
+            </button>
+          </span>
         </div>
       {/if}
       <!-- svelte-ignore a11y_interactive_supports_focus -->
@@ -149,6 +176,12 @@
     display: flex;
     flex-direction: column;
     font-size: 13px;
+  }
+  .star-actions {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 8px;
   }
   .update-error {
     color: var(--failure);

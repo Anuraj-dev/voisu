@@ -15,6 +15,7 @@
   let autoPasteBusy = $state(false);
   let toneBusy = $state(false);
   let autostartBusy = $state(false);
+  let starBusy = $state(false);
   let wordsBusy = $state(false);
   let wordsStatus = $state('');
   // The provider whose key is being replaced, if any. Saved key text is
@@ -117,6 +118,20 @@
       // Render what the system reports, not the requested value.
       box.checked = ui.app.autostart;
       autostartBusy = false;
+    }
+  }
+
+  async function toggleStarPrompt(event) {
+    const box = event.currentTarget;
+    starBusy = true;
+    errors.system = '';
+    try {
+      ui.app.starPrompt = await invoke('set_star_prompt', { enabled: box.checked });
+    } catch (e) {
+      fail('system', 'Could not change Star prompt.');
+    } finally {
+      box.checked = ui.app.starPrompt;
+      starBusy = false;
     }
   }
 
@@ -298,6 +313,14 @@
   <h2 id="system-title">System</h2>
   <div class="card">
     {@render toggle('autostart', 'Start at login', '', app.autostart, autostartBusy, toggleAutostart)}
+    {@render toggle(
+      'star-prompt',
+      'Star prompt',
+      'Once, after steady use, ask for a GitHub star.',
+      app.starPrompt,
+      starBusy,
+      toggleStarPrompt,
+    )}
     {@render problem('system')}
   </div>
 </section>
