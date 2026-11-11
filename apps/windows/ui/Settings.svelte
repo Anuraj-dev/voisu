@@ -323,7 +323,7 @@
     {@render toggle(
       'star-prompt',
       'Star prompt',
-      'Once, after steady use, ask for a GitHub star.',
+      'After steady use, ask for a GitHub star.',
       app.starPrompt,
       starBusy,
       toggleStarPrompt,
