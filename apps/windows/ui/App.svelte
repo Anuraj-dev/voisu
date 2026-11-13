@@ -131,10 +131,21 @@
     overflow-y: auto;
     padding: 22px 28px 20px;
   }
+  @media (max-width: 620px) {
+    .shell {
+      grid-template-columns: 56px 1fr;
+    }
+    .pane {
+      padding: 20px 20px 18px;
+    }
+  }
   :global(.banners) + .pane {
     padding-top: 16px;
   }
+  /* A maximized window centres the page instead of stretching it. */
   .page {
+    max-width: 720px;
+    margin: 0 auto;
     animation: page-in 120ms ease-out;
   }
 </style>
