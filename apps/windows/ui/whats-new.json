@@ -5,8 +5,7 @@
     "items": [
       { "kind": "new", "text": "Settings moved into a sidebar, with a page each for Dictation, Words, API keys and General." },
       { "kind": "new", "text": "After an update, Voisu shows what changed, and What's new lists every release." },
-      { "kind": "improved", "text": "When an update is ready, the banner can show what it brings before you restart." },
-      { "kind": "improved", "text": "Voisu has a new logo: three voice bars and a text cursor." }
+      { "kind": "improved", "text": "When an update is ready, the banner can show what it brings before you restart." }
     ]
   },
   {

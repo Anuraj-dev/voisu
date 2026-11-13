@@ -74,7 +74,7 @@
 
 <div class="setup">
 <aside class="brand">
-  <Logo size={44} blink />
+  <Logo size={44} />
   <header>
     <h1>Set up Voisu</h1>
     <p class="muted">Voisu needs two free API keys: one from Groq, one from Deepgram.</p>
