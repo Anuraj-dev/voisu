@@ -2,6 +2,8 @@
 // last Transcript and the current Recording phase. Only the backend writes
 // settings; this mirrors them.
 import { invoke } from '@tauri-apps/api/core';
+import NOTES from './whats-new.json';
+import { unseen, itemsFor } from './whats-new.js';
 
 export const ui = $state({
   app: {
@@ -24,6 +26,11 @@ export const ui = $state({
     // accessibility, inputMonitoring }; null on Windows.
     permissions: null,
     updateVersion: null,
+    // The pending update's notes, the items of whats-new.json, when its
+    // manifest carried them; null otherwise.
+    updateNotes: null,
+    // The version whose What's new was last shown; null before any was.
+    seenVersion: null,
     // The Star prompt switch, and whether its banner is due.
     starPrompt: true,
     showStar: false,
@@ -41,13 +48,54 @@ export const ui = $state({
   // Date.now() when the current Recording started; the hero ticks from it.
   recordingSince: 0,
   // One boost word per line; saved only on "Save words". Kept here so it
-  // survives switching tabs.
+  // survives switching pages.
   wordsDraft: '',
+  // The sidebar page: home | dictation | words | keys | general | whats-new
+  page: 'home',
+  // "Restart to update" sits on the banner and on What's new; both share
+  // one run and its error.
+  updating: false,
+  updateError: '',
 });
+
+export async function installUpdate() {
+  if (ui.updating) return;
+  ui.updating = true;
+  ui.updateError = '';
+  try {
+    // Ends this process when the installer starts.
+    await invoke('install_update');
+  } catch (e) {
+    ui.updateError = typeof e === 'string' ? e : 'Could not start the update.';
+  } finally {
+    ui.updating = false;
+  }
+}
+
+// The pending update's notes for this platform, or [] when it has none.
+export const pendingNotes = () => itemsFor(ui.app.updateNotes, ui.app.platform);
 
 export const keysReady = () => ui.app.groqSaved && ui.app.deepgramSaved;
 
 export const isMac = () => ui.app.platform === 'mac';
+
+// The releases since the last What's new the user saw, up to this version.
+// Empty during Setup: a fresh install never sees notes for itself.
+export const unseenReleases = () =>
+  keysReady() && ui.app.version && ui.app.seenVersion !== ui.app.version
+    ? unseen(NOTES, ui.app.seenVersion, ui.app.version, ui.app.platform)
+    : [];
+
+// Records this version's What's new as seen; the backend's state-changed
+// event then rereads seenVersion, which clears the sidebar dot.
+export async function markVersionSeen() {
+  try {
+    await invoke('mark_version_seen');
+  } catch (e) {
+    // Not worth an error line: the notes simply show again next launch.
+    console.warn('mark_version_seen failed', e);
+  }
+}
 
 export const keyStoreHint = () =>
   isMac() ? 'Keys stay on this Mac, in the macOS Keychain.' : 'Keys stay on this PC, in Windows Credential Manager.';

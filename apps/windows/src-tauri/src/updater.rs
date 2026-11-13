@@ -9,6 +9,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
@@ -147,6 +148,45 @@ pub fn pending_version(app: &AppHandle) -> Option<String> {
     ready.as_ref().map(|ready| ready.update.version.clone())
 }
 
+/// One line of a release's notes, as `apps/windows/ui/whats-new.json` writes
+/// it. The release job copies that version's items into `latest.json`'s
+/// `notes`, which the plugin hands over as the update's `body`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteItem {
+    pub kind: NoteKind,
+    pub text: String,
+    /// The platforms it applies to (`windows`, `mac`); none means all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platforms: Option<Vec<String>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NoteKind {
+    New,
+    Improved,
+    Fixed,
+}
+
+/// The items in an update's notes. Notes that are not such a list (older
+/// releases carry the release page's URL) are None; an item this version
+/// cannot read, such as a kind added later, is dropped on its own.
+pub fn parse_notes(body: Option<&str>) -> Option<Vec<NoteItem>> {
+    let items: Vec<serde_json::Value> = serde_json::from_str(body?.trim()).ok()?;
+    let notes: Vec<NoteItem> = items
+        .into_iter()
+        .filter_map(|item| serde_json::from_value(item).ok())
+        .collect();
+    (!notes.is_empty()).then_some(notes)
+}
+
+/// The downloaded update's notes, if one waits and its manifest carried them.
+pub fn pending_notes(app: &AppHandle) -> Option<Vec<NoteItem>> {
+    let state = app.state::<UpdaterState>();
+    let ready = state.ready.lock().unwrap();
+    parse_notes(ready.as_ref()?.update.body.as_deref())
+}
+
 /// Runs the downloaded installer, which ends this process on Windows (on
 /// macOS the plugin swaps the app bundle in place). Does
 /// nothing when no update is pending. An installer that fails before the
@@ -191,5 +231,49 @@ mod tests {
     fn a_clock_set_backwards_checks_again() {
         let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         assert!(is_due(Some(start), start - Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn notes_from_whats_new_parse_into_items() {
+        let body = r#"[{"kind":"new","text":"A sidebar."},
+            {"kind":"fixed","text":"Paste works.","platforms":["windows"]}]"#;
+        assert_eq!(
+            parse_notes(Some(body)),
+            Some(vec![
+                NoteItem {
+                    kind: NoteKind::New,
+                    text: "A sidebar.".to_owned(),
+                    platforms: None,
+                },
+                NoteItem {
+                    kind: NoteKind::Fixed,
+                    text: "Paste works.".to_owned(),
+                    platforms: Some(vec!["windows".to_owned()]),
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn notes_that_are_not_items_are_none() {
+        for body in [
+            None,
+            Some(""),
+            Some("https://github.com/Anuraj-dev/voisu/releases/tag/v0.77.0"),
+            Some("{not json"),
+            Some(r#"{"kind":"new","text":"not a list"}"#),
+            Some("[]"),
+            Some(r#"[{"kind":"removed","text":"a later kind"}, 5]"#),
+        ] {
+            assert_eq!(parse_notes(body), None, "{body:?}");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_item_drops_alone() {
+        let body = r#"[{"kind":"removed","text":"later"},{"kind":"improved","text":"Kept."}]"#;
+        let notes = parse_notes(Some(body)).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].kind, NoteKind::Improved);
     }
 }

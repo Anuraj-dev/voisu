@@ -1,6 +1,7 @@
 <script>
-  import { ui, isMac } from './state.svelte.js';
-  import Permissions from './Permissions.svelte';
+  import { ui, isMac } from '../state.svelte.js';
+  import Permissions from '../Permissions.svelte';
+  import ErrorLine from '../ErrorLine.svelte';
 
   let now = $state(Date.now());
   let copiedFor = $state(null);
@@ -53,10 +54,9 @@
     }
   });
 
-  const rows = $derived([
+  const glance = $derived([
     { label: 'Delivery', value: ui.app.autoPaste ? 'Pastes automatically' : 'Copies to clipboard' },
     { label: 'Writing', value: ui.app.tone === 'informal' ? 'Informal' : 'Formal' },
-    { label: 'Start at login', value: ui.app.autostart ? 'On' : 'Off' },
   ]);
 
   async function copyTranscript() {
@@ -68,14 +68,13 @@
       error = 'Could not copy to the clipboard.';
     }
   }
-
 </script>
 
 <!-- The timer sits outside the accessibility tree, so the live region
      speaks status changes only, not every tick. -->
 <section class="hero {hero.tone}" aria-live="polite">
   <h1>
-    <span class="dot" aria-hidden="true"></span>{hero.title}{#if hero.timer}<span aria-hidden="true">&nbsp;{elapsed}</span>{/if}
+    <span class="dot" aria-hidden="true"></span>{hero.title}{#if hero.timer}<span class="timer" aria-hidden="true">{elapsed}</span>{/if}
   </h1>
   {#if hero.hint === 'ready'}
     <p class="muted">Hold <kbd>{ui.app.trigger.label}</kbd>, speak, release. Double-tap for hands-free, Esc to cancel.</p>
@@ -88,15 +87,15 @@
 
 <Permissions />
 
-<dl class="rows">
+<dl class="glance">
   <div>
     <dt>Trigger Key</dt>
     <dd><kbd>{ui.app.trigger.label}</kbd></dd>
   </div>
-  {#each rows as row (row.label)}
+  {#each glance as item (item.label)}
     <div>
-      <dt>{row.label}</dt>
-      <dd>{row.value}</dd>
+      <dt>{item.label}</dt>
+      <dd>{item.value}</dd>
     </div>
   {/each}
 </dl>
@@ -115,62 +114,92 @@
   {/if}
 </section>
 
-{#if error}<p class="error" role="alert"><span aria-hidden="true">✕</span> {error}</p>{/if}
-
-<footer class="hint">Voisu v{ui.app.version}</footer>
+<ErrorLine message={error} />
 
 <style>
   .hero {
+    --tone: var(--accent);
     display: flex;
     flex-direction: column;
     gap: 6px;
-    padding: 4px 0 20px;
+    padding: 18px 20px 18px;
+    margin-bottom: 14px;
+    border-radius: var(--radius);
+    background:
+      radial-gradient(120% 140% at 0% 0%, color-mix(in srgb, var(--tone) 13%, transparent), transparent 62%),
+      var(--overlay-1);
+    border: 1px solid color-mix(in srgb, var(--tone) 24%, var(--overlay-2));
+  }
+  .processing {
+    --tone: var(--processing);
+  }
+  .failure {
+    --tone: var(--failure);
   }
   h1 {
     display: flex;
     align-items: center;
     gap: 10px;
+    font-size: 22px;
     font-variant-numeric: tabular-nums;
+  }
+  .timer {
+    margin-left: 2px;
+    color: var(--text-2);
+    font-weight: 500;
   }
   .dot {
     flex: none;
     width: 10px;
     height: 10px;
     border-radius: 50%;
-    background: var(--accent);
+    background: var(--tone);
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--tone) 18%, transparent);
   }
   .recording .dot {
     animation: pulse 1.2s ease-in-out infinite;
-  }
-  .processing .dot {
-    background: var(--processing);
-  }
-  .failure .dot {
-    background: var(--failure);
   }
   @keyframes pulse {
     50% {
       opacity: 0.35;
     }
   }
-  .rows {
-    margin: 0 0 20px;
-    border-top: 1px solid var(--overlay-2);
+  .hero + :global(.permissions) {
+    margin-bottom: 14px;
   }
-  .rows div {
+  .glance {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    margin: 0 0 14px;
+    border: 1px solid var(--overlay-2);
+    border-radius: var(--radius);
+    background: var(--overlay-1);
+  }
+  .glance div {
     display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    padding: 9px 0;
-    border-bottom: 1px solid var(--overlay-2);
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+    padding: 10px 14px 11px;
+  }
+  .glance div + div {
+    border-left: 1px solid var(--hairline);
   }
   dt {
+    font-size: 11.5px;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
     color: var(--text-2);
   }
   dd {
     margin: 0;
-    text-align: right;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  dd kbd {
+    font-size: 13px;
   }
   .transcript {
     display: flex;
@@ -189,13 +218,10 @@
   .text {
     white-space: pre-wrap;
     user-select: text;
-    max-height: 160px;
+    max-height: 120px;
     overflow-y: auto;
   }
-  .error {
+  .transcript + :global(.error) {
     margin-top: 12px;
-  }
-  footer {
-    margin-top: 20px;
   }
 </style>

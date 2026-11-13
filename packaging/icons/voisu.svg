@@ -1,9 +1,20 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
-  <rect width="512" height="512" rx="112" fill="#17191D"/>
-  <rect x="76" y="172" width="360" height="168" rx="84" fill="none" stroke="#65D6A0" stroke-width="28"/>
-  <g fill="#8FB4FF">
-    <rect x="152" y="222" width="40" height="68" rx="20"/>
-    <rect x="236" y="204" width="40" height="104" rx="20"/>
-    <rect x="320" y="222" width="40" height="68" rx="20"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="512" height="512">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1f2227"/>
+      <stop offset="1" stop-color="#131518"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="58" fill="url(#tile)"/>
+  <rect x=".75" y=".75" width="254.5" height="254.5" rx="57.25" fill="none" stroke="#fff" stroke-opacity=".07" stroke-width="1.5"/>
+  <g fill="#65d6a0">
+    <rect x="54" y="100" width="24" height="56" rx="12"/>
+    <rect x="94" y="66" width="24" height="124" rx="12"/>
+    <rect x="134" y="86" width="24" height="84" rx="12"/>
+  </g>
+  <g fill="#f4f5f7">
+    <rect x="183" y="60" width="10" height="136" rx="5"/>
+    <rect x="172" y="58" width="32" height="10" rx="5"/>
+    <rect x="172" y="188" width="32" height="10" rx="5"/>
   </g>
 </svg>

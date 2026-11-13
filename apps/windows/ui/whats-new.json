@@ -1,0 +1,100 @@
+[
+  {
+    "version": "0.78.0",
+    "date": "2026-11-13",
+    "items": [
+      { "kind": "new", "text": "Settings moved into a sidebar, with a page each for Dictation, Words, API keys and General." },
+      { "kind": "new", "text": "After an update, Voisu shows what changed, and What's new lists every release." },
+      { "kind": "improved", "text": "When an update is ready, the banner can show what it brings before you restart." },
+      { "kind": "improved", "text": "Voisu has a new logo: three voice bars and a text cursor." }
+    ]
+  },
+  {
+    "version": "0.77.0",
+    "date": "2026-11-11",
+    "items": [
+      { "kind": "new", "text": "After steady use, Voisu may ask for a GitHub star. The Star prompt switch turns this off." },
+      { "kind": "new", "text": "A Support card in Settings lets you star Voisu on GitHub any time." }
+    ]
+  },
+  {
+    "version": "0.75.0",
+    "date": "2026-11-11",
+    "items": [
+      { "kind": "new", "text": "Voisu now runs on Macs with Apple Silicon and macOS 13 or later.", "platforms": ["mac"] }
+    ]
+  },
+  {
+    "version": "0.74.2",
+    "date": "2026-11-08",
+    "items": [
+      { "kind": "fixed", "text": "Fixed a rare case where a long dictation came out as only a few words.", "platforms": ["windows"] }
+    ]
+  },
+  {
+    "version": "0.74.1",
+    "date": "2026-11-08",
+    "items": [
+      { "kind": "fixed", "text": "A quick tap with no speech no longer pastes \"Thank you.\"", "platforms": ["windows"] }
+    ]
+  },
+  {
+    "version": "0.74.0",
+    "date": "2026-11-06",
+    "items": [
+      { "kind": "new", "text": "A first-run Setup screen walks you through your two free API keys.", "platforms": ["windows"] },
+      { "kind": "new", "text": "The window now has an Overview with your last Transcript, and Settings on its own tab.", "platforms": ["windows"] },
+      { "kind": "new", "text": "When an update is ready, a banner offers to restart and install it.", "platforms": ["windows"] },
+      { "kind": "improved", "text": "Informal tone keeps capitals at the start of sentences and for \"I\".", "platforms": ["windows"] }
+    ]
+  },
+  {
+    "version": "0.73.0",
+    "date": "2026-11-06",
+    "items": [
+      { "kind": "improved", "text": "Informal tone writes in lowercase and turns more chat phrases into abbreviations.", "platforms": ["windows"] }
+    ]
+  },
+  {
+    "version": "0.71.0",
+    "date": "2026-11-05",
+    "items": [
+      { "kind": "new", "text": "An Informal tone switch turns chat phrases into abbreviations and drops the final full stop.", "platforms": ["windows"] }
+    ]
+  },
+  {
+    "version": "0.69.2",
+    "date": "2026-11-04",
+    "items": [
+      { "kind": "improved", "text": "The check mark after a paste now clears after a moment instead of lingering.", "platforms": ["windows"] }
+    ]
+  },
+  {
+    "version": "0.69.1",
+    "date": "2026-11-03",
+    "items": [
+      { "kind": "improved", "text": "The Trigger Key picker now offers presets only. A custom key saved earlier goes back to Ctrl+Win.", "platforms": ["windows"] }
+    ]
+  },
+  {
+    "version": "0.68.0",
+    "date": "2026-11-03",
+    "items": [
+      { "kind": "new", "text": "Choose your own Trigger Key in Settings. It applies straight away, no restart.", "platforms": ["windows"] }
+    ]
+  },
+  {
+    "version": "0.67.0",
+    "date": "2026-11-03",
+    "items": [
+      { "kind": "new", "text": "Say \"new line\" or \"new paragraph\", punctuation marks, quotes or first/second lists, and Voisu formats them.", "platforms": ["windows"] }
+    ]
+  },
+  {
+    "version": "0.66.0",
+    "date": "2026-11-03",
+    "items": [
+      { "kind": "new", "text": "First release of Voisu for Windows: hold Ctrl+Win, speak, and your words are pasted where you type.", "platforms": ["windows"] }
+    ]
+  }
+]
