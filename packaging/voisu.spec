@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.78.1
+Version:        0.79.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -167,6 +167,9 @@ install -D -m 0644 packaging/icons/voisu.svg %{buildroot}%{_datadir}/icons/hicol
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Fri Nov 13 2026 Voisu maintainers <voisu@example.invalid> - 0.79.0-1
+- feat(desktop): open as a compact portrait window that can resize and go full screen (#324)
+
 * Fri Nov 13 2026 Voisu maintainers <voisu@example.invalid> - 0.78.1-1
 - fix(desktop): go back to the three-bar logo (#323)
 - docs(readme): lead with the product and move platform guides into docs (#322)
