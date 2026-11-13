@@ -43,7 +43,7 @@ const state = {
   groqSaved: !inSetup || screen === 'setup-partial',
   deepgramSaved: !inSetup,
   autostart: true,
-  version: '0.78.0',
+  version: '0.79.0',
   autoPaste: true,
   overlaySize: 'medium',
   boostWords: ['Voisu', 'Deepgram'],
@@ -81,7 +81,7 @@ const state = {
       ]
     : null,
   // A fresh install has seen nothing; `updated` last saw 0.77.0.
-  seenVersion: inSetup ? null : screen === 'updated' ? '0.77.0' : '0.78.0',
+  seenVersion: inSetup ? null : screen === 'updated' ? '0.77.0' : '0.79.0',
   starPrompt: true,
   // `star` shows the banner; `star-closed` is after its × (Settings still
   // carries the Support card, as on every screen).

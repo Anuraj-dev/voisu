@@ -1,11 +1,12 @@
 [
   {
-    "version": "0.78.0",
+    "version": "0.79.0",
     "date": "2026-11-13",
     "items": [
       { "kind": "new", "text": "Settings moved into a sidebar, with a page each for Dictation, Words, API keys and General." },
       { "kind": "new", "text": "After an update, Voisu shows what changed, and What's new lists every release." },
-      { "kind": "improved", "text": "When an update is ready, the banner can show what it brings before you restart." }
+      { "kind": "improved", "text": "When an update is ready, the banner can show what it brings before you restart." },
+      { "kind": "improved", "text": "The window opens compact, and you can now resize it or make it full screen." }
     ]
   },
   {
