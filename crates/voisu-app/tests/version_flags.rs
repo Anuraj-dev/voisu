@@ -36,6 +36,7 @@ commands:
   local remove [--yes]          delete the Local model
   update [--check|--dry-run] [--switch-to-bin]
                                 update Voisu
+  update-check [on|off]         check once a day for a newer version
 
 options:
   -h, --help, help              show this help
