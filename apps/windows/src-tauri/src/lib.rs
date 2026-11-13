@@ -127,6 +127,11 @@ struct UiState {
     permissions: Option<Permissions>,
     /// A downloaded update waiting for "Restart to update".
     update_version: Option<String>,
+    /// That update's notes, when its manifest carried them.
+    update_notes: Option<Vec<updater::NoteItem>>,
+    /// The version whose What's new was last shown; the window shows it
+    /// again once `version` differs.
+    seen_version: Option<String>,
     /// The Star prompt switch in Settings.
     star_prompt: bool,
     /// Whether the window shows the "Enjoying Voisu?" banner, judged on
@@ -241,6 +246,8 @@ fn get_state(app: AppHandle) -> UiState {
         platform: PLATFORM,
         permissions: permissions::current(),
         update_version: updater::pending_version(&app),
+        update_notes: updater::pending_notes(&app),
+        seen_version: settings.seen_version,
         star_prompt: settings.star_prompt,
         show_star: app
             .state::<AppState>()
@@ -331,6 +338,15 @@ fn set_star_prompt(app: AppHandle, enabled: bool) -> bool {
     let enabled = update_settings(&app, |settings| settings.star_prompt = enabled).star_prompt;
     let _ = app.emit(STATE_CHANGED, ());
     enabled
+}
+
+/// Records that the user saw this version's What's new (the dialog after an
+/// update, the What's new page, or finishing Setup), so it shows only once.
+#[tauri::command]
+fn mark_version_seen(app: AppHandle) {
+    let version = app.package_info().version.to_string();
+    update_settings(&app, |settings| settings.seen_version = Some(version));
+    let _ = app.emit(STATE_CHANGED, ());
 }
 
 const REPO_URL: &str = "https://github.com/Anuraj-dev/voisu";
@@ -657,6 +673,7 @@ pub fn run() {
             open_permission_settings,
             install_update,
             set_star_prompt,
+            mark_version_seen,
             star_on_github,
             close_star_banner,
             engine::last_transcript

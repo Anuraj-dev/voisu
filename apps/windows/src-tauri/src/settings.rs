@@ -62,6 +62,11 @@ pub struct Settings {
     /// Off stops the banner and the notification, never the Settings card.
     #[serde(deserialize_with = "lenient_on")]
     pub star_prompt: bool,
+    /// The version whose What's new the user last saw (or that Setup
+    /// finished on). The window shows the notes again once the running
+    /// version differs. None before any; junk reads as None.
+    #[serde(deserialize_with = "lenient")]
+    pub seen_version: Option<String>,
 }
 
 /// A field with a value this version does not understand (a size a later
@@ -119,6 +124,7 @@ impl Default for Settings {
             boost_words: vec!["Voisu".to_owned()],
             tone: Tone::Formal,
             star_prompt: true,
+            seen_version: None,
         }
     }
 }
@@ -370,5 +376,37 @@ mod tests {
         assert_eq!(Settings::load(&path).boost_words, ["Voisu", "Tauri"]);
         fs::write(&path, br#"{"boost_words": "Voisu"}"#).unwrap();
         assert!(Settings::load(&path).boost_words.is_empty());
+    }
+
+    #[test]
+    fn the_seen_version_round_trips_and_junk_reads_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let seen = Settings {
+            seen_version: Some("0.78.0".to_owned()),
+            ..Settings::default()
+        };
+        seen.save(&path).unwrap();
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains(r#""seen_version": "0.78.0""#)
+        );
+        assert_eq!(Settings::load(&path), seen);
+
+        // A file from before the field, and hand-edited junk, keep every
+        // other setting.
+        for value in [
+            "",
+            r#", "seen_version": 5"#,
+            r#", "seen_version": {}"#,
+            r#", "seen_version": null"#,
+        ] {
+            let json = format!(r#"{{"auto_paste": false{value}}}"#);
+            fs::write(&path, &json).unwrap();
+            let settings = Settings::load(&path);
+            assert_eq!(settings.seen_version, None, "{json}");
+            assert!(!settings.auto_paste, "{json} wiped another setting");
+        }
     }
 }

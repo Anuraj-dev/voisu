@@ -1,36 +1,49 @@
 // Mock of @tauri-apps/api/core for `npm run dev:mock`: fake state for
 // screenshots, chosen by `?screen=`. See SCREENS below. `&platform=mac` shows
-// the macOS build: its Trigger Keys, wording and missing permissions.
+// the macOS build on any screen: its Trigger Keys, wording and missing
+// permissions.
 import { emit, hasListener } from './event.js';
 
 const params = new URLSearchParams(location.search);
-const screen = params.get('screen') ?? 'overview';
+// `overview` is the old name of `home`; `settings` opens Dictation, where
+// the old Settings tab's first section now lives.
+const ALIASES = { overview: 'home', settings: 'dictation' };
+const asked = params.get('screen') ?? 'home';
+const screen = ALIASES[asked] ?? asked;
 const mac = params.get('platform') === 'mac';
 const DEFAULT_KEY = mac ? 'Ctrl+Alt' : 'Ctrl+Win';
 
+// Sidebar pages, opened by clicking their item once the app renders.
+const PAGES = ['dictation', 'words', 'keys', 'general', 'whats-new'];
 const SCREENS = [
   'setup',
   'setup-partial',
   'setup-error',
-  'overview',
+  'home',
   'recording',
   'processing',
   'failed',
   'hook-down',
+  // A pending update whose manifest carried notes.
   'update',
+  // Just updated from 0.77.0: the What's new dialog opens.
+  'updated',
   'star',
   'star-closed',
-  'settings',
+  ...PAGES,
+  // What's new with the pending update's notes under "Ready to install".
+  'whats-new-pending',
   'replace-key',
 ];
-if (!SCREENS.includes(screen)) console.warn(`unknown ?screen=${screen}; try ${SCREENS.join(', ')}`);
+if (!SCREENS.includes(screen)) console.warn(`unknown ?screen=${asked}; try ${SCREENS.join(', ')}`);
+const pending = screen === 'update' || screen === 'whats-new-pending';
 
 const inSetup = screen.startsWith('setup');
 const state = {
   groqSaved: !inSetup || screen === 'setup-partial',
   deepgramSaved: !inSetup,
   autostart: true,
-  version: '0.73.0',
+  version: '0.78.0',
   autoPaste: true,
   overlaySize: 'medium',
   boostWords: ['Voisu', 'Deepgram'],
@@ -59,7 +72,16 @@ const state = {
         inputMonitoring: screen !== 'hook-down',
       }
     : null,
-  updateVersion: screen === 'update' ? '0.74.0' : null,
+  updateVersion: pending ? '0.79.0' : null,
+  updateNotes: pending
+    ? [
+        { kind: 'new', text: 'Pick a microphone in Dictation settings.' },
+        { kind: 'improved', text: 'The overlay follows the screen your cursor is on.' },
+        { kind: 'fixed', text: 'Paste no longer drops the first letter in some terminals.', platforms: ['windows'] },
+      ]
+    : null,
+  // A fresh install has seen nothing; `updated` last saw 0.77.0.
+  seenVersion: inSetup ? null : screen === 'updated' ? '0.77.0' : '0.78.0',
   starPrompt: true,
   // `star` shows the banner; `star-closed` is after its × (Settings still
   // carries the Support card, as on every screen).
@@ -122,6 +144,10 @@ const COMMANDS = {
     state.showStar = false;
     emit('state-changed', null);
   },
+  mark_version_seen: () => {
+    state.seenVersion = state.version;
+    emit('state-changed', null);
+  },
   open_permission_settings: ({ pane }) => {
     console.info('mock: open System Settings', pane);
     // As if the user turned it on.
@@ -149,6 +175,9 @@ const type = (input, value) => {
   input.dispatchEvent(new Event('input', { bubbles: true }));
 };
 
+const open = async (page, ready = () => true) =>
+  (await until(() => ready() && $(`[data-page="${page}"]`))).click();
+
 async function drive() {
   if (screen === 'setup-error') {
     type(await until(() => $('#key-groq')), 'gsk_wrong_key');
@@ -166,10 +195,14 @@ async function drive() {
     }
   } else if (screen === 'star-closed') {
     (await until(() => $('button[aria-label="Close"]'))).click();
-    (await until(() => !$('button[aria-label="Close"]') && $('#tab-settings'))).click();
-  } else if (screen === 'settings' || screen === 'replace-key') {
-    (await until(() => $('#tab-settings'))).click();
-    if (screen === 'replace-key') (await until(() => $('button[aria-label="Replace Groq key"]'))).click();
+    await open('general', () => !$('button[aria-label="Close"]'));
+  } else if (PAGES.includes(screen)) {
+    await open(screen);
+  } else if (screen === 'whats-new-pending') {
+    await open('whats-new');
+  } else if (screen === 'replace-key') {
+    await open('keys');
+    (await until(() => $('button[aria-label="Replace Groq key"]'))).click();
   }
 }
 drive();

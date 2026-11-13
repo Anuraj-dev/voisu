@@ -13,8 +13,8 @@
       {
         "label": "settings",
         "title": "Voisu",
-        "width": 460,
-        "height": 640,
+        "width": 760,
+        "height": 540,
         "resizable": false,
         "maximizable": false,
         "minimizable": true,

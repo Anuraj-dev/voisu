@@ -490,6 +490,11 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Only the release notes; first, since checkout empties the workspace.
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: apps/windows/ui/whats-new.json
+          sparse-checkout-cone-mode: false
       - uses: actions/download-artifact@v4
         with:
           name: windows-release
@@ -506,6 +511,12 @@ jobs:
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
           set -euo pipefail
+          # The app's What's new reads the notes as this version's items from
+          # whats-new.json (compact JSON); without an entry, the release page.
+          notes="$(jq -c --arg v "$VERSION" \
+            'first(.[] | select(.version == $v) | .items) // empty' \
+            apps/windows/ui/whats-new.json)"
+          [ -n "$notes" ] || notes="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
           cd dist/windows
           # Stable name for the landing page's releases/latest/download link;
           # the versioned copy is what latest.json points at, so an updater
@@ -514,7 +525,7 @@ jobs:
           cp Voisu-Setup-x64.exe "$versioned"
           jq -n \
             --arg version "$VERSION" \
-            --arg notes "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}" \
+            --arg notes "$notes" \
             --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --arg signature "$(cat Voisu-Setup-x64.exe.sig)" \
             --arg url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${versioned}" \

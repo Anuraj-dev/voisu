@@ -49,6 +49,15 @@ its final push (race-guard skip or a rejected non-fast-forward push), the commit
 lost — the next merge to `main` re-classifies everything since the last
 `chore(release):` marker and bumps accordingly. No manual repair needed.
 
+### Desktop release notes (What's new)
+
+A PR with a user-visible Windows or macOS app change adds its entry to
+`apps/windows/ui/whats-new.json` under the version the PR will release as (the next
+minor for a `feat:`, the next patch for a `fix:`), newest first, as
+`{kind: new|improved|fixed, text, platforms?}`. The app shows these after an update, and
+`release.yml` copies that version's items into `latest.json`'s `notes` (the release page
+URL when there is no entry).
+
 ## Pipeline stages
 
 ```
