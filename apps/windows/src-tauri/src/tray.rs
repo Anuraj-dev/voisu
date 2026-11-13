@@ -163,17 +163,18 @@ fn tray_image(app: &AppHandle) -> Option<Image<'static>> {
     Some(Image::new_owned(rgba, icon.width(), icon.height()))
 }
 
-/// Keeps only the app icon's green bars, in black; the dark tile they sit
-/// on drops out. How much greener than red a pixel is says how much of it is
-/// bar, so the bars' anti-aliased edges stay soft.
+/// Keeps the app icon's mark (the green bars and the off-white caret), in
+/// black; the dark tile it sits on drops out. How much brighter than the
+/// tile a pixel is says how much of it is mark, so anti-aliased edges stay
+/// soft.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn template(rgba: &[u8]) -> Vec<u8> {
     rgba.as_chunks::<4>()
         .0
         .iter()
         .flat_map(|px| {
-            let green = f32::from(px[1].saturating_sub(px[0]));
-            let mark = ((green - 16.0) / 80.0).clamp(0.0, 1.0);
+            let brightest = f32::from(px[0].max(px[1]).max(px[2]));
+            let mark = ((brightest - 48.0) / 160.0).clamp(0.0, 1.0);
             [0, 0, 0, (f32::from(px[3]) * mark).round() as u8]
         })
         .collect()
@@ -295,8 +296,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_mac_template_keeps_the_bars_and_drops_the_tile() {
+    fn the_mac_template_keeps_the_mark_and_drops_the_tile() {
         let bar = [104, 222, 165, 255];
+        let caret = [244, 245, 247, 255];
+        assert_eq!(template(&caret), [0, 0, 0, 255]);
         let tile = [24, 26, 30, 255];
         let clear = [0, 0, 0, 0];
         let half_bar = [104, 222, 165, 128];
