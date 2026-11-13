@@ -1,11 +1,17 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
   <title>Voisu</title>
   <rect width="512" height="512" fill="#17191D"/>
-  <rect x="96" y="112" width="320" height="150" rx="75" fill="none" stroke="#65D6A0" stroke-width="26"/>
-  <g fill="#8FB4FF">
-    <rect x="164" y="157" width="36" height="60" rx="18"/>
-    <rect x="238" y="141" width="36" height="92" rx="18"/>
-    <rect x="312" y="157" width="36" height="60" rx="18"/>
+  <g transform="translate(128 64) scale(1)">
+    <g fill="#65D6A0">
+      <rect x="54" y="100" width="24" height="56" rx="12"/>
+      <rect x="94" y="66" width="24" height="124" rx="12"/>
+      <rect x="134" y="86" width="24" height="84" rx="12"/>
+    </g>
+    <g fill="#F4F5F7">
+      <rect x="183" y="60" width="10" height="136" rx="5"/>
+      <rect x="172" y="58" width="32" height="10" rx="5"/>
+      <rect x="172" y="188" width="32" height="10" rx="5"/>
+    </g>
   </g>
   <text x="256" y="388" text-anchor="middle" fill="#F4F5F7" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="104" font-weight="600" letter-spacing="-2">voisu</text>
 </svg>
