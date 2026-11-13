@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.77.0
+Version:        0.78.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -167,6 +167,10 @@ install -D -m 0644 packaging/icons/voisu.svg %{buildroot}%{_datadir}/icons/hicol
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Fri Nov 13 2026 Voisu maintainers <voisu@example.invalid> - 0.78.0-1
+- feat(desktop): split settings into pages and show what's new after an update (#320)
+- test(cli): expect the update-check line in voisu --help (#321)
+
 * Wed Nov 11 2026 Voisu maintainers <voisu@example.invalid> - 0.77.0-1
 - feat(windows): ask for a GitHub star after steady use, with a permanent Settings card (#319)
 
