@@ -246,6 +246,11 @@
     gap: 8px;
     padding: 20px 26px 16px;
     min-width: 0;
+    /* One readable column, even in a maximized window. */
+    box-sizing: border-box;
+    width: 100%;
+    max-width: 620px;
+    margin-inline: auto;
   }
   .step {
     display: flex;
@@ -288,5 +293,30 @@
     align-items: flex-start;
     gap: 6px;
     margin-top: auto;
+  }
+  /* The default portrait window stacks the intro above the form. The form
+     numbers the steps itself, so the outline goes. */
+  @media (max-width: 620px) {
+    .setup {
+      grid-template-columns: 1fr;
+      grid-template-rows: auto 1fr;
+    }
+    .brand {
+      position: static;
+      height: auto;
+      gap: 12px;
+      padding: 22px 22px 16px;
+      border-right: 0;
+      border-bottom: 1px solid var(--hairline);
+    }
+    .outline {
+      display: none;
+    }
+    footer {
+      margin-top: 0;
+    }
+    form {
+      padding: 16px 22px;
+    }
   }
 </style>

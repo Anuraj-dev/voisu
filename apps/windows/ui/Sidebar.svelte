@@ -37,10 +37,11 @@
     class="item"
     data-page={id}
     aria-current={ui.page === id ? 'page' : undefined}
+    title={name}
     onclick={() => (ui.page = id)}
   >
     <Icon name={id} />
-    <span>{name}</span>
+    <span class="label">{name}</span>
     {#if dot}<span class="dot" title="New notes"></span><span class="sr">, new notes</span>{/if}
   </button>
 {/snippet}
@@ -49,7 +50,7 @@
 <nav aria-label="Voisu" onkeydown={onKey}>
   <div class="brand">
     <Logo size={26} />
-    <span>Voisu</span>
+    <span class="label">Voisu</span>
   </div>
   <ul>
     {#each PAGES as page (page.id)}
@@ -136,6 +137,40 @@
     overflow: hidden;
     clip-path: inset(50%);
     white-space: nowrap;
+  }
+  /* A narrow window keeps the icons and hides the words, so the default
+     portrait window leaves the page its room. The labels stay readable to
+     screen readers and show as tooltips. */
+  @media (max-width: 620px) {
+    nav {
+      padding: 16px 8px 12px;
+    }
+    .brand {
+      justify-content: center;
+      padding: 0 0 18px;
+    }
+    .item {
+      justify-content: center;
+      position: relative;
+      padding: 8px 0;
+    }
+    .label {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip-path: inset(50%);
+      white-space: nowrap;
+    }
+    .dot {
+      position: absolute;
+      top: 5px;
+      right: 9px;
+      margin: 0;
+    }
+    .version {
+      display: none;
+    }
   }
   .version {
     padding: 0 10px;
