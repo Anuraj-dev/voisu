@@ -222,7 +222,8 @@ pub fn star(path: Option<&Path>, open: impl FnOnce(&str) -> Result<(), String>) 
     let opened = open(REPO_URL).is_ok();
     let saved = match path {
         Some(path) => mark_answered(path).map_err(|error| error.to_string()),
-        None => Err("no state folder".to_owned()),
+        // Without a state folder the nudge never shows, so nothing is lost.
+        None => Ok(()),
     };
     Starred { opened, saved }
 }
