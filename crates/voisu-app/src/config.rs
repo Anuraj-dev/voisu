@@ -501,7 +501,7 @@ pub fn set_tone(tone: Tone) -> Result<PathBuf, String> {
 
 /// An On/Off setting stored as a root key, `key = "on"` or `key = "off"`. Each
 /// defaults to on when the key or the config file is missing. A value Voisu
-/// cannot read takes [`Switch::when_unclear`].
+/// cannot read keeps the update check off and the star prompt on.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Switch {
     /// `update_check`: the daily automatic check for a newer release. Off
