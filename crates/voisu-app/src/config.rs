@@ -500,7 +500,8 @@ pub fn set_tone(tone: Tone) -> Result<PathBuf, String> {
 }
 
 /// An On/Off setting stored as a root key, `key = "on"` or `key = "off"`. Each
-/// defaults to on when the key is missing, unreadable or unrecognised.
+/// defaults to on when the key or the config file is missing. A value Voisu
+/// cannot read takes [`Switch::when_unclear`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Switch {
     /// `update_check`: the daily automatic check for a newer release. Off
@@ -518,6 +519,16 @@ impl Switch {
             Switch::StarPrompt => "star_prompt",
         }
     }
+
+    /// The value when the key is present but unrecognised, or the config
+    /// cannot be read. The update check is a network opt-out, so a value the
+    /// user may have meant as "no" keeps it off.
+    fn when_unclear(self) -> bool {
+        match self {
+            Switch::UpdateCheck => false,
+            Switch::StarPrompt => true,
+        }
+    }
 }
 
 /// Whether `switch` is on in the user's config.
@@ -532,9 +543,26 @@ pub fn set_switch(switch: Switch, on: bool) -> Result<PathBuf, String> {
 
 pub(crate) fn switch_at(path: &Path, switch: Switch) -> bool {
     match std::fs::read_to_string(path) {
-        Ok(contents) => parse_switch(&contents, switch.key()).unwrap_or(true),
-        Err(_) => true,
+        Ok(contents) => match parse_switch(&contents, switch.key()) {
+            Some(on) => on,
+            None if has_root_key(&contents, switch.key()) => switch.when_unclear(),
+            None => true,
+        },
+        Err(error) if error.kind() == ErrorKind::NotFound => true,
+        Err(_) => switch.when_unclear(),
     }
+}
+
+/// Whether the root table sets `key` at all, whatever its value.
+fn has_root_key(contents: &str, key: &str) -> bool {
+    contents
+        .lines()
+        .map(|line| strip_comment(line).trim())
+        .take_while(|line| !line.starts_with('['))
+        .any(|line| {
+            line.split_once('=')
+                .is_some_and(|(name, _)| name.trim() == key)
+        })
 }
 
 pub(crate) fn set_switch_at(path: &Path, switch: Switch, on: bool) -> Result<PathBuf, String> {
@@ -2331,7 +2359,31 @@ other_key = 5
     }
 
     #[test]
-    fn switch_values_parse_in_both_spellings_and_unknown_is_on() {
+    fn an_unclear_update_check_stays_off_but_an_unclear_star_prompt_stays_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for value in ["\"no\"", "0", "\"disabled\""] {
+            std::fs::write(
+                &path,
+                format!("update_check = {value}\nstar_prompt = {value}\n"),
+            )
+            .unwrap();
+            assert!(!switch_at(&path, Switch::UpdateCheck), "{value}");
+            assert!(switch_at(&path, Switch::StarPrompt), "{value}");
+        }
+        // A key that only appears in another table is missing from the root.
+        std::fs::write(&path, "[other]\nupdate_check = \"no\"\n").unwrap();
+        assert!(switch_at(&path, Switch::UpdateCheck));
+
+        // A config Voisu cannot read: a directory where the file should be.
+        let unreadable = dir.path().join("dir.toml");
+        std::fs::create_dir(&unreadable).unwrap();
+        assert!(!switch_at(&unreadable, Switch::UpdateCheck));
+        assert!(switch_at(&unreadable, Switch::StarPrompt));
+    }
+
+    #[test]
+    fn switch_values_parse_in_both_spellings_and_unknown_is_none() {
         for (contents, expected) in [
             ("update_check = \"off\"", Some(false)),
             ("update_check = 'on'", Some(true)),
