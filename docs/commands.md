@@ -23,6 +23,8 @@
 | `voisu service install` / `start` / `stop` / `restart` / `status` / `uninstall` | Manage the user services |
 | `voisu update [--check\|--dry-run] [--switch-to-bin]` | Update Voisu through its package manager (Linux, see [Update](linux.md#update)) |
 | `voisu update-check [on\|off]` | Turn the daily update check on or off (Linux, see [Update check](linux.md#update-check)) |
+| `voisu star` | Open Voisu's GitHub page to star it; Voisu stops asking (Linux) |
+| `voisu star-prompt [on\|off]` | Turn the star request on or off (Linux, see [Star prompt](linux.md#star-prompt)) |
 
 ---
 
