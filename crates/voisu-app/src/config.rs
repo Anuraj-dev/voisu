@@ -561,8 +561,17 @@ fn has_root_key(contents: &str, key: &str) -> bool {
         .take_while(|line| !line.starts_with('['))
         .any(|line| {
             line.split_once('=')
-                .is_some_and(|(name, _)| name.trim() == key)
+                .is_some_and(|(name, _)| names_key(name, key))
         })
+}
+
+/// Whether a TOML key `name` is `key`, bare or quoted (`"key"`, `'key'`).
+fn names_key(name: &str, key: &str) -> bool {
+    let name = name.trim();
+    let unquoted = ['"', '\'']
+        .iter()
+        .find_map(|quote| name.strip_prefix(*quote)?.strip_suffix(*quote));
+    unquoted.unwrap_or(name) == key
 }
 
 pub(crate) fn set_switch_at(path: &Path, switch: Switch, on: bool) -> Result<PathBuf, String> {
@@ -595,7 +604,7 @@ fn parse_switch(contents: &str, key: &str) -> Option<bool> {
         let Some((name, value)) = line.split_once('=') else {
             continue;
         };
-        if name.trim() != key {
+        if !names_key(name, key) {
             continue;
         }
         let value = value
@@ -624,7 +633,7 @@ fn merge_switch(existing: &str, key: &str, on: bool) -> String {
         let is_root_key = root_end.is_none()
             && trimmed
                 .split_once('=')
-                .is_some_and(|(name, _)| name.trim() == key);
+                .is_some_and(|(name, _)| names_key(name, key));
         if !is_root_key {
             lines.push(line);
         }
@@ -2371,9 +2380,24 @@ other_key = 5
             assert!(!switch_at(&path, Switch::UpdateCheck), "{value}");
             assert!(switch_at(&path, Switch::StarPrompt), "{value}");
         }
-        // A key that only appears in another table is missing from the root.
-        std::fs::write(&path, "[other]\nupdate_check = \"no\"\n").unwrap();
-        assert!(switch_at(&path, Switch::UpdateCheck));
+        std::fs::write(&path, "update_check =\n").unwrap();
+        assert!(!switch_at(&path, Switch::UpdateCheck));
+        // A quoted key is the same key, and writing replaces it.
+        std::fs::write(&path, "\"update_check\" = \"off\"\n").unwrap();
+        assert!(!switch_at(&path, Switch::UpdateCheck));
+        set_switch_at(&path, Switch::UpdateCheck, true).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "update_check = \"on\"\n"
+        );
+        // Another key, or the key in another table, is missing from the root.
+        for contents in [
+            "update_check_x = \"no\"\n",
+            "[other]\nupdate_check = \"no\"\n",
+        ] {
+            std::fs::write(&path, contents).unwrap();
+            assert!(switch_at(&path, Switch::UpdateCheck), "{contents}");
+        }
 
         // A config Voisu cannot read: a directory where the file should be.
         let unreadable = dir.path().join("dir.toml");
