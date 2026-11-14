@@ -184,3 +184,65 @@ No Raja English/Hinglish dictation corpus is checked in, so quality rankings and
 Qwen3-ASR 0.6B and 1.7B have a pinned isolated Transformers CUDA runtime (`tools/local-asr/runtimes/qwen-transformers`) and host snapshots under `~/.local/share/voisu/local-asr/` (outside `target/`, so `cargo clean` cannot delete them). A 2026-09-22 RTX 5050 (8151 MiB) offline JFK run observed `cuda:0` with no CPU spill: 0.6B peak RAM 2465 MiB / VRAM 1804 MiB; 1.7B peak RAM 4869 MiB / VRAM 4196 MiB, which must fit both total and currently free VRAM less a 512 MiB desktop headroom (`DESKTOP_HEADROOM_BYTES` in `voisu_asr/adapters.py`; it was a 25% reserve until 2026-09-27). Production Local selection stays closed.
 
 Fun-ASR-Nano GGUF hashes, Fun-ASR-Nano-2512-hf `model.safetensors` SHA-256 `1bbb6dcc5d8b75084a399d48c4d4b0f3aa1d3f09f2616ae40ed2c4fba03d89c9`, and the llama.cpp `runtime-llamacpp-v0.2.6` Linux x64 AVX2 package (`aaebc5470f846ce915200b35d6e9f9bd0a0d3ed399d39e49bdeb7a1f1782bc70`) are pinned. A 2026-09-22 JFK smoke on this RTX 5050 host observed: Fun-ASR llama.cpp CPU Transcript in 1.67s; Fun-ASR-Nano-2512-hf Transformers CUDA `cuda:0` peak RAM 2576 MiB / VRAM 1625 MiB, no CPU spill, offline; Moonshine Voice 0.1.5 CPU load 0.274s / cold 1.994s / warm 1.934s. Cohere Transcribe remains Hugging Face gated (`401 GatedRepo`, no accepted token). Root still needs the real-host protected launcher gate before any Model Recommendation is treated as measured. English only for these three; none is a Hindi option.
+
+## Cloud STT benchmark
+
+`tools/local-asr/cloud_bench.py` measures WER and latency of cloud speech-to-text models on the same frozen corpus, with the same tokenizer and WER as `benchmark.py`. It uploads the private audio to the providers you name, so run it only on a corpus you are allowed to send. API keys come from the environment and are never written to disk:
+
+| Candidate | Environment |
+|---|---|
+| `groq-whisper-large-v3`, `groq-whisper-large-v3-turbo` | `GROQ_API_KEY` |
+| `deepgram-nova-3` (prerecorded endpoint, not streaming latency) | `DEEPGRAM_API_KEY` |
+| `elevenlabs-scribe-v2` | `ELEVENLABS_API_KEY` |
+| `assemblyai-universal`, `assemblyai-universal-3-5-pro` (upload, create, poll; latency is the total) | `ASSEMBLYAI_API_KEY` |
+| `cloudflare-whisper-large-v3-turbo` | `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID` |
+
+```sh
+EVAL="$HOME/.local/state/voisu/local-asr-eval-v1"
+python3 tools/local-asr/cloud_bench.py transcribe \
+  --corpus "$EVAL/corpus.json" \
+  --candidate groq-whisper-large-v3 --candidate groq-whisper-large-v3-turbo --candidate deepgram-nova-3 \
+  --output "$EVAL/results/cloud-run.json" --repeats 3
+python3 tools/local-asr/cloud_bench.py score \
+  --corpus "$EVAL/corpus.json" --run "$EVAL/results/cloud-run.json" \
+  --output "$EVAL/results/cloud-report.json"
+```
+
+`transcribe` resumes: rerunning the same command skips rows that already succeeded and retries failed ones, and the run file is rewritten after every row. HTTP 429 waits for `Retry-After` (capped at 60 s, three retries) and that wait is excluded from `latency_ms`. Other useful flags are `--split`, `--language`, `--limit`, `--concurrency`, `--min-interval-ms` and `--upload-format` (the default `auto` uploads FLAC when the `flac` binary is installed, like production). Concurrency above 1 inflates latency on a shared connection, so keep it at 1 for latency numbers.
+
+The run file holds transcript text. The tool refuses to write it to a path inside a git work tree unless the path is gitignored. The report holds aggregates and per-record counts only: pooled WER with substitutions, deletions and insertions, latency p50, p90 and max, real-time factor, the negative-stratum hallucination count, and the fraction of records whose critical tokens all appear. Override a provider's base URL with `CLOUD_BENCH_<PROVIDER>_URL` (for example `CLOUD_BENCH_GROQ_URL`) to test against a local fake server.
+
+## Cloud LLM benchmark
+
+`tools/local-asr/llm_bench.py` measures the post-STT cloud LLM step on the frozen corpus: Intent Reconstruction (`--task intent-reconstruction`) or Minimal Grammar (`--task grammar`). It takes the Transcript text from an existing STT run file (the `--stt-run` rows, selected by candidate name with `--source-a` and `--source-b`) and sends it to the models you name, then scores the delivered text as WER against the human reference. It sends private transcript text to the providers you name, so run it only on a corpus you are allowed to send. Keys come from the environment and are never written to disk:
+
+| Model spec | Environment |
+|---|---|
+| `groq:qwen/qwen3.8-27b`, `groq:openai/gpt-oss-20b`, `groq:openai/gpt-oss-120b` | `GROQ_API_KEY` |
+| `cerebras:qwen-3.8-27b`, `cerebras:gpt-oss-120b` | `CEREBRAS_API_KEY` |
+
+```sh
+EVAL="$HOME/.local/state/voisu/local-asr-eval-v1"
+python3 tools/local-asr/llm_bench.py run \
+  --corpus "$EVAL/corpus.json" --stt-run "$EVAL/results/cloud-run.json" \
+  --task intent-reconstruction --source-a deepgram-nova-3 --source-b groq-whisper-large-v3 \
+  --model groq:qwen/qwen3.8-27b --model groq:openai/gpt-oss-20b --model groq:openai/gpt-oss-120b \
+  --model cerebras:qwen-3.8-27b --model cerebras:gpt-oss-120b \
+  --output "$EVAL/results/llm-run.json" --repeats 3 --min-interval-ms 500
+python3 tools/local-asr/llm_bench.py score \
+  --corpus "$EVAL/corpus.json" --llm-run "$EVAL/results/llm-run.json" \
+  --stt-run "$EVAL/results/cloud-run.json" --output "$EVAL/results/llm-report.json"
+```
+
+For `--task grammar` pass only `--source-a` (the one Transcript Minimal Grammar edits) and a model such as `groq:openai/gpt-oss-20b`.
+
+**The prompt comes from Rust.** The tool never holds a copy of the system prompt, schema or sampling parameters. It starts one long-lived Rust helper per run (`cargo run -p voisu-cloud --example dump_llm_request` for Intent Reconstruction, `cargo run -p voisu-app --example dump_llm_request` for grammar; override with `--rust-cmd`, and `cargo` must be on `PATH`). The helper prints the exact production request body, then validates each model response with the production code and returns the delivered text and outcome. Intent Reconstruction runs through `TranscriptDecisionPipeline`, so the disagreement gate, sanitisation, response parser, length and coverage guards and the fallback to a safe source are the real ones. Grammar uses the production `build_request` and `extract_candidate` and the production edit application. The first run compiles the helper.
+
+Differences from production:
+
+- The helper uses an empty dictionary and no user vocabulary or word confidences, so prompts for dictionary-heavy records are shorter than in the app.
+- Grammar skips the English-eligibility and command-span gates and protected-name handling.
+- HTTP goes through Python `urllib` with its own timeout (`--timeout-seconds`, default 15), not the daemon's curl transport and deadline.
+- Production sends `reasoning_effort: "none"`, which the gpt-oss models reject (Groq answers HTTP 400). For gpt-oss models only, the tool sends `"low"` instead. Qwen models get the production value untouched.
+
+Each row records HTTP status, retries, final-attempt latency (429 waits excluded, honouring `Retry-After` capped at 60 s, three retries), token counts including reasoning tokens, and the outcome (`accepted`, `rejected`, `failed`, `http_NNN`, `timeout`). `run` resumes: rerunning skips rows that succeeded and retries failed ones. The run file holds transcript text, so the tool refuses a path that is tracked or not gitignored inside a git work tree. The report holds aggregates only: pooled WER for the model and for each source, better, worse and same counts per record, latency p50, p90 and max, and completion tokens. Only English and Hinglish records are scored. In the table, `err`, `p50`, `p90`, `max` and `ctok` are per model and repeat on each stratum row. `invented` counts model words absent from both sources and `dropped` counts agreed words the model removed; both are flags for review (a correctly joined word such as "con fig" to "config" counts as invented), not error counts. Override a provider's base URL with `LLM_BENCH_GROQ_URL` or `LLM_BENCH_CEREBRAS_URL` to test against a local fake server.

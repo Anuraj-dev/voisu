@@ -194,7 +194,18 @@ fn request_groq_intent_reconstruction(
             "Groq rejected the Intent Reconstruction request",
         ));
     }
-    let response: serde_json::Value = serde_json::from_slice(&outcome.stdout).map_err(|_| {
+    parse_intent_reconstruction_response_body(&outcome.stdout)
+}
+
+/// Turn one Intent Reconstruction chat-completions response body into the
+/// model's wording. Shared by the production request and the developer
+/// benchmark (`examples/dump_llm_request.rs`) so both accept exactly the same
+/// envelope.
+#[doc(hidden)]
+pub fn parse_intent_reconstruction_response_body(
+    body: &[u8],
+) -> Result<MergeResult, BoundaryError> {
+    let response: serde_json::Value = serde_json::from_slice(body).map_err(|_| {
         BoundaryError::new(
             BoundaryKind::Validation,
             "Groq Intent Reconstruction returned malformed JSON",
@@ -212,7 +223,10 @@ fn request_groq_intent_reconstruction(
     voisu_core::parse_intent_reconstruction_response(content)
 }
 
-pub(super) fn groq_intent_reconstruction_request_body(
+/// The exact production Intent Reconstruction request body. Public (hidden)
+/// only so the developer benchmark can emit it instead of keeping a copy.
+#[doc(hidden)]
+pub fn groq_intent_reconstruction_request_body(
     request: &IntentReconstructionRequest,
 ) -> serde_json::Value {
     let sources: Vec<_> = request
