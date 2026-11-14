@@ -427,12 +427,17 @@ fn switch_meaning(switch: Switch, on: bool) -> &'static str {
 fn star() -> ExitCode {
     use voisu_app::star_prompt;
     let path = star_prompt::state_path();
-    match star_prompt::star(path.as_deref(), star_prompt::open_in_browser) {
-        Ok(()) => println!("Opening {}. Thank you!", star_prompt::REPO_URL),
-        Err(_) => println!(
+    let starred = star_prompt::star(path.as_deref(), star_prompt::open_in_browser);
+    if starred.opened {
+        println!("Opening {}. Thank you!", star_prompt::REPO_URL);
+    } else {
+        println!(
             "Open {} in your browser to star Voisu. Thank you!",
             star_prompt::REPO_URL
-        ),
+        );
+    }
+    if let Err(error) = starred.saved {
+        eprintln!("Voisu could not save your answer ({error}), so it may ask again.");
     }
     ExitCode::SUCCESS
 }

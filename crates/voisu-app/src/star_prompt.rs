@@ -218,15 +218,23 @@ pub fn mark_answered(path: &Path) -> std::io::Result<()> {
 
 /// `Star`: opens the repository through `open` and ends the nudge for good,
 /// even when the browser does not open.
-pub fn star(
-    path: Option<&Path>,
-    open: impl FnOnce(&str) -> Result<(), String>,
-) -> Result<(), String> {
-    let opened = open(REPO_URL);
-    if let Some(path) = path {
-        mark_answered(path).map_err(|error| error.to_string())?;
-    }
-    opened
+pub fn star(path: Option<&Path>, open: impl FnOnce(&str) -> Result<(), String>) -> Starred {
+    let opened = open(REPO_URL).is_ok();
+    let saved = match path {
+        Some(path) => mark_answered(path).map_err(|error| error.to_string()),
+        None => Err("no state folder".to_owned()),
+    };
+    Starred { opened, saved }
+}
+
+/// What [`star`] managed: opening the page and saving the answer are
+/// reported apart, so a failed save never reads as a failed open.
+#[derive(Debug)]
+pub struct Starred {
+    /// The browser launcher started.
+    pub opened: bool,
+    /// The answer was saved; on `Err` the nudge may show again.
+    pub saved: Result<(), String>,
 }
 
 /// How long [`open_in_browser`] waits to learn whether the launcher failed.
@@ -524,7 +532,7 @@ mod tests {
         let (_dir, path) = file();
         write(&path, &state(20, &["a", "b", "c"])).unwrap();
         close(&path, "2026-11-11").unwrap();
-        star(Some(&path), |_| Ok(())).unwrap();
+        star(Some(&path), |_| Ok(())).saved.unwrap();
         assert!(!line_shows(&path, true, "2026-12-11"));
         assert!(!line_shows(&path, true, "2099-01-01"));
     }
@@ -649,8 +657,20 @@ mod tests {
             Err("no browser".to_owned())
         });
         assert_eq!(opened.as_deref(), Some(REPO_URL));
-        assert!(result.is_err());
+        assert!(!result.opened);
+        assert!(result.saved.is_ok());
         assert!(read(&path).answered);
+    }
+
+    #[test]
+    fn a_failed_save_does_not_read_as_a_failed_open() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory where the state file should be cannot be written.
+        let path = dir.path().join("star-prompt.json");
+        std::fs::create_dir_all(path.join("x")).unwrap();
+        let result = star(Some(&path), |_| Ok(()));
+        assert!(result.opened);
+        assert!(result.saved.is_err());
     }
 
     #[test]

@@ -259,12 +259,20 @@ fn load_settings() -> SettingsSnapshot {
 fn star() -> Reply {
     use crate::star_prompt;
     let path = star_prompt::state_path();
-    let text = match star_prompt::star(path.as_deref(), star_prompt::open_in_browser) {
-        Ok(()) => "Opened GitHub. Thank you!".to_owned(),
-        Err(_) => format!("Open {} to star Voisu. Thank you!", star_prompt::REPO_URL),
+    let starred = star_prompt::star(path.as_deref(), star_prompt::open_in_browser);
+    let mut text = if starred.opened {
+        "Opened GitHub. Thank you!".to_owned()
+    } else {
+        format!("Open {} to star Voisu. Thank you!", star_prompt::REPO_URL)
+    };
+    let kind = if starred.saved.is_ok() {
+        Tone::Success
+    } else {
+        text.push_str(" Voisu could not save that, so it may ask again.");
+        Tone::Caution
     };
     Reply::Applied {
-        kind: Tone::Success,
+        kind,
         text,
         refresh: &[Refresh::Settings],
     }
