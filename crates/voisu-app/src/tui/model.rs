@@ -113,6 +113,10 @@ pub struct SettingsSnapshot {
     pub tone: WritingTone,
     pub deepgram: bool,
     pub update_check: bool,
+    pub star_prompt: bool,
+    /// The star prompt line shows on Home: threshold met, setting on, not
+    /// answered, and not hidden by a close.
+    pub star_line: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -194,6 +198,11 @@ pub enum Job {
     SetTone(WritingTone),
     SetDeepgram(bool),
     SetUpdateCheck(bool),
+    SetStarPrompt(bool),
+    /// Opens the repository page and ends the star nudge for good.
+    Star,
+    /// Closes the Home star line (30 days the first time, for good after).
+    CloseStar,
     SetEngine {
         mode: AsrMode,
         /// The daemon's own word that Local is Ready.
@@ -212,7 +221,10 @@ pub enum Job {
 impl Job {
     /// Whether this job can take seconds, and so must not delay quick ones.
     pub fn is_slow(&self) -> bool {
-        matches!(self, Job::Doctor | Job::SaveKey { .. } | Job::Service(_))
+        matches!(
+            self,
+            Job::Doctor | Job::SaveKey { .. } | Job::Service(_) | Job::Star
+        )
     }
 }
 
@@ -232,6 +244,9 @@ impl fmt::Debug for Job {
             Job::SetTone(tone) => write!(f, "SetTone({tone:?})"),
             Job::SetDeepgram(enabled) => write!(f, "SetDeepgram({enabled})"),
             Job::SetUpdateCheck(on) => write!(f, "SetUpdateCheck({on})"),
+            Job::SetStarPrompt(on) => write!(f, "SetStarPrompt({on})"),
+            Job::Star => f.write_str("Star"),
+            Job::CloseStar => f.write_str("CloseStar"),
             Job::SetEngine { mode, local_ready } => write!(f, "SetEngine({mode:?}, {local_ready})"),
             Job::AddTerm(term) => write!(f, "AddTerm({term:?})"),
             Job::RemoveTerm(term) => write!(f, "RemoveTerm({term:?})"),
@@ -472,11 +487,13 @@ pub enum SettingsRow {
     DeepgramKey,
     TriggerKey,
     UpdateCheck,
+    StarPrompt,
     RunSetup,
+    Star,
 }
 
 impl SettingsRow {
-    pub const ALL: [SettingsRow; 11] = [
+    pub const ALL: [SettingsRow; 13] = [
         SettingsRow::Engine,
         SettingsRow::Delivery,
         SettingsRow::Writing,
@@ -487,7 +504,9 @@ impl SettingsRow {
         SettingsRow::DeepgramKey,
         SettingsRow::TriggerKey,
         SettingsRow::UpdateCheck,
+        SettingsRow::StarPrompt,
         SettingsRow::RunSetup,
+        SettingsRow::Star,
     ];
 
     pub fn label(self) -> &'static str {
@@ -502,7 +521,9 @@ impl SettingsRow {
             SettingsRow::DeepgramKey => "Deepgram key",
             SettingsRow::TriggerKey => "Trigger Key",
             SettingsRow::UpdateCheck => "Update check",
+            SettingsRow::StarPrompt => "Star prompt",
             SettingsRow::RunSetup => "Run setup",
+            SettingsRow::Star => "Star on GitHub",
         }
     }
 
@@ -523,6 +544,7 @@ impl SettingsRow {
             SettingsRow::TriggerKey => None,
             SettingsRow::GroqKey | SettingsRow::DeepgramKey => Some("enter key"),
             SettingsRow::RunSetup => Some("run setup"),
+            SettingsRow::Star => Some("star"),
             _ => Some("change"),
         }
     }
@@ -552,9 +574,12 @@ impl SettingsRow {
             SettingsRow::UpdateCheck => {
                 "Once a day, reads the newest version number from GitHub. No identifier or usage is sent."
             }
+            SettingsRow::StarPrompt => "Lets Voisu ask for a GitHub star after a few days of use.",
             SettingsRow::RunSetup => {
                 "Walks through your keys, Engine and Trigger Key again. Safe to re-run."
             }
+            // Always here, whatever the nudge or the Star prompt setting say.
+            SettingsRow::Star => crate::star_prompt::ENTRY,
         }
     }
 }
@@ -699,6 +724,11 @@ impl App {
         self.service_busy.is_none()
     }
 
+    /// Whether the star prompt line shows on Home.
+    pub fn star_line(&self) -> bool {
+        self.settings.is_some_and(|settings| settings.star_line)
+    }
+
     /// True while keystrokes may be the user's own dictation arriving here.
     pub fn guarded(&self) -> bool {
         self.daemon_active() || self.now.mono_ms < self.guard_until_mono_ms
@@ -710,6 +740,7 @@ impl App {
                 fix: self.fix().map(Fix::label),
                 checks: self.checks_open,
                 restart: self.can_restart(),
+                star: !self.checks_open && self.star_line(),
             },
             Tab::History => Context::History {
                 has_records: self.history.as_ref().is_some_and(|items| !items.is_empty()),
@@ -931,6 +962,9 @@ impl App {
             SettingsRow::UpdateCheck => self.settings.map_or_else(loading, |settings| {
                 plain(if settings.update_check { "On" } else { "Off" }.to_owned())
             }),
+            SettingsRow::StarPrompt => self.settings.map_or_else(loading, |settings| {
+                plain(if settings.star_prompt { "On" } else { "Off" }.to_owned())
+            }),
             SettingsRow::GroqKey => self.key_value(Provider::Groq),
             SettingsRow::DeepgramKey => self.key_value(Provider::Deepgram),
             SettingsRow::TriggerKey => match (&self.shortcut, &self.daemon) {
@@ -938,7 +972,7 @@ impl App {
                 (None, _) if self.daemon_down() => plain("Unknown until Voisu runs".to_owned()),
                 (None, _) => loading(),
             },
-            SettingsRow::RunSetup => plain(String::new()),
+            SettingsRow::RunSetup | SettingsRow::Star => plain(String::new()),
         };
         if self.restart_pending.contains(&row) && self.settings.is_some() {
             return (format!("{value} · after restart"), Tone::Caution);
@@ -1273,6 +1307,17 @@ impl App {
             Action::Submit => self.submit_prompt(effects),
             // Bound only on the setup screens, which take their keys in `on_key`.
             Action::Keep | Action::PasteClipboard => {}
+            Action::Star | Action::CloseStar => {
+                if let Some(settings) = &mut self.settings {
+                    settings.star_line = false;
+                    self.dirty = true;
+                    effects.push(Effect::Job(if action == Action::Star {
+                        Job::Star
+                    } else {
+                        Job::CloseStar
+                    }));
+                }
+            }
             Action::ConfirmRemove => {
                 if let Some(Prompt::ConfirmRemove(term)) = self.prompt.take() {
                     self.dirty = true;
@@ -1383,6 +1428,13 @@ impl App {
                     effects.push(Effect::Job(Job::SetUpdateCheck(settings.update_check)));
                 }
             }
+            SettingsRow::StarPrompt => {
+                if let Some(settings) = &mut self.settings {
+                    settings.star_prompt = !settings.star_prompt;
+                    settings.star_line &= settings.star_prompt;
+                    effects.push(Effect::Job(Job::SetStarPrompt(settings.star_prompt)));
+                }
+            }
             SettingsRow::GroqKey => {
                 self.prompt = Some(Prompt::Key(Provider::Groq, PromptText::default()));
             }
@@ -1391,6 +1443,12 @@ impl App {
             }
             SettingsRow::TriggerKey => return,
             SettingsRow::RunSetup => self.start_setup(effects),
+            SettingsRow::Star => {
+                if let Some(settings) = &mut self.settings {
+                    settings.star_line = false;
+                }
+                effects.push(Effect::Job(Job::Star));
+            }
         }
         self.dirty = true;
     }
@@ -1736,6 +1794,8 @@ pub(super) mod test_support {
             tone: WritingTone::Formal,
             deepgram: true,
             update_check: true,
+            star_prompt: true,
+            star_line: false,
         }
     }
 
@@ -2067,6 +2127,98 @@ mod tests {
             ("Off".to_owned(), Tone::Plain)
         );
         assert!(app.restart_pending.is_empty());
+    }
+
+    fn with_star_line() -> App {
+        let mut app = ready_app();
+        let _ = update(
+            &mut app,
+            Msg::Reply(Reply::Settings(SettingsSnapshot {
+                star_line: true,
+                ..settings()
+            })),
+            at(0),
+        );
+        app
+    }
+
+    #[test]
+    fn s_on_home_stars_and_x_closes_both_hiding_the_line() {
+        let mut app = with_star_line();
+        assert!(app.star_line());
+        let effects = press(&mut app, KeyCode::Char('s'), 0);
+        assert!(
+            matches!(&effects[..], [Effect::Job(Job::Star)]),
+            "{effects:?}"
+        );
+        assert!(!app.star_line());
+        assert!(press(&mut app, KeyCode::Char('s'), 0).is_empty());
+
+        // Closing is not "don't ask again": the setting stays on.
+        let mut app = with_star_line();
+        let effects = press(&mut app, KeyCode::Char('x'), 0);
+        assert!(
+            matches!(&effects[..], [Effect::Job(Job::CloseStar)]),
+            "{effects:?}"
+        );
+        assert!(!app.star_line());
+        assert_eq!(app.setting_value(SettingsRow::StarPrompt).0, "On");
+    }
+
+    fn on_row(row: SettingsRow, star_prompt: bool) -> App {
+        let mut app = ready_app();
+        let _ = update(
+            &mut app,
+            Msg::Reply(Reply::Settings(SettingsSnapshot {
+                star_prompt,
+                ..settings()
+            })),
+            at(0),
+        );
+        app.tab = Tab::Settings;
+        app.settings_selected = SettingsRow::ALL.iter().position(|r| *r == row).unwrap();
+        app
+    }
+
+    #[test]
+    fn the_star_row_opens_github_whatever_the_setting_says() {
+        for star_prompt in [true, false] {
+            let mut app = on_row(SettingsRow::Star, star_prompt);
+            assert_eq!(
+                SettingsRow::Star.description(),
+                "Voisu is free and built by one student. A star helps others find it."
+            );
+            let effects = press(&mut app, KeyCode::Enter, 0);
+            assert!(
+                matches!(&effects[..], [Effect::Job(Job::Star)]),
+                "{effects:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn without_the_line_s_and_x_do_nothing_on_home() {
+        let mut app = ready_app();
+        assert!(!app.star_line());
+        assert!(press(&mut app, KeyCode::Char('s'), 0).is_empty());
+        assert!(press(&mut app, KeyCode::Char('x'), 0).is_empty());
+    }
+
+    #[test]
+    fn turning_the_star_prompt_row_off_hides_the_line() {
+        let mut app = with_star_line();
+        app.tab = Tab::Settings;
+        app.settings_selected = SettingsRow::ALL
+            .iter()
+            .position(|row| *row == SettingsRow::StarPrompt)
+            .unwrap();
+        assert_eq!(app.setting_value(SettingsRow::StarPrompt).0, "On");
+        let effects = press(&mut app, KeyCode::Enter, 0);
+        assert!(matches!(
+            &effects[..],
+            [Effect::Job(Job::SetStarPrompt(false))]
+        ));
+        assert!(!app.star_line());
     }
 
     #[test]
@@ -2813,7 +2965,7 @@ mod tests {
     fn run_setup_row_hands_off_to_the_wizard() {
         let mut app = ready_app();
         app.tab = Tab::Settings;
-        app.settings_selected = 10;
+        app.settings_selected = 11;
         let effects = press(&mut app, KeyCode::Enter, 0);
         assert!(matches!(effects.as_slice(), [Effect::StartSetup]));
         assert!(app.setup.is_some());

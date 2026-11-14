@@ -35,6 +35,7 @@ pub mod setup_engine;
 pub mod setup_flow;
 pub mod setup_profile;
 pub mod smart_writing;
+pub mod star_prompt;
 pub mod system;
 pub mod tui;
 pub mod ubuntu_gnome;

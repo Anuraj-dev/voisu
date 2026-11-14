@@ -37,6 +37,8 @@ commands:
   update [--check|--dry-run] [--switch-to-bin]
                                 update Voisu
   update-check [on|off]         check once a day for a newer version
+  star                          star Voisu on GitHub (opens your browser)
+  star-prompt [on|off]          let Voisu ask for a GitHub star
 
 options:
   -h, --help, help              show this help

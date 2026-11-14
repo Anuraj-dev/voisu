@@ -183,6 +183,18 @@ pub fn execute(job: Job, replies: &Sender<Reply>) {
             },
             &[Refresh::Settings],
         )),
+        Job::SetStarPrompt(on) => send(applied_setting(
+            config::set_switch(config::Switch::StarPrompt, on),
+            format!("Star prompt turned {}.", if on { "on" } else { "off" }),
+            if on {
+                "Voisu may ask after a few days of use."
+            } else {
+                "Voisu won't ask again."
+            },
+            &[Refresh::Settings],
+        )),
+        Job::Star => send(star()),
+        Job::CloseStar => send(close_star()),
         Job::SetEngine { mode, local_ready } => send(set_engine(mode, local_ready)),
         Job::AddTerm(term) => send(dictionary_result(
             crate::dictionary::add_user_term(&term),
@@ -212,6 +224,7 @@ pub fn execute(job: Job, replies: &Sender<Reply>) {
 }
 
 fn load_settings() -> SettingsSnapshot {
+    let star_prompt = config::switch(config::Switch::StarPrompt);
     // A legacy `clipboard` means different things in different sessions, and
     // this terminal may not be in the service's session, so it is never resolved
     // here.
@@ -234,6 +247,63 @@ fn load_settings() -> SettingsSnapshot {
         tone: config::tone(),
         deepgram: config::deepgram_enabled(),
         update_check: config::switch(config::Switch::UpdateCheck),
+        star_prompt,
+        // Judged against today on every read, so a line closed 30 days ago
+        // comes back without waiting for a dictation.
+        star_line: crate::star_prompt::state_path()
+            .is_some_and(|path| crate::star_prompt::line_shows(&path, star_prompt, &today())),
+    }
+}
+
+/// Opens the repository page and answers the star prompt for good.
+fn star() -> Reply {
+    use crate::star_prompt;
+    let path = star_prompt::state_path();
+    let starred = star_prompt::star(path.as_deref(), star_prompt::open_in_browser);
+    let mut text = if starred.opened {
+        "Opened GitHub. Thank you!".to_owned()
+    } else {
+        format!("Open {} to star Voisu. Thank you!", star_prompt::REPO_URL)
+    };
+    let kind = if starred.saved.is_ok() {
+        Tone::Success
+    } else {
+        text.push_str(" Voisu could not save that, so it may ask again.");
+        Tone::Caution
+    };
+    Reply::Applied {
+        kind,
+        text,
+        refresh: &[Refresh::Settings],
+    }
+}
+
+fn today() -> String {
+    crate::star_prompt::local_date(crate::update_notice::unix_now())
+}
+
+/// Closes the Home star line: hidden for 30 days the first time, for good
+/// the second.
+fn close_star() -> Reply {
+    use crate::star_prompt;
+    let closed = star_prompt::state_path()
+        .ok_or_else(|| "no state folder".to_owned())
+        .and_then(|path| star_prompt::close(&path, &today()).map_err(|error| error.to_string()));
+    let (kind, text) = match closed {
+        Ok(state) if state.closes >= 2 => (Tone::Plain, "Voisu won't ask again.".to_owned()),
+        Ok(_) => (
+            Tone::Plain,
+            format!(
+                "Hidden. Voisu may ask once more in {} days.",
+                star_prompt::RETURN_AFTER_DAYS
+            ),
+        ),
+        Err(error) => (Tone::Caution, format!("Couldn't save that: {error}")),
+    };
+    Reply::Applied {
+        kind,
+        text,
+        refresh: &[Refresh::Settings],
     }
 }
 

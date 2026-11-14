@@ -324,7 +324,7 @@ mod tests {
 
     use super::super::keys::every_context;
     use super::super::model::test_support::*;
-    use super::super::model::{Msg, Reply, SettingsRow, StatusPoll, update};
+    use super::super::model::{Msg, Reply, SettingsRow, SettingsSnapshot, StatusPoll, update};
     use super::*;
 
     const UNICODE: Look = Look {
@@ -465,6 +465,78 @@ mod tests {
         assert!(!joined(&lines).contains("Update available"));
     }
 
+    fn with_star_line() -> App {
+        let mut app = ready_app();
+        let _ = update(
+            &mut app,
+            Msg::Reply(Reply::Settings(SettingsSnapshot {
+                star_line: true,
+                ..settings()
+            })),
+            at(0),
+        );
+        app
+    }
+
+    #[test]
+    fn home_asks_for_a_star_below_the_rows_with_its_keys() {
+        let mut app = with_star_line();
+        let lines = screen(&mut app, &UNICODE, (80, 24));
+        assert_eq!(lines[13], "");
+        assert_eq!(lines[14], "   Enjoying Voisu?  s Star on GitHub · x close");
+
+        let mut app = ready_app();
+        let lines = screen(&mut app, &UNICODE, (80, 24));
+        assert!(!joined(&lines).contains("Enjoying"), "{}", joined(&lines));
+    }
+
+    #[test]
+    fn the_star_line_fits_the_minimum_size_and_yields_to_the_checks_list() {
+        for look in [UNICODE, NO_COLOR, ASCII] {
+            let mut app = with_star_line();
+            let lines = screen(&mut app, &look, (60, 16));
+            assert!(
+                joined(&lines).contains("Enjoying Voisu?  s "),
+                "{}",
+                joined(&lines)
+            );
+            for line in &lines {
+                assert!(text::width(line) <= 60, "{line}");
+            }
+        }
+        let mut app = with_star_line();
+        let _ = press(&mut app, KeyCode::Char('d'), 0);
+        let lines = screen(&mut app, &UNICODE, (80, 24));
+        assert!(!joined(&lines).contains("Enjoying"));
+    }
+
+    #[test]
+    fn the_star_row_and_its_line_fit_every_size_with_the_setting_off() {
+        for size in [(80, 24), (60, 16)] {
+            for look in [UNICODE, NO_COLOR, ASCII] {
+                let mut app = app_on('2');
+                let _ = update(
+                    &mut app,
+                    Msg::Reply(Reply::Settings(SettingsSnapshot {
+                        star_prompt: false,
+                        ..settings()
+                    })),
+                    at(0),
+                );
+                app.settings_selected = SettingsRow::ALL.len() - 1;
+                let lines = screen(&mut app, &look, size);
+                let all = joined(&lines);
+                assert!(all.contains("Star on GitHub"), "{size:?}\n{all}");
+                // The entry's sentence is there whole, however it wraps.
+                let words = all.split_whitespace().collect::<Vec<_>>().join(" ");
+                assert!(words.contains(crate::star_prompt::ENTRY), "{size:?}\n{all}");
+                for line in &lines {
+                    assert!(text::width(line) <= usize::from(size.0), "{line}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_last_row_quotes_and_truncates_the_newest_transcript() {
         let mut app = ready_app();
@@ -495,14 +567,16 @@ mod tests {
         assert_eq!(lines[12], "   Deepgram key  Can't reach it");
         assert_eq!(lines[13], "   Trigger Key   Not bound");
         assert_eq!(lines[14], "   Update check  On");
-        assert_eq!(lines[15], "   Run setup");
-        assert_eq!(lines[16], "");
-        assert_eq!(lines[17], "   Where your speech becomes text.");
+        assert_eq!(lines[15], "   Star prompt   On");
+        assert_eq!(lines[16], "   Run setup");
+        assert_eq!(lines[17], "   Star on GitHub");
+        assert_eq!(lines[18], "");
+        assert_eq!(lines[19], "   Where your speech becomes text.");
         assert_eq!(
-            lines[18],
+            lines[20],
             "     ● Cloud  Fast and accurate. Needs internet."
         );
-        assert_eq!(lines[19], "       Local  Private. Stays on this computer.");
+        assert_eq!(lines[21], "       Local  Private. Stays on this computer.");
     }
 
     #[test]
@@ -511,13 +585,13 @@ mod tests {
         app.settings_selected = 4;
         let lines = screen(&mut app, &UNICODE, (80, 24));
         assert_eq!(lines[9], " ▌ Tone          Formal");
-        assert_eq!(lines[17], "   How casual your words read.");
+        assert_eq!(lines[19], "   How casual your words read.");
         assert_eq!(
-            lines[18],
+            lines[20],
             "     ● Formal    Full words and a closing full stop."
         );
         assert_eq!(
-            lines[19],
+            lines[21],
             "       Informal  Abbreviations like btw, no final full stop."
         );
     }
@@ -528,10 +602,10 @@ mod tests {
         let _ = press(&mut app, KeyCode::Down, 0);
         let lines = screen(&mut app, &UNICODE, (80, 24));
         assert_eq!(lines[6], " ▌ Delivery      Paste");
-        assert_eq!(lines[17], "   How your words reach your window.");
-        assert_eq!(lines[18], "     ● Paste  Puts your words into your window.");
-        assert_eq!(lines[19], "       Copy   Copies only; you press Ctrl+V.");
-        assert_eq!(lines[20], "", "Delivery offers exactly two choices");
+        assert_eq!(lines[19], "   How your words reach your window.");
+        assert_eq!(lines[20], "     ● Paste  Puts your words into your window.");
+        assert_eq!(lines[21], "       Copy   Copies only; you press Ctrl+V.");
+        assert_eq!(lines[22], "", "Delivery offers exactly two choices");
     }
 
     #[test]
@@ -542,13 +616,13 @@ mod tests {
         let _ = press(&mut app, KeyCode::Down, 0);
         let lines = screen(&mut app, &UNICODE, (80, 24));
         // `●` stays on the value in effect; `▌` follows the highlight.
-        assert!(lines[18].starts_with("     ● Paste"), "{}", lines[18]);
-        assert!(lines[19].starts_with("   ▌   Copy"), "{}", lines[19]);
+        assert!(lines[20].starts_with("     ● Paste"), "{}", lines[20]);
+        assert!(lines[21].starts_with("   ▌   Copy"), "{}", lines[21]);
         assert_eq!(lines[22], "", "the toast line stays free");
         assert_eq!(lines[23], " ↑↓ pick   ↵ choose   Esc cancel");
         let ascii = screen(&mut app, &ASCII, (80, 24));
-        assert!(ascii[18].starts_with("     * Paste"), "{}", ascii[18]);
-        assert!(ascii[19].starts_with("   >   Copy"), "{}", ascii[19]);
+        assert!(ascii[20].starts_with("     * Paste"), "{}", ascii[20]);
+        assert!(ascii[21].starts_with("   >   Copy"), "{}", ascii[21]);
     }
 
     #[test]
@@ -577,8 +651,10 @@ mod tests {
             )
         );
         assert_eq!(lines[14], beside("   Update check  On", ""));
-        assert_eq!(lines[15], beside("   Run setup", ""));
-        assert_eq!(lines[16], "", "nothing below the rows");
+        assert_eq!(lines[15], beside("   Star prompt   On", ""));
+        assert_eq!(lines[16], beside("   Run setup", ""));
+        assert_eq!(lines[17], beside("   Star on GitHub", ""));
+        assert_eq!(lines[18], "", "nothing below the rows");
 
         // Picking happens in the panel, the same lines gaining the highlight.
         let _ = press(&mut app, KeyCode::Enter, 0);

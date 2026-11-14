@@ -20,6 +20,7 @@ enum CliAction {
     KeyCheck(Provider),
     SetDeepgram(bool),
     Switch(Switch, Option<bool>),
+    Star,
     SetAsrMode(AsrMode),
     Delivery(Option<DeliveryMode>),
     Writing(Option<WritingMode>),
@@ -53,6 +54,7 @@ fn main() -> ExitCode {
         Ok(CliAction::KeyCheck(provider)) => key_check(provider),
         Ok(CliAction::SetDeepgram(enabled)) => set_deepgram(enabled),
         Ok(CliAction::Switch(switch, state)) => switch_command(switch, state),
+        Ok(CliAction::Star) => star(),
         Ok(CliAction::SetAsrMode(mode)) => set_asr_mode(mode),
         Ok(CliAction::Delivery(mode)) => delivery(mode),
         Ok(CliAction::Writing(mode)) => writing(mode),
@@ -403,6 +405,7 @@ fn switch_command(switch: Switch, state: Option<bool>) -> ExitCode {
 fn switch_label(switch: Switch) -> &'static str {
     match switch {
         Switch::UpdateCheck => "Update check",
+        Switch::StarPrompt => "Star prompt",
     }
 }
 
@@ -414,7 +417,29 @@ fn switch_meaning(switch: Switch, on: bool) -> &'static str {
         (Switch::UpdateCheck, false) => {
             "Voisu never checks by itself; voisu update --check still does"
         }
+        (Switch::StarPrompt, true) => "after a few days of use Voisu may ask for a GitHub star",
+        (Switch::StarPrompt, false) => "Voisu never asks for a GitHub star",
     }
+}
+
+/// Opens the repository page and ends the star nudge for good. It works
+/// whatever the nudge or the setting say. Without a browser it names the page.
+fn star() -> ExitCode {
+    use voisu_app::star_prompt;
+    let path = star_prompt::state_path();
+    let starred = star_prompt::star(path.as_deref(), star_prompt::open_in_browser);
+    if starred.opened {
+        println!("Opening {}. Thank you!", star_prompt::REPO_URL);
+    } else {
+        println!(
+            "Open {} in your browser to star Voisu. Thank you!",
+            star_prompt::REPO_URL
+        );
+    }
+    if let Err(error) = starred.saved {
+        eprintln!("Voisu could not save your answer ({error}), so it may ask again.");
+    }
+    ExitCode::SUCCESS
 }
 
 /// Reads or persists the Delivery mode. A running daemon resolves configuration
@@ -693,6 +718,12 @@ fn parse_command() -> Result<CliAction, String> {
             Switch::UpdateCheck,
             Some(parse_on_off(state, "update-check")?),
         )),
+        [command] if command == "star" => Ok(CliAction::Star),
+        [command] if command == "star-prompt" => Ok(CliAction::Switch(Switch::StarPrompt, None)),
+        [command, state] if command == "star-prompt" => Ok(CliAction::Switch(
+            Switch::StarPrompt,
+            Some(parse_on_off(state, "star-prompt")?),
+        )),
         [command, engine] if command == "engine" => {
             Ok(CliAction::SetAsrMode(parse_asr_mode(engine)?))
         }
@@ -839,6 +870,8 @@ commands:
   update [--check|--dry-run] [--switch-to-bin]
                                 update Voisu
   update-check [on|off]         check once a day for a newer version
+  star                          star Voisu on GitHub (opens your browser)
+  star-prompt [on|off]          let Voisu ask for a GitHub star
 
 options:
   -h, --help, help              show this help

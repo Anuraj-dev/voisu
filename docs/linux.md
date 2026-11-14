@@ -113,7 +113,13 @@ A binary no package owns (for example a `cargo` build) is not updated.
 
 Once a day Voisu downloads a small version file, `latest-linux.json`, from GitHub Releases, so it can show *Update available* on the interface's Home screen and in `voisu status`. Voisu sends no identifier, no settings and no usage; the request carries only Voisu's version in its user agent. GitHub sees it like any other download, with your IP address and the time. GitHub publicly counts downloads of each release file, and that count is how Voisu estimates how many installs are active. `voisu status` never contacts the network; it reads the last answer.
 
-Turn it off with `voisu update-check off`, or *Settings → Update check* in the interface. Voisu then never checks by itself. `voisu update --check` still works when you ask.
+Turn it off with `voisu update-check off`, or *Settings → Update check* in the interface. Voisu then never checks by itself. A value Voisu cannot read, such as `update_check = "no"`, also keeps it off. `voisu update --check` still works when you ask.
+
+## Star prompt
+
+After 20 dictations spread over at least 3 days, Voisu sends one desktop notification asking whether you'd star it on GitHub, and the interface's Home screen shows *Enjoying Voisu?* with a key to star and a key to close. Closing it hides it for 30 days; it then comes back once, with no second notification, and a second close hides it for good. Closing or ignoring the notification changes nothing. Starring from anywhere ends it for good. The count lives only on this computer and is never sent anywhere.
+
+`voisu star` and *Settings → Star on GitHub* open the GitHub page at any time. Turn the request off with `voisu star-prompt off`, or *Settings → Star prompt* in the interface; the Settings entry stays.
 
 ## Trigger Key by desktop
 

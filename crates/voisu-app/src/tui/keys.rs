@@ -31,6 +31,8 @@ pub enum Context {
         checks: bool,
         /// `r` restarts Voisu: nothing else is starting or restarting it.
         restart: bool,
+        /// The star prompt line shows: `s` stars, `x` closes it.
+        star: bool,
     },
     History {
         has_records: bool,
@@ -102,6 +104,10 @@ pub enum Action {
     Keep,
     /// Read a key from the clipboard.
     PasteClipboard,
+    /// Open the repository to star it, ending the star nudge.
+    Star,
+    /// Close the star nudge: for 30 days the first time, for good the second.
+    CloseStar,
 }
 
 /// One row of the table: how it reads, and which keys do what.
@@ -303,6 +309,7 @@ pub fn bindings(context: &Context) -> Vec<Binding> {
             fix,
             checks,
             restart: can_restart,
+            star,
         } => {
             let mut rows = Vec::new();
             if let Some(fix) = fix {
@@ -321,6 +328,18 @@ pub fn bindings(context: &Context) -> Vec<Binding> {
             if *can_restart {
                 // Five fit: a fix or the scroll hint outranks it; `?` lists it.
                 rows.push(restart(fix.is_none() && !*checks));
+            }
+            if *star {
+                // The line itself names both keys, so they stay out of the
+                // footer; `?` lists them.
+                rows.push(Binding {
+                    in_footer: false,
+                    ..simple('s', "s", "star Voisu on GitHub", Action::Star)
+                });
+                rows.push(Binding {
+                    in_footer: false,
+                    ..simple('x', "x", "close the star request", Action::CloseStar)
+                });
             }
             rows.push(help());
             rows.push(quit());
@@ -479,11 +498,14 @@ pub(super) fn every_context() -> Vec<Context> {
     for fix in [None, Some("Run setup"), Some("Restart Voisu")] {
         for checks in [false, true] {
             for restart in [false, true] {
-                contexts.push(Context::Home {
-                    fix,
-                    checks,
-                    restart,
-                });
+                for star in [false, true] {
+                    contexts.push(Context::Home {
+                        fix,
+                        checks,
+                        restart,
+                        star,
+                    });
+                }
             }
         }
     }
@@ -537,6 +559,7 @@ mod tests {
             fix: None,
             checks: false,
             restart: true,
+            star: true,
         })
         .iter()
         .map(|hint| format!("{} {}", hint.keys, hint.label))
@@ -566,6 +589,7 @@ mod tests {
                     fix,
                     checks,
                     restart: true,
+                    star: false,
                 };
                 assert_eq!(action_for(&context, letter('r')), Some(Action::Restart));
             }
