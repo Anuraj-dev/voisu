@@ -20,14 +20,23 @@
 //!   "face" to `Voisu`; the shape keeps each vowel letter where it falls. The
 //!   hearing must also have at least as many vowel groups as the entry, so a
 //!   syllable is never invented ("isk" is not `Isaac`, "luks" not `Lucas`);
-//!   a run whose letters spell the entry exactly counts as distance zero;
+//!   a run whose letters spell the entry exactly counts as distance zero. A
+//!   single heard word against an entry whose shape has five letters or
+//!   fewer needs distance zero: one letter off a short name is usually a
+//!   common word the lexicon lacks ("sofa" is not `Sofia`, "lossy" is not
+//!   `Lucy`). A word capitalized mid-sentence, a name the model wrote, keeps
+//!   the ordinary bound;
 //! * **exact shape for ordinary words** — when every heard word is in the
 //!   embedded [`ENGLISH_WORDS`] lexicon the distance must be zero, either
 //!   word by word ("voice you" and `Voisu` are both `voisu`) or with the
 //!   words' letters joined ("deep gram" spells `Deepgram`). Vowels are not
 //!   folded together, so "meet you" (`metu`) is not `Matteo` (`mateo`) and
 //!   "had son" is not `Hudson`. A two-word English hearing of a name that
-//!   needs any vowel change ("cooper nets", "jonah than") therefore stays;
+//!   needs any vowel change ("cooper nets", "jonah than") therefore stays.
+//!   Accepted trade-off: a compound entry spoken as its two real words
+//!   ("tail wind" for `Tailwind`, "ray cast" for `Raycast`, "jack son" for
+//!   `Jackson`) is swapped, by the same rule that fixes "deep gram". Those
+//!   word pairs are rare in speech unless the user means the entry;
 //! * **not everyday speech** — a run made only of words ranked below
 //!   [`EVERYDAY_RANK`] is never swapped, even when it sounds or spells exactly
 //!   like an entry ("way land", "east one", "out then", "all over");
@@ -37,13 +46,15 @@
 //!   break. Each word has two or more ASCII letters and nothing else, is not
 //!   one of the [`FUNCTION_WORDS`] ("dock her", "are in", "log in" stay), is
 //!   not written in capitals past its first letter (acronyms such as "LUKS",
-//!   names such as "GitHub"), and the run never starts with "you" ("you bunt
-//!   too" stays). It sits outside spoken quotes and say-the-words spans, and
+//!   names such as "GitHub"), and no word after the first starts with a
+//!   capital: the model already wrote a proper noun there ("new Vim" stays,
+//!   lowercase "new vim" is `Neovim`). The run never starts with "you" ("you
+//!   bunt too" stays) or "no" ("no vim" stays). It sits outside spoken quotes and say-the-words spans, and
 //!   is not part of a URL, path, email or identifier;
 //! * **not an English word** — a single heard word in the lexicon is never
 //!   swapped ("sorry" stays `sorry` with `Sarah` in the Dictionary);
 //! * **unambiguous** — exactly one entry matches at that position, and no
-//!   word of the run is part of a span exact-match correction rewrites.
+//!   word of the run is part of a span exact matching matches.
 //!
 //! The pass writes the entry as the user wrote it; an all-lowercase entry
 //! takes a capital only at a sentence start the speaker capitalized. It
@@ -81,8 +92,8 @@ const ENGLISH_WORDS: &str = include_str!("english-words.txt");
 
 /// Lexicon ranks below this are everyday words. A run made only of them is
 /// ordinary speech even when it spells or sounds exactly like an entry: "way
-/// land" (ranks 346 and 318) is not `Wayland`, "east one" is not `Easton`.
-/// "voice" ranks 1,304, so "voice you" stays a `Voisu` hearing.
+/// land" (ranks 345 and 317) is not `Wayland`, "east one" is not `Easton`.
+/// "voice" ranks 1,303, so "voice you" stays a `Voisu` hearing.
 const EVERYDAY_RANK: usize = 1_000;
 
 /// Each lexicon word with its frequency rank, most frequent first (0).
@@ -271,7 +282,7 @@ fn words(text: &str) -> Vec<Word> {
     words
 }
 
-/// Words inside a span exact-match correction rewrites: the entry's word
+/// Words inside a span exact matching matches: the entry's word
 /// sequence, case-insensitive, as [`super::apply_user_vocabulary`] matches
 /// it. Exact matching owns those spans; the phonetic pass never re-targets
 /// them. A run whose letters merely join to an entry ("deep gram" for
@@ -405,10 +416,17 @@ impl<'a> Context<'a> {
     /// run; two different entries matching here is ambiguous and yields none.
     fn best_match(&self, index: usize) -> Option<(usize, &'a Entry)> {
         // "you" may end a run ("voice you"), never start one: "you bunt too"
-        // is a question, not `Ubuntu`.
-        if self.words[index].letters == "you" {
+        // is a question, not `Ubuntu`. "no" never starts one either: "no Vim"
+        // is a negation, not `Neovim`.
+        if matches!(self.words[index].letters.as_str(), "you" | "no") {
             return None;
         }
+        let start = self.words[index].start;
+        let written_name = self.text[start..]
+            .chars()
+            .next()
+            .is_some_and(char::is_uppercase)
+            && !starts_sentence(self.text, start);
         let mut found: Vec<(&'a Entry, usize, usize)> = Vec::new();
         let mut joined = String::new();
         let mut all_english = true;
@@ -422,6 +440,17 @@ impl<'a> Context<'a> {
                 break;
             }
             if count > 1 && !plain_gap(&self.text[self.words[last - 1].end..word.start]) {
+                break;
+            }
+            // A capital after the first word is a proper noun the model
+            // already wrote ("new Vim" is the editor Vim): the run ends there.
+            // A first-word capital may just start a sentence ("Voice you").
+            if count > 1
+                && self.text[word.start..]
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_uppercase)
+            {
                 break;
             }
             joined.push_str(&word.letters);
@@ -453,14 +482,24 @@ impl<'a> Context<'a> {
                 // differ by a vowel ("cooper nets" for `Kubernetes`, "jonah
                 // than" for `Jonathan`) unswapped: letting them through needs
                 // a vowel tolerance that turns "meet you" into `Matteo`.
-                let bound = if all_english {
+                // A single heard word against a short entry also needs an
+                // exact shape: the lexicon misses plenty of common words, and
+                // one letter off a short name is another word ("sofa" is not
+                // `Sofia`, "lossy" is not `Lucy`, "oddity" is not `Aditi`).
+                // A word the model capitalized mid-sentence is a name it
+                // already wrote; how close such a name may be ("Anya" for
+                // `Anna`) is a product decision this rule leaves unchanged.
+                let short_word = count == 1 && entry.shape.len() <= 5 && !written_name;
+                let bound = if all_english || short_word {
                     0
                 } else {
                     (entry.shape.len() / 4).max(1)
                 };
                 // Letters that join to the entry ("deep gram") are the
                 // strongest evidence there is; exact matching leaves them
-                // because it matches whole words. Otherwise a hearing never
+                // because it matches whole words. Accepted trade-off: a
+                // compound entry heard as its real words ("tail wind" for
+                // `Tailwind`, "jack son" for `Jackson`) swaps the same way. Otherwise a hearing never
                 // drops a syllable the entry spells: "isk" is not `Isaac` and
                 // "luks" is not `Lucas`, while extra vowels are fine ("hyper
                 // land" for `Hyprland`).
@@ -652,17 +691,22 @@ fn syllables(display: &str) -> usize {
         .sum()
 }
 
+/// Whether byte `start` begins a sentence: nothing but whitespace before it,
+/// or a sentence terminal or line break just before.
+fn starts_sentence(text: &str, start: usize) -> bool {
+    let before = &text[..start];
+    let sentence = before.trim_end();
+    sentence.is_empty()
+        || sentence.ends_with(['.', '!', '?'])
+        || before[sentence.len()..].contains(['\n', '\r'])
+}
+
 /// The entry as the user wrote it. An all-lowercase entry takes a capital
 /// only when the heard run started a sentence with one; any other casing
 /// ("iPhone") is kept exactly.
 fn written_form(display: &str, text: &str, start: usize) -> String {
     let heard_capital = text[start..].chars().next().is_some_and(char::is_uppercase);
-    let before = &text[..start];
-    let sentence = before.trim_end();
-    let sentence_start = sentence.is_empty()
-        || sentence.ends_with(['.', '!', '?'])
-        || before[sentence.len()..].contains(['\n', '\r']);
-    if !(heard_capital && sentence_start) || display.chars().any(char::is_uppercase) {
+    if !(heard_capital && starts_sentence(text, start)) || display.chars().any(char::is_uppercase) {
         return display.to_owned();
     }
     let mut characters = display.chars();

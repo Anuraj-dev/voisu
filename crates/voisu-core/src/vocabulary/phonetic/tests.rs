@@ -531,11 +531,75 @@ fn a_hearing_never_leaves_a_stray_word_behind() {
     // "toe key oh" once became "Tokio oh". It is now refused outright: all
     // three are English words, and no exact sound shape covers them.
     let text = "use toe key oh for async";
-    let corrected = apply_phonetic_dictionary(text, &terms(&["Tokio"]));
-    assert!(
-        corrected == text || corrected == "use Tokio for async",
-        "{corrected}"
+    assert_eq!(apply_phonetic_dictionary(text, &terms(&["Tokio"])), text);
+}
+
+#[test]
+fn a_common_word_is_never_swapped_into_a_short_name() {
+    // None of these is in the lexicon, and each is one sound off a short
+    // name; a single heard word must match a short entry exactly.
+    let dictionary = names_and_tech();
+    for text in [
+        "let's sit on the sofa for a bit",
+        "I feel lousy today",
+        "the compression is lossy",
+        "what an oddity",
+        "the meson decays fast",
+        "belay that order",
+        "a hoary old joke",
+        "she played with elan",
+        "a cup of kava",
+    ] {
+        assert_eq!(apply_phonetic_dictionary(text, &dictionary), text, "{text}");
+    }
+    // At a sentence start the capital says nothing: still a common word.
+    assert_eq!(
+        apply_phonetic_dictionary("Sofa is comfy.", &dictionary),
+        "Sofa is comfy."
     );
+    // A name the model wrote mid-sentence keeps the ordinary bound; whether
+    // "Anya" should become `Anna` is a product decision left as it was.
+    assert_eq!(
+        apply_phonetic_dictionary("I talked to Anya yesterday", &terms(&["Anna"])),
+        "I talked to Anna yesterday"
+    );
+}
+
+#[test]
+fn a_capitalized_later_word_or_a_leading_no_ends_the_hearing() {
+    let dictionary = names_and_tech();
+    for text in [
+        "a new Vim release",
+        "there is no Vim here",
+        "there is no vim here",
+    ] {
+        assert_eq!(apply_phonetic_dictionary(text, &dictionary), text, "{text}");
+    }
+    assert_eq!(
+        apply_phonetic_dictionary("I use new vim daily", &dictionary),
+        "I use Neovim daily"
+    );
+    // A sentence-start capital on the first word still counts.
+    assert_eq!(
+        apply_phonetic_dictionary("New vim is out.", &dictionary),
+        "Neovim is out."
+    );
+}
+
+#[test]
+fn a_longer_entry_still_takes_a_one_word_hearing_one_sound_off() {
+    let dictionary = names_and_tech();
+    for (heard, expected) in [
+        ("switch to hyperland now", "switch to Hyprland now"),
+        ("the postgress database", "the Postgres database"),
+        ("deploy on kubernetis", "deploy on Kubernetes"),
+    ] {
+        assert_eq!(
+            apply_phonetic_dictionary(heard, &dictionary),
+            expected,
+            "{heard}"
+        );
+    }
 }
 
 #[test]
@@ -759,8 +823,10 @@ fn a_full_dictionary_over_a_long_transcript_is_fast() {
     let words = text.split_whitespace().count();
     assert!(words >= 2000);
     let started = std::time::Instant::now();
-    let _ = apply_phonetic_dictionary(&text, &dictionary);
+    let corrected = apply_phonetic_dictionary(&text, &dictionary);
     let elapsed = started.elapsed();
+    assert!(corrected.contains("Voisu"), "{corrected}");
+    assert!(corrected.contains("Deepgram"), "{corrected}");
     eprintln!(
         "phonetic pass: {} entries x {words} words in {elapsed:?}",
         dictionary.len()
