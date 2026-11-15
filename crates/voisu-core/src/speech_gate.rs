@@ -23,8 +23,9 @@
 //! 2. **Frames.** 20 ms frames (the last may be partial), RMS of samples
 //!    normalized to -1..1.
 //! 3. **Adaptive threshold.** `effective = max(3 * p10, thr / 30)
-//!    .clamp(0.0003, thr)`, where `p10` is the 10th-percentile frame RMS (the
-//!    recording's own noise floor) and `thr` is [`SPEECH_THRESHOLD`]. The
+//!    .clamp(0.0003, thr)`, where `p10` is the 10th-percentile RMS of the
+//!    non-zero frames (the recording's own noise floor; digital-zero frames
+//!    are skipped) and `thr` is [`SPEECH_THRESHOLD`]. The
 //!    `.min(thr)` cap is essential: without it a pause-free clip sets its own
 //!    floor, because its 10th-percentile frame is already speech, and it is
 //!    rejected as silence.
@@ -96,9 +97,14 @@ pub fn detect_speech(samples: &[i16], sample_rate: u32) -> SpeechPresence {
     let frame_len = ((sample_rate * FRAME_MS / 1000) as usize).max(1);
     let frame_rms: Vec<f32> = samples.chunks(frame_len).map(centered_rms).collect();
 
-    let mut sorted = frame_rms.clone();
+    // Digital-zero frames (PipeWire start-up gaps) say nothing about the
+    // room's noise floor; counting them would drag p10 to 0 on a short clip.
+    let mut sorted: Vec<f32> = frame_rms.iter().copied().filter(|rms| *rms > 0.0).collect();
     sorted.sort_by(f32::total_cmp);
-    let floor = sorted[((sorted.len() - 1) as f32 * NOISE_FLOOR_PERCENTILE) as usize];
+    let floor = sorted
+        .get(((sorted.len().saturating_sub(1)) as f32 * NOISE_FLOOR_PERCENTILE) as usize)
+        .copied()
+        .unwrap_or(0.0);
     let effective_threshold = (floor * NOISE_FLOOR_MULTIPLE)
         .max(SPEECH_THRESHOLD / MAX_ADAPTIVE_DROP)
         // max(MIN_ENERGY_THRESHOLD).min(SPEECH_THRESHOLD): the cap is essential.
@@ -246,9 +252,10 @@ mod tests {
     #[test]
     fn leading_digital_zeros_on_a_dc_offset_mic_do_not_read_as_speech() {
         // PipeWire start-up can emit zeros before the offset appears; the step
-        // from 0 to 600 must not read as loud frames. 200 ms of zeros is 5% of
-        // this 4 s clip, so p10 is still the noise floor.
-        let audio = noise(4 * RATE as usize, 20.0, 5);
+        // from 0 to 600 must not read as loud frames, and the zero frames must
+        // not drag p10 below the noise. 200 ms of zeros is 10% of this 2 s
+        // clip, enough to set p10 to 0 if zero frames counted.
+        let audio = noise(2 * RATE as usize, 20.0, 5);
         let mut samples = pcm(&audio, 600.0);
         samples[..3_200].fill(0);
         let decision = detect_speech(&samples, RATE);
