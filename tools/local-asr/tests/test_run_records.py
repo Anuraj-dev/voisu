@@ -101,34 +101,40 @@ class RunRecordTests(unittest.TestCase):
         self.assertEqual([item[0] for item in a["english_heldout"]["strict_wer"]["per_clip"]], ["en-01.wav", "en-02.wav"])
         self.assertAlmostEqual(a["english_heldout"]["strict_wer"]["estimate"], 1 / 8)
 
-    def test_unimplemented_metrics_are_marked_not_fatal(self):
-        _, _, result = self.bench_run([self.manifest("model-a", {})])
+    def test_metric_slots_hold_real_values(self):
+        _, _, result = self.bench_run([self.manifest("model-a", {"en-02.wav": "open the request"})])
         record = result["records"][0]
         heldout = record["scopes"]["english_heldout"]
-        self.assertEqual(heldout["normalized_wer"]["status"], "not_implemented")
-        self.assertEqual(heldout["critical_token_error_rate"]["status"], "not_implemented")
-        self.assertEqual(heldout["strict_wer"]["ci"]["status"], "not_implemented")
+        self.assertEqual(heldout["normalized_wer"]["status"], "measured")
+        self.assertEqual(heldout["normalized_wer"]["estimate"], 2 / 8)
+        self.assertEqual(heldout["critical_token_error_rate"]["status"], "measured")
+        self.assertEqual(heldout["critical_token_error_rate"]["per_clip"], [["en-01.wav", 0, 1]])  # only en-01 lists critical tokens
+        self.assertEqual(heldout["strict_wer"]["ci"]["status"], "measured")
+        self.assertLessEqual(heldout["strict_wer"]["ci"]["low"], heldout["strict_wer"]["estimate"])
+        self.assertGreaterEqual(heldout["strict_wer"]["ci"]["high"], heldout["strict_wer"]["estimate"])
         self.assertIsNone(record["memory"]["system_memory_delta_bytes"])
         self.assertTrue(any("system-wide memory" in item for item in record["limitations"]))
-        self.assertIn("n/i", run_records.format_run_report(result))
+        self.assertNotIn("CI n/i", run_records.format_run_report(result))
 
     def test_negative_insertions_are_counted(self):
         _, _, result = self.bench_run([self.manifest("model-a", {"neg-01.wav": "thank you for watching"}), self.manifest("model-b", {})])
         self.assertEqual(result["records"][0]["negatives"], {"clips": 1, "insertions": 4, "clips_with_insertions": 1})
         self.assertEqual(result["records"][1]["negatives"], {"clips": 1, "insertions": 0, "clips_with_insertions": 0})
 
-    def test_comparisons_pair_every_two_records_and_verdicts_wait_for_the_metrics(self):
+    def test_comparisons_pair_every_two_records_and_verdicts_follow_the_rule(self):
         _, _, result = self.bench_run([self.manifest("model-a", {"en-02.wav": "open the request"}), self.manifest("model-b", {})], baseline_id="model-a")
         self.assertEqual(result["incumbent"], "model-a")
         self.assertEqual(len(result["comparisons"]), len(run_records.SCOPES) * len(run_records.METRICS))
         strict = next(c for c in result["comparisons"] if c["scope"] == "english_heldout" and c["metric"] == "strict_wer")
-        self.assertEqual(strict["status"], "ci_not_implemented")
+        self.assertEqual(strict["status"], "measured")
         self.assertEqual(strict["clips"], 2)
         self.assertAlmostEqual(strict["difference"]["estimate"], 0 - 2 / 8)
+        self.assertLessEqual(strict["difference"]["low"], strict["difference"]["estimate"])
         self.assertEqual(len(result["verdicts"]), 1)
         verdict = result["verdicts"][0]
-        self.assertEqual(verdict["verdict"], "pending")
-        self.assertEqual(verdict["checks"], {"paired_ci_better": None, "zero_negative_insertions": True, "no_critical_regression": None})
+        # Two held-out clips cannot separate the models: the paired CI reaches 0, so no winner.
+        self.assertEqual(verdict["verdict"], "not_winner")
+        self.assertEqual(verdict["checks"], {"paired_ci_better": False, "zero_negative_insertions": True, "no_critical_regression": True})
 
     def test_records_from_different_corpora_are_not_paired(self):
         _, _, result = self.bench_run([self.manifest("model-a", {}), self.manifest("model-b", {})])

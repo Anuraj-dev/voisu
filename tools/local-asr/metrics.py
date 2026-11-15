@@ -6,20 +6,18 @@ total reference units.  A metric is first reduced to one `ClipRatio` per clip
 bootstrap intervals and paired comparisons all share one representation and
 one resampling unit: the clip.
 
-Implemented: strict WER clips (the existing `benchmark.strict_tokens` and
-`benchmark.wer`, unchanged) and `ratio_of_sums`.
-
-Interfaces only (raise NotImplementedError): normalized tokens and WER, the
-critical-token error rate, the bootstrap CI and the paired bootstrap
-difference.  Their contracts are below; `tests/test_metrics_contract.py`
-holds expected-failure tests that must pass once they are implemented
-(remove each `@unittest.expectedFailure` as its function lands).
+Strict WER clips use the existing `benchmark.strict_tokens` and
+`benchmark.wer`, unchanged.  Normalized WER, the critical-token error rate,
+the bootstrap CI and the paired bootstrap difference follow the contracts in
+their docstrings; `tests/test_metrics_contract.py` pins them.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
+import random
 import sys
 from typing import Callable, Iterable, Mapping, Sequence
 
@@ -132,6 +130,157 @@ def strict_wer_clips(pairs: Iterable[tuple[str, str, str]]) -> list[ClipRatio]:
     return result
 
 
+# English number words for `normalize_tokens` step 4.  An ordinal word is its
+# cardinal base plus a flag; it can only end a number.
+_UNITS = {w: i for i, w in enumerate(["one", "two", "three", "four", "five", "six", "seven", "eight", "nine"], 1)}
+_TEENS = {w: i for i, w in enumerate(["ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen"], 10)}
+_TENS = {w: i * 10 for i, w in enumerate(["twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"], 2)}
+_SCALES = (("million", 1_000_000), ("thousand", 1_000))
+_ORDINAL_BASES = {
+    "first": "one", "second": "two", "third": "three", "fourth": "four", "fifth": "five", "sixth": "six",
+    "seventh": "seven", "eighth": "eight", "ninth": "nine", "tenth": "ten", "eleventh": "eleven", "twelfth": "twelve",
+    "thirteenth": "thirteen", "fourteenth": "fourteen", "fifteenth": "fifteen", "sixteenth": "sixteen",
+    "seventeenth": "seventeen", "eighteenth": "eighteen", "nineteenth": "nineteen", "twentieth": "twenty",
+    "thirtieth": "thirty", "fortieth": "forty", "fiftieth": "fifty", "sixtieth": "sixty", "seventieth": "seventy",
+    "eightieth": "eighty", "ninetieth": "ninety", "hundredth": "hundred", "thousandth": "thousand", "millionth": "million",
+}
+_CARDINAL_WORDS = {"zero", "hundred", *_UNITS, *_TEENS, *_TENS, *(word for word, _ in _SCALES)}
+
+
+def _number_word(token: str) -> tuple[str, bool] | None:
+    """(cardinal word, is_ordinal) for a number word (or "and"), else None."""
+
+    if token in _CARDINAL_WORDS or token == "and":  # "and" is kept so groups can absorb it; never starts a number
+        return token, False
+    base = _ORDINAL_BASES.get(token)
+    return (base, True) if base else None
+
+
+def _parse_group(words: Sequence[tuple[str, bool] | None], i: int, *, allow_bare_hundred: bool) -> tuple[int, int, bool] | None:
+    """One group of 1..999 at `i`: [unit hundred] [and] [tens/teen/unit].
+
+    Returns (value, next index, ended_on_ordinal) or None when no group starts at `i`.
+    """
+
+    def word(j):
+        entry = words[j] if j < len(words) else None
+        return entry[0] if entry else None
+
+    value, j = 0, i
+    head = word(j)
+    if head in _UNITS and word(j + 1) == "hundred":
+        value, j = _UNITS[head] * 100, j + 2
+    elif head == "hundred" and allow_bare_hundred:
+        value, j = 100, j + 1
+    if value:
+        if words[j - 1][1]:
+            return value, j, True
+        # "one hundred and five": "and" is absorbed only before a continuation.
+        k = j + 1 if word(j) == "and" else j
+        if word(k) in _TEENS or word(k) in _TENS or word(k) in _UNITS:
+            j = k
+        else:
+            return value, j, False
+    head = word(j)
+    if head in _TEENS:
+        return value + _TEENS[head], j + 1, words[j][1]
+    if head in _TENS:
+        if not words[j][1] and word(j + 1) in _UNITS:
+            return value + _TENS[head] + _UNITS[word(j + 1)], j + 2, words[j + 1][1]
+        return value + _TENS[head], j + 1, words[j][1]
+    if head in _UNITS:
+        return value + _UNITS[head], j + 1, words[j][1]
+    return None
+
+
+def _parse_number(words: Sequence[tuple[str, bool] | None], i: int) -> tuple[int, int, bool]:
+    """The longest number starting at `i` (a number word): (value, next index, ordinal)."""
+
+    if words[i] == ("zero", False):
+        return 0, i + 1, False
+    total, j, floor = 0, i, 0
+    while True:
+        group = _parse_group(words, j, allow_bare_hundred=j == i)
+        value, k = 1, j  # a bare leading "thousand" / "million" counts one
+        if group is not None:
+            value, k, ordinal = group
+            if ordinal:
+                return total + value, k, True
+        scale = next(((index, size) for index, (name, size) in enumerate(_SCALES, 1) if k < len(words) and words[k] and words[k][0] == name), None)
+        if scale is None or scale[0] <= floor or (group is None and j != i):
+            return (total + value, k, False) if group is not None else (total, j, False)
+        total, j, floor = total + value * scale[1], k + 1, scale[0]
+        if words[k][1]:
+            return total, j, True
+        # "two thousand and five": absorb "and" only when a group follows.
+        if j + 1 < len(words) and words[j] == ("and", False) and _parse_group(words, j + 1, allow_bare_hundred=False):
+            j += 1
+
+
+def _ordinal_suffix(value: int) -> str:
+    if value % 100 in (11, 12, 13):
+        return "th"
+    return {1: "st", 2: "nd", 3: "rd"}.get(value % 10, "th")
+
+
+def _number_words_to_digits(tokens: Sequence[str]) -> list[str]:
+    words = [_number_word(token) for token in tokens]
+    result: list[str] = []
+    i = 0
+    while i < len(tokens):
+        if words[i] is None or words[i][0] == "and":
+            result.append(tokens[i])
+            i += 1
+            continue
+        value, i, ordinal = _parse_number(words, i)
+        result.append(f"{value}{_ordinal_suffix(value)}" if ordinal else str(value))
+    return result
+
+
+def _count_occurrences(haystack: Sequence[str], needle: Sequence[str]) -> int:
+    """Non-overlapping contiguous occurrences of `needle`, scanning left to right."""
+
+    count, i, size = 0, 0, len(needle)
+    while i + size <= len(haystack):
+        if tuple(haystack[i:i + size]) == tuple(needle):
+            count, i = count + 1, i + size
+        else:
+            i += 1
+    return count
+
+
+def _checked_clips(clips: Sequence[ClipRatio], iterations: int, level: float) -> list[ClipRatio]:
+    """Validated clips sorted by record_id (the `bootstrap_ci` input rules)."""
+
+    if iterations < 1:
+        raise ValueError("iterations must be at least 1")
+    if not 0 < level < 1:
+        raise ValueError("level must be between 0 and 1 (exclusive)")
+    if not clips:
+        raise ValueError("bootstrap needs at least one clip")
+    ordered = sorted(clips, key=lambda clip: clip.record_id)
+    for previous, clip in zip(ordered, ordered[1:]):
+        if previous.record_id == clip.record_id:
+            raise ValueError(f"duplicate record_id {clip.record_id!r}")
+    for clip in ordered:
+        if clip.denominator <= 0:
+            raise ValueError(f"{clip.record_id}: denominator must be positive")
+    return ordered
+
+
+def _percentile_bounds(statistics: list[float], level: float) -> tuple[float, float]:
+    """Type-7 quantiles at (1 - level) / 2 and (1 + level) / 2."""
+
+    ordered = sorted(statistics)
+
+    def quantile(q: float) -> float:
+        position = q * (len(ordered) - 1)
+        lower, upper = math.floor(position), math.ceil(position)
+        return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+
+    return quantile((1 - level) / 2), quantile((1 + level) / 2)
+
+
 def normalize_tokens(text: str, token_map: Mapping[str, str] | None = None) -> list[str]:
     """Tokens for normalized WER (`NORMALIZED_WER_VERSION`); applied to reference and hypothesis alike.
 
@@ -158,7 +307,11 @@ def normalize_tokens(text: str, token_map: Mapping[str, str] | None = None) -> l
     ("e mail" vs "email"), currency, years read as pairs ("twenty twenty six").
     """
 
-    raise NotImplementedError("normalized WER tokenizer is specified but not implemented")
+    tokens = [token for token in strict_tokens(text.replace("%", " percent ").replace("&", " and ")) if token not in FILLER_WORDS]
+    tokens = _number_words_to_digits(tokens)
+    if token_map:
+        tokens = [token_map.get(token, token) for token in tokens]
+    return tokens
 
 
 def normalized_wer_clips(pairs: Iterable[tuple[str, str, str]], token_map: Mapping[str, str] | None = None) -> list[ClipRatio]:
@@ -170,7 +323,14 @@ def normalized_wer_clips(pairs: Iterable[tuple[str, str, str]], token_map: Mappi
     reference normalizes to no tokens.
     """
 
-    raise NotImplementedError("normalized WER is specified but not implemented")
+    result = []
+    for record_id, reference, hypothesis in pairs:
+        ref = normalize_tokens(reference, token_map)
+        if not ref:
+            raise ValueError(f"{record_id}: normalized WER needs a reference with at least one token")
+        counts = _benchmark.wer(ref, normalize_tokens(hypothesis, token_map))
+        result.append(ClipRatio(record_id, counts["distance"], counts["reference_tokens"]))
+    return result
 
 
 def critical_token_clips(
@@ -196,7 +356,21 @@ def critical_token_clips(
     (all tokens present anywhere, bucketed by tag), which stays unchanged.
     """
 
-    raise NotImplementedError("critical-token error rate is specified but not implemented")
+    tokenize = tokenizer or normalize_tokens
+    result = []
+    for record_id, entries, hypothesis in triples:
+        if not entries:
+            continue
+        wanted: dict[tuple[str, ...], int] = {}
+        for entry in entries:
+            sequence = tuple(tokenize(entry))
+            if not sequence:
+                raise ValueError(f"{record_id}: critical token {entry!r} tokenizes to nothing")
+            wanted[sequence] = wanted.get(sequence, 0) + 1
+        heard = tokenize(hypothesis)
+        missed = sum(count - min(count, _count_occurrences(heard, sequence)) for sequence, count in wanted.items())
+        result.append(ClipRatio(record_id, missed, len(entries)))
+    return result
 
 
 def bootstrap_ci(
@@ -224,7 +398,16 @@ def bootstrap_ci(
     - Same inputs and seed give identical output.
     """
 
-    raise NotImplementedError("bootstrap CI is specified but not implemented")
+    ordered = _checked_clips(clips, iterations, level)
+    numerators, denominators = [c.numerator for c in ordered], [c.denominator for c in ordered]
+    n = len(ordered)
+    rng = random.Random(seed)
+    statistics = []
+    for _ in range(iterations):
+        picks = [rng.randrange(n) for _ in range(n)]
+        statistics.append(sum(numerators[i] for i in picks) / sum(denominators[i] for i in picks))
+    low, high = _percentile_bounds(statistics, level)
+    return Interval(ratio_of_sums(ordered), low, high, level, iterations, seed, n)
 
 
 def paired_bootstrap_difference(
@@ -252,4 +435,16 @@ def paired_bootstrap_difference(
     - Same inputs and seed give identical output.
     """
 
-    raise NotImplementedError("paired bootstrap is specified but not implemented")
+    base, cand = _checked_clips(baseline, iterations, level), _checked_clips(candidate, iterations, level)
+    if [c.record_id for c in base] != [c.record_id for c in cand]:
+        raise ValueError("baseline and candidate must cover the same record_ids")
+    base_num, base_den = [c.numerator for c in base], [c.denominator for c in base]
+    cand_num, cand_den = [c.numerator for c in cand], [c.denominator for c in cand]
+    n = len(base)
+    rng = random.Random(seed)
+    statistics = []
+    for _ in range(iterations):
+        picks = [rng.randrange(n) for _ in range(n)]
+        statistics.append(sum(cand_num[i] for i in picks) / sum(cand_den[i] for i in picks) - sum(base_num[i] for i in picks) / sum(base_den[i] for i in picks))
+    low, high = _percentile_bounds(statistics, level)
+    return PairedDifference(ratio_of_sums(cand) - ratio_of_sums(base), low, high, level, iterations, seed, n)
