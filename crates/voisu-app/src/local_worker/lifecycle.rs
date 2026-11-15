@@ -117,9 +117,32 @@ impl<C: WorkerChild, D: DeliverySeam> LocalLifecycle<C, D> {
     }
 
     pub fn prepare(&mut self, recording_id: &str, now: Instant) -> Result<(), SupervisorError> {
-        let correlation = self.correlation(recording_id, "prepare");
+        let correlation = self.prepare_correlation(recording_id);
         self.supervisor.prepare(correlation, now)?;
         Ok(())
+    }
+
+    /// The `Prepare` correlation for the attached worker, for a load that runs
+    /// on a supervisor checked out with [`Self::take_supervisor`].
+    #[must_use]
+    pub fn prepare_correlation(&self, recording_id: &str) -> Correlation {
+        self.correlation(recording_id, "prepare")
+    }
+
+    /// The idle timeout: a Ready worker that has done no work for the
+    /// configured time is unloaded to free its RAM/VRAM. Busy work is never
+    /// dropped. The generation is retired first, so a late frame from the old
+    /// process cannot count. A confirmed exit is a planned exit, credited back
+    /// to the restart budget, so idle cycles never exhaust crash protection.
+    pub fn unload_idle(&mut self) -> Result<ReapOutcome, SupervisorError> {
+        if matches!(
+            self.supervisor.state(),
+            WorkerState::Busy | WorkerState::Stopping
+        ) {
+            return Err(SupervisorError::Busy);
+        }
+        self.invalidate();
+        self.supervisor.unload_idle()
     }
 
     pub fn transcribe(
@@ -557,6 +580,26 @@ mod tests {
         // The failed worker's start stays counted: this unload is not a
         // clean planned exit, so the budget is still spent.
         assert!(life.restart_budget_exhausted(now));
+    }
+
+    #[test]
+    fn idle_unload_reaps_the_child_and_credits_the_restart_budget() {
+        let mut life = ready("hello");
+        let generation = life.generation();
+        let now = Instant::now();
+        // Many idle unload/reload cycles are planned exits, never crashes.
+        for _ in 0..MAX_RESTARTS + 2 {
+            assert_eq!(life.unload_idle().unwrap(), ReapOutcome::Exited);
+            assert!(!life.has_child());
+            assert_eq!(life.state(), WorkerState::Absent);
+            assert!(!life.restart_budget_exhausted(now));
+            life.attach(FakeWorker::default(), now).unwrap();
+        }
+        assert!(life.generation() > generation);
+        let correlation = life.prepare_correlation("rec-2");
+        assert_eq!(correlation.generation, life.generation());
+        assert_eq!(correlation.request_id, "prepare");
+        assert_eq!(correlation.recording_id, "rec-2");
     }
 
     #[test]

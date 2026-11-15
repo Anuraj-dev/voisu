@@ -566,11 +566,11 @@ mod tests {
         assert_eq!(lines[11], "   Groq key      Works");
         assert_eq!(lines[12], "   Deepgram key  Can't reach it");
         assert_eq!(lines[13], "   Trigger Key   Not bound");
-        assert_eq!(lines[14], "   Update check  On");
-        assert_eq!(lines[15], "   Star prompt   On");
-        assert_eq!(lines[16], "   Run setup");
-        assert_eq!(lines[17], "   Star on GitHub");
-        assert_eq!(lines[18], "");
+        assert_eq!(lines[14], "   Local unload  After 5 min");
+        assert_eq!(lines[15], "   Update check  On");
+        assert_eq!(lines[16], "   Star prompt   On");
+        assert_eq!(lines[17], "   Run setup");
+        assert_eq!(lines[18], "   Star on GitHub");
         assert_eq!(lines[19], "   Where your speech becomes text.");
         assert_eq!(
             lines[20],
@@ -650,11 +650,12 @@ mod tests {
                 "    Local  Private. Stays on this computer."
             )
         );
-        assert_eq!(lines[14], beside("   Update check  On", ""));
-        assert_eq!(lines[15], beside("   Star prompt   On", ""));
-        assert_eq!(lines[16], beside("   Run setup", ""));
-        assert_eq!(lines[17], beside("   Star on GitHub", ""));
-        assert_eq!(lines[18], "", "nothing below the rows");
+        assert_eq!(lines[14], beside("   Local unload  After 5 min", ""));
+        assert_eq!(lines[15], beside("   Update check  On", ""));
+        assert_eq!(lines[16], beside("   Star prompt   On", ""));
+        assert_eq!(lines[17], beside("   Run setup", ""));
+        assert_eq!(lines[18], beside("   Star on GitHub", ""));
+        assert_eq!(lines[19], "", "nothing below the rows");
 
         // Picking happens in the panel, the same lines gaining the highlight.
         let _ = press(&mut app, KeyCode::Enter, 0);
@@ -770,14 +771,19 @@ mod tests {
             app.settings_selected = index;
             let row = app.selected_setting();
 
-            // At 80x24 every row, the description and the whole guide show.
+            // At 80x24 the description and the whole guide show. Every row
+            // shows beside a guide of up to two values; a taller guide (Layout,
+            // Local unload) scrolls the rows to keep the selected one in view.
             let body = joined(&screen(&mut app, &UNICODE, (80, 24)));
-            for other in SettingsRow::ALL {
-                assert!(
-                    body.contains(other.label()),
-                    "{index}: lost {}",
-                    other.label()
-                );
+            assert!(body.contains(row.label()), "{index}\n{body}");
+            if row.choices().len() <= 2 {
+                for other in SettingsRow::ALL {
+                    assert!(
+                        body.contains(other.label()),
+                        "{index}: lost {}",
+                        other.label()
+                    );
+                }
             }
             let description = row.description();
             let last_word = description.split_whitespace().last().expect("word");

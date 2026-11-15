@@ -65,7 +65,7 @@ Run `voisu` with no arguments in a terminal. It is a full-screen, keyboard-only 
 | `q` | Quit |
 
 - **Home** shows what matters now: ready to dictate, or the one problem and the single key that fixes it. `d` runs every `voisu doctor` check.
-- **Settings** covers Engine, Delivery, Writing, Layout, Tone, Deepgram and your keys. Each choice is explained beside it, and Settings offers a restart when the service needs one.
+- **Settings** covers Engine, Delivery, Writing, Layout, Tone, Deepgram, your keys and Local unload. Each choice is explained beside it, and Settings offers a restart when the service needs one.
 - **Dictionary** holds the words Voisu should spell your way. `a` adds, `d` removes. Local mode on the Whisper-based model also hands your words to the model as a hint before it transcribes, and corrects by sound: a name it wrote as it heard it ("voice you") becomes your entry ("Voisu") when the entry has two or more syllables. Cloud mode corrects exact spellings only.
 - **History** lists recent Recordings. `c` copies one.
 
@@ -149,6 +149,12 @@ If the Trigger Key does not respond, run `voisu doctor`. It reports a portal wit
 Nothing downloads until you agree to the size, the licence, the English-only limit, and that this is development evidence rather than a Bakeoff Winner. Once installed, the model runs offline in a sandboxed worker. Local has no automatic GPU, CPU or Cloud fallback, and it fails closed until the model is Ready.
 
 Remove it with `voisu local remove`, or `voisu local remove --yes` without a terminal.
+
+### Local unload
+
+After 5 minutes with no Recording, Voisu unloads the Local model, so it uses no memory or VRAM while you are not dictating. Starting a Recording loads it again while you speak. If the model is still loading when you stop, Voisu waits for it; a load that does not finish within 60 seconds fails the Recording, with no Cloud fallback. A Recording in progress is never unloaded.
+
+`voisu local-unload` shows the setting. `voisu local-unload 900` unloads after 15 minutes (30 to 86400 seconds), and `voisu local-unload off` keeps the model loaded. A model already unloaded stays unloaded until your next Recording. In the interface it is **Local unload** under Settings. A change applies within 30 seconds, without a restart.
 
 ## Ubuntu GNOME troubleshooting
 

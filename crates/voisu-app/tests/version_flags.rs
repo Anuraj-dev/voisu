@@ -34,6 +34,7 @@ commands:
   service <install|start|stop|restart|status|uninstall>
                                 manage the Voisu service
   local remove [--yes]          delete the Local model
+  local-unload [off|SECONDS]    free an idle Local model's memory after this long
   update [--check|--dry-run] [--switch-to-bin]
                                 update Voisu
   update-check [on|off]         check once a day for a newer version

@@ -561,8 +561,8 @@ pub fn admit_capture(
     }
 }
 
-/// Stop/Replay CLI budget: Local uses the worker processing deadline, Cloud stays
-/// on the existing provider budget.
+/// Stop/Replay CLI budget: Local uses the worker processing deadline plus the
+/// wait for a reload started at Start; Cloud stays on the provider budget.
 #[must_use]
 pub fn processing_response_deadline() -> Duration {
     processing_response_deadline_at(
@@ -577,7 +577,10 @@ pub fn processing_response_deadline_at(config_path: &Path, state_dir: Option<&Pa
         return crate::system::PROCESSING_RESPONSE_DEADLINE;
     };
     match load_mode(config_path, state_dir) {
-        Ok((AsrMode::Local, _)) => crate::local_worker::local_response_deadline(),
+        // Stop may first wait for a Local reload started at Start.
+        Ok((AsrMode::Local, _)) => {
+            crate::local_worker::local_response_deadline() + crate::local_routing::LOAD_WAIT
+        }
         _ => crate::system::PROCESSING_RESPONSE_DEADLINE,
     }
 }
@@ -1039,7 +1042,10 @@ mod tests {
         let state = home.path().join("state");
         persist_asr_mode_at(&config, &state, AsrMode::Local).unwrap();
         let local = processing_response_deadline_at(&config, Some(&state));
-        assert_eq!(local, crate::local_worker::local_response_deadline());
+        assert_eq!(
+            local,
+            crate::local_worker::local_response_deadline() + crate::local_routing::LOAD_WAIT
+        );
         persist_asr_mode_at(&config, &state, AsrMode::Cloud).unwrap();
         let cloud = processing_response_deadline_at(&config, Some(&state));
         assert_eq!(cloud, crate::system::PROCESSING_RESPONSE_DEADLINE);

@@ -553,6 +553,102 @@ pub(crate) fn switch_at(path: &Path, switch: Switch) -> bool {
     }
 }
 
+/// `local_idle_unload`: how long an idle Local worker keeps its model loaded.
+const LOCAL_IDLE_UNLOAD_KEY: &str = "local_idle_unload";
+/// Five minutes: Parakeet reloads in about a second, overlapped with speech.
+pub const DEFAULT_LOCAL_IDLE_UNLOAD: Option<Duration> = Some(Duration::from_secs(300));
+/// Shorter would reload on nearly every Recording.
+pub const MIN_LOCAL_IDLE_UNLOAD: Duration = Duration::from_secs(30);
+pub const MAX_LOCAL_IDLE_UNLOAD: Duration = Duration::from_secs(86_400);
+
+/// How long an idle Local worker stays loaded before it is unloaded to free
+/// RAM/VRAM; `None` keeps it loaded. Missing, unreadable or out-of-range
+/// values keep the default.
+pub fn local_idle_unload() -> Option<Duration> {
+    local_idle_unload_at(&config_path())
+}
+
+/// Persists the Local idle unload (`None` = never), keeping every other line.
+pub fn set_local_idle_unload(after: Option<Duration>) -> Result<PathBuf, String> {
+    set_local_idle_unload_at(&config_path(), after)
+}
+
+/// How the CLI and the TUI name an idle-unload setting: `never`,
+/// `after 5 min` for whole minutes, otherwise `after 90 s`.
+#[must_use]
+pub fn local_idle_unload_label(after: Option<Duration>) -> String {
+    match after.map(|after| after.as_secs()) {
+        None => "never".to_owned(),
+        Some(secs) if secs % 60 == 0 => format!("after {} min", secs / 60),
+        Some(secs) => format!("after {secs} s"),
+    }
+}
+
+/// User input: `off`/`never`, or whole seconds from 30 to 86400.
+pub fn parse_local_idle_unload(input: &str) -> Result<Option<Duration>, String> {
+    idle_unload_value(input).ok_or_else(|| {
+        format!(
+            "expected off, never, or whole seconds from {} to {}",
+            MIN_LOCAL_IDLE_UNLOAD.as_secs(),
+            MAX_LOCAL_IDLE_UNLOAD.as_secs()
+        )
+    })
+}
+
+fn idle_unload_value(value: &str) -> Option<Option<Duration>> {
+    let value = value.trim().to_ascii_lowercase();
+    if matches!(value.as_str(), "off" | "never" | "false") {
+        return Some(None);
+    }
+    let secs = Duration::from_secs(value.parse::<u64>().ok()?);
+    (MIN_LOCAL_IDLE_UNLOAD..=MAX_LOCAL_IDLE_UNLOAD)
+        .contains(&secs)
+        .then_some(Some(secs))
+}
+
+pub(crate) fn local_idle_unload_at(path: &Path) -> Option<Duration> {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return DEFAULT_LOCAL_IDLE_UNLOAD;
+    };
+    contents
+        .lines()
+        .map(|line| strip_comment(line).trim())
+        .take_while(|line| !line.starts_with('['))
+        .find_map(|line| {
+            let (name, value) = line.split_once('=')?;
+            names_key(name, LOCAL_IDLE_UNLOAD_KEY).then_some(value)
+        })
+        .and_then(|value| idle_unload_value(value.trim().trim_matches(|c| c == '"' || c == '\'')))
+        .unwrap_or(DEFAULT_LOCAL_IDLE_UNLOAD)
+}
+
+pub(crate) fn set_local_idle_unload_at(
+    path: &Path,
+    after: Option<Duration>,
+) -> Result<PathBuf, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("config path has no parent: {}", path.display()))?;
+    let _lock = ConfigLock::acquire(path)?;
+    let existing = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(format!(
+                "cannot read existing config {} before writing: {error}",
+                path.display()
+            ));
+        }
+    };
+    let value = after.map_or_else(|| "\"off\"".to_owned(), |after| after.as_secs().to_string());
+    write_atomic(
+        path,
+        parent,
+        &merge_root_value(&existing, LOCAL_IDLE_UNLOAD_KEY, &value),
+    )?;
+    Ok(path.to_path_buf())
+}
+
 /// Whether the root table sets `key` at all, whatever its value.
 fn has_root_key(contents: &str, key: &str) -> bool {
     contents
@@ -623,6 +719,12 @@ fn parse_switch(contents: &str, key: &str) -> Option<bool> {
 /// `existing` with the root `key` replaced by one `key = "on|off"` line at the
 /// end of the root table. Every other line is kept as it was.
 fn merge_switch(existing: &str, key: &str, on: bool) -> String {
+    merge_root_value(existing, key, if on { "\"on\"" } else { "\"off\"" })
+}
+
+/// `existing` with the root `key` replaced by one `key = value` line at the
+/// end of the root table; `value` is already a TOML literal.
+fn merge_root_value(existing: &str, key: &str, value: &str) -> String {
     let mut lines: Vec<&str> = Vec::new();
     let mut root_end = None;
     for line in existing.lines() {
@@ -642,7 +744,7 @@ fn merge_switch(existing: &str, key: &str, on: bool) -> String {
     while insert_at > 0 && lines[insert_at - 1].trim().is_empty() {
         insert_at -= 1;
     }
-    let setting = format!("{key} = \"{}\"", if on { "on" } else { "off" });
+    let setting = format!("{key} = {value}");
     lines.insert(insert_at, &setting);
     let mut out = lines.join("\n");
     out.push('\n');
@@ -2422,6 +2524,56 @@ other_key = 5
                 expected,
                 "{contents}"
             );
+        }
+    }
+
+    #[test]
+    fn local_idle_unload_defaults_to_five_minutes_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("voisu").join("config.toml");
+        assert_eq!(local_idle_unload_at(&path), DEFAULT_LOCAL_IDLE_UNLOAD);
+        assert_eq!(DEFAULT_LOCAL_IDLE_UNLOAD, Some(Duration::from_secs(300)));
+        write_tone(&path, Tone::Informal).unwrap();
+        set_local_idle_unload_at(&path, None).unwrap();
+        assert_eq!(local_idle_unload_at(&path), None);
+        set_local_idle_unload_at(&path, Some(Duration::from_secs(90))).unwrap();
+        assert_eq!(local_idle_unload_at(&path), Some(Duration::from_secs(90)));
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            contents.matches("local_idle_unload =").count(),
+            1,
+            "{contents}"
+        );
+        assert!(contents.contains("local_idle_unload = 90\n"), "{contents}");
+        assert_eq!(read_tone(&path), Some(Tone::Informal));
+        for (value, expected) in [
+            ("\"off\"", None),
+            ("\"never\"", None),
+            ("false", None),
+            ("\"600\"", Some(Duration::from_secs(600))),
+            // Out of range or unreadable keeps the default: memory is freed.
+            ("5", DEFAULT_LOCAL_IDLE_UNLOAD),
+            ("\"soon\"", DEFAULT_LOCAL_IDLE_UNLOAD),
+        ] {
+            std::fs::write(&path, format!("local_idle_unload = {value}\n")).unwrap();
+            assert_eq!(local_idle_unload_at(&path), expected, "{value}");
+        }
+    }
+
+    #[test]
+    fn local_idle_unload_input_accepts_off_or_whole_seconds_from_thirty() {
+        assert_eq!(parse_local_idle_unload("off"), Ok(None));
+        assert_eq!(parse_local_idle_unload("Never"), Ok(None));
+        assert_eq!(
+            parse_local_idle_unload("30"),
+            Ok(Some(Duration::from_secs(30)))
+        );
+        assert_eq!(
+            parse_local_idle_unload("86400"),
+            Ok(Some(Duration::from_secs(86_400)))
+        );
+        for bad in ["29", "0", "-5", "86401", "5m", "", "on"] {
+            assert!(parse_local_idle_unload(bad).is_err(), "{bad}");
         }
     }
 }

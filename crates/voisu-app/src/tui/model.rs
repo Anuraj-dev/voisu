@@ -5,6 +5,7 @@
 //! testable without any of them.
 
 use std::fmt;
+use std::time::Duration;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use voisu_core::{
@@ -112,6 +113,8 @@ pub struct SettingsSnapshot {
     pub rendering: RenderingPolicy,
     pub tone: WritingTone,
     pub deepgram: bool,
+    /// How long an idle Local worker keeps its model loaded; `None` = never.
+    pub local_idle_unload: Option<Duration>,
     pub update_check: bool,
     pub star_prompt: bool,
     /// The star prompt line shows on Home: threshold met, setting on, not
@@ -197,6 +200,7 @@ pub enum Job {
     SetRendering(RenderingPolicy),
     SetTone(WritingTone),
     SetDeepgram(bool),
+    SetLocalIdleUnload(Option<Duration>),
     SetUpdateCheck(bool),
     SetStarPrompt(bool),
     /// Opens the repository page and ends the star nudge for good.
@@ -243,6 +247,7 @@ impl fmt::Debug for Job {
             Job::SetRendering(policy) => write!(f, "SetRendering({policy:?})"),
             Job::SetTone(tone) => write!(f, "SetTone({tone:?})"),
             Job::SetDeepgram(enabled) => write!(f, "SetDeepgram({enabled})"),
+            Job::SetLocalIdleUnload(after) => write!(f, "SetLocalIdleUnload({after:?})"),
             Job::SetUpdateCheck(on) => write!(f, "SetUpdateCheck({on})"),
             Job::SetStarPrompt(on) => write!(f, "SetStarPrompt({on})"),
             Job::Star => f.write_str("Star"),
@@ -362,6 +367,11 @@ const LAYOUTS: [RenderingPolicy; 3] = [
     RenderingPolicy::Structured,
 ];
 const TONES: [WritingTone; 2] = [WritingTone::Formal, WritingTone::Informal];
+const fn minutes(n: u64) -> Option<Duration> {
+    Some(Duration::from_secs(n * 60))
+}
+const LOCAL_UNLOADS: [Option<Duration>; 5] =
+    [None, minutes(1), minutes(5), minutes(15), minutes(30)];
 
 const ENGINE_CHOICES: [Choice; 2] = [
     choice("Cloud", "Fast and accurate. Needs internet."),
@@ -383,6 +393,13 @@ const LAYOUT_CHOICES: [Choice; 3] = [
 const TONE_CHOICES: [Choice; 2] = [
     choice("Formal", "Full words and a closing full stop."),
     choice("Informal", "Abbreviations like btw, no final full stop."),
+];
+const LOCAL_UNLOAD_CHOICES: [Choice; 5] = [
+    choice("Never", "Keeps the Local model loaded."),
+    choice("After 1 min", "Frees memory soonest; reloads as you speak."),
+    choice("After 5 min", "The default."),
+    choice("After 15 min", "Reloads less often."),
+    choice("After 30 min", "Holds memory longest."),
 ];
 
 pub fn engine_label(mode: AsrMode) -> &'static str {
@@ -412,6 +429,15 @@ pub fn layout_label(policy: RenderingPolicy) -> &'static str {
 
 pub fn tone_label(tone: WritingTone) -> &'static str {
     TONE_CHOICES[position(&TONES, tone)].label
+}
+
+/// `Never`, `After 5 min`, or a hand-set `After 90 s`.
+pub fn local_unload_label(after: Option<Duration>) -> String {
+    let label = crate::config::local_idle_unload_label(after);
+    let mut chars = label.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
 }
 
 /// A provider key's check result in plain words.
@@ -486,6 +512,7 @@ pub enum SettingsRow {
     GroqKey,
     DeepgramKey,
     TriggerKey,
+    LocalUnload,
     UpdateCheck,
     StarPrompt,
     RunSetup,
@@ -493,7 +520,7 @@ pub enum SettingsRow {
 }
 
 impl SettingsRow {
-    pub const ALL: [SettingsRow; 13] = [
+    pub const ALL: [SettingsRow; 14] = [
         SettingsRow::Engine,
         SettingsRow::Delivery,
         SettingsRow::Writing,
@@ -503,6 +530,7 @@ impl SettingsRow {
         SettingsRow::GroqKey,
         SettingsRow::DeepgramKey,
         SettingsRow::TriggerKey,
+        SettingsRow::LocalUnload,
         SettingsRow::UpdateCheck,
         SettingsRow::StarPrompt,
         SettingsRow::RunSetup,
@@ -520,6 +548,7 @@ impl SettingsRow {
             SettingsRow::GroqKey => "Groq key",
             SettingsRow::DeepgramKey => "Deepgram key",
             SettingsRow::TriggerKey => "Trigger Key",
+            SettingsRow::LocalUnload => "Local unload",
             SettingsRow::UpdateCheck => "Update check",
             SettingsRow::StarPrompt => "Star prompt",
             SettingsRow::RunSetup => "Run setup",
@@ -535,6 +564,7 @@ impl SettingsRow {
             SettingsRow::Writing => &WRITING_CHOICES,
             SettingsRow::Rendering => &LAYOUT_CHOICES,
             SettingsRow::Tone => &TONE_CHOICES,
+            SettingsRow::LocalUnload => &LOCAL_UNLOAD_CHOICES,
             _ => &[],
         }
     }
@@ -570,6 +600,9 @@ impl SettingsRow {
             }
             SettingsRow::TriggerKey => {
                 "The shortcut that starts and stops a Recording. You can't change it here."
+            }
+            SettingsRow::LocalUnload => {
+                "Frees the Local model's memory when idle. It reloads when you start recording."
             }
             SettingsRow::UpdateCheck => {
                 "Once a day, reads the newest version number from GitHub. No identifier or usage is sent."
@@ -958,6 +991,9 @@ impl App {
             }),
             SettingsRow::Deepgram => self.settings.map_or_else(loading, |settings| {
                 plain(if settings.deepgram { "On" } else { "Off" }.to_owned())
+            }),
+            SettingsRow::LocalUnload => self.settings.map_or_else(loading, |settings| {
+                plain(local_unload_label(settings.local_idle_unload))
             }),
             SettingsRow::UpdateCheck => self.settings.map_or_else(loading, |settings| {
                 plain(if settings.update_check { "On" } else { "Off" }.to_owned())
@@ -1410,7 +1446,8 @@ impl App {
             | SettingsRow::Delivery
             | SettingsRow::Writing
             | SettingsRow::Rendering
-            | SettingsRow::Tone => {
+            | SettingsRow::Tone
+            | SettingsRow::LocalUnload => {
                 let Some(picked) = self.current_choice(row) else {
                     return;
                 };
@@ -1462,6 +1499,11 @@ impl App {
             SettingsRow::Writing => position(&WRITINGS, settings.writing),
             SettingsRow::Rendering => position(&LAYOUTS, settings.rendering),
             SettingsRow::Tone => position(&TONES, settings.tone),
+            // A hand-set value opens on the default.
+            SettingsRow::LocalUnload => LOCAL_UNLOADS
+                .iter()
+                .position(|after| *after == settings.local_idle_unload)
+                .unwrap_or(2),
             _ => return None,
         })
     }
@@ -1470,6 +1512,14 @@ impl App {
     /// is a real change, because it replaces the old value.
     pub fn choice_in_effect(&self, row: SettingsRow) -> Option<usize> {
         if row == SettingsRow::Delivery && self.settings.is_some_and(|s| s.legacy_delivery) {
+            return None;
+        }
+        // A hand-set Local unload (say 90 s) matches no choice.
+        if row == SettingsRow::LocalUnload
+            && self
+                .settings
+                .is_some_and(|s| !LOCAL_UNLOADS.contains(&s.local_idle_unload))
+        {
             return None;
         }
         self.current_choice(row)
@@ -1508,6 +1558,10 @@ impl App {
             SettingsRow::Tone => {
                 settings.tone = TONES[picked];
                 Job::SetTone(settings.tone)
+            }
+            SettingsRow::LocalUnload => {
+                settings.local_idle_unload = LOCAL_UNLOADS[picked];
+                Job::SetLocalIdleUnload(settings.local_idle_unload)
             }
             _ => return,
         };
@@ -1793,6 +1847,7 @@ pub(super) mod test_support {
             rendering: RenderingPolicy::Adaptive,
             tone: WritingTone::Formal,
             deepgram: true,
+            local_idle_unload: crate::config::DEFAULT_LOCAL_IDLE_UNLOAD,
             update_check: true,
             star_prompt: true,
             star_line: false,
@@ -2808,6 +2863,75 @@ mod tests {
         assert!(app.prompt.is_none());
     }
 
+    fn on_local_unload(after: Option<Duration>) -> App {
+        let mut app = ready_app();
+        let _ = update(
+            &mut app,
+            Msg::Reply(Reply::Settings(SettingsSnapshot {
+                local_idle_unload: after,
+                ..settings()
+            })),
+            at(0),
+        );
+        app.tab = Tab::Settings;
+        app.settings_selected = SettingsRow::ALL
+            .iter()
+            .position(|row| *row == SettingsRow::LocalUnload)
+            .unwrap();
+        app
+    }
+
+    #[test]
+    fn the_local_unload_row_shows_never_whole_minutes_or_seconds() {
+        assert_eq!(SettingsRow::LocalUnload.label(), "Local unload");
+        for (after, shown) in [
+            (Some(Duration::from_secs(300)), "After 5 min"),
+            (None, "Never"),
+            (Some(Duration::from_secs(90)), "After 90 s"),
+        ] {
+            assert_eq!(
+                on_local_unload(after).setting_value(SettingsRow::LocalUnload),
+                (shown.to_owned(), Tone::Plain)
+            );
+        }
+    }
+
+    #[test]
+    fn the_local_unload_row_picks_a_new_timeout_and_applies_without_restart() {
+        let mut app = on_local_unload(Some(Duration::from_secs(300)));
+        assert!(press(&mut app, KeyCode::Enter, 0).is_empty());
+        assert!(matches!(
+            app.prompt,
+            Some(Prompt::Choice { row: SettingsRow::LocalUnload, picked }) if LOCAL_UNLOADS[picked] == Some(Duration::from_secs(300))
+        ));
+        for _ in 0..5 {
+            let _ = press(&mut app, KeyCode::Up, 0);
+        }
+        let effects = press(&mut app, KeyCode::Enter, 0);
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Job(Job::SetLocalIdleUnload(None))]
+            ),
+            "{effects:?}"
+        );
+        assert_eq!(app.setting_value(SettingsRow::LocalUnload).0, "Never");
+        assert!(app.restart_pending.is_empty());
+
+        // A hand-set value matches no choice, so every choice is a change.
+        let mut app = on_local_unload(Some(Duration::from_secs(90)));
+        assert_eq!(app.choice_in_effect(SettingsRow::LocalUnload), None);
+        let _ = press(&mut app, KeyCode::Enter, 0);
+        let effects = press(&mut app, KeyCode::Enter, 0);
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Job(Job::SetLocalIdleUnload(Some(after)))] if after.as_secs() == 300
+            ),
+            "{effects:?}"
+        );
+    }
+
     #[test]
     fn the_picker_stops_at_both_ends() {
         let mut app = ready_app();
@@ -2965,7 +3089,10 @@ mod tests {
     fn run_setup_row_hands_off_to_the_wizard() {
         let mut app = ready_app();
         app.tab = Tab::Settings;
-        app.settings_selected = 11;
+        app.settings_selected = SettingsRow::ALL
+            .iter()
+            .position(|row| *row == SettingsRow::RunSetup)
+            .unwrap();
         let effects = press(&mut app, KeyCode::Enter, 0);
         assert!(matches!(effects.as_slice(), [Effect::StartSetup]));
         assert!(app.setup.is_some());

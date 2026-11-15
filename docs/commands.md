@@ -10,6 +10,7 @@
 | `voisu setup` | Set up step by step: Cloud or Local, keys or Consented Install, Trigger Key |
 | `voisu engine [cloud\|local]` | Transcribe online with Cloud, or on this computer with an installed Local model |
 | `voisu local remove [--yes]` | Remove a Consented Install. `--yes` is required when stdin is not a terminal |
+| `voisu local-unload [off\|SECONDS]` | Free an idle Local model's memory after this long (default 300, from 30 to 86400; `off` or `never` keeps it loaded; one already unloaded reloads at the next Recording). Linux, see [Local unload](linux.md#local-unload) |
 | `voisu key set` / `key check <groq\|deepgram>` | Save or check a Groq or Deepgram key (key on stdin) |
 | `voisu deepgram on` / `off` | Enable or disable Deepgram streaming |
 | `voisu delivery [paste\|copy]` | Paste the Transcript into your window, or only copy it |
