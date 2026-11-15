@@ -25,6 +25,11 @@ use std::path::{Path, PathBuf};
 /// until adding the next one would cross this budget, then stops.
 pub const WHISPER_PROMPT_TOKEN_BUDGET: usize = 224;
 
+/// The Local prompt's byte cap. faster-whisper prepends a space and keeps only
+/// the last 223 prompt tokens, so 222 bytes (a provable token upper bound) is
+/// the most that survives uncut: the highest-priority first term is never lost.
+pub const LOCAL_PROMPT_MAX_BYTES: usize = 222;
+
 /// Deepgram rejects streaming connections whose keyterms exceed this provable
 /// token bound. The daemon must stay within it because a 400 response kills
 /// the entire streaming connection.
@@ -295,7 +300,7 @@ pub fn whisper_prompt_for_terms(terms: &[String]) -> String {
 /// The Local `initial_prompt` for models that honour one (distil-whisper):
 /// the user's own Dictionary terms as the bare comma-separated glossary the
 /// Cloud Whisper prompt uses, in stored order, de-duplicated case-insensitively
-/// (first spelling wins) and cut at the [`WHISPER_PROMPT_TOKEN_BUDGET`] by
+/// (first spelling wins) and cut at [`LOCAL_PROMPT_MAX_BYTES`] by
 /// dropping whole terms, never by truncating one. Built-in terms are left out
 /// so an empty personal Dictionary yields `None` and the request stays exactly
 /// as it was before this prompt existed.
@@ -307,7 +312,7 @@ pub fn local_prompt_for_terms(user_terms: &[String]) -> Option<String> {
         .filter(|term| !term.is_empty() && seen.insert(comparison_key(term)))
         .map(str::to_owned)
         .collect();
-    let prompt = whisper_prompt_from_terms(&unique);
+    let prompt = glossary_within(&unique, LOCAL_PROMPT_MAX_BYTES);
     (!prompt.is_empty()).then_some(prompt)
 }
 
@@ -555,6 +560,12 @@ fn merged_terms_with(user: Vec<String>) -> Vec<String> {
 /// tokens. Truncation uses the conservative `token_upper_bound` so the result
 /// provably never exceeds the budget.
 fn whisper_prompt_from_terms(terms: &[String]) -> String {
+    glossary_within(terms, WHISPER_PROMPT_TOKEN_BUDGET)
+}
+
+/// The comma-separated glossary of as many leading `terms` as fit `budget`
+/// tokens (measured by the conservative byte bound); whole terms only.
+fn glossary_within(terms: &[String], budget: usize) -> String {
     let mut prompt = String::new();
     for term in terms {
         let candidate_len = if prompt.is_empty() {
@@ -562,7 +573,7 @@ fn whisper_prompt_from_terms(terms: &[String]) -> String {
         } else {
             prompt.len() + ", ".len() + term.len()
         };
-        if token_upper_bound(candidate_len) > WHISPER_PROMPT_TOKEN_BUDGET {
+        if token_upper_bound(candidate_len) > budget {
             break;
         }
         if !prompt.is_empty() {
@@ -753,7 +764,7 @@ Tokio   # inline comment
     fn local_prompt_drops_whole_terms_past_the_cap() {
         let terms: Vec<String> = (0..2000).map(|i| format!("term{i:04}")).collect();
         let prompt = local_prompt_for_terms(&terms).unwrap();
-        assert!(prompt.len() <= WHISPER_PROMPT_TOKEN_BUDGET);
+        assert!(prompt.len() <= LOCAL_PROMPT_MAX_BYTES);
         assert!(prompt.starts_with("term0000, term0001"));
         // Every listed term is whole: the cap never cuts one mid-way.
         for listed in prompt.split(", ") {
@@ -764,8 +775,26 @@ Tokio   # inline comment
 
     #[test]
     fn local_prompt_is_none_when_the_first_term_alone_exceeds_the_cap() {
-        let huge = "x".repeat(WHISPER_PROMPT_TOKEN_BUDGET + 1);
+        let huge = "x".repeat(LOCAL_PROMPT_MAX_BYTES + 1);
         assert_eq!(local_prompt_for_terms(&[huge]), None);
+    }
+
+    #[test]
+    fn local_prompt_is_capped_at_222_bytes_so_the_first_term_is_never_cut() {
+        // faster-whisper prepends a space and keeps the last 223 tokens, so
+        // 222 bytes is the most that survives intact.
+        assert_eq!(LOCAL_PROMPT_MAX_BYTES, 222);
+        let exact = "x".repeat(222);
+        let terms = [exact];
+        assert_eq!(local_prompt_for_terms(&terms), terms.first().cloned());
+        assert_eq!(local_prompt_for_terms(&["x".repeat(223)]), None);
+        // Two terms whose glossary would be 223 bytes: the second is dropped.
+        let first = "a".repeat(110);
+        let second = "b".repeat(111);
+        assert_eq!(
+            local_prompt_for_terms(&[first.clone(), second]),
+            Some(first)
+        );
     }
 
     #[test]

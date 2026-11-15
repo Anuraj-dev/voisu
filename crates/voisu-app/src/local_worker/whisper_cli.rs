@@ -161,6 +161,8 @@ impl WhisperCppWorker {
                 Ok(WorkerFrame::Ready {
                     correlation: correlation.clone(),
                     observed_device: "cpu".into(),
+                    // whisper.cpp ignores prompts, so it never advertises them.
+                    accepts_prompt: false,
                 })
             }
             Err(error) => Err(error),

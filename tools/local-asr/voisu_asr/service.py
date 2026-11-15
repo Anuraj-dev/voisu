@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import sys
 import time
+import unicodedata
 from pathlib import Path
 from typing import BinaryIO, Callable
 
@@ -30,7 +32,7 @@ def _error_response(request_id_value: str, code: str, message: object) -> dict[s
 
 def _ready_response(manifest: Manifest, adapter: BaseAdapter, request_id_value: str) -> dict[str, object]:
     metadata = adapter.metadata
-    return {
+    response: dict[str, object] = {
         "v": 1,
         "id": request_id_value,
         "status": "ready",
@@ -41,6 +43,11 @@ def _ready_response(manifest: Manifest, adapter: BaseAdapter, request_id_value: 
         "peak_host_ram_bytes": metadata.peak_host_ram_bytes,
         "peak_gpu_memory_bytes": metadata.peak_gpu_memory_bytes,
     }
+    # Capability negotiation: the daemon sends a transcribe `prompt` only to a
+    # worker that said so here. An older worker never does, and then none is sent.
+    if adapter.accepts_initial_prompt:
+        response["accepts_prompt"] = True
+    return response
 
 
 # Mirrors the daemon's MAX_PROMPT_BYTES. The daemon builds the prompt within a
@@ -49,14 +56,38 @@ MAX_PROMPT_BYTES = 1024
 
 
 def _validated_prompt(request: dict) -> str | None:
-    """The optional `prompt` field: absent is None, otherwise a bounded non-empty string."""
+    """The optional `prompt` field, under the one rule the daemon also applies:
+    non-empty after trimming, within MAX_PROMPT_BYTES, no control characters."""
 
     if "prompt" not in request:
         return None
     prompt = request["prompt"]
-    if not isinstance(prompt, str) or not prompt.strip() or len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
-        raise ProtocolError("invalid_request", "prompt must be a non-empty string within the size limit")
+    if (
+        not isinstance(prompt, str)
+        or not prompt.strip()
+        or len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES
+        or any(unicodedata.category(ch) == "Cc" for ch in prompt)
+    ):
+        raise ProtocolError("invalid_request", "prompt must be a non-empty string without control characters within the size limit")
     return prompt
+
+
+def _is_prompt_echo(text: str, prompt: str) -> bool:
+    """True when `text` only recites the prompt glossary.
+
+    A quiet window can make Whisper emit its own prompt. That is two or more
+    distinct prompt terms joined by commas or spaces, optionally ending in a
+    period. A single term stays: people do dictate one name.
+    """
+
+    terms = sorted({term.strip() for term in prompt.split(",") if term.strip()}, key=len, reverse=True)
+    if len(terms) < 2:
+        return False
+    term = "|".join(re.escape(item) for item in terms)
+    recital = re.fullmatch(rf"\s*((?:{term})(?:[\s,]+(?:{term}))+)[\s,]*\.?\s*", text, re.IGNORECASE)
+    if recital is None:
+        return False
+    return len({found.lower() for found in re.findall(term, recital.group(1), re.IGNORECASE)}) >= 2
 
 
 def _transcribe(
@@ -82,6 +113,8 @@ def _transcribe(
         # other adapter keeps its one-argument transcribe(pcm).
         if prompt is not None and adapter.accepts_initial_prompt:
             text = adapter.transcribe(window, initial_prompt=prompt)
+            if _is_prompt_echo(text, prompt):
+                text = ""
         else:
             text = adapter.transcribe(window)
         metadata = adapter.metadata
@@ -145,10 +178,14 @@ def serve_stream(
                         prepared = True
                     write_json_frame(writer, _ready_response(manifest, adapter, request_id_value))
                 elif operation == "transcribe":
+                    if "pcm_bytes" not in request:
+                        raise ProtocolError("invalid_request", "transcribe needs pcm_bytes")
+                    # Read the PCM before judging anything else, so a rejected
+                    # request (unknown key, bad prompt) never leaves its audio
+                    # in the stream to be parsed as the next frame header.
+                    pcm = read_pcm(reader, request["pcm_bytes"])
                     if not {"v", "op", "id", "pcm_bytes"} <= set(request) <= {"v", "op", "id", "pcm_bytes", "prompt"}:
                         raise ProtocolError("invalid_request", "transcribe has unknown fields")
-                    pcm = read_pcm(reader, request["pcm_bytes"])
-                    # After the PCM read so a bad prompt leaves the stream in sync.
                     prompt = _validated_prompt(request)
                     if not prepared:
                         write_json_frame(writer, _error_response(request_id_value, "not_ready", "send prepare before transcribe"))

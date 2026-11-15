@@ -762,12 +762,13 @@ impl Gate {
     }
 
     #[cfg(test)]
-    fn attach_ready_worker(&mut self, hash: String, text: &str) {
+    fn attach_ready_worker(&mut self, hash: String, text: &str, accepts_prompt: bool) {
         let mut supervisor = WorkerSupervisor::absent();
         let worker = FakeWorker {
             scripted_text: Some(text.to_owned()),
             generation: 1,
             model_receipt_hash: hash.clone(),
+            accepts_prompt,
             ..FakeWorker::default()
         };
         if supervisor.attach_ready(worker, Instant::now()).is_err() {
@@ -864,20 +865,6 @@ fn silence_outcome(observed_device: &str) -> Result<WorkerOutcome, LocalError> {
     })
 }
 
-/// The model that honours an `initial_prompt`. Parakeet and the other Local
-/// models ignore prompts, so they are never sent one.
-const DISTIL_CATALOG_ID: &str = "distil-large-v3.5-int8";
-
-/// The `initial_prompt` for one Local request: the user's Dictionary terms for
-/// distil, nothing for any other model and nothing for an empty Dictionary.
-/// The Dictionary is the Recording's own snapshot, taken when it started.
-fn initial_prompt_for(catalog_id: &str, user_terms: &[String]) -> Option<String> {
-    if catalog_id != DISTIL_CATALOG_ID {
-        return None;
-    }
-    crate::dictionary::local_prompt_for_terms(user_terms)
-}
-
 fn infer_unlocked(
     session: &mut InferenceSession,
     recording_id: &str,
@@ -886,7 +873,9 @@ fn infer_unlocked(
     user_terms: &[String],
 ) -> Result<WorkerOutcome, LocalError> {
     let correlation = correlation(&session.receipt_hash, recording_id, request_id);
-    let prompt = initial_prompt_for(&session.catalog_id, user_terms);
+    // The supervisor drops the prompt unless this worker advertised support,
+    // so Parakeet and an old worker are sent exactly what they always were.
+    let prompt = crate::dictionary::local_prompt_for_terms(user_terms);
     transcribe_through_supervisor(
         &mut session.supervisor,
         correlation,
@@ -1746,10 +1735,17 @@ pub fn sentinel_is_clean() -> bool {
 /// Test-only: attach a Ready worker and verified receipt without env.
 #[cfg(test)]
 pub fn inject_ready(receipt: ActiveReceipt, text: &str) {
+    inject_ready_with_prompt_support(receipt, text, false);
+}
+
+/// Test-only: like [`inject_ready`], with a worker whose Ready does or does
+/// not advertise prompt support.
+#[cfg(test)]
+pub fn inject_ready_with_prompt_support(receipt: ActiveReceipt, text: &str, accepts_prompt: bool) {
     let mut gate = gate().lock().expect("gate");
     let hash = receipt.receipt_hash.clone();
     gate.receipt = Some(receipt.clone());
-    gate.attach_ready_worker(hash, text);
+    gate.attach_ready_worker(hash, text, accepts_prompt);
     gate.readiness = LocalReadiness::Ready {
         model_identity: Some(receipt.catalog_id),
     };
@@ -2646,15 +2642,19 @@ mod tests {
         assert!(sentinel_is_clean());
     }
 
-    fn distil_receipt() -> ActiveReceipt {
-        let mut receipt = fixture_receipt();
-        receipt.catalog_id = DISTIL_CATALOG_ID.into();
-        receipt.artifact_id = "distil-artifact".into();
-        receipt
-    }
-
-    fn prompt_seen_by_worker(receipt: ActiveReceipt, terms: &[&str]) -> Option<String> {
-        inject_ready(receipt, "hello");
+    /// Runs one Recording through an injected worker and reports what the
+    /// worker saw: `(transcribe_count, last_prompt)`. The fake starts with a
+    /// sentinel prompt, so a Transcribe that never arrived cannot read as "no
+    /// prompt".
+    fn worker_saw(accepts_prompt: bool, terms: &[&str]) -> (u32, Option<String>) {
+        inject_ready_with_prompt_support(fixture_receipt(), "hello", accepts_prompt);
+        gate()
+            .lock()
+            .expect("gate")
+            .lifecycle
+            .child_mut()
+            .unwrap()
+            .last_prompt = Some("sentinel".into());
         begin_live("rec-prompt");
         let terms: Vec<String> = terms.iter().map(|term| (*term).to_owned()).collect();
         complete_recording(
@@ -2667,31 +2667,29 @@ mod tests {
         )
         .unwrap();
         let mut gate = gate().lock().expect("gate");
-        gate.lifecycle.child_mut().unwrap().last_prompt.clone()
+        let child = gate.lifecycle.child_mut().unwrap();
+        (child.transcribe_count, child.last_prompt.clone())
     }
 
     #[test]
-    fn distil_gets_the_dictionary_as_its_initial_prompt() {
+    fn a_prompt_capable_worker_gets_the_dictionary_as_its_initial_prompt() {
         let _lock = test_session();
         assert_eq!(
-            prompt_seen_by_worker(distil_receipt(), &["Voisu", "Tokio"]).as_deref(),
-            Some("Voisu, Tokio")
+            worker_saw(true, &["Voisu", "Tokio"]),
+            (1, Some("Voisu, Tokio".to_owned()))
         );
     }
 
     #[test]
-    fn distil_with_an_empty_dictionary_sends_no_prompt() {
+    fn a_prompt_capable_worker_with_an_empty_dictionary_gets_no_prompt() {
         let _lock = test_session();
-        assert_eq!(prompt_seen_by_worker(distil_receipt(), &[]), None);
+        assert_eq!(worker_saw(true, &[]), (1, None));
     }
 
     #[test]
-    fn parakeet_never_gets_a_prompt() {
+    fn a_worker_that_did_not_advertise_prompt_support_never_gets_one() {
         let _lock = test_session();
-        assert_eq!(
-            prompt_seen_by_worker(parakeet_receipt(), &["Voisu", "Tokio"]),
-            None
-        );
+        assert_eq!(worker_saw(false, &["Voisu", "Tokio"]), (1, None));
     }
 
     #[test]

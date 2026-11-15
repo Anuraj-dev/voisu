@@ -22,7 +22,8 @@ use crate::local_model::{DevManifest, VerifiedConsentedInstall};
 
 use super::bounds::{CANCEL_GRACE, MAX_JSON_FRAME_BYTES, MAX_PCM_BYTES, REAP_OBSERVE};
 use super::protocol::{
-    ControlFrame, Correlation, FrameError, WorkerFrame, validate_pcm, validate_transcript,
+    ControlFrame, Correlation, FrameError, WorkerFrame, is_valid_prompt, validate_pcm,
+    validate_transcript,
 };
 use super::supervisor::{ReapOutcome, SupervisorError, WorkerChild};
 use super::whisper_cli::WhisperCppWorker;
@@ -385,6 +386,10 @@ impl DevWorker {
                 Ok(WorkerFrame::Ready {
                     correlation: correlation.clone(),
                     observed_device: observed.to_owned(),
+                    accepts_prompt: value
+                        .get("accepts_prompt")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
                 })
             }
             Some("transcript") => {
@@ -519,11 +524,12 @@ impl DevWorker {
 }
 
 /// The wire request for one Transcribe. The `prompt` key exists only when a
-/// prompt was given, so a request without one is byte-identical to what
+/// valid prompt was given, so a request without one is byte-identical to what
 /// workers received before prompts existed.
 fn transcribe_request(id: &str, pcm_bytes: usize, prompt: Option<&str>) -> Value {
     let mut request = json!({"v": 1, "op": "transcribe", "id": id, "pcm_bytes": pcm_bytes});
-    if let Some(prompt) = prompt {
+    // An invalid prompt is dropped, not sent: the worker would refuse it.
+    if let Some(prompt) = prompt.filter(|prompt| is_valid_prompt(prompt)) {
         request["prompt"] = Value::from(prompt);
     }
     request
@@ -1119,6 +1125,41 @@ mod tests {
                 "prompt": "Voisu, Tokio",
             })
         );
+    }
+
+    #[test]
+    fn transcribe_request_drops_a_prompt_that_breaks_the_rule() {
+        let bare = json!({"v": 1, "op": "transcribe", "id": "q", "pcm_bytes": 4});
+        for bad in ["", "   ", "a\nb", "a\u{0}b"] {
+            assert_eq!(transcribe_request("q", 4, Some(bad)), bare, "{bad:?}");
+        }
+        let long = "x".repeat(super::super::bounds::MAX_PROMPT_BYTES + 1);
+        assert_eq!(transcribe_request("q", 4, Some(&long)), bare);
+    }
+
+    #[test]
+    fn ready_records_prompt_support_from_the_workers_flag() {
+        let ready = |flag: Option<Value>| {
+            let mut value = json!({
+                "id": "q",
+                "status": "ready",
+                "model_id": "nemotron-3.5-0.6b",
+                "observed_device": "cpu",
+                "resident": true,
+            });
+            if let Some(flag) = flag {
+                value["accepts_prompt"] = flag;
+            }
+            let mut worker = DevWorker::for_test(test_manifest("cpu"), "h");
+            match worker.map_reply(value, &corr()).unwrap() {
+                WorkerFrame::Ready { accepts_prompt, .. } => accepts_prompt,
+                other => panic!("not ready: {other:?}"),
+            }
+        };
+        assert!(!ready(None), "an old worker never advertises it");
+        assert!(ready(Some(json!(true))));
+        assert!(!ready(Some(json!(false))));
+        assert!(!ready(Some(json!("true"))));
     }
 
     #[test]

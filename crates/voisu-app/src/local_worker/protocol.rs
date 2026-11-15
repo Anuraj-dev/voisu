@@ -64,6 +64,9 @@ pub enum WorkerFrame {
     Ready {
         correlation: Correlation,
         observed_device: String,
+        /// The worker's loaded adapter honours a Transcribe `prompt`. Absent
+        /// from an old worker's ready, which reads as `false`.
+        accepts_prompt: bool,
     },
     Transcript {
         correlation: Correlation,
@@ -194,6 +197,10 @@ pub fn parse_worker(value: &serde_json::Value) -> Result<WorkerFrame, FrameError
         Some("ready") => Ok(WorkerFrame::Ready {
             correlation: correlation_from(value)?,
             observed_device: required_string(value, "observed_device")?,
+            accepts_prompt: value
+                .get("accepts_prompt")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
         }),
         Some("transcript") => {
             let text = required_string(value, "text")?;
@@ -244,23 +251,24 @@ fn required_string(value: &serde_json::Value, key: &str) -> Result<String, Frame
         .ok_or(FrameError::InvalidJson)
 }
 
-/// The optional `prompt` of a Transcribe frame: a bounded string without
-/// NUL or unsupported control characters, or absent.
+/// The one prompt rule, shared with the Python worker: non-empty after
+/// trimming, at most [`MAX_PROMPT_BYTES`], and no control characters.
+#[must_use]
+pub fn is_valid_prompt(prompt: &str) -> bool {
+    !prompt.trim().is_empty()
+        && prompt.len() <= MAX_PROMPT_BYTES
+        && !prompt.chars().any(char::is_control)
+}
+
+/// The optional `prompt` of a Transcribe frame: valid per [`is_valid_prompt`],
+/// or absent.
 fn optional_prompt(value: &serde_json::Value) -> Result<Option<String>, FrameError> {
     let Some(raw) = value.get("prompt") else {
         return Ok(None);
     };
     let prompt = raw.as_str().ok_or(FrameError::InvalidJson)?;
-    if prompt.len() > MAX_PROMPT_BYTES {
-        return Err(FrameError::JsonTooLarge {
-            bytes: prompt.len(),
-        });
-    }
-    if prompt.as_bytes().contains(&0) {
-        return Err(FrameError::EmbeddedNul);
-    }
-    if prompt.chars().any(unsupported_control) {
-        return Err(FrameError::UnsupportedControl);
+    if !is_valid_prompt(prompt) {
+        return Err(FrameError::InvalidJson);
     }
     Ok(Some(prompt.to_owned()))
 }
@@ -482,12 +490,47 @@ mod tests {
         );
     }
 
+    fn ready_json() -> serde_json::Value {
+        let mut value = control_json();
+        value["kind"] = serde_json::json!("ready");
+        value["observed_device"] = serde_json::json!("cpu");
+        value
+    }
+
+    #[test]
+    fn ready_advertises_prompt_support_only_with_a_true_flag() {
+        let accepts = |value: &serde_json::Value| match parse_worker(value).unwrap() {
+            WorkerFrame::Ready { accepts_prompt, .. } => accepts_prompt,
+            other => panic!("not ready: {other:?}"),
+        };
+        let mut value = ready_json();
+        assert!(!accepts(&value), "an old ready has no flag");
+        value["accepts_prompt"] = serde_json::json!(true);
+        assert!(accepts(&value));
+        value["accepts_prompt"] = serde_json::json!(false);
+        assert!(!accepts(&value));
+        value["accepts_prompt"] = serde_json::json!("yes");
+        assert!(!accepts(&value), "a non-boolean flag is not support");
+    }
+
+    #[test]
+    fn one_prompt_rule_for_both_sides() {
+        assert!(is_valid_prompt("Voisu, Tokio"));
+        assert!(is_valid_prompt(&"x".repeat(MAX_PROMPT_BYTES)));
+        for bad in ["", "  \t ", "a\nb", "a\u{0}b", "a\u{7}b", "a\u{85}b"] {
+            assert!(!is_valid_prompt(bad), "{bad:?}");
+        }
+        assert!(!is_valid_prompt(&"x".repeat(MAX_PROMPT_BYTES + 1)));
+    }
+
     #[test]
     fn a_malformed_prompt_fails_closed() {
         for bad in [
             serde_json::json!(7),
             serde_json::json!("a\u{0}b"),
             serde_json::json!("a\u{7}b"),
+            serde_json::json!("a\nb"),
+            serde_json::json!("  "),
             serde_json::json!("x".repeat(MAX_PROMPT_BYTES + 1)),
         ] {
             let mut value = transcribe_json();
