@@ -103,18 +103,12 @@ class CheckTests(unittest.TestCase):
         self.assertIn("contaminates held-out", tuning["missing"])
         self.assertNotIn('pin "split": "heldout"', tuning["missing"])
 
-    def test_tuning_cap_is_one_named_constant(self):
+    def test_forty_tuning_clips_are_at_the_cap(self):
         records = full_corpus(150_000)
         for record in records[60:80]:
             record["split"] = "development"  # 40 tuning, 60 held out
         names = {item["name"] for item in corpus_lock.check_corpus(records)["checks"] if not item["ok"]}
         self.assertEqual(names, {"held-out English speech"})  # 40 tuning is at the cap
-        with unittest.mock.patch.object(corpus_lock, "TUNING_CAP", 30):
-            names = {item["name"] for item in corpus_lock.check_corpus(records)["checks"] if not item["ok"]}
-            self.assertEqual(names, {"held-out English speech", "tuning English speech"})
-        with unittest.mock.patch.object(corpus_lock, "TUNING_CAP", None):
-            names = [item["name"] for item in corpus_lock.check_corpus(records)["checks"]]
-            self.assertNotIn("tuning English speech", names)
 
     def test_counts_report_critical_tokens_and_reference_sources(self):
         records = [speech(1, critical_tokens=["Voisu", "42"], reference_source="adjudicated"), speech(2, reference_source="scripted"), speech(3)]

@@ -70,6 +70,7 @@ class NumberWordEdgeCases(unittest.TestCase):
         for written, spoken in (("1,000", "one thousand"), ("1,250,000", "one million two hundred fifty thousand"),
                                 ("1999", "nineteen ninety nine"), ("2026", "twenty twenty six"),
                                 ("1.5", "one point five"), ("3.14", "three point one four"),
+                                ("1.2.3", "one point two point three"),
                                 ("2500", "twenty five hundred"), ("100", "a hundred"), ("100", "one hundred"),
                                 ("1900", "nineteen hundred"), ("1905", "nineteen hundred and five")):
             with self.subTest(written=written, spoken=spoken):

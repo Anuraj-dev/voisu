@@ -27,7 +27,9 @@ mirror `crates/voisu-app/src/local_worker/bakeoff.rs`:
 Hinglish clips can stay in the corpus. They are listed but never count.
 
 Tuning clips never enter the winner decision; the cap of 40 only bounds the
-tuning split. Do not move tuned clips into held-out to meet the held-out
+tuning split. `tools/transcript-quality/bakeoff-contract-v1.json` (exactly 20
+tuning clips) is the frozen r7 attestation contract. It does not gate this
+corpus; `check-corpus` is the gate. Do not move tuned clips into held-out to meet the held-out
 threshold: clips you tuned on would contaminate the decision set. Record new
 held-out clips instead.
 

@@ -154,11 +154,12 @@ class RunRecordTests(unittest.TestCase):
         # A two-clip corpus is far below the lock: pending whatever the other checks say.
         self.assertFalse(result["corpus_lock"]["ok"])
         self.assertEqual(verdict["verdict"], "pending")
-        self.assertEqual(verdict["checks"], {"corpus_lock_met": False, "complete_coverage": True, "paired_ci_better": False,
+        self.assertEqual(verdict["checks"], {"corpus_lock_met": False, "quality_evidence": False, "complete_coverage": True, "paired_ci_better": False,
                                              "zero_negative_insertions": True, "no_critical_regression": True})
         self.assertIn("corpus lock NOT met", run_records.format_run_report(result))
-        # With the lock met, the paired CI reaching 0 decides: no winner.
+        # With the lock met and real-model evidence, the paired CI reaching 0 decides: no winner.
         run_dir, report, _ = self.bench_run([self.manifest("model-a", {"en-02.wav": "open the request"}), self.manifest("model-b", {})], baseline_id="model-a")
+        report = {**report, "quality_evidence": True}
         with mock.patch.object(run_records.corpus_lock, "check_corpus", return_value={"ok": True, "missing": []}):
             locked = run_records.build_run_report(self.corpus, benchmark.read_json(run_dir / "replay.json"), report, incumbent="model-a")
         self.assertEqual(locked["verdicts"][0]["verdict"], "not_winner")
@@ -170,6 +171,7 @@ class RunRecordTests(unittest.TestCase):
 
     def test_candidate_missing_clips_cannot_win(self):
         run_dir, report, _ = self.bench_run([self.manifest("model-a", {"en-02.wav": "open the request"}), self.manifest("model-b", {})], baseline_id="model-a")
+        report = {**report, "quality_evidence": True}
         with mock.patch.object(run_records.corpus_lock, "check_corpus", return_value={"ok": True, "missing": []}):
             for record_id in ("en-02.wav", "neg-01.wav"):
                 with self.subTest(record_id=record_id):
@@ -249,9 +251,9 @@ def _record(label, *, insertions=0, measured=80, negatives=20):
 class WinnerRuleTests(unittest.TestCase):
     incumbent = _record("inc")
 
-    def verdict(self, primary, critical, insertions=0, *, candidate=None, lock=True):
+    def verdict(self, primary, critical, insertions=0, *, candidate=None, lock=True, quality=True):
         candidate = candidate or _record("cand", insertions=insertions)
-        return run_records.winner_verdict(self.incumbent, candidate, [primary, critical], corpus_lock_met=lock)
+        return run_records.winner_verdict(self.incumbent, candidate, [primary, critical], corpus_lock_met=lock, quality_evidence=quality)
 
     def test_unmet_corpus_lock_is_pending_even_when_every_check_passes(self):
         better = _comparison(run_records.PRIMARY_METRIC, estimate=-0.02, low=-0.03, high=-0.01)
@@ -260,6 +262,14 @@ class WinnerRuleTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "pending")
         self.assertIs(result["checks"]["corpus_lock_met"], False)
         self.assertEqual(self.verdict(better, fine, insertions=3, lock=False)["verdict"], "pending")
+
+    def test_fixture_evidence_is_pending_even_when_every_check_passes(self):
+        better = _comparison(run_records.PRIMARY_METRIC, estimate=-0.02, low=-0.03, high=-0.01)
+        fine = _comparison("critical_token_error_rate", estimate=0.0)
+        for quality in (False, None):
+            result = self.verdict(better, fine, quality=quality)
+            self.assertEqual(result["verdict"], "pending")
+            self.assertIsNot(result["checks"]["quality_evidence"], True)
 
     def test_incomplete_coverage_blocks_a_win(self):
         better = _comparison(run_records.PRIMARY_METRIC, estimate=-0.02, low=-0.03, high=-0.01)
@@ -298,7 +308,7 @@ class WinnerRuleTests(unittest.TestCase):
         better = _comparison(run_records.PRIMARY_METRIC, estimate=-0.02, low=-0.03, high=-0.01)
         other_scope = {**better, "scope": "english_all"}
         other_pair = {**better, "candidate": "someone-else"}
-        result = run_records.winner_verdict(self.incumbent, _record("cand"), [other_scope, other_pair], corpus_lock_met=True)
+        result = run_records.winner_verdict(self.incumbent, _record("cand"), [other_scope, other_pair], corpus_lock_met=True, quality_evidence=True)
         self.assertEqual(result["checks"]["paired_ci_better"], None)
 
 

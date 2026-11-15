@@ -273,7 +273,7 @@ def compare(baseline: Mapping[str, Any], candidate: Mapping[str, Any], scope: st
 
 
 def winner_verdict(incumbent: Mapping[str, Any], candidate: Mapping[str, Any], comparisons: Iterable[Mapping[str, Any]], *,
-                   corpus_lock_met: bool) -> dict[str, Any]:
+                   corpus_lock_met: bool, quality_evidence: bool | None) -> dict[str, Any]:
     """The spec's winner rule for one candidate against the incumbent (see module docstring)."""
 
     by_metric = {item["metric"]: item for item in comparisons
@@ -296,9 +296,10 @@ def winner_verdict(incumbent: Mapping[str, Any], candidate: Mapping[str, Any], c
         no_regression = None
     else:
         no_regression = critical["difference"]["estimate"] <= 0
-    checks = {"corpus_lock_met": corpus_lock_met, "complete_coverage": coverage, "paired_ci_better": better,
+    checks = {"corpus_lock_met": corpus_lock_met, "quality_evidence": quality_evidence, "complete_coverage": coverage, "paired_ci_better": better,
               "zero_negative_insertions": no_insertions, "no_critical_regression": no_regression}
-    if not corpus_lock_met:
+    # An unmet lock or fixture/partial evidence can never decide: pending, whatever else holds.
+    if not corpus_lock_met or quality_evidence is not True:
         verdict = "pending"
     elif any(value is False for value in checks.values()):
         verdict = "not_winner"
@@ -343,7 +344,8 @@ def build_run_report(corpus: Mapping[str, Any], evidence: Mapping[str, Any], rep
                 continue
             # The rule reads incumbent -> candidate; build that direction explicitly.
             directed = [compare(chosen[0], record, DECISION_SCOPE, metric, iterations=iterations, seed=seed, level=level) for metric in METRICS]
-            verdicts.append(winner_verdict(chosen[0], record, directed, corpus_lock_met=lock["ok"]))
+            verdicts.append(winner_verdict(chosen[0], record, directed, corpus_lock_met=lock["ok"],
+                                         quality_evidence=report.get("quality_evidence")))
     return {
         "schema_version": RUN_RECORD_SCHEMA_VERSION,
         "kind": "run_report",
@@ -352,6 +354,7 @@ def build_run_report(corpus: Mapping[str, Any], evidence: Mapping[str, Any], rep
         "report_sha256": report.get("report_sha256"),
         "incumbent": incumbent,
         "corpus_lock": {"ok": lock["ok"], "missing": lock["missing"]},
+        "quality_evidence": report.get("quality_evidence"),
         "bootstrap": {"iterations": iterations, "seed": seed, "level": level, "unit": "clip"},
         "records": records,
         "comparisons": comparisons,

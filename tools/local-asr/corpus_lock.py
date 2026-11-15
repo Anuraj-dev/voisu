@@ -27,10 +27,6 @@ MIN_HELD_OUT_SPEECH = 80
 MIN_LONGEST_BAND = 5
 RSS_GROWTH_MAX_MIB = 128  # soak gate over 200 recordings; not a corpus property
 
-# The tuning-split cap the check enforces (None stops checking it).  Tuning
-# clips are free for settings work and never enter the winner decision.
-TUNING_CAP: int | None = MAX_TUNING_SPEECH
-
 # Bakeoff duration bands (Python-only), upper bound inclusive, in milliseconds:
 # a clip of exactly 120000 ms is in "30-120s", 120001 ms in "120-600s".  A clip
 # under 1 s still lands in "1-10s"; one over 600 s is outside every band.
@@ -125,11 +121,9 @@ def check_corpus(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
 
     counts = corpus_counts(records)
     bands = counts["bands"]
-    tuning = []
-    if TUNING_CAP is not None:
-        tuning = [_check("tuning English speech", counts["tuning_speech"], at_most=TUNING_CAP,
-                         hint="tuning clips: the tuning split exceeds the cap; moving tuned clips into held-out "
-                              "contaminates held-out, so this needs a decision (new clips, or a different cap)")]
+    tuning = [_check("tuning English speech", counts["tuning_speech"], at_most=MAX_TUNING_SPEECH,
+                      hint="tuning clips: the tuning split exceeds the cap; moving tuned clips into held-out "
+                           "contaminates held-out, so this needs a decision (new clips, or a different cap)")]
     checks = [
         _check("English speech clips", counts["speech"], at_least=MIN_SPEECH_RECORDINGS, hint="English speech clips"),
         _check("held-out English speech", counts["heldout_speech"], at_least=MIN_HELD_OUT_SPEECH, hint='held-out speech clips (record new ones with "split": "heldout"; never move tuned clips in)'),

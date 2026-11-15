@@ -264,14 +264,16 @@ def _ordinal_suffix(value: int) -> str:
     return {1: "st", 2: "nd", 3: "rd"}.get(value % 10, "th")
 
 
-# "1,000" -> "1000"; "1.5" -> "1 point 5" (one token per decimal digit, as spoken).
+# "1,000" -> "1000"; "1.5" -> "1 point 5" (one token per decimal digit, as spoken);
+# "1.2.3" -> "1 point 2 point 3" (every dot of a dotted run is spoken).
 _DIGIT_GROUPS_RE = re.compile(r"\b\d{1,3}(?:,\d{3})+\b")
-_DECIMAL_RE = re.compile(r"(\d)\.(\d+)")
+_DECIMAL_RE = re.compile(r"\b(\d+)((?:\.\d+)+)\b")
 
 
 def _digit_forms(text: str) -> str:
     text = _DIGIT_GROUPS_RE.sub(lambda match: match.group(0).replace(",", ""), text)
-    return _DECIMAL_RE.sub(lambda match: f"{match.group(1)} point {' '.join(match.group(2))}", text)
+    return _DECIMAL_RE.sub(
+        lambda match: match.group(1) + "".join(f" point {' '.join(part)}" for part in match.group(2).split(".")[1:]), text)
 
 
 def _number_words_to_digits(tokens: Sequence[str]) -> list[str]:
