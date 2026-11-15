@@ -13,9 +13,11 @@ repository.  Run it through `tools/dev bench ...` or directly.
 
   bench.py run --model ID=MANIFEST [--model ID2=MANIFEST2 ...] [--baseline ID]
       Replay the frozen corpus through the protected `voisu` seam for each
-      model, score it, and write replay.json, report.json, run.json and
-      table.txt to <eval-dir>/runs/<UTC timestamp>/.  `--model ID` alone uses
-      the ready manifest that `models` lists for ID.  The table shows raw and
+      model, score it, and write replay.json, report.json, run.json,
+      run_records.json and table.txt to <eval-dir>/runs/<UTC timestamp>/.
+      `--model ID` alone uses the ready manifest that `models` lists for ID.
+      run_records.json holds one run record per model (see run_records.py)
+      and, with --baseline, the winner-rule verdicts.  The table shows raw and
       delivered WER, per-language WER, words invented on silence (FP), critical
       content misses, and latency.  Changes are shown against the latest
       earlier run (same corpus) of --baseline, or of the model with the most
@@ -53,6 +55,7 @@ from typing import Any, Collection, Mapping, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import benchmark  # noqa: E402  (sibling module; the single source of replay/score logic)
+import run_records  # noqa: E402  (sibling module; run records, comparisons, verdicts)
 
 BenchmarkError = benchmark.BenchmarkError
 
@@ -430,6 +433,10 @@ def run_bench(eval_dir: Path, corpus_path: Path, model_args: Sequence[str], root
     }
     benchmark.write_json(run_dir / "run.json", meta)
     (run_dir / "table.txt").write_text(table + "\n", encoding="utf-8")
+    # Per-config run records for the bakeoff (metrics not implemented yet are marked, not fatal).
+    _, token_map = benchmark.load_spelling_normalizer(normalizer)
+    incumbent = baseline_id if baseline_id in model_ids else None
+    benchmark.write_json(run_dir / "run_records.json", run_records.build_run_report(corpus, evidence, report, incumbent=incumbent, token_map=token_map or None))
     return run_dir, report, table
 
 

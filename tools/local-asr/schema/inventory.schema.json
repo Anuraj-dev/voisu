@@ -31,7 +31,8 @@
         "tags": {"type": "array", "items": {"type": "string"}},
         "critical_tokens": {"type": "array", "items": {"type": "string"}},
         "consent_id": {"type": "string", "minLength": 1},
-        "split": {"enum": [null, "development", "heldout"]}
+        "split": {"enum": [null, "development", "heldout"], "description": "null until freeze unless the reference row pins it with \"split\" (\"heldout\", \"development\", or the alias \"tuning\") or \"heldout\": true/false"},
+        "reference_source": {"enum": ["scripted", "adjudicated"], "description": "scripted: read from a prompt; adjudicated: transcribed by ear after recording (spontaneous speech). Absent on older rows."}
       },
       "additionalProperties": true
     }

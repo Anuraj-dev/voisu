@@ -5,5 +5,33 @@
     "consent_id": "<local-consent-receipt-id>",
     "tags": ["commands"],
     "critical_tokens": ["<critical-token>"]
+  },
+  "en-scripted-0001.wav": {
+    "language": "english",
+    "reference": "<the prompt exactly as read, corrected for any slip>",
+    "reference_source": "scripted",
+    "split": "heldout",
+    "tags": ["dictation", "numbers"],
+    "critical_tokens": ["<a number as spoken, e.g. forty two>", "<a name>"]
+  },
+  "en-long-0001.wav": {
+    "language": "english",
+    "reference": "<verbatim transcript of 60-120 s of unscripted speech, written by listening>",
+    "reference_source": "adjudicated",
+    "split": "heldout",
+    "tags": ["spontaneous", "long"],
+    "critical_tokens": ["<a name>", "<a negation, e.g. do not>"]
+  },
+  "en-tuning-0001.wav": {
+    "language": "english",
+    "reference": "<reference>",
+    "reference_source": "scripted",
+    "split": "tuning"
+  },
+  "neg-0001.wav": {
+    "language": "negative",
+    "reference": "",
+    "split": "heldout",
+    "tags": ["room-noise"]
   }
 }

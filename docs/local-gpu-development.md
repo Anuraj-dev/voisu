@@ -20,6 +20,8 @@ cohere-transcribe-03-2026
 
 Use a directory outside the repository. Put consented 16 kHz, mono, signed 16-bit PCM WAV files under `audio/`. Create one adjudicated reference row per WAV in `references.json`; references must describe what was actually spoken, including omissions, repeats, and code-switches. A negative sample has `"language": "negative"` and an empty reference.
 
+To grow the corpus to the bakeoff thresholds (held-out pinning, long clips, critical tokens, references for spontaneous speech, and `benchmark.py check-corpus`), see [local-asr-corpus.md](local-asr-corpus.md).
+
 ```sh
 mkdir -m 700 -p "$HOME/.local/state/voisu/local-asr-eval-v1/audio"
 mkdir -m 700 -p "$HOME/.local/state/voisu/local-asr-eval-v1/results"

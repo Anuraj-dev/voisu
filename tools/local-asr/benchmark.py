@@ -33,6 +33,10 @@ SCHEMA_VERSION = 1
 REPORT_SCHEMA_VERSION = 1
 MAX_REFERENCE_CHARS = 64 * 1024
 CORPUS_LANGUAGES = ("english", "hinglish", "negative")
+# How a speech reference was made.  "scripted": the prompt that was read aloud,
+# so a misread counts against the model.  "adjudicated": a verbatim transcript
+# written by listening to the clip (the only valid choice for spontaneous speech).
+REFERENCE_SOURCES = ("scripted", "adjudicated")
 EXPECTED_MODELS = (
     "nemotron-3.5-0.6b",
     "parakeet-tdt-0.6b-v3",
@@ -163,6 +167,33 @@ def _consent_for(row: Mapping[str, Any], consent: Mapping[str, Any]) -> str:
     return value.strip()
 
 
+def _explicit_split(row: Mapping[str, Any], record_id: str) -> str | None:
+    """A split pinned in the reference row, or None to let `freeze` hash one.
+
+    `"split": "heldout"` (or `"heldout": true`) holds a clip out; `"development"`
+    (alias `"tuning"`, the bakeoff's name; or `"heldout": false`) keeps it for
+    tuning.  The bakeoff lock needs at least 80 held-out speech clips and at
+    most 20 tuning ones, which a hashed fraction cannot guarantee.
+    """
+
+    split = row.get("split")
+    flag = row.get("heldout")
+    _require(flag is None or isinstance(flag, bool), f"heldout for {record_id} must be true or false")
+    if split is None and flag is None:
+        return None
+    _require(split in (None, "heldout", "development", "tuning"), f"split for {record_id} must be heldout or development")
+    value = "heldout" if (split == "heldout" or flag is True) else "development"
+    _require(flag is None or split is None or (flag is True) == (split == "heldout"), f"split and heldout disagree for {record_id}")
+    return value
+
+
+def split_bucket(seed: str, language: str, record_id: str) -> float:
+    """The [0, 1) value `freeze` compares with the held-out fraction."""
+
+    key = f"{seed}\0{language}\0{record_id}".encode("utf-8")
+    return int.from_bytes(hashlib.sha256(key).digest()[:8], "big") / 2**64
+
+
 def inventory(input_dir: Path, refs_path: Path, consent_path: Path, corpus_id: str) -> dict[str, Any]:
     """Inventory consented audio and adjudicated references without copying audio."""
 
@@ -196,7 +227,7 @@ def inventory(input_dir: Path, refs_path: Path, consent_path: Path, corpus_id: s
         _require(isinstance(tags, list) and all(isinstance(tag, str) for tag in tags), f"tags for {record_id} must be strings")
         critical_tokens = row.get("critical_tokens", [])
         _require(isinstance(critical_tokens, list) and all(isinstance(token, str) for token in critical_tokens), f"critical_tokens for {record_id} must be strings")
-        records.append({
+        record = {
             "record_id": record_id,
             "audio_path": str(audio.resolve()),
             "audio_relpath": rel,
@@ -208,8 +239,14 @@ def inventory(input_dir: Path, refs_path: Path, consent_path: Path, corpus_id: s
             "tags": sorted(set(tags)),
             "critical_tokens": critical_tokens,
             "consent_id": _consent_for(row, consent),
-            "split": None,
-        })
+            "split": _explicit_split(row, record_id),
+        }
+        # Only written when the reference row names it, so an inventory of
+        # older references (and its hash) is unchanged.
+        if "reference_source" in row:
+            _require(row["reference_source"] in REFERENCE_SOURCES, f"reference_source for {record_id} must be one of {', '.join(REFERENCE_SOURCES)}")
+            record["reference_source"] = row["reference_source"]
+        records.append(record)
     source = {"schema_version": SCHEMA_VERSION, "kind": "inventory", "corpus_id": corpus_id, "records": records}
     return {**source, "inventory_sha256": content_hash(source, "inventory_sha256")}
 
@@ -249,9 +286,10 @@ def freeze(inventory_value: Mapping[str, Any], seed: str, heldout_fraction: floa
     rows = []
     for row in sorted(inventory_value["records"], key=lambda item: item["record_id"]):
         copy = dict(row)
-        key = f"{seed}\0{copy['language']}\0{copy['record_id']}".encode("utf-8")
-        bucket = int.from_bytes(hashlib.sha256(key).digest()[:8], "big") / 2**64
-        copy["split"] = "heldout" if bucket < heldout_fraction else "development"
+        # A split pinned in the references wins; otherwise hash one.
+        if copy.get("split") not in {"development", "heldout"}:
+            bucket = split_bucket(seed, copy["language"], copy["record_id"])
+            copy["split"] = "heldout" if bucket < heldout_fraction else "development"
         rows.append(copy)
     # A one-item stratum cannot be both tuned and held out. Keep the split
     # deterministic and state the limitation in the manifest metadata.
@@ -686,7 +724,7 @@ def replay(corpus: Mapping[str, Any], model_manifests: Sequence[str], rust_cli: 
                 "raw_text": response.get("raw_text", response.get("text")) if response.get("status") not in {"unavailable", "error"} else None,
                 "delivered_text": response.get("delivered_text"),
             }
-            for key in ("model_revision", "runtime_revision", "receipt_sha256", "artifact_hashes", "host_profile", "duration_profile", "backend", "requested_device", "observed_device", "resident", "load_ms", "inference_ms", "stop_to_transcript_ms", "stop_to_delivery_ms", "phase", "session_id", "peak_host_ram_bytes", "peak_gpu_memory_bytes", "duration_ms", "audio_ms", "cpu_time_ms"):
+            for key in ("model_revision", "runtime_revision", "receipt_sha256", "artifact_hashes", "host_profile", "duration_profile", "backend", "requested_device", "observed_device", "resident", "load_ms", "inference_ms", "stop_to_transcript_ms", "stop_to_delivery_ms", "phase", "session_id", "peak_host_ram_bytes", "peak_gpu_memory_bytes", "system_memory_delta_bytes", "duration_ms", "audio_ms", "cpu_time_ms"):
                 if key in response:
                     row[key] = response[key]
             if response.get("status") not in {"unavailable", "error"}:
@@ -1011,7 +1049,85 @@ def _command_parser() -> argparse.ArgumentParser:
     rec_parser.add_argument("--duration-profile")
     rec_parser.add_argument("--host-profile")
     rec_parser.add_argument("--output", type=Path)
+    check_parser = sub.add_parser("check-corpus", help="check an inventory or frozen corpus against the bakeoff corpus thresholds and print what is missing")
+    source = check_parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--corpus", type=Path, help="frozen corpus manifest")
+    source.add_argument("--inventory", type=Path, help="inventory manifest (unpinned splits stay unassigned unless --seed is given)")
+    check_parser.add_argument("--profile", choices=("p0a", "bakeoff"), default="p0a")
+    check_parser.add_argument("--seed", help="with --inventory: project the splits freeze would hash for this seed")
+    check_parser.add_argument("--heldout-fraction", type=float, default=0.2)
+    check_parser.add_argument("--json", action="store_true", help="print the check as JSON")
+    records_parser = sub.add_parser("records", help="build run records, paired comparisons and winner verdicts from a scored run")
+    records_parser.add_argument("--corpus", type=Path, required=True)
+    records_parser.add_argument("--evidence", type=Path, required=True)
+    records_parser.add_argument("--report", type=Path, required=True)
+    records_parser.add_argument("--threads", action="append", default=[], metavar="MODEL_ID=N")
+    records_parser.add_argument("--window-s", type=float, help="declared window length for every model (default: worker default)")
+    records_parser.add_argument("--overlap-s", type=float, help="declared window overlap for every model (default: worker default)")
+    records_parser.add_argument("--incumbent", help="model_id the winner rule compares every other model against")
+    records_parser.add_argument("--normalizer", type=Path, help="spelling map applied last by normalized WER")
+    records_parser.add_argument("--output", type=Path, required=True)
     return parser
+
+
+def _sibling(name: str) -> Any:
+    """Import a helper module that lives next to this script."""
+
+    import importlib
+
+    here = str(Path(__file__).resolve().parent)
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    return importlib.import_module(name)
+
+
+def _check_corpus_command(args: argparse.Namespace) -> int:
+    corpus_lock = _sibling("corpus_lock")
+
+    if args.corpus:
+        value = read_json(args.corpus)
+        validate_frozen(value)
+        records = value["records"]
+    else:
+        value = read_json(args.inventory)
+        validate_inventory(value)
+        records = [dict(record) for record in value["records"]]
+        if args.seed is not None:
+            _require(0 < args.heldout_fraction < 1, "heldout fraction must be between 0 and 1")
+            for record in records:
+                if record.get("split") not in {"development", "heldout"}:
+                    bucket = split_bucket(args.seed, record["language"], record["record_id"])
+                    record["split"] = "heldout" if bucket < args.heldout_fraction else "development"
+    result = corpus_lock.check_corpus(records, args.profile)
+    print(json.dumps(result, ensure_ascii=False, indent=2) if args.json else corpus_lock.format_check(result))
+    return 0 if result["ok"] else 1
+
+
+def _records_command(args: argparse.Namespace) -> int:
+    run_records = _sibling("run_records")
+
+    corpus = read_json(args.corpus)
+    validate_frozen(corpus)
+    configs: dict[str, dict[str, Any]] = {}
+    for item in args.threads:
+        model_id, sep, count = item.partition("=")
+        _require(bool(sep) and count.isdigit() and int(count) > 0, f"--threads expects MODEL_ID=N, got {item}")
+        configs.setdefault(model_id, {})["threads"] = int(count)
+    report = read_json(args.report)
+    for model in report.get("models") or []:
+        config = configs.setdefault(model["model_id"], {})
+        if args.window_s is not None:
+            config["window_s"] = args.window_s
+        if args.overlap_s is not None:
+            config["overlap_s"] = args.overlap_s
+    try:
+        _, token_map = load_spelling_normalizer(args.normalizer)
+        result = run_records.build_run_report(corpus, _load_replay_rows(args.evidence), report, configs=configs, incumbent=args.incumbent, token_map=token_map or None)
+    except ValueError as exc:
+        raise BenchmarkError(str(exc)) from exc
+    write_json(args.output, result)
+    print(run_records.format_run_report(result))
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1031,6 +1147,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 write_json(args.output, result)
             else:
                 print(json.dumps(result, ensure_ascii=False, indent=2))
+        elif args.command == "check-corpus":
+            return _check_corpus_command(args)
+        elif args.command == "records":
+            return _records_command(args)
         return 0
     except BenchmarkError as exc:
         print(f"benchmark: {exc}", file=sys.stderr)
