@@ -154,7 +154,7 @@ Remove it with `voisu local remove`, or `voisu local remove --yes` without a ter
 
 After 5 minutes with no Recording, Voisu unloads the Local model, so it uses no memory or VRAM while you are not dictating. Starting a Recording loads it again while you speak. If the model is still loading when you stop, Voisu waits for it; a load that does not finish within 60 seconds fails the Recording, with no Cloud fallback. A Recording in progress is never unloaded.
 
-`voisu local-unload` shows the setting. `voisu local-unload 900` unloads after 15 minutes (30 to 86400 seconds), and `voisu local-unload off` keeps the model loaded. In the interface it is **Local unload** under Settings. A change applies within 30 seconds, without a restart.
+`voisu local-unload` shows the setting. `voisu local-unload 900` unloads after 15 minutes (30 to 86400 seconds), and `voisu local-unload off` keeps the model loaded. A model already unloaded stays unloaded until your next Recording. In the interface it is **Local unload** under Settings. A change applies within 30 seconds, without a restart.
 
 ## Ubuntu GNOME troubleshooting
 

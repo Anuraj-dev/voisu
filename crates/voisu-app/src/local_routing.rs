@@ -124,6 +124,12 @@ struct Gate {
     verification_count: std::cell::Cell<u32>,
     #[cfg(test)]
     test_before_refresh: Option<Box<dyn FnOnce() + Send>>,
+    /// Runs where a launch verifies and starts the worker process.
+    #[cfg(test)]
+    test_before_launch: Option<Box<dyn FnOnce() + Send>>,
+    /// Replaces `LOAD_WAIT` at Stop.
+    #[cfg(test)]
+    test_load_wait: Option<Duration>,
 }
 
 impl Gate {
@@ -170,6 +176,10 @@ impl Gate {
             verification_count: std::cell::Cell::new(0),
             #[cfg(test)]
             test_before_refresh: None,
+            #[cfg(test)]
+            test_before_launch: None,
+            #[cfg(test)]
+            test_load_wait: None,
         }
     }
 
@@ -297,6 +307,24 @@ impl Gate {
     }
 
     fn admit(&mut self, kind_ready_required: bool) -> LocalAdmission {
+        if self.loading_in_background && self.admitted_generation.is_none() {
+            // A Start abandoned during a reload left the load running: this
+            // Start joins it, and its Stop waits on the same load.
+            return match self.receipt.clone() {
+                Some(receipt) if !self.cloud_selected() => {
+                    self.admitted_generation = Some(self.lifecycle.generation());
+                    self.readiness = LocalReadiness::Busy;
+                    self.publish(self.readiness.clone());
+                    LocalAdmission::Ready {
+                        model_identity: local_model_identity(&receipt),
+                        receipt,
+                    }
+                }
+                _ => LocalAdmission::Unavailable {
+                    error: LOCAL_NOT_READY.to_owned(),
+                },
+            };
+        }
         let readiness = self.refresh();
         if kind_ready_required && !readiness.admits_capture() {
             return LocalAdmission::Unavailable {
@@ -528,18 +556,12 @@ impl Gate {
         }
     }
 
+    #[cfg(test)]
     fn verify_consented(
         &self,
     ) -> Result<crate::local_model::VerifiedConsentedInstall, crate::local_model::ConsentedError>
     {
-        #[cfg(test)]
-        {
-            self.verify_consented_with_progress(|| {})
-        }
-        #[cfg(not(test))]
-        {
-            crate::local_worker::verify_default_consented_install()
-        }
+        self.verify_consented_with_progress(|| {})
     }
 
     fn verify_consented_with_progress(
@@ -668,6 +690,10 @@ impl Gate {
         let Some(worker) = self.spawn_worker(selected) else {
             return false;
         };
+        self.attach_worker(selected, worker)
+    }
+
+    fn attach_worker(&mut self, selected: &ActiveReceipt, worker: GateWorker) -> bool {
         self.lifecycle
             .pin_model_receipt_hash(selected.receipt_hash.clone());
         if self
@@ -689,70 +715,93 @@ impl Gate {
         true
     }
 
-    /// Recording start with the worker idle-unloaded: launch it now and leave
-    /// its load (`Prepare`, up to `LOAD_DEADLINE`) to run off the gate lock,
-    /// so it overlaps speech and the daemon actor never waits on it. A
-    /// launch failure refuses the Start before capture, as a failed load
-    /// always has. Cloud selected launches nothing.
+    /// Recording start with the worker idle-unloaded: only flip state here.
+    /// Verify (a full weights hash), launch and `Prepare` (up to
+    /// `LOAD_DEADLINE`) all run on the load thread, so capture starts at once
+    /// and the load overlaps speech. A failure there leaves Local unavailable
+    /// and the Recording fails closed at Stop. Cloud selected launches
+    /// nothing.
     fn begin_reload(&mut self, selected: &ActiveReceipt) -> bool {
         self.parked = false;
         if self.cloud_preempts_launch() {
             self.publish(self.readiness.clone());
             return false;
         }
-        if !self.attach_selected_worker(selected) {
+        self.worker_failure = None;
+        if !self.lifecycle.can_launch_replacement() {
             self.lifecycle.mark_unavailable();
             self.readiness = self.not_ready();
             self.publish(self.readiness.clone());
             return false;
         }
-        let correlation = self.lifecycle.prepare_correlation("l4-prepare");
         self.loading_in_background = true;
         self.pending_load = Some(PendingLoad {
-            supervisor: self.lifecycle.take_supervisor(),
-            correlation,
-            selected: selected.clone(),
+            launch: self.launch_plan(selected),
             #[cfg(test)]
             hook: self.test_load_hook.take(),
         });
         true
     }
 
-    /// The reload thread is done: return its supervisor and settle readiness.
+    /// The load thread launched the worker (or failed to): attach it and
+    /// check its supervisor out for `Prepare`. `None` means the load ended.
+    fn attach_launched(
+        &mut self,
+        launch: WorkerLaunch,
+        result: Result<GateWorker, Option<String>>,
+    ) -> Option<PreparingLoad> {
+        let selected = launch.selected.clone();
+        let attached = self
+            .settle_launch(launch, result)
+            .is_some_and(|worker| self.attach_worker(&selected, worker));
+        if !attached {
+            self.fail_load(None);
+            return None;
+        }
+        if self.admitted_generation.is_some() {
+            // The Recording admitted before the launch now pins this worker.
+            self.admitted_generation = Some(self.lifecycle.generation());
+        }
+        let correlation = self.lifecycle.prepare_correlation("l4-prepare");
+        Some(PreparingLoad {
+            supervisor: self.lifecycle.take_supervisor(),
+            correlation,
+            selected,
+        })
+    }
+
+    /// The load thread is done: return its supervisor and settle readiness.
     /// A failed or overdue load leaves Local unavailable, so the waiting
     /// Recording fails closed; nothing falls back to Cloud.
     fn finish_load(&mut self, done: FinishedLoad) {
         self.lifecycle.restore_supervisor(done.supervisor);
-        self.loading_in_background = false;
         match done.result {
             Ok(()) if self.lifecycle.state() == WorkerState::Ready => {
+                self.loading_in_background = false;
                 self.capture_runtime_identity(&done.selected);
                 self.idle_since = Some(self.now());
+                if self.admitted_generation.is_none() {
+                    // The Recording was abandoned during the load; Cloud
+                    // selected in the meantime unloads it here.
+                    self.release_admission();
+                }
             }
-            result => {
-                self.worker_failure = Some(match result {
-                    Err(error) => error.to_string(),
-                    Ok(()) => "Local worker did not become ready".to_owned(),
-                });
-                self.lifecycle.mark_unavailable();
-                self.readiness = self.not_ready();
-                self.publish(self.readiness.clone());
-            }
-        }
-        if self.admitted_generation.is_none() {
-            // The Recording was abandoned during the load; Cloud selected in
-            // the meantime unloads it here.
-            self.release_admission();
+            Ok(()) => self.fail_load(Some("Local worker did not become ready".to_owned())),
+            Err(error) => self.fail_load(Some(error)),
         }
     }
 
-    /// The reload thread panicked and took the supervisor with it.
-    fn abort_load(&mut self) {
+    fn fail_load(&mut self, failure: Option<String>) {
         self.loading_in_background = false;
-        self.worker_failure = Some("Local worker load failed".to_owned());
+        if failure.is_some() {
+            self.worker_failure = failure;
+        }
         self.lifecycle.mark_unavailable();
         self.readiness = self.not_ready();
         self.publish(self.readiness.clone());
+        if self.admitted_generation.is_none() {
+            self.release_admission();
+        }
     }
 
     /// The idle timer: unload a Ready worker no work has used for `timeout`
@@ -839,110 +888,60 @@ impl Gate {
         if !self.lifecycle.can_launch_replacement() {
             return None;
         }
-        if !crate::local_model::development_local_enabled() && is_consented_receipt(selected) {
-            // This exact re-verification and receipt comparison also runs in
-            // tests. Only process creation is replaced by the scripted worker.
-            let install = match self.verify_consented() {
-                Ok(install)
-                    if crate::local_worker::consented_active_receipt(&install) == *selected =>
-                {
-                    install
-                }
-                _ => {
-                    self.worker_failure = Some(LOCAL_UNAVAILABLE.into());
-                    return None;
-                }
-            };
-            #[cfg(not(test))]
-            {
-                return match crate::local_worker::launch_consented_worker(install) {
-                    Ok(worker) => Some(RuntimeWorker::Consented(Box::new(worker))),
-                    Err(error) => {
-                        self.worker_failure = Some(match error {
-                            crate::local_model::ConsentedError::Health(detail) => detail,
-                            crate::local_model::ConsentedError::GpuBusy => {
-                                crate::local_worker::GPU_BUSY.to_owned()
-                            }
-                            error => format!("{error:?}"),
-                        });
-                        None
-                    }
-                };
-            }
+        let mut launch = self.launch_plan(selected);
+        let result = launch.run();
+        self.settle_launch(launch, result)
+    }
+
+    /// What a launch needs, taken out of the gate so it can run unlocked.
+    fn launch_plan(&mut self, selected: &ActiveReceipt) -> WorkerLaunch {
+        WorkerLaunch {
+            selected: selected.clone(),
             #[cfg(test)]
-            drop(install);
+            consented: self.test_consented.take(),
+            #[cfg(test)]
+            next_worker: self.test_next_worker.take(),
+            #[cfg(test)]
+            before: self.test_before_launch.take(),
+            #[cfg(test)]
+            launched: false,
+            #[cfg(test)]
+            verified: false,
         }
+    }
+
+    /// Return a launch's borrowed test state and record why it failed.
+    fn settle_launch(
+        &mut self,
+        launch: WorkerLaunch,
+        result: Result<GateWorker, Option<String>>,
+    ) -> Option<GateWorker> {
         #[cfg(test)]
         {
-            let _ = selected;
-            self.launch_count = self.launch_count.saturating_add(1);
-            self.test_next_worker.take()
+            if self.test_consented.is_none() {
+                self.test_consented = launch.consented;
+            }
+            if self.test_next_worker.is_none() {
+                self.test_next_worker = launch.next_worker;
+            }
+            if launch.launched {
+                self.launch_count = self.launch_count.saturating_add(1);
+            }
+            if launch.verified {
+                self.verification_count
+                    .set(self.verification_count.get() + 1);
+            }
         }
         #[cfg(not(test))]
-        {
-            if development_local_enabled()
-                && let Ok((manifest, handle)) =
-                    DevelopmentStore::open_default().and_then(|store| store.selected())
-                && selected.catalog_id == manifest.model_id
-                && selected.artifact_id == handle.manifest_hash
-            {
-                return match crate::local_worker::DevWorker::launch(
-                    manifest,
-                    handle.manifest_hash,
-                    &handle.path,
-                ) {
-                    Ok(worker) => Some(RuntimeWorker::Development(Box::new(worker))),
-                    Err(error) => {
-                        self.worker_failure = Some(error.to_string());
-                        None
-                    }
-                };
-            }
-            let catalog = shipped_catalog();
-            let entry = catalog.entries.iter().find(|entry| {
-                entry.id == selected.catalog_id && entry.revision == selected.catalog_revision
-            })?;
-            if !entry.production_weights {
-                return None;
-            }
-            if runtime_selection(&catalog).map(|chosen| chosen.id) != Some(entry.id) {
-                return None;
-            }
-            if entry.runtime_abi.protocol != crate::local_worker::PROTOCOL_VERSION
-                || selected.runtime_abi != entry.runtime_abi.abi_id
-                || selected.protocol != entry.runtime_abi.protocol
-            {
-                return None;
-            }
-            for file in entry.files {
-                match selected.files.get(file.name) {
-                    Some(pin) if pin.sha256_hex == file.sha256_hex && pin.bytes == file.bytes => {}
-                    _ => return None,
+        drop(launch);
+        match result {
+            Ok(worker) => Some(worker),
+            Err(failure) => {
+                if failure.is_some() {
+                    self.worker_failure = failure;
                 }
+                None
             }
-            let weights = entry
-                .files
-                .iter()
-                .find(|file| file.kind == FileKind::Weights)
-                .map(|file| file.name)?;
-            let artifact = (|| {
-                let dir = models_dir().ok()?;
-                let store = ModelStore::open(dir).ok()?;
-                Some(
-                    store
-                        .root()
-                        .join("artifacts")
-                        .join(entry.id)
-                        .join(entry.revision)
-                        .join(&selected.artifact_id),
-                )
-            })()?;
-            if !artifact.join(weights).is_file() {
-                return None;
-            }
-            WhisperCppWorker::from_artifact(&artifact, weights, &selected.receipt_hash)
-                .ok()
-                .map(RuntimeWorker::Whisper)
         }
     }
 
@@ -982,41 +981,181 @@ impl Gate {
 #[cfg(test)]
 type LoadHook = Box<dyn FnOnce(&mut WorkerSupervisor<GateWorker>) + Send>;
 
-/// A reload checked out of the gate: its `Prepare` runs with the lock free.
+/// One worker launch: re-verify a consented install, then start the process.
+/// Verification hashes the full weights (seconds), so a reload runs this on
+/// its load thread with the gate lock free.
+struct WorkerLaunch {
+    selected: ActiveReceipt,
+    #[cfg(test)]
+    consented: Option<(
+        crate::local_model::ModelStore,
+        crate::local_model::ConsentedCatalogEntry,
+    )>,
+    #[cfg(test)]
+    next_worker: Option<FakeWorker>,
+    #[cfg(test)]
+    before: Option<Box<dyn FnOnce() + Send>>,
+    #[cfg(test)]
+    launched: bool,
+    #[cfg(test)]
+    verified: bool,
+}
+
+impl WorkerLaunch {
+    /// `Err(Some(reason))` explains a failure; `Err(None)` has no detail.
+    fn run(&mut self) -> Result<GateWorker, Option<String>> {
+        #[cfg(test)]
+        if let Some(before) = self.before.take() {
+            before();
+        }
+        if !crate::local_model::development_local_enabled() && is_consented_receipt(&self.selected)
+        {
+            // This exact re-verification and receipt comparison also runs in
+            // tests. Only process creation is replaced by the scripted worker.
+            let install = match self.verify() {
+                Ok(install)
+                    if crate::local_worker::consented_active_receipt(&install) == self.selected =>
+                {
+                    install
+                }
+                _ => return Err(Some(LOCAL_UNAVAILABLE.into())),
+            };
+            #[cfg(not(test))]
+            {
+                return crate::local_worker::launch_consented_worker(install)
+                    .map(|worker| RuntimeWorker::Consented(Box::new(worker)))
+                    .map_err(|error| {
+                        Some(match error {
+                            crate::local_model::ConsentedError::Health(detail) => detail,
+                            crate::local_model::ConsentedError::GpuBusy => {
+                                crate::local_worker::GPU_BUSY.to_owned()
+                            }
+                            error => format!("{error:?}"),
+                        })
+                    });
+            }
+            #[cfg(test)]
+            drop(install);
+        }
+        #[cfg(test)]
+        {
+            self.launched = true;
+            self.next_worker.take().ok_or(None)
+        }
+        #[cfg(not(test))]
+        launch_unconsented(&self.selected)
+    }
+
+    fn verify(
+        &mut self,
+    ) -> Result<crate::local_model::VerifiedConsentedInstall, crate::local_model::ConsentedError>
+    {
+        #[cfg(test)]
+        {
+            self.verified = true;
+            let (store, entry) = self
+                .consented
+                .as_ref()
+                .ok_or(crate::local_model::ConsentedError::Missing)?;
+            crate::local_model::consented::verify_with_entry_notifying(store, entry, || {})
+        }
+        #[cfg(not(test))]
+        {
+            crate::local_worker::verify_default_consented_install()
+        }
+    }
+}
+
+/// A development or shipped whisper.cpp worker.
+#[cfg(not(test))]
+fn launch_unconsented(selected: &ActiveReceipt) -> Result<GateWorker, Option<String>> {
+    if development_local_enabled()
+        && let Ok((manifest, handle)) =
+            DevelopmentStore::open_default().and_then(|store| store.selected())
+        && selected.catalog_id == manifest.model_id
+        && selected.artifact_id == handle.manifest_hash
+    {
+        return crate::local_worker::DevWorker::launch(
+            manifest,
+            handle.manifest_hash,
+            &handle.path,
+        )
+        .map(|worker| RuntimeWorker::Development(Box::new(worker)))
+        .map_err(|error| Some(error.to_string()));
+    }
+    launch_shipped_whisper(selected).ok_or(None)
+}
+
+#[cfg(not(test))]
+fn launch_shipped_whisper(selected: &ActiveReceipt) -> Option<GateWorker> {
+    let catalog = shipped_catalog();
+    let entry = catalog.entries.iter().find(|entry| {
+        entry.id == selected.catalog_id && entry.revision == selected.catalog_revision
+    })?;
+    if !entry.production_weights {
+        return None;
+    }
+    if runtime_selection(&catalog).map(|chosen| chosen.id) != Some(entry.id) {
+        return None;
+    }
+    if entry.runtime_abi.protocol != crate::local_worker::PROTOCOL_VERSION
+        || selected.runtime_abi != entry.runtime_abi.abi_id
+        || selected.protocol != entry.runtime_abi.protocol
+    {
+        return None;
+    }
+    for file in entry.files {
+        match selected.files.get(file.name) {
+            Some(pin) if pin.sha256_hex == file.sha256_hex && pin.bytes == file.bytes => {}
+            _ => return None,
+        }
+    }
+    let weights = entry
+        .files
+        .iter()
+        .find(|file| file.kind == FileKind::Weights)
+        .map(|file| file.name)?;
+    let artifact = (|| {
+        let dir = models_dir().ok()?;
+        let store = ModelStore::open(dir).ok()?;
+        Some(
+            store
+                .root()
+                .join("artifacts")
+                .join(entry.id)
+                .join(entry.revision)
+                .join(&selected.artifact_id),
+        )
+    })()?;
+    if !artifact.join(weights).is_file() {
+        return None;
+    }
+    WhisperCppWorker::from_artifact(&artifact, weights, &selected.receipt_hash)
+        .ok()
+        .map(RuntimeWorker::Whisper)
+}
+
+/// A reload `admit` started, for its caller to run off the gate lock.
 struct PendingLoad {
+    launch: WorkerLaunch,
+    #[cfg(test)]
+    hook: Option<LoadHook>,
+}
+
+/// An attached worker whose supervisor is checked out for `Prepare`.
+struct PreparingLoad {
     supervisor: WorkerSupervisor<GateWorker>,
     correlation: Correlation,
     selected: ActiveReceipt,
-    #[cfg(test)]
-    hook: Option<LoadHook>,
 }
 
 struct FinishedLoad {
     supervisor: WorkerSupervisor<GateWorker>,
     selected: ActiveReceipt,
-    result: Result<(), crate::local_worker::SupervisorError>,
+    result: Result<(), String>,
 }
 
-impl PendingLoad {
-    /// Bounded by the supervisor's `LOAD_DEADLINE`.
-    fn run(mut self) -> FinishedLoad {
-        let result = self
-            .supervisor
-            .prepare(self.correlation, Instant::now())
-            .map(|_| ());
-        #[cfg(test)]
-        if let Some(hook) = self.hook.take() {
-            hook(&mut self.supervisor);
-        }
-        FinishedLoad {
-            supervisor: self.supervisor,
-            selected: self.selected,
-            result,
-        }
-    }
-}
-
-/// Signalled under the gate lock whenever a reload finishes.
+/// Notified after a reload finishes, once the gate lock is released.
 fn load_finished() -> &'static Condvar {
     static DONE: Condvar = Condvar::new();
     &DONE
@@ -1024,7 +1163,16 @@ fn load_finished() -> &'static Condvar {
 
 /// How long a Stop waits for a reload: the load's own bound plus margin, so
 /// a stuck load thread still fails closed instead of hanging the Recording.
-const LOAD_WAIT: Duration = Duration::from_secs(65);
+pub(crate) const LOAD_WAIT: Duration = Duration::from_secs(65);
+
+fn load_wait(gate: &Gate) -> Duration {
+    #[cfg(test)]
+    if let Some(wait) = gate.test_load_wait {
+        return wait;
+    }
+    let _ = gate;
+    LOAD_WAIT
+}
 
 #[cfg(test)]
 static LOAD_WAITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -1060,14 +1208,53 @@ fn spawn_background_load(load: PendingLoad) {
     }
 }
 
+/// Launch, attach and load the worker, taking the gate lock only to attach
+/// and to settle. `Prepare` is bounded by the supervisor's `LOAD_DEADLINE`.
+/// A panic keeps the supervisor (and its restart budget) and fails the load.
 fn run_background_load(load: PendingLoad) {
-    let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load.run()));
-    match gate().lock() {
-        Ok(mut gate) => match done {
-            Ok(done) => gate.finish_load(done),
-            Err(_) => gate.abort_load(),
-        },
-        Err(poison) => publish_poisoned_gate(poison),
+    let PendingLoad {
+        mut launch,
+        #[cfg(test)]
+        hook,
+    } = load;
+    let launched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| launch.run()))
+        .unwrap_or_else(|_| {
+            eprintln!("Local worker launch panicked; Local is unavailable");
+            Err(Some("Local worker launch failed".to_owned()))
+        });
+    let preparing = match gate().lock() {
+        Ok(mut gate) => gate.attach_launched(launch, launched),
+        Err(poison) => {
+            publish_poisoned_gate(poison);
+            None
+        }
+    };
+    if let Some(mut preparing) = preparing {
+        let correlation = preparing.correlation.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let result = preparing
+                .supervisor
+                .prepare(correlation, Instant::now())
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+            #[cfg(test)]
+            if let Some(hook) = hook {
+                hook(&mut preparing.supervisor);
+            }
+            result
+        }))
+        .unwrap_or_else(|_| {
+            eprintln!("Local worker load panicked; Local is unavailable");
+            Err("Local worker load failed".to_owned())
+        });
+        match gate().lock() {
+            Ok(mut gate) => gate.finish_load(FinishedLoad {
+                supervisor: preparing.supervisor,
+                selected: preparing.selected,
+                result,
+            }),
+            Err(poison) => publish_poisoned_gate(poison),
+        }
     }
     load_finished().notify_all();
 }
@@ -1108,8 +1295,9 @@ fn take_inference_session() -> Result<InferenceSession, LocalError> {
         // The worker reloaded at Start is still loading: wait for it.
         #[cfg(test)]
         LOAD_WAITS.fetch_add(1, Ordering::SeqCst);
+        let wait = load_wait(&gate);
         gate = load_finished()
-            .wait_timeout_while(gate, LOAD_WAIT, |gate| gate.loading_in_background)
+            .wait_timeout_while(gate, wait, |gate| gate.loading_in_background)
             .map_err(|_| LocalError::Unavailable)?
             .0;
     }
@@ -1288,8 +1476,15 @@ fn spawn_idle_unload_timer() {
             loop {
                 std::thread::sleep(wait);
                 let timeout = crate::config::local_idle_unload();
-                let Ok(mut gate) = gate().lock() else {
-                    return;
+                let mut gate = match gate().lock() {
+                    Ok(gate) => gate,
+                    Err(poison) => {
+                        // Worker ownership is uncertain after a panic; the
+                        // gate stays poisoned and fails closed.
+                        eprintln!("Local idle-unload timer stopped: the Local gate panicked");
+                        publish_poisoned_gate(poison);
+                        return;
+                    }
                 };
                 wait = gate
                     .unload_if_idle(Instant::now(), timeout)
@@ -1644,6 +1839,29 @@ pub fn skip_cloud_doctor_probes() -> bool {
     )
 }
 
+fn admitted_receipt_hash() -> Option<String> {
+    let gate = gate().lock().ok()?;
+    gate.receipt
+        .as_ref()
+        .map(|receipt| receipt.receipt_hash.clone())
+}
+
+#[cfg(test)]
+static TEST_RECOVERY_DIR: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+/// The recovery store a Local Recording persists to (a temp dir in tests).
+fn open_recovery() -> Result<RecoveryStore, RecoveryError> {
+    #[cfg(test)]
+    if let Some(dir) = TEST_RECOVERY_DIR
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone()
+    {
+        return RecoveryStore::open(dir, RecoveryClock::system());
+    }
+    RecoveryStore::open_default(RecoveryClock::system())
+}
+
 /// Finish a Local Recording: optional recovery persist, inference, tail, Delivery.
 pub fn complete_recording(
     recording_id: &str,
@@ -1656,17 +1874,34 @@ pub fn complete_recording(
     if cloud_selected {
         return Err(LocalError::CloudSelected);
     }
-    let mut session = take_inference_session()?;
-    assert_gate_unlocked();
-    if recovery_enabled {
-        let persist = RecoveryStore::open_default(RecoveryClock::system()).and_then(|store| {
-            store.persist_before_inference(recording_id, &pcm, &session.receipt_hash)
-        });
-        if let Err(error) = persist {
-            restore_inference_session(session);
-            return Err(LocalError::Recovery(error));
+    // Persist before waiting on a reload, so a failed or overdue load still
+    // leaves the audio to recover. The receipt is fixed through the load.
+    let persisted = recovery_enabled
+        && match admitted_receipt_hash() {
+            Some(receipt_hash) => {
+                let persist = open_recovery().and_then(|store| {
+                    store.persist_before_inference(recording_id, &pcm, &receipt_hash)
+                });
+                if let Err(error) = persist {
+                    if let Ok(mut gate) = gate().lock() {
+                        gate.release_admission();
+                    }
+                    return Err(LocalError::Recovery(error));
+                }
+                true
+            }
+            None => false,
+        };
+    let mut session = match take_inference_session() {
+        Ok(session) => session,
+        Err(error) => {
+            if persisted {
+                let _ = open_recovery().and_then(|store| store.mark_failed(recording_id));
+            }
+            return Err(error);
         }
-    }
+    };
+    assert_gate_unlocked();
     let request_id = format!("{recording_id}-asr");
     let outcome = match infer_unlocked(
         &mut session,
@@ -1682,8 +1917,7 @@ pub fn complete_recording(
                 Err(silence_error) => {
                     restore_inference_session(session);
                     if recovery_enabled {
-                        let _ = RecoveryStore::open_default(RecoveryClock::system())
-                            .and_then(|store| store.mark_failed(recording_id));
+                        let _ = open_recovery().and_then(|store| store.mark_failed(recording_id));
                     }
                     return Err(silence_error);
                 }
@@ -1692,8 +1926,7 @@ pub fn complete_recording(
         Err(error) => {
             restore_inference_session(session);
             if recovery_enabled {
-                let _ = RecoveryStore::open_default(RecoveryClock::system())
-                    .and_then(|store| store.mark_failed(recording_id));
+                let _ = open_recovery().and_then(|store| store.mark_failed(recording_id));
             }
             return Err(error);
         }
@@ -2103,6 +2336,9 @@ pub fn reset_gate_for_tests() {
     // A previous test's unload or reload must not reach this test's worker.
     join_cloud_unloads_for_tests();
     join_background_loads_for_tests();
+    *TEST_RECOVERY_DIR
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = None;
     if let Ok(mut gate) = gate().lock() {
         *gate = Gate::new();
         gate.published = published_readiness().clone();
@@ -3424,12 +3660,14 @@ mod tests {
         gate.test_next_worker = Some(next_consented_worker(&receipt));
         // Start admits at once; the load runs off the gate while the user speaks.
         assert!(matches!(gate.admit(true), LocalAdmission::Ready { .. }));
-        assert_eq!(gate.launch_count, 2);
+        // Verify and launch belong to the load, not to Start.
+        assert_eq!(gate.launch_count, 1);
         let load = gate.pending_load.take().expect("load started at Start");
         assert!(gate.loading_in_background);
         assert_eq!(gate.refresh(), LocalReadiness::Busy);
-        assert_eq!(gate.launch_count, 2, "refresh never launches beside it");
-        gate.finish_load(load.run());
+        assert_eq!(gate.launch_count, 1, "refresh never launches beside it");
+        gate.run_load_here(load);
+        assert_eq!(gate.launch_count, 2);
         assert!(!gate.loading_in_background);
         assert_eq!(gate.lifecycle.state(), WorkerState::Ready);
         assert!(gate.lifecycle.has_child());
@@ -3544,5 +3782,202 @@ mod tests {
             matches!(published, LocalReadiness::Unavailable { .. }),
             "{published:?}"
         );
+    }
+
+    impl Gate {
+        /// The load thread's steps, on a gate the test owns.
+        fn run_load_here(&mut self, load: PendingLoad) {
+            let PendingLoad { mut launch, hook } = load;
+            let launched = launch.run();
+            let Some(mut preparing) = self.attach_launched(launch, launched) else {
+                return;
+            };
+            let result = preparing
+                .supervisor
+                .prepare(preparing.correlation, Instant::now())
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+            if let Some(hook) = hook {
+                hook(&mut preparing.supervisor);
+            }
+            self.finish_load(FinishedLoad {
+                supervisor: preparing.supervisor,
+                selected: preparing.selected,
+                result,
+            });
+        }
+    }
+
+    /// Blocks the reload's `Prepare` until the returned sender fires.
+    fn hold_the_load() -> std::sync::mpsc::Sender<()> {
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        gate().lock().unwrap().test_load_hook = Some(Box::new(move |supervisor| {
+            let _ = hold.recv();
+            // infer_unlocked's fixed test correlation names generation 1.
+            if let Some(child) = supervisor.child_mut() {
+                child.generation = 1;
+            }
+        }));
+        release
+    }
+
+    fn reloaded_worker() -> FakeWorker {
+        FakeWorker {
+            scripted_text: Some("reloaded".into()),
+            ..FakeWorker::default()
+        }
+    }
+
+    #[test]
+    fn recording_start_never_verifies_or_launches_on_the_caller() {
+        let _session = test_session();
+        idle_unloaded_global(reloaded_worker());
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        gate().lock().unwrap().test_before_launch = Some(Box::new(move || {
+            let _ = hold.recv();
+        }));
+        let (sent, admitted) = std::sync::mpsc::channel();
+        std::thread::spawn(move || sent.send(admit_local(true)).unwrap());
+        // Verify + launch are parked on the barrier: Start must not wait on it.
+        let admission = admitted.recv_timeout(secs(10));
+        release.send(()).unwrap();
+        assert!(
+            matches!(admission, Ok(LocalAdmission::Ready { .. })),
+            "{admission:?}"
+        );
+        abandon_live("never-begun");
+        join_background_loads_for_tests();
+        assert!(local_worker_loaded_for_tests());
+        assert_eq!(gate().lock().unwrap().launch_count, 1);
+    }
+
+    #[test]
+    fn a_failed_launch_after_start_fails_closed_at_stop() {
+        let _session = test_session();
+        idle_unloaded_global(reloaded_worker());
+        gate().lock().unwrap().test_next_worker = None;
+        assert!(matches!(admit_local(true), LocalAdmission::Ready { .. }));
+        begin_live("rec-no-launch");
+        let result = complete_recording(
+            "rec-no-launch",
+            vec![1, 0, 2, 0],
+            &[],
+            WritingMode::Literal,
+            false,
+            false,
+        );
+        assert!(matches!(result, Err(LocalError::Unavailable)), "{result:?}");
+        join_background_loads_for_tests();
+        assert!(matches!(
+            readiness_snapshot(),
+            LocalReadiness::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn a_start_abandoned_during_a_reload_lets_the_next_start_join_it() {
+        let _session = test_session();
+        idle_unloaded_global(reloaded_worker());
+        let release = hold_the_load();
+        assert!(matches!(admit_local(true), LocalAdmission::Ready { .. }));
+        begin_live("rec-dropped");
+        abandon_live("rec-dropped");
+        let again = admit_local(true);
+        assert!(matches!(again, LocalAdmission::Ready { .. }), "{again:?}");
+        begin_live("rec-joined");
+        let waits_before = LOAD_WAITS.load(Ordering::SeqCst);
+        let stop = std::thread::spawn(|| {
+            complete_recording(
+                "rec-joined",
+                vec![1, 0, 2, 0],
+                &[],
+                WritingMode::Literal,
+                false,
+                false,
+            )
+        });
+        while LOAD_WAITS.load(Ordering::SeqCst) == waits_before {
+            std::thread::yield_now();
+        }
+        release.send(()).unwrap();
+        let completion = stop.join().unwrap().expect("transcribed after the load");
+        assert_eq!(
+            completion.decision,
+            TerminalDecision::Transcript("reloaded".to_owned())
+        );
+        join_background_loads_for_tests();
+    }
+
+    #[test]
+    fn stop_gives_up_on_a_load_past_its_wait() {
+        let _session = test_session();
+        idle_unloaded_global(reloaded_worker());
+        let release = hold_the_load();
+        gate().lock().unwrap().test_load_wait = Some(Duration::from_millis(50));
+        assert!(matches!(admit_local(true), LocalAdmission::Ready { .. }));
+        begin_live("rec-overdue");
+        let waits_before = LOAD_WAITS.load(Ordering::SeqCst);
+        let result = complete_recording(
+            "rec-overdue",
+            vec![1, 0, 2, 0],
+            &[],
+            WritingMode::Literal,
+            false,
+            false,
+        );
+        assert!(matches!(result, Err(LocalError::Unavailable)), "{result:?}");
+        assert!(LOAD_WAITS.load(Ordering::SeqCst) > waits_before);
+        release.send(()).unwrap();
+        join_background_loads_for_tests();
+        // The late load still lands, ready for the next Recording.
+        assert!(matches!(readiness_snapshot(), LocalReadiness::Ready { .. }));
+    }
+
+    #[test]
+    fn a_failed_reload_at_stop_keeps_the_recovery_audio() {
+        let _session = test_session();
+        let recovery = tempfile::tempdir().unwrap();
+        *TEST_RECOVERY_DIR.lock().unwrap() = Some(recovery.path().join("local-recovery"));
+        idle_unloaded_global(FakeWorker {
+            block_for: Some(crate::local_worker::LOAD_DEADLINE + secs(1)),
+            ..FakeWorker::default()
+        });
+        assert!(matches!(admit_local(true), LocalAdmission::Ready { .. }));
+        begin_live("rec-kept");
+        let pcm = vec![1, 0, 2, 0];
+        let result = complete_recording(
+            "rec-kept",
+            pcm.clone(),
+            &[],
+            WritingMode::Literal,
+            true,
+            false,
+        );
+        assert!(matches!(result, Err(LocalError::Unavailable)), "{result:?}");
+        join_background_loads_for_tests();
+        let store = RecoveryStore::open(
+            recovery.path().join("local-recovery"),
+            RecoveryClock::system(),
+        )
+        .unwrap();
+        assert_eq!(store.read_pcm("rec-kept").unwrap(), pcm);
+    }
+
+    #[test]
+    fn a_panicking_load_keeps_its_supervisor() {
+        let _session = test_session();
+        idle_unloaded_global(reloaded_worker());
+        gate().lock().unwrap().test_load_hook =
+            Some(Box::new(|_| panic!("load thread panicked on purpose")));
+        assert!(matches!(admit_local(true), LocalAdmission::Ready { .. }));
+        abandon_live("never-begun");
+        join_background_loads_for_tests();
+        // The worker (and the restart budget it carries) came back to the
+        // gate; only readiness failed.
+        assert!(local_worker_loaded_for_tests());
+        assert!(matches!(
+            readiness_snapshot(),
+            LocalReadiness::Unavailable { .. }
+        ));
     }
 }
