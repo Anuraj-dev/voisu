@@ -440,6 +440,16 @@ impl Gate {
             self.readiness = LocalReadiness::Busy;
             return self.readiness.clone();
         }
+        if self.loading_in_background && !self.inference_checked_out && !self.cloud_selected() {
+            // A Start abandoned during a reload left the load running with no
+            // admission: the next Start may join it (see `admit`), so the
+            // daemon's pre-capture check must see Ready, not Loading.
+            if let Some(receipt) = &self.receipt {
+                return LocalReadiness::Ready {
+                    model_identity: Some(local_model_identity(receipt)),
+                };
+            }
+        }
         if self.inference_checked_out || self.loading_in_background {
             return self.readiness.clone();
         }
@@ -696,15 +706,12 @@ impl Gate {
     fn attach_worker(&mut self, selected: &ActiveReceipt, worker: GateWorker) -> bool {
         self.lifecycle
             .pin_model_receipt_hash(selected.receipt_hash.clone());
-        if self
+        let attached = self
             .lifecycle
             .attach_replacement(worker, Instant::now())
-            .is_err()
-        {
-            return false;
-        }
+            .is_ok();
         #[cfg(test)]
-        {
+        if attached {
             let generation = self.lifecycle.generation();
             let hash = selected.receipt_hash.clone();
             if let Some(child) = self.lifecycle.child_mut() {
@@ -712,7 +719,7 @@ impl Gate {
                 child.model_receipt_hash = hash;
             }
         }
-        true
+        attached
     }
 
     /// Recording start with the worker idle-unloaded: only flip state here.
@@ -3882,6 +3889,10 @@ mod tests {
         assert!(matches!(admit_local(true), LocalAdmission::Ready { .. }));
         begin_live("rec-dropped");
         abandon_live("rec-dropped");
+        // Production Start checks readiness through `refresh` before it
+        // admits, so the join must be visible there too.
+        let precheck = gate().lock().unwrap().refresh();
+        assert!(precheck.admits_capture(), "{precheck:?}");
         let again = admit_local(true);
         assert!(matches!(again, LocalAdmission::Ready { .. }), "{again:?}");
         begin_live("rec-joined");
