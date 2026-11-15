@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.84.0
+Version:        0.84.1
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -168,6 +168,9 @@ install -D -m 0644 packaging/icons/voisu.svg %{buildroot}%{_datadir}/icons/hicol
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Sun Nov 15 2026 Voisu maintainers <voisu@example.invalid> - 0.84.1-1
+- fix(local): keep the Dictionary prompt when one term has a tab (#335)
+
 * Sun Nov 15 2026 Voisu maintainers <voisu@example.invalid> - 0.84.0-1
 - feat(local): spell Dictionary words better in Local distil transcripts (#334)
 
