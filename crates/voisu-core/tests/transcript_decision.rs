@@ -3747,6 +3747,8 @@ fn repeated_silence_phrase_is_silence() {
         "Bye. Bye. Bye.",
         "Bye-bye. Bye-bye.",
         "  \"Thank you.\"  \"Thank you.\"  ",
+        // Exactly at the repeat cap (8); nine is rejected below.
+        "Thank you thank you thank you thank you thank you thank you thank you thank you.",
     ] {
         assert!(is_whisper_silence_phrase(text), "{text:?} is a repeat");
     }
