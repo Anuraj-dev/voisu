@@ -121,6 +121,15 @@ impl RestartBudget {
         Ok(())
     }
 
+    /// Hands back one start: the worker it launched was unloaded on purpose
+    /// and exited cleanly, so it was never a crash restart. A start that
+    /// already slid out of the window is simply gone.
+    fn credit(&mut self, started: Instant) {
+        if let Some(index) = self.starts.iter().position(|start| *start == started) {
+            self.starts.remove(index);
+        }
+    }
+
     /// True once the rolling budget is spent. Recovery never happens on its
     /// own: the supervisor runs no restart loop, so a new start requires an
     /// explicit Setup retry (`attach_*`) or a daemon restart (fresh
@@ -326,6 +335,9 @@ pub struct WorkerSupervisor<C> {
     state: WorkerState,
     child: Option<C>,
     restarts: RestartBudget,
+    /// Budget entry of the attached child, credited back if a planned unload
+    /// reaps it. Cleared whenever the child goes, so a crash keeps its count.
+    child_started: Option<Instant>,
     observed_device: String,
     last_terminal_request: Option<String>,
 }
@@ -337,6 +349,7 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
             state: WorkerState::Absent,
             child: None,
             restarts: RestartBudget::default(),
+            child_started: None,
             observed_device: "unknown".into(),
             last_terminal_request: None,
         }
@@ -358,6 +371,7 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
         }
         self.restarts.try_register(now)?;
         self.child = Some(child);
+        self.child_started = Some(now);
         self.state = WorkerState::Ready;
         self.last_terminal_request = None;
         Ok(())
@@ -373,6 +387,7 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
         }
         self.restarts.try_register(now)?;
         self.child = Some(child);
+        self.child_started = Some(now);
         self.state = WorkerState::Loading;
         self.last_terminal_request = None;
         Ok(())
@@ -389,6 +404,10 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
     /// child and go `Absent` without transcribing. Busy work is never dropped
     /// silently — cancel it explicitly first. An unreaped child blocks the
     /// unload instead of leaking: the caller must reap, never attach over it.
+    ///
+    /// A deliberate unload is not a crash: when the child is confirmed gone
+    /// its start is credited back to the restart budget, so switching
+    /// Engines (or a later idle unload) never exhausts crash protection.
     pub fn unload_idle(&mut self) -> Result<ReapOutcome, SupervisorError> {
         match self.state {
             WorkerState::Busy | WorkerState::Stopping => Err(SupervisorError::Busy),
@@ -396,11 +415,17 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
                 "worker unreaped; reap before new work",
             )),
             _ => {
+                let started = self.child_started;
                 let outcome = match self.child.as_mut() {
                     Some(child) => child.cancel_and_reap()?,
                     None => ReapOutcome::Exited,
                 };
                 self.apply_reap(outcome);
+                if let Some(started) = started
+                    && self.child.is_none()
+                {
+                    self.restarts.credit(started);
+                }
                 Ok(outcome)
             }
         }
@@ -504,6 +529,7 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
             }
             ReapOutcome::Exited | ReapOutcome::Killed => {
                 self.child = None;
+                self.child_started = None;
                 self.state = WorkerState::Absent;
             }
         }
@@ -977,6 +1003,68 @@ mod tests {
         assert_eq!(supervisor.cancel().unwrap(), ReapOutcome::Exited);
         assert_eq!(supervisor.unload_idle().unwrap(), ReapOutcome::Exited);
         assert_eq!(supervisor.state(), WorkerState::Absent);
+    }
+
+    #[test]
+    fn planned_unloads_do_not_spend_the_restart_budget() {
+        let mut supervisor = WorkerSupervisor::<FakeWorker>::absent();
+        let t0 = Instant::now();
+        for _ in 0..MAX_RESTARTS * 2 {
+            supervisor
+                .attach_pending(FakeWorker::default(), t0)
+                .expect("a cleanly unloaded start is credited back");
+            assert_eq!(supervisor.unload_idle().unwrap(), ReapOutcome::Exited);
+        }
+        assert!(!supervisor.restart_exhausted(t0));
+    }
+
+    #[test]
+    fn crash_restarts_stay_capped_around_planned_unloads() {
+        let mut supervisor = WorkerSupervisor::<FakeWorker>::absent();
+        let t0 = Instant::now();
+        // One clean load and unload first: it must not refund later crashes.
+        supervisor
+            .attach_pending(FakeWorker::default(), t0)
+            .unwrap();
+        supervisor.unload_idle().unwrap();
+        for _ in 0..MAX_RESTARTS {
+            let crashing = FakeWorker {
+                crash: true,
+                ..FakeWorker::default()
+            };
+            supervisor.attach_pending(crashing, t0).unwrap();
+            assert!(matches!(
+                supervisor.prepare(corr(), t0).unwrap_err(),
+                SupervisorError::Crashed
+            ));
+            assert!(!supervisor.has_child());
+            // A planned unload after the crash has no live start to credit.
+            assert_eq!(supervisor.unload_idle().unwrap(), ReapOutcome::Exited);
+        }
+        assert!(matches!(
+            supervisor.attach_pending(FakeWorker::default(), t0),
+            Err(SupervisorError::RestartExhausted)
+        ));
+    }
+
+    #[test]
+    fn an_unreaped_unload_keeps_its_start_counted() {
+        let mut supervisor = WorkerSupervisor::<FakeWorker>::absent();
+        let t0 = Instant::now();
+        for _ in 0..MAX_RESTARTS - 1 {
+            supervisor
+                .attach_pending(FakeWorker::default(), t0)
+                .unwrap();
+            supervisor.cancel().unwrap();
+        }
+        let stuck = FakeWorker {
+            reap: ReapOutcome::Unreaped,
+            ..FakeWorker::default()
+        };
+        supervisor.attach_pending(stuck, t0).unwrap();
+        assert_eq!(supervisor.unload_idle().unwrap(), ReapOutcome::Unreaped);
+        assert!(supervisor.has_child());
+        assert!(supervisor.restart_exhausted(t0));
     }
 
     #[test]
