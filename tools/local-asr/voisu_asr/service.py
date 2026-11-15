@@ -114,6 +114,9 @@ def _transcribe(
         if prompt is not None and adapter.accepts_initial_prompt:
             text = adapter.transcribe(window, initial_prompt=prompt)
             if _is_prompt_echo(text, prompt):
+                # Local diagnostic only, and it never names the terms: lets the
+                # bench and real use show whether this ever eats real speech.
+                print("voisu-asr: dropped a window that only listed Dictionary terms", file=sys.stderr)
                 text = ""
         else:
             text = adapter.transcribe(window)
