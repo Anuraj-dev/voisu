@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import math
 from pathlib import Path
 import random
+import re
 import sys
 from typing import Callable, Iterable, Mapping, Sequence
 
@@ -41,12 +42,12 @@ def _benchmark_module():
 _benchmark = _benchmark_module()
 strict_tokens: Callable[[str], list[str]] = _benchmark.strict_tokens
 
-NORMALIZED_WER_VERSION = "voisu-normalized-wer-v1"
+NORMALIZED_WER_VERSION = "voisu-normalized-wer-v2"
 BOOTSTRAP_ITERATIONS = 10_000
 BOOTSTRAP_SEED = 20261115
 CI_LEVEL = 0.95
 # Spoken fillers removed by normalize_tokens (after casefolding).
-FILLER_WORDS = frozenset({"um", "uh", "er", "erm", "hmm", "mm", "ah"})
+FILLER_WORDS = frozenset({"um", "uhm", "uh", "er", "erm", "hmm", "mm", "ah"})
 
 
 @dataclass(frozen=True)
@@ -144,6 +145,7 @@ _ORDINAL_BASES = {
     "thirtieth": "thirty", "fortieth": "forty", "fiftieth": "fifty", "sixtieth": "sixty", "seventieth": "seventy",
     "eightieth": "eighty", "ninetieth": "ninety", "hundredth": "hundred", "thousandth": "thousand", "millionth": "million",
 }
+_SCALE_WORDS = frozenset({"hundred", *(name for name, _ in _SCALES)})
 _CARDINAL_WORDS = {"zero", "hundred", *_UNITS, *_TEENS, *_TENS, *(word for word, _ in _SCALES)}
 
 
@@ -193,11 +195,50 @@ def _parse_group(words: Sequence[tuple[str, bool] | None], i: int, *, allow_bare
     return None
 
 
+def _word(words: Sequence[tuple[str, bool] | None], j: int) -> tuple[str, bool] | None:
+    return words[j] if j < len(words) else None
+
+
+def _hundreds_or_year(words: Sequence[tuple[str, bool] | None], i: int) -> tuple[int, int, bool] | None:
+    """Spoken forms starting with a group of 10..99 that place-value parsing misses.
+
+    - "N hundred" with N in 10..99: "twenty five hundred" -> 2500,
+      "nineteen hundred and five" -> 1905.
+    - A year read as two pairs, first pair 13..20: "nineteen ninety nine" ->
+      1999, "twenty twenty six" -> 2026.  The first pair stops at 20 so clock
+      times ("ten thirty", "eleven fifteen") stay two numbers.
+    """
+
+    head = _parse_group(words, i, allow_bare_hundred=False)
+    if head is None or head[2] or not 10 <= head[0] <= 99:
+        return None
+    value, j, _ = head
+    nxt = _word(words, j)
+    if nxt is not None and nxt[0] == "hundred":
+        value *= 100
+        if nxt[1]:
+            return value, j + 1, True
+        k = j + 2 if _word(words, j + 1) == ("and", False) else j + 1
+        rest = _parse_group(words, k, allow_bare_hundred=False)
+        if rest is not None and rest[0] < 100:
+            return value + rest[0], rest[1], rest[2]
+        return value, j + 1, False
+    if 13 <= value <= 20:
+        tail = _parse_group(words, j, allow_bare_hundred=False)
+        after = _word(words, tail[1]) if tail else None
+        if tail is not None and not tail[2] and 10 <= tail[0] <= 99 and (after is None or after[0] not in _SCALE_WORDS):
+            return value * 100 + tail[0], tail[1], False
+    return None
+
+
 def _parse_number(words: Sequence[tuple[str, bool] | None], i: int) -> tuple[int, int, bool]:
     """The longest number starting at `i` (a number word): (value, next index, ordinal)."""
 
     if words[i] == ("zero", False):
         return 0, i + 1, False
+    special = _hundreds_or_year(words, i)
+    if special is not None:
+        return special
     total, j, floor = 0, i, 0
     while True:
         group = _parse_group(words, j, allow_bare_hundred=j == i)
@@ -223,11 +264,25 @@ def _ordinal_suffix(value: int) -> str:
     return {1: "st", 2: "nd", 3: "rd"}.get(value % 10, "th")
 
 
+# "1,000" -> "1000"; "1.5" -> "1 point 5" (one token per decimal digit, as spoken).
+_DIGIT_GROUPS_RE = re.compile(r"\b\d{1,3}(?:,\d{3})+\b")
+_DECIMAL_RE = re.compile(r"(\d)\.(\d+)")
+
+
+def _digit_forms(text: str) -> str:
+    text = _DIGIT_GROUPS_RE.sub(lambda match: match.group(0).replace(",", ""), text)
+    return _DECIMAL_RE.sub(lambda match: f"{match.group(1)} point {' '.join(match.group(2))}", text)
+
+
 def _number_words_to_digits(tokens: Sequence[str]) -> list[str]:
     words = [_number_word(token) for token in tokens]
     result: list[str] = []
     i = 0
     while i < len(tokens):
+        # "a hundred" / "a thousand" / "a million": the "a" is part of the number.
+        if tokens[i] == "a" and i + 1 < len(tokens) and words[i + 1] == (tokens[i + 1], False) and tokens[i + 1] in _SCALE_WORDS:
+            i += 1
+            continue
         if words[i] is None or words[i][0] == "and":
             result.append(tokens[i])
             i += 1
@@ -286,7 +341,10 @@ def normalize_tokens(text: str, token_map: Mapping[str, str] | None = None) -> l
 
     Contract, in order:
 
-    1. Replace each "%" with " percent " and each "&" with " and ".
+    1. Replace each "%" with " percent " and each "&" with " and "; join
+       comma digit groups ("1,000" -> "1000"); spell a decimal point
+       ("1.5" -> "1 point 5", one token per decimal digit: "3.14" ->
+       "3 point 1 4").
     2. Tokenize with `strict_tokens` (NFKC, casefold, word tokens; punctuation
        and hyphens split or dropped exactly as in strict WER).
     3. Drop tokens in `FILLER_WORDS`.
@@ -296,18 +354,24 @@ def normalize_tokens(text: str, token_map: Mapping[str, str] | None = None) -> l
        - cardinals zero..999,999,999: "twenty five" -> "25",
          "one hundred and five" -> "105" ("and" is absorbed only between
          number words of one number), "two thousand twenty six" -> "2026",
-         "a hundred" stays ["a", "100"];
+         "a hundred" / "one hundred" -> "100" (an "a" right before hundred,
+         thousand or million is absorbed);
+       - "N hundred" for N in 10..99: "twenty five hundred" -> "2500",
+         "nineteen hundred" -> "1900";
+       - years read as two pairs, first pair 13..20: "nineteen ninety nine"
+         -> "1999", "twenty twenty six" -> "2026" ("ten thirty" stays
+         ["10", "30"]);
        - a run ending in an ordinal word becomes digits plus its suffix:
          "twenty first" -> "21st", "third" -> "3rd", "hundredth" -> "100th";
        - digit tokens already present are left as they are.
     5. Map each token through `token_map` (one token to one token, e.g. the
        spelling map `benchmark.load_spelling_normalizer` returns), last.
 
-    Not normalized in v1: contractions ("don't" vs "do not"), compounds
-    ("e mail" vs "email"), currency, years read as pairs ("twenty twenty six").
+    Not normalized: contractions ("don't" vs "do not"), compounds ("e mail"
+    vs "email"), currency, "oh" in years ("nineteen oh five").
     """
 
-    tokens = [token for token in strict_tokens(text.replace("%", " percent ").replace("&", " and ")) if token not in FILLER_WORDS]
+    tokens = [token for token in strict_tokens(_digit_forms(text.replace("%", " percent ").replace("&", " and "))) if token not in FILLER_WORDS]
     tokens = _number_words_to_digits(tokens)
     if token_map:
         tokens = [token_map.get(token, token) for token in tokens]

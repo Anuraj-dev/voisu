@@ -7,6 +7,7 @@ import re
 import sys
 import tempfile
 import unittest
+import unittest.mock
 import wave
 
 
@@ -92,11 +93,28 @@ class CheckTests(unittest.TestCase):
 
     def test_too_many_tuning_clips_and_unassigned_clips_fail(self):
         records = full_corpus(150_000)
-        records[0]["split"] = "development"
-        records[1]["split"] = None
+        for record in records[:21]:
+            record["split"] = "development"  # 41 tuning: one over the cap
+        records[21]["split"] = None
         result = corpus_lock.check_corpus(records)
         failed = {item["name"] for item in result["checks"] if not item["ok"]}
         self.assertEqual(failed, {"held-out English speech", "tuning English speech", "speech with no split"})
+        tuning = next(item for item in result["checks"] if item["name"] == "tuning English speech")
+        self.assertIn("contaminates held-out", tuning["missing"])
+        self.assertNotIn('pin "split": "heldout"', tuning["missing"])
+
+    def test_tuning_cap_is_one_named_constant(self):
+        records = full_corpus(150_000)
+        for record in records[60:80]:
+            record["split"] = "development"  # 40 tuning, 60 held out
+        names = {item["name"] for item in corpus_lock.check_corpus(records)["checks"] if not item["ok"]}
+        self.assertEqual(names, {"held-out English speech"})  # 40 tuning is at the cap
+        with unittest.mock.patch.object(corpus_lock, "TUNING_CAP", 30):
+            names = {item["name"] for item in corpus_lock.check_corpus(records)["checks"] if not item["ok"]}
+            self.assertEqual(names, {"held-out English speech", "tuning English speech"})
+        with unittest.mock.patch.object(corpus_lock, "TUNING_CAP", None):
+            names = [item["name"] for item in corpus_lock.check_corpus(records)["checks"]]
+            self.assertNotIn("tuning English speech", names)
 
     def test_counts_report_critical_tokens_and_reference_sources(self):
         records = [speech(1, critical_tokens=["Voisu", "42"], reference_source="adjudicated"), speech(2, reference_source="scripted"), speech(3)]

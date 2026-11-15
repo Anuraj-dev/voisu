@@ -18,11 +18,12 @@ use super::supervisor::{
 };
 
 pub const CORPUS_CONTRACT_ID: &str = "voisu-local-asr-bakeoff-en-v1";
-pub const CORPUS_VERSION: &str = "2026-09-08.r7.lock";
+pub const CORPUS_VERSION: &str = "2026-11-15.r8.lock";
 
 pub const MIN_SPEECH_RECORDINGS: usize = 100;
 pub const MIN_NEGATIVE_RECORDINGS: usize = 20;
-pub const MAX_TUNING_SPEECH: usize = 20;
+/// Tuning clips never enter the winner decision; this only bounds the tuning split.
+pub const MAX_TUNING_SPEECH: usize = 40;
 pub const MIN_HELD_OUT_SPEECH: usize = 80;
 pub const MIN_LONGEST_BAND: usize = 5;
 
@@ -1075,6 +1076,29 @@ mod tests {
         assert_eq!(wer.reference_tokens, 2);
         assert_eq!(wer.error_rate, 1.0);
         assert_eq!(corpus_wer(&[&outcome]), Some(1.0));
+    }
+
+    #[test]
+    fn tuning_split_is_capped_at_forty() {
+        let mut cases = locked_size_corpus(all_speech_bands);
+        let extra = |i: usize| BakeoffCase {
+            id: format!("t{i}"),
+            kind: CaseKind::Speech,
+            split: Split::Tuning,
+            band: DurationBand::OneToTen,
+            audio_hash: format!("ht{i}"),
+            reference: "hello raja".into(),
+            pcm: vec![1, 0],
+            speech: Duration::from_millis(200),
+            stratum: "pilot-quiet".into(),
+            critical: Vec::new(),
+            scripted_hypothesis: None,
+        };
+        cases.extend((0..MAX_TUNING_SPEECH - 20).map(extra));
+        assert_eq!(MAX_TUNING_SPEECH, 40);
+        assert!(corpus_lock_satisfied(&cases));
+        cases.push(extra(MAX_TUNING_SPEECH));
+        assert!(!corpus_lock_satisfied(&cases));
     }
 
     #[test]

@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ASR_ROOT = Path(__file__).parents[1]
@@ -36,12 +37,15 @@ class RunRecordTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
+        self.build_corpus(REFS)
+
+    def build_corpus(self, refs):
         self.eval_dir = self.root / "eval"
         audio = self.eval_dir / "audio"
-        audio.mkdir(parents=True)
-        for index, name in enumerate(REFS):
+        audio.mkdir(parents=True, exist_ok=True)
+        for index, name in enumerate(refs):
             make_wav(audio / name, 1600 + 200 * index)
-        (self.eval_dir / "references.json").write_text(json.dumps(REFS), encoding="utf-8")
+        (self.eval_dir / "references.json").write_text(json.dumps(refs), encoding="utf-8")
         (self.eval_dir / "consent.json").write_text(json.dumps({"consent_id": "c-1"}), encoding="utf-8")
         inventory = benchmark.inventory(audio, self.eval_dir / "references.json", self.eval_dir / "consent.json", "records-v1")
         self.corpus = benchmark.freeze(inventory, "seed", 0.5)
@@ -68,20 +72,27 @@ class RunRecordTests(unittest.TestCase):
         self.assertEqual([r["run_key"]["model_id"] for r in result["records"]], ["model-a", "model-b"])
         for record in result["records"]:
             self.assertEqual(tuple(record), run_records.RUN_RECORD_FIELDS)
-            self.assertEqual(set(record["run_key"]), {"model_id", "runtime", "backend", "device", "threads", "window", "host_profile"})
+            self.assertEqual(set(record["run_key"]), {"model_id", "runtime", "backend", "device", "threads", "threads_source", "window", "host_profile"})
+            self.assertTrue(record["run_key"]["threads_source"].startswith("not_measured"))
             self.assertEqual(record["run_key"]["window"], {"window_s": 30, "overlap_s": 0, "merge": "none", "source": run_records.WORKER_DEFAULT_WINDOW["source"]})
             self.assertEqual(set(record["scopes"]), set(run_records.SCOPES))
             for scope in record["scopes"].values():
                 self.assertEqual(tuple(scope), run_records.SCOPE_FIELDS)
+                for band in scope["bands"].values():
+                    self.assertEqual(tuple(band), run_records.BAND_FIELDS)
                 for metric in run_records.METRICS:
                     self.assertEqual(tuple(scope[metric]), run_records.METRIC_FIELDS)
                     self.assertEqual(tuple(scope[metric]["ci"]), run_records.CI_FIELDS)
             self.assertEqual(set(record["latency_ms"]), {"warm_inference", "stop_to_transcript"})
-            self.assertEqual(set(record["memory"]), {"peak_rss_bytes", "peak_gpu_memory_bytes", "system_memory_delta_bytes"})
-            self.assertEqual(set(record["negatives"]), {"clips", "insertions", "clips_with_insertions"})
-        # No transcript text in the records file.
-        self.assertNotIn("open the request now", (run_dir / "run_records.json").read_text())
-        self.assertNotIn("thank you", (run_dir / "run_records.json").read_text())
+            self.assertEqual(set(record["memory"]), {"peak_rss_bytes", "peak_gpu_memory_bytes", "system_memory_delta_bytes", "system_memory_delta_status"})
+            self.assertTrue(record["memory"]["system_memory_delta_status"].startswith("not_measured"))
+            self.assertEqual(set(record["negatives"]), {"clips", "expected", "insertions", "clips_with_insertions"})
+        # No transcript, reference or critical-token text in the records file.
+        written = (run_dir / "run_records.json").read_text()
+        for text in ["open the request now", "thank you", *(ref["reference"] for ref in REFS.values() if ref["reference"]),
+                     *(token for ref in REFS.values() for token in ref.get("critical_tokens", []))]:
+            self.assertNotIn(text, written)
+        self.assertIn("n/m", run_records.format_run_report(result))
 
     def test_strict_wer_and_latency_match_the_score_report(self):
         _, report, result = self.bench_run([self.manifest("model-a", {"en-01.wav": "ship release", "en-03.wav": "tune on this one too"}), self.manifest("model-b", {})])
@@ -114,12 +125,20 @@ class RunRecordTests(unittest.TestCase):
         self.assertGreaterEqual(heldout["strict_wer"]["ci"]["high"], heldout["strict_wer"]["estimate"])
         self.assertIsNone(record["memory"]["system_memory_delta_bytes"])
         self.assertTrue(any("system-wide memory" in item for item in record["limitations"]))
-        self.assertNotIn("CI n/i", run_records.format_run_report(result))
+        report_text = run_records.format_run_report(result)
+        self.assertNotIn("n/i", report_text)
+        self.assertNotIn("not implemented", report_text)
+
+    def test_duration_bands_count_clips_and_tokens(self):
+        _, _, result = self.bench_run([self.manifest("model-a", {"en-02.wav": "open the request"})])
+        bands = result["records"][0]["scopes"]["english_heldout"]["bands"]
+        self.assertEqual(bands, {"1-10s": {"expected": 2, "measured": 2, "reference_tokens": 8, "strict_wer": 2 / 8}})
+        self.assertIn("1-10s n=2/2 tok=8", run_records.format_run_report(result))
 
     def test_negative_insertions_are_counted(self):
         _, _, result = self.bench_run([self.manifest("model-a", {"neg-01.wav": "thank you for watching"}), self.manifest("model-b", {})])
-        self.assertEqual(result["records"][0]["negatives"], {"clips": 1, "insertions": 4, "clips_with_insertions": 1})
-        self.assertEqual(result["records"][1]["negatives"], {"clips": 1, "insertions": 0, "clips_with_insertions": 0})
+        self.assertEqual(result["records"][0]["negatives"], {"clips": 1, "expected": 1, "insertions": 4, "clips_with_insertions": 1})
+        self.assertEqual(result["records"][1]["negatives"], {"clips": 1, "expected": 1, "insertions": 0, "clips_with_insertions": 0})
 
     def test_comparisons_pair_every_two_records_and_verdicts_follow_the_rule(self):
         _, _, result = self.bench_run([self.manifest("model-a", {"en-02.wav": "open the request"}), self.manifest("model-b", {})], baseline_id="model-a")
@@ -132,9 +151,60 @@ class RunRecordTests(unittest.TestCase):
         self.assertLessEqual(strict["difference"]["low"], strict["difference"]["estimate"])
         self.assertEqual(len(result["verdicts"]), 1)
         verdict = result["verdicts"][0]
-        # Two held-out clips cannot separate the models: the paired CI reaches 0, so no winner.
-        self.assertEqual(verdict["verdict"], "not_winner")
-        self.assertEqual(verdict["checks"], {"paired_ci_better": False, "zero_negative_insertions": True, "no_critical_regression": True})
+        # A two-clip corpus is far below the lock: pending whatever the other checks say.
+        self.assertFalse(result["corpus_lock"]["ok"])
+        self.assertEqual(verdict["verdict"], "pending")
+        self.assertEqual(verdict["checks"], {"corpus_lock_met": False, "complete_coverage": True, "paired_ci_better": False,
+                                             "zero_negative_insertions": True, "no_critical_regression": True})
+        self.assertIn("corpus lock NOT met", run_records.format_run_report(result))
+        # With the lock met, the paired CI reaching 0 decides: no winner.
+        run_dir, report, _ = self.bench_run([self.manifest("model-a", {"en-02.wav": "open the request"}), self.manifest("model-b", {})], baseline_id="model-a")
+        with mock.patch.object(run_records.corpus_lock, "check_corpus", return_value={"ok": True, "missing": []}):
+            locked = run_records.build_run_report(self.corpus, benchmark.read_json(run_dir / "replay.json"), report, incumbent="model-a")
+        self.assertEqual(locked["verdicts"][0]["verdict"], "not_winner")
+
+    def _without_row(self, run_dir, model_id, record_id):
+        evidence = benchmark.read_json(run_dir / "replay.json")
+        evidence["records"] = [row for row in evidence["records"] if (row["model_id"], row["record_id"]) != (model_id, record_id)]
+        return evidence
+
+    def test_candidate_missing_clips_cannot_win(self):
+        run_dir, report, _ = self.bench_run([self.manifest("model-a", {"en-02.wav": "open the request"}), self.manifest("model-b", {})], baseline_id="model-a")
+        with mock.patch.object(run_records.corpus_lock, "check_corpus", return_value={"ok": True, "missing": []}):
+            for record_id in ("en-02.wav", "neg-01.wav"):
+                with self.subTest(record_id=record_id):
+                    result = run_records.build_run_report(self.corpus, self._without_row(run_dir, "model-b", record_id), report, incumbent="model-a")
+                    verdict = result["verdicts"][0]
+                    self.assertIs(verdict["checks"]["complete_coverage"], False)
+                    self.assertEqual(verdict["verdict"], "not_winner")
+            # The incumbent missing a clip leaves coverage unjudged.
+            result = run_records.build_run_report(self.corpus, self._without_row(run_dir, "model-a", "en-01.wav"), report, incumbent="model-a")
+            self.assertIsNone(result["verdicts"][0]["checks"]["complete_coverage"])
+
+    def test_reference_that_normalizes_to_nothing_is_invalid_not_fatal(self):
+        refs = {**REFS, "en-04.wav": {"language": "english", "reference": "um", "split": "heldout"}}
+        self.build_corpus(refs)
+        _, _, result = self.bench_run([self.manifest("model-a", {}), self.manifest("model-b", {})], baseline_id="model-a")
+        heldout = result["records"][0]["scopes"]["english_heldout"]
+        self.assertEqual(heldout["strict_wer"]["status"], "measured")
+        self.assertEqual(heldout["normalized_wer"]["status"], "invalid_reference")
+        self.assertEqual(heldout["normalized_wer"]["ci"]["status"], "invalid_reference")
+        self.assertIsNone(result["verdicts"][0]["checks"]["paired_ci_better"])
+        self.assertIn("invalid ref", run_records.format_run_report(result))
+
+    def test_critical_tokens_use_the_spelling_map(self):
+        corpus = {"records": [{"record_id": "a", "critical_tokens": ["colour"]}]}
+        rows = [{"record_id": "a", "raw_text": "the color"}]
+        slot = run_records.metric_slot("critical_token_error_rate", rows, {"a": corpus["records"][0]}, iterations=10, seed=1, level=0.95, token_map={"colour": "color"})
+        self.assertEqual(slot["per_clip"], [["a", 0, 1]])
+        slot = run_records.metric_slot("critical_token_error_rate", rows, {"a": corpus["records"][0]}, iterations=10, seed=1, level=0.95)
+        self.assertEqual(slot["per_clip"], [["a", 1, 1]])
+
+    def test_manifest_cpu_cores_is_declared_as_threads(self):
+        path = self.root / "m.json"
+        path.write_text(json.dumps({"model_id": "m", "limits": {"cpu_cores": 4}}), encoding="utf-8")
+        self.assertEqual(bench._declared_threads([f"m={path}", f"x={self.root / 'missing.json'}"])["m"]["threads"], 4)
+        self.assertNotIn("x", bench._declared_threads([f"x={self.root / 'missing.json'}"]))
 
     def test_records_from_different_corpora_are_not_paired(self):
         _, _, result = self.bench_run([self.manifest("model-a", {}), self.manifest("model-b", {})])
@@ -166,19 +236,42 @@ class RunRecordTests(unittest.TestCase):
         self.assertIn("verdict model-b", stdout.getvalue())
 
 
-def _comparison(metric, *, estimate, low=None, high=None, status="measured", baseline="inc", candidate="cand"):
-    return {"baseline": baseline, "candidate": candidate, "scope": run_records.DECISION_SCOPE, "metric": metric, "status": status,
+def _comparison(metric, *, estimate, low=None, high=None, status="measured", baseline="inc", candidate="cand", dropped=0):
+    return {"baseline": baseline, "candidate": candidate, "scope": run_records.DECISION_SCOPE, "metric": metric, "status": status, "dropped_clips": dropped,
             "difference": {"estimate": estimate, "low": low, "high": high, "excludes_zero": None if low is None else (low > 0 or high < 0)}}
 
 
+def _record(label, *, insertions=0, measured=80, negatives=20):
+    return {"label": label, "scopes": {run_records.DECISION_SCOPE: {"clips": {"measured": measured, "expected": 80}}},
+            "negatives": {"clips": negatives, "expected": 20, "insertions": insertions}}
+
+
 class WinnerRuleTests(unittest.TestCase):
-    incumbent = {"label": "inc", "negatives": {"insertions": 0}}
+    incumbent = _record("inc")
 
-    def verdict(self, primary, critical, insertions=0):
-        candidate = {"label": "cand", "negatives": {"insertions": insertions}}
-        return run_records.winner_verdict(self.incumbent, candidate, [primary, critical])
+    def verdict(self, primary, critical, insertions=0, *, candidate=None, lock=True):
+        candidate = candidate or _record("cand", insertions=insertions)
+        return run_records.winner_verdict(self.incumbent, candidate, [primary, critical], corpus_lock_met=lock)
 
-    def test_winner_needs_all_three_checks(self):
+    def test_unmet_corpus_lock_is_pending_even_when_every_check_passes(self):
+        better = _comparison(run_records.PRIMARY_METRIC, estimate=-0.02, low=-0.03, high=-0.01)
+        fine = _comparison("critical_token_error_rate", estimate=0.0)
+        result = self.verdict(better, fine, lock=False)
+        self.assertEqual(result["verdict"], "pending")
+        self.assertIs(result["checks"]["corpus_lock_met"], False)
+        self.assertEqual(self.verdict(better, fine, insertions=3, lock=False)["verdict"], "pending")
+
+    def test_incomplete_coverage_blocks_a_win(self):
+        better = _comparison(run_records.PRIMARY_METRIC, estimate=-0.02, low=-0.03, high=-0.01)
+        fine = _comparison("critical_token_error_rate", estimate=0.0)
+        self.assertEqual(self.verdict(better, fine, candidate=_record("cand", measured=79))["verdict"], "not_winner")
+        self.assertEqual(self.verdict(better, fine, candidate=_record("cand", negatives=19))["verdict"], "not_winner")
+        dropped = _comparison(run_records.PRIMARY_METRIC, estimate=-0.02, low=-0.03, high=-0.01, dropped=1)
+        result = self.verdict(dropped, fine)
+        self.assertEqual(result["verdict"], "pending")
+        self.assertIsNone(result["checks"]["complete_coverage"])
+
+    def test_winner_needs_every_check(self):
         better = _comparison(run_records.PRIMARY_METRIC, estimate=-0.02, low=-0.03, high=-0.01)
         no_regression = _comparison("critical_token_error_rate", estimate=0.0, low=-0.01, high=0.01)
         self.assertEqual(self.verdict(better, no_regression)["verdict"], "winner")
@@ -192,11 +285,11 @@ class WinnerRuleTests(unittest.TestCase):
         self.assertEqual(self.verdict(better, worse)["verdict"], "not_winner")
         self.assertEqual(self.verdict(better, fine, insertions=1)["verdict"], "not_winner")
         # A failed check decides even when another is still unmeasured.
-        self.assertEqual(self.verdict(_comparison(run_records.PRIMARY_METRIC, estimate=None, status="not_implemented"), worse)["verdict"], "not_winner")
+        self.assertEqual(self.verdict(_comparison(run_records.PRIMARY_METRIC, estimate=None, status="invalid_reference"), worse)["verdict"], "not_winner")
 
     def test_unmeasured_check_is_pending(self):
         better = _comparison(run_records.PRIMARY_METRIC, estimate=-0.02, low=-0.03, high=-0.01)
-        unmeasured = _comparison("critical_token_error_rate", estimate=None, status="not_implemented")
+        unmeasured = _comparison("critical_token_error_rate", estimate=None, status="no_clips")
         result = self.verdict(better, unmeasured)
         self.assertEqual(result["verdict"], "pending")
         self.assertIsNone(result["checks"]["no_critical_regression"])
@@ -205,8 +298,8 @@ class WinnerRuleTests(unittest.TestCase):
         better = _comparison(run_records.PRIMARY_METRIC, estimate=-0.02, low=-0.03, high=-0.01)
         other_scope = {**better, "scope": "english_all"}
         other_pair = {**better, "candidate": "someone-else"}
-        candidate = {"label": "cand", "negatives": {"insertions": 0}}
-        self.assertEqual(run_records.winner_verdict(self.incumbent, candidate, [other_scope, other_pair])["checks"]["paired_ci_better"], None)
+        result = run_records.winner_verdict(self.incumbent, _record("cand"), [other_scope, other_pair], corpus_lock_met=True)
+        self.assertEqual(result["checks"]["paired_ci_better"], None)
 
 
 if __name__ == "__main__":

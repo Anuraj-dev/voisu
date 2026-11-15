@@ -4,10 +4,11 @@ Pure functions over inventory or frozen-corpus records (see
 `schema/inventory.schema.json`); no audio is read here.  `benchmark.py
 check-corpus` validates the file first and then prints `format_check`.
 
-The thresholds mirror `crates/voisu-app/src/local_worker/bakeoff.rs`
-(`corpus_lock_satisfied`) exactly, and one corpus serves both the Rust bakeoff
-lock and the local-accuracy P0a target: at least 5 clips in the longest band
-(120-600 s).
+The threshold constants below mirror `crates/voisu-app/src/local_worker/bakeoff.rs`
+(`corpus_lock_satisfied`); `tests/test_corpus_lock.py` fails when they drift.
+The duration band edges (`BANDS`) and the per-band checks are Python-only.
+One corpus serves both the Rust bakeoff lock and the local-accuracy P0a
+target: at least 5 clips in the longest band (120-600 s).
 
 The bakeoff counts English speech only.  Hinglish clips stay in the corpus and
 are reported, but never count toward a threshold.
@@ -21,13 +22,18 @@ from typing import Any, Iterable, Mapping, Sequence
 # and fails when these drift.
 MIN_SPEECH_RECORDINGS = 100
 MIN_NEGATIVE_RECORDINGS = 20
-MAX_TUNING_SPEECH = 20
+MAX_TUNING_SPEECH = 40  # tuning clips never enter the winner decision
 MIN_HELD_OUT_SPEECH = 80
 MIN_LONGEST_BAND = 5
 RSS_GROWTH_MAX_MIB = 128  # soak gate over 200 recordings; not a corpus property
 
-# Bakeoff duration bands, upper bound inclusive, in milliseconds.  A clip under
-# 1 s still lands in "1-10s"; one over 600 s is outside every band.
+# The tuning-split cap the check enforces (None stops checking it).  Tuning
+# clips are free for settings work and never enter the winner decision.
+TUNING_CAP: int | None = MAX_TUNING_SPEECH
+
+# Bakeoff duration bands (Python-only), upper bound inclusive, in milliseconds:
+# a clip of exactly 120000 ms is in "30-120s", 120001 ms in "120-600s".  A clip
+# under 1 s still lands in "1-10s"; one over 600 s is outside every band.
 BANDS: tuple[tuple[str, int], ...] = (
     ("1-10s", 10_000),
     ("10-30s", 30_000),
@@ -119,10 +125,15 @@ def check_corpus(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
 
     counts = corpus_counts(records)
     bands = counts["bands"]
+    tuning = []
+    if TUNING_CAP is not None:
+        tuning = [_check("tuning English speech", counts["tuning_speech"], at_most=TUNING_CAP,
+                         hint="tuning clips: the tuning split exceeds the cap; moving tuned clips into held-out "
+                              "contaminates held-out, so this needs a decision (new clips, or a different cap)")]
     checks = [
         _check("English speech clips", counts["speech"], at_least=MIN_SPEECH_RECORDINGS, hint="English speech clips"),
-        _check("held-out English speech", counts["heldout_speech"], at_least=MIN_HELD_OUT_SPEECH, hint='held-out speech clips (pin "split": "heldout" in references)'),
-        _check("tuning English speech", counts["tuning_speech"], at_most=MAX_TUNING_SPEECH, hint='tuning clips (pin "split": "heldout")'),
+        _check("held-out English speech", counts["heldout_speech"], at_least=MIN_HELD_OUT_SPEECH, hint='held-out speech clips (record new ones with "split": "heldout"; never move tuned clips in)'),
+        *tuning,
         _check("negatives", counts["negative"], at_least=MIN_NEGATIVE_RECORDINGS, hint="negative clips (silence, noise, no speech)"),
         _check("speech with no split", counts["unassigned_speech"], at_most=0, hint="unassigned clips: freeze the inventory or pin a split"),
         _check("duplicate audio", counts["duplicate_audio"], at_most=0, hint="duplicate recordings"),

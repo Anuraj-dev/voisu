@@ -433,11 +433,31 @@ def run_bench(eval_dir: Path, corpus_path: Path, model_args: Sequence[str], root
     }
     benchmark.write_json(run_dir / "run.json", meta)
     (run_dir / "table.txt").write_text(table + "\n", encoding="utf-8")
-    # Per-config run records for the bakeoff (metrics not implemented yet are marked, not fatal).
+    # Per-config run records for the bakeoff.
     _, token_map = benchmark.load_spelling_normalizer(normalizer)
     incumbent = baseline_id if baseline_id in model_ids else None
-    benchmark.write_json(run_dir / "run_records.json", run_records.build_run_report(corpus, evidence, report, incumbent=incumbent, token_map=token_map or None))
+    benchmark.write_json(run_dir / "run_records.json", run_records.build_run_report(corpus, evidence, report, configs=_declared_threads(models),
+                                                                                    incumbent=incumbent, token_map=token_map or None))
     return run_dir, report, table
+
+
+def _declared_threads(models: Sequence[str]) -> dict[str, dict[str, Any]]:
+    """Per model_id, the manifest's `limits.cpu_cores` as the declared thread cap.
+
+    It is the CPU cap the protected replay runs under, not an observed thread
+    count; models without one get no entry, so their records say "not measured".
+    """
+
+    configs: dict[str, dict[str, Any]] = {}
+    for item in models:
+        model_id, _, path = item.partition("=")
+        try:
+            cores = json.loads(Path(path).read_text(encoding="utf-8")).get("limits", {}).get("cpu_cores")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(cores, int) and not isinstance(cores, bool) and cores > 0:
+            configs[model_id] = {"threads": cores, "threads_source": "manifest limits.cpu_cores (CPU cap, not an observed thread count)"}
+    return configs
 
 
 def _failure_notes(evidence: Mapping[str, Any]) -> str:

@@ -54,7 +54,7 @@ class NumberWordEdgeCases(unittest.TestCase):
         self.assertEqual(tokens("zero"), ["0"])
         self.assertEqual(tokens("hundred"), ["100"])
         self.assertEqual(tokens("twenty-five"), ["25"])
-        self.assertEqual(tokens("a thousand"), ["a", "1000"])
+        self.assertEqual(tokens("a thousand"), ["1000"])
         self.assertEqual(tokens("two hundred and fifty one thousand and three"), ["251003"])
         self.assertEqual(tokens("two million three hundred forty five thousand six hundred seventy eight"), ["2345678"])
         self.assertEqual(tokens("nine hundred ninety nine million nine hundred ninety nine thousand nine hundred ninety nine"), ["999999999"])
@@ -65,8 +65,25 @@ class NumberWordEdgeCases(unittest.TestCase):
         self.assertEqual(tokens("ten and a half"), ["10", "and", "a", "half"])
         self.assertEqual(tokens("five hundred and"), ["500", "and"])
 
-    def test_year_pairs_are_not_joined(self):
-        self.assertEqual(metrics.normalize_tokens("twenty twenty six"), ["20", "26"])
+    def test_digit_and_spoken_number_forms_agree(self):
+        tokens = metrics.normalize_tokens
+        for written, spoken in (("1,000", "one thousand"), ("1,250,000", "one million two hundred fifty thousand"),
+                                ("1999", "nineteen ninety nine"), ("2026", "twenty twenty six"),
+                                ("1.5", "one point five"), ("3.14", "three point one four"),
+                                ("2500", "twenty five hundred"), ("100", "a hundred"), ("100", "one hundred"),
+                                ("1900", "nineteen hundred"), ("1905", "nineteen hundred and five")):
+            with self.subTest(written=written, spoken=spoken):
+                self.assertEqual(tokens(written), tokens(spoken))
+                self.assertEqual(len(tokens(spoken)), 1 if "." not in written else len(tokens(written)))
+
+    def test_year_rule_leaves_clock_times_and_scales_alone(self):
+        tokens = metrics.normalize_tokens
+        self.assertEqual(tokens("ten thirty"), ["10", "30"])
+        self.assertEqual(tokens("twenty twenty thousand"), ["20", "20000"])
+        self.assertEqual(tokens("a lot"), ["a", "lot"])
+
+    def test_uhm_is_a_filler(self):
+        self.assertEqual(metrics.normalize_tokens("uhm yes"), ["yes"])
 
     def test_digits_split_runs_and_are_kept(self):
         self.assertEqual(metrics.normalize_tokens("twenty 5 apples"), ["20", "5", "apples"])
@@ -89,7 +106,7 @@ class NormalizedTokenContract(unittest.TestCase):
         self.assertEqual(metrics.normalize_tokens("salt & pepper"), ["salt", "and", "pepper"])
         self.assertEqual(metrics.normalize_tokens("one hundred and five"), ["105"])
         self.assertEqual(metrics.normalize_tokens("two thousand twenty six"), ["2026"])
-        self.assertEqual(metrics.normalize_tokens("a hundred"), ["a", "100"])
+        self.assertEqual(metrics.normalize_tokens("a hundred"), ["100"])
         self.assertEqual(metrics.normalize_tokens("no one came"), ["no", "1", "came"])
         self.assertEqual(metrics.normalize_tokens("bread and butter"), ["bread", "and", "butter"])
         self.assertEqual(metrics.normalize_tokens("version 3"), ["version", "3"])

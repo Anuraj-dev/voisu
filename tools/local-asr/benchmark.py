@@ -173,7 +173,7 @@ def _explicit_split(row: Mapping[str, Any], record_id: str) -> str | None:
     `"split": "heldout"` (or `"heldout": true`) holds a clip out; `"development"`
     (alias `"tuning"`, the bakeoff's name; or `"heldout": false`) keeps it for
     tuning.  The bakeoff lock needs at least 80 held-out speech clips and at
-    most 20 tuning ones, which a hashed fraction cannot guarantee.
+    most 40 tuning ones, which a hashed fraction cannot guarantee.
     """
 
     split = row.get("split")
