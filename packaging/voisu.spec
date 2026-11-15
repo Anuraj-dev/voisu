@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.81.2
+Version:        0.82.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -167,6 +167,10 @@ install -D -m 0644 packaging/icons/voisu.svg %{buildroot}%{_datadir}/icons/hicol
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Sun Nov 15 2026 Voisu maintainers <voisu@example.invalid> - 0.82.0-1
+- fix(local): keep Local working after upgrades change worker files (#331)
+- feat(tools): bench local ASR models against a locked corpus (#330)
+
 * Sun Nov 15 2026 Voisu maintainers <voisu@example.invalid> - 0.81.2-1
 - fix(local): free Local GPU memory when Cloud is selected (#328)
 
