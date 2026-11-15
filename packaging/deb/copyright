@@ -57,6 +57,22 @@ Comment:
  (https://github.com/peteonrails/voxtype, src/vad/energy.rs at commit fbedd62).
  The notice is also kept in THIRD_PARTY_NOTICES.md in the source tree.
 
+Files: crates/voisu-core/src/vocabulary/phonetic.rs
+Copyright: 2025 Peter Jackson
+ 2026 Anuraj Jit Saikia
+License: MIT
+Comment:
+ Phonetic Dictionary matching is adapted from VoxType src/text/vocabulary.rs
+ (https://github.com/peteonrails/voxtype, commit fbedd62).
+
+Files: crates/voisu-core/src/vocabulary/english-words.txt
+Copyright: 2015 Ilya Semenov
+License: MIT
+Comment:
+ The 30,000 most frequent words of results/enwiki-2023-04-13.txt from
+ https://github.com/IlyaSemenov/wikipedia-word-frequency at commit
+ d11c4fab211156e96ab5943850dd6f98604707fb, embedded in the voisu binaries.
+
 License: MIT
  Permission is hereby granted, free of charge, to any person obtaining a copy
  of this software and associated documentation files (the "Software"), to deal

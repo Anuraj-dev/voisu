@@ -68,6 +68,10 @@ The user-approved global shortcut whose first activation starts a Recording and
 whose next activation stops it.
 _Avoid_: Hold key, push-to-talk key
 
+**Dictionary**:
+The user's own list of words, names and terms that Voisu should spell the user's way. Every Transcript gets exact-match correction: a heard span with the entry's words in order, ignoring case, joined by whitespace or the entry's own separators ("claude code" for "claude-code"), takes the entry's spelling while keeping the heard casing shape; Cloud skips spans Deepgram heard with high confidence. Local Transcripts also get correction by sound: a word or short run of words that sounds like an entry of two or more syllables ("voice you" for "Voisu") is replaced by the entry as written. A run never crosses punctuation, a spaced dash or a line break. A single ordinary English word, a run of everyday words ("way land", "will end"), an acronym, a function word and a capitalized word after the first ("new Vim") are never swapped. A run of ordinary English words, or a single word heard for a short entry ("sofa" for "Sofia") and not capitalized mid-sentence, must sound exactly like the entry, not just close to it. Accepted trade-off: a compound entry spoken as its own two words ("tail wind" for "Tailwind", "jack son" for "Jackson") is swapped, as "deep gram" is for "Deepgram". Cloud Transcripts get exact-match correction only.
+_Avoid_: Vocabulary list, glossary, custom words
+
 **Delivery**:
 Placing the final Transcript into the focused application, with clipboard
 preservation as the fallback.

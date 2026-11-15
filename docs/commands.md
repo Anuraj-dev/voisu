@@ -16,7 +16,7 @@
 | `voisu writing [clean\|exact]` | `clean` fixes punctuation and formatting. `exact` keeps your words as spoken |
 | `voisu layout [plain\|auto\|sections]` | Choose how text is laid out: plain, automatic, or sections |
 | `voisu tone [formal\|informal]` | `formal` keeps full words. `informal` uses chat abbreviations like btw and drops the final full stop |
-| `voisu dictionary add` / `remove <term>` / `list` | Personal pronunciation dictionary |
+| `voisu dictionary add` / `remove <term>` / `list` | Personal pronunciation dictionary. Local mode also corrects entries of two or more syllables by sound |
 | `voisu history [--json\|--verbose]` | List recent Recordings |
 | `voisu export <correlation-id>` | Redacted diagnostic export for one Recording |
 | `voisu doctor [--verbose]` | Host readiness diagnostics |
