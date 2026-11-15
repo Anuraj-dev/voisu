@@ -13,9 +13,11 @@ repository.  Run it through `tools/dev bench ...` or directly.
 
   bench.py run --model ID=MANIFEST [--model ID2=MANIFEST2 ...] [--baseline ID]
       Replay the frozen corpus through the protected `voisu` seam for each
-      model, score it, and write replay.json, report.json, run.json and
-      table.txt to <eval-dir>/runs/<UTC timestamp>/.  `--model ID` alone uses
-      the ready manifest that `models` lists for ID.  The table shows raw and
+      model, score it, and write replay.json, report.json, run.json,
+      run_records.json and table.txt to <eval-dir>/runs/<UTC timestamp>/.
+      `--model ID` alone uses the ready manifest that `models` lists for ID.
+      run_records.json holds one run record per model (see run_records.py)
+      and, with --baseline, the winner-rule verdicts.  The table shows raw and
       delivered WER, per-language WER, words invented on silence (FP), critical
       content misses, and latency.  Changes are shown against the latest
       earlier run (same corpus) of --baseline, or of the model with the most
@@ -53,6 +55,7 @@ from typing import Any, Collection, Mapping, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import benchmark  # noqa: E402  (sibling module; the single source of replay/score logic)
+import run_records  # noqa: E402  (sibling module; run records, comparisons, verdicts)
 
 BenchmarkError = benchmark.BenchmarkError
 
@@ -430,7 +433,31 @@ def run_bench(eval_dir: Path, corpus_path: Path, model_args: Sequence[str], root
     }
     benchmark.write_json(run_dir / "run.json", meta)
     (run_dir / "table.txt").write_text(table + "\n", encoding="utf-8")
+    # Per-config run records for the bakeoff.
+    _, token_map = benchmark.load_spelling_normalizer(normalizer)
+    incumbent = baseline_id if baseline_id in model_ids else None
+    benchmark.write_json(run_dir / "run_records.json", run_records.build_run_report(corpus, evidence, report, configs=_declared_threads(models),
+                                                                                    incumbent=incumbent, token_map=token_map or None))
     return run_dir, report, table
+
+
+def _declared_threads(models: Sequence[str]) -> dict[str, dict[str, Any]]:
+    """Per model_id, the manifest's `limits.cpu_cores` as the declared thread cap.
+
+    It is the CPU cap the protected replay runs under, not an observed thread
+    count; models without one get no entry, so their records say "not measured".
+    """
+
+    configs: dict[str, dict[str, Any]] = {}
+    for item in models:
+        model_id, _, path = item.partition("=")
+        try:
+            cores = json.loads(Path(path).read_text(encoding="utf-8")).get("limits", {}).get("cpu_cores")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(cores, int) and not isinstance(cores, bool) and cores > 0:
+            configs[model_id] = {"threads": cores, "threads_source": "manifest limits.cpu_cores (CPU cap, not an observed thread count)"}
+    return configs
 
 
 def _failure_notes(evidence: Mapping[str, Any]) -> str:
@@ -521,6 +548,7 @@ def _draft_entry(row: Mapping[str, Any]) -> dict[str, Any]:
         "language": UNREVIEWED_LANGUAGE,
         "reference": row["final_transcript"],
         "review_status": "unreviewed",
+        "split": "heldout",  # new clips are held out by default; set "tuning" only to tune on one
         "tags": ["capture", "unreviewed"],
         "source": {
             "kind": "debug-capture", "correlation_id": row["correlation_id"],
