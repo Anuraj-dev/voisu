@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.83.0
+Version:        0.83.1
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -168,6 +168,9 @@ install -D -m 0644 packaging/icons/voisu.svg %{buildroot}%{_datadir}/icons/hicol
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Sun Nov 15 2026 Voisu maintainers <voisu@example.invalid> - 0.83.1-1
+- fix(local): unload an unavailable Local worker when Cloud is selected (#333)
+
 * Sun Nov 15 2026 Voisu maintainers <voisu@example.invalid> - 0.83.0-1
 - feat(local): correct misheard Dictionary names by sound (#332)
 
