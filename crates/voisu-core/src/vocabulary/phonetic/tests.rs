@@ -106,6 +106,8 @@ fn the_edit_distance_bound_rejects_codes_that_only_collide() {
         ("fuss", "Voisu"),
         ("fees", "Voisu"),
         ("phase you", "Voisu"),
+        // A real split hearing, refused because both words are English and
+        // the shapes differ by a vowel (see the bound in `best_match`).
         ("cooper nets", "Kubernetes"),
     ];
     let encoder = DoubleMetaphone::new(None);
@@ -124,31 +126,416 @@ fn the_edit_distance_bound_rejects_codes_that_only_collide() {
             "{heard} -> {entry}"
         );
     }
+    // Refused for the same reason: allowing a vowel change between English
+    // words is what turned "meet you" into `Matteo`.
+    let text = "ask jonah than about it";
+    assert_eq!(apply_phonetic_dictionary(text, &terms(&["Jonathan"])), text);
+}
+
+/// Tech entries of the kind Voisu users add, including two that are also
+/// ordinary words when split ("in box", "log in").
+const TECH: &[&str] = &[
+    "Voisu",
+    "Hyprland",
+    "Deepgram",
+    "Kubernetes",
+    "Tokio",
+    "Wayland",
+    "Mistral",
+    "Redis",
+    "Kotlin",
+    "Neovim",
+    "Postgres",
+    "Anthropic",
+    "Docker",
+    "Ubuntu",
+    "Fedora",
+    "Parakeet",
+    "Pipewire",
+    "Systemd",
+    "Grafana",
+    "Terraform",
+    "Ansible",
+    "Nginx",
+    "Kafka",
+    "Elixir",
+    "Erlang",
+    "Haskell",
+    "Python",
+    "Golang",
+    "Rustacean",
+    "TypeScript",
+    "JavaScript",
+    "Webpack",
+    "Svelte",
+    "Tailwind",
+    "Vercel",
+    "Netlify",
+    "Supabase",
+    "Firebase",
+    "Mongo",
+    "MySQL",
+    "SQLite",
+    "Cassandra",
+    "Prometheus",
+    "Jenkins",
+    "GitHub",
+    "GitLab",
+    "Bitbucket",
+    "Jira",
+    "Confluence",
+    "Figma",
+    "Notion",
+    "Obsidian",
+    "Raycast",
+    "Alacritty",
+    "Kitty",
+    "Wezterm",
+    "Zellij",
+    "Tmux",
+    "Ollama",
+    "Llama",
+    "Gemini",
+    "Claude Code",
+    "OpenAI",
+    "Whisper",
+    "Qwen",
+    "Groq",
+    "Mixtral",
+    "Pytorch",
+    "TensorFlow",
+    "Jupyter",
+    "Numpy",
+    "Pandas",
+    "Matplotlib",
+    "Fastapi",
+    "Django",
+    "Flask",
+    "Rails",
+    "Laravel",
+    "Symfony",
+    "Kubectl",
+    "Helm",
+    "Istio",
+    "Envoy",
+    "Traefik",
+    "Caddy",
+    "Cloudflare",
+    "Tailscale",
+    "Wireguard",
+    "OpenSSH",
+    "Gnome",
+    "Plasma",
+    "Omarchy",
+    "Arch Linux",
+    "Pacman",
+    "Flatpak",
+    "Snapcraft",
+    "Inbox",
+    "Login",
+];
+
+/// Common first names across several languages, led by the ones everyday
+/// phrases once turned into ("nice to meet you" became `Matteo`).
+const NAMES: &[&str] = &[
+    "Matteo",
+    "Harry",
+    "Nora",
+    "Lucia",
+    "Anna",
+    "Oliver",
+    "Sofia",
+    "Hudson",
+    "Ethan",
+    "Priyanka",
+    "Anuraj",
+    "Jonathan",
+    "Rebecca",
+    "Sarah",
+    "Aaron",
+    "Daniel",
+    "Maria",
+    "Olivia",
+    "Ellen",
+    "Emma",
+    "Ava",
+    "Isabella",
+    "Mia",
+    "Amelia",
+    "Harper",
+    "Evelyn",
+    "Abigail",
+    "Emily",
+    "Ella",
+    "Elizabeth",
+    "Camila",
+    "Luna",
+    "Mila",
+    "Aria",
+    "Scarlett",
+    "Penelope",
+    "Layla",
+    "Chloe",
+    "Victoria",
+    "Madison",
+    "Eleanor",
+    "Grace",
+    "Hazel",
+    "Violet",
+    "Aurora",
+    "Savannah",
+    "Audrey",
+    "Brooklyn",
+    "Bella",
+    "Claire",
+    "Skylar",
+    "Lucy",
+    "Paisley",
+    "Everly",
+    "Liam",
+    "Noah",
+    "William",
+    "Elijah",
+    "Lucas",
+    "Mason",
+    "Logan",
+    "Alexander",
+    "Jacob",
+    "Michael",
+    "Sebastian",
+    "Mateo",
+    "Jackson",
+    "Levi",
+    "Henry",
+    "Owen",
+    "Wyatt",
+    "Dylan",
+    "Luke",
+    "Gabriel",
+    "Anthony",
+    "Isaac",
+    "Grayson",
+    "Julian",
+    "Christopher",
+    "Joshua",
+    "Andrew",
+    "Lincoln",
+    "Ezra",
+    "Hunter",
+    "Connor",
+    "Jeremiah",
+    "Easton",
+    "Kai",
+    "Arjun",
+    "Rohan",
+    "Ananya",
+    "Deepika",
+    "Vikram",
+    "Rahul",
+    "Aditi",
+    "Kavya",
+    "Ishaan",
+    "Neha",
+    "Pooja",
+    "Sanjay",
+    "Tanvi",
+    "Yusuf",
+];
+
+/// A full 200-entry Dictionary: every tech entry, then names up to the limit.
+fn names_and_tech() -> Vec<String> {
+    let dictionary: Vec<String> = TECH
+        .iter()
+        .chain(NAMES)
+        .take(USER_VOCABULARY_TERM_LIMIT)
+        .map(|term| (*term).to_owned())
+        .collect();
+    assert_eq!(dictionary.len(), USER_VOCABULARY_TERM_LIMIT);
+    dictionary
+}
+
+/// Everyday dictation that once swapped to a name or a tool ("I hear you"
+/// became `Harry`, "will end" became `Wayland`), plus more of the same kind.
+const EVERYDAY_PHRASES: &[&str] = &[
+    "It was nice to meet you",
+    "I hear you",
+    "Here you go",
+    "Is there a pharmacy near you?",
+    "I met you last year",
+    "I don't want to lose you",
+    "Which one you want",
+    "There was paint all over the floor",
+    "so if you delete it",
+    "I'll take you to the station",
+    "He took you there",
+    "The meeting will end at five",
+    "I had son and daughter",
+    "We went out then came back",
+    "the most royal family",
+    "road days are long",
+    "Thank you so much",
+    "See you later",
+    "Can you hear me",
+    "I miss you",
+    "Did you get my message",
+    "Are you coming tonight",
+    "Let me know when you arrive",
+    "I'll call you back",
+    "Nice to see you again",
+    "What do you think",
+    "Do you want some coffee",
+    "Could you send me the file",
+    "I love you",
+    "I told you so",
+    "Before you go",
+    "After you finish",
+    "Bless you",
+    "Good to hear from you",
+    "I'll text you tomorrow",
+    "Will you marry me",
+    "Here we go again",
+    "Give you a call",
+    "Got you covered",
+    "Mind you",
+    "Show you around",
+    "Catch you later",
+    "Hold on a second",
+    "Let me check my notes",
+    "Please review the pull request",
+    "The rain fell all over the town",
+    "Pick you up at noon",
+    "Wait for you outside",
+    "Lend you a hand",
+    "Owe you one",
+    "Remind you later",
+    "Ask you something",
+    "Tell you what",
+    "Teach you how",
+    "Join you there",
+    "Follow you home",
+    "Meet you there",
+    "Trust you completely",
+    "Pay you back",
+    "Beat you to it",
+    "Need you here",
+    "Visit you soon",
+    "Hear you loud and clear",
+    "Near you now",
+    "Keep you posted",
+    "Leave you alone",
+    "Help you out",
+    "Make you happy",
+    "Write you a note",
+    "Read you the list",
+    "Forgive you",
+    "Believe you",
+    "the road we took was way longer",
+    "we walked east one more block",
+    "check your in box first",
+    "please log in again",
+    "the LUKS header is fine",
+    "set the isk value",
+    "Raise your voice and face the deep program",
+    "a happy hyperlink can help the highland governess cover current energy",
+];
+
+#[test]
+fn everyday_phrases_are_never_swapped_against_a_full_dictionary() {
+    let dictionary = names_and_tech();
+    for &phrase in EVERYDAY_PHRASES {
+        assert_eq!(
+            apply_phonetic_dictionary(phrase, &dictionary),
+            phrase,
+            "{phrase:?} must stay"
+        );
+    }
 }
 
 #[test]
-fn common_english_words_are_never_swapped_against_a_realistic_dictionary() {
-    let dictionary = realistic();
-    let common = "the be to of and a in that have I it for not on with he as you do at \
-        this but his by from they we say her she or an will my one all would there their \
-        what so up out if about who get which go me when make can like time no just him \
-        know take people into year your good some could them see other than then now look \
-        only come its over think also back after use two how our work first well way even \
-        new want because any these give day most us voice voices face phase vice vase fuss \
-        focus deep program happy realm hyper land cover governess cabinets current anger \
-        energy injury honor enrage and you new rage hyperlink pipe wire tail scale grams \
-        diagram deacon digger dagger hippie helper harland holland highland heartland \
-        kerberos cubans cabernet copernicus vista visa voicemail voiceover invoice noise";
-    for word in common.split_whitespace() {
+fn true_hearings_still_swap_against_a_full_dictionary() {
+    let dictionary = names_and_tech();
+    for (heard, expected) in [
+        ("voice you is great", "Voisu is great"),
+        ("switch on hyper land now", "switch on Hyprland now"),
+        ("Voice you is open", "Voisu is open"),
+        ("try voice-you now", "try Voisu now"),
+        ("ask pre yanka about it", "ask Priyanka about it"),
+        ("write it in cot lin", "write it in Kotlin"),
+        ("I use new vim daily", "I use Neovim daily"),
+        ("the post gress database", "the Postgres database"),
+        (
+            "deploy on cuber net ease today",
+            "deploy on Kubernetes today",
+        ),
+        ("ask clawed code to fix it", "ask Claude Code to fix it"),
+        // Split hearings spelled exactly like the entry.
+        ("the deep gram model is fine", "the Deepgram model is fine"),
+        ("deploy on kuber netes", "deploy on Kubernetes"),
+        ("call anu raj later", "call Anuraj later"),
+        ("install fed ora today", "install Fedora today"),
+        ("tell re becca hello", "tell Rebecca hello"),
+        ("run dock er compose", "run Docker compose"),
+    ] {
         assert_eq!(
-            apply_phonetic_dictionary(word, &dictionary),
-            word,
-            "{word} must stay"
+            apply_phonetic_dictionary(heard, &dictionary),
+            expected,
+            "{heard:?}"
         );
     }
-    let sentence = "Raise your voice and face the deep program; a happy hyperlink can help \
-        the highland governess cover current energy.";
-    assert_eq!(apply_phonetic_dictionary(sentence, &dictionary), sentence);
+}
+
+#[test]
+fn split_entry_words_that_are_function_words_stay() {
+    // "in box" and "log in" spell `Inbox` and `Login`, but "in" is a function
+    // word: the speaker almost always meant the two words.
+    let dictionary = terms(&["Inbox", "Login"]);
+    for text in ["check your in box", "please log in now"] {
+        assert_eq!(apply_phonetic_dictionary(text, &dictionary), text, "{text}");
+    }
+}
+
+#[test]
+fn everyday_runs_stay_even_when_they_spell_the_entry() {
+    for (text, entry) in [
+        ("the way land goes", "Wayland"),
+        ("walk east one block", "Easton"),
+        ("we went out then", "Ethan"),
+        ("paint all over it", "Oliver"),
+    ] {
+        assert_eq!(
+            apply_phonetic_dictionary(text, &terms(&[entry])),
+            text,
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn a_hearing_never_gains_a_syllable_and_acronyms_stay() {
+    for (text, entry) in [
+        ("set the isk value", "Isaac"),
+        ("open the luks volume", "Lucas"),
+        ("open the LUKS volume", "Lucas"),
+        ("the CVE list", "Kevin"),
+    ] {
+        assert_eq!(
+            apply_phonetic_dictionary(text, &terms(&[entry])),
+            text,
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn a_hearing_never_leaves_a_stray_word_behind() {
+    // "toe key oh" once became "Tokio oh". It is now refused outright: all
+    // three are English words, and no exact sound shape covers them.
+    let text = "use toe key oh for async";
+    let corrected = apply_phonetic_dictionary(text, &terms(&["Tokio"]));
+    assert!(
+        corrected == text || corrected == "use Tokio for async",
+        "{corrected}"
+    );
 }
 
 #[test]
@@ -207,11 +594,11 @@ fn the_lexicon_is_a_plain_lowercase_word_list() {
     assert!(lexicon.len() >= 29_000, "{}", lexicon.len());
     assert!(
         lexicon
-            .iter()
+            .keys()
             .all(|word| { !word.is_empty() && word.bytes().all(|byte| byte.is_ascii_lowercase()) })
     );
     for word in ["sorry", "iron", "tunnel", "merry", "jeans", "walls"] {
-        assert!(lexicon.contains(word), "{word}");
+        assert!(lexicon.contains_key(word), "{word}");
     }
 }
 
@@ -352,11 +739,21 @@ fn entry_casing_is_kept_and_capitals_only_start_sentences() {
 
 #[test]
 fn a_full_dictionary_over_a_long_transcript_is_fast() {
-    let dictionary: Vec<String> = (0..USER_VOCABULARY_TERM_LIMIT)
-        .map(|index| format!("Zentrova{}", ["lin", "dar", "mex", "pol"][index % 4]))
-        .chain(realistic())
-        .take(USER_VOCABULARY_TERM_LIMIT)
+    // 10 x 20 distinct two-part names. Several share Double Metaphone codes
+    // with the transcript (Voisu, Voisko, Hyprland, Deepgram), so
+    // the shape comparison really runs.
+    let heads = ["Vo", "Hy", "Dee", "Ku", "Za", "Mo", "Te", "Ri", "Pa", "Lo"];
+    let tails = [
+        "isu", "prland", "pgram", "bern", "lin", "dar", "mex", "pol", "vane", "isko", "rith",
+        "mund", "tova", "nexa", "quil", "brio", "fent", "gado", "huma", "jolt",
+    ];
+    let dictionary: Vec<String> = heads
+        .iter()
+        .flat_map(|head| tails.iter().map(move |tail| format!("{head}{tail}")))
         .collect();
+    let distinct: HashSet<String> = dictionary.iter().map(|term| term.to_lowercase()).collect();
+    assert_eq!(distinct.len(), USER_VOCABULARY_TERM_LIMIT);
+    assert_eq!(dictionary.len(), USER_VOCABULARY_TERM_LIMIT);
     let sentence = "so I said voice you runs on hyper land and the deep gram model is fine ";
     let text = sentence.repeat(2000 / sentence.split_whitespace().count() + 1);
     let words = text.split_whitespace().count();

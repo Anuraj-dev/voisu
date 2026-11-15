@@ -69,7 +69,7 @@ whose next activation stops it.
 _Avoid_: Hold key, push-to-talk key
 
 **Dictionary**:
-The user's own list of words, names and terms that Voisu should spell the user's way. Every Transcript gets exact-match correction: a heard span that already spells an entry, ignoring case and spacing, takes the entry's spelling while keeping the heard casing shape; Cloud skips spans Deepgram heard with high confidence. Local Transcripts also get correction by sound: a word or short run of words that sounds like an entry of two or more syllables ("voice you" for "Voisu") is replaced by the entry as written. A run never crosses punctuation, a spaced dash or a line break, and a single ordinary English word is never swapped. Cloud Transcripts get exact-match correction only.
+The user's own list of words, names and terms that Voisu should spell the user's way. Every Transcript gets exact-match correction: a heard span with the entry's words in order, ignoring case, joined by whitespace or the entry's own separators ("claude code" for "claude-code"), takes the entry's spelling while keeping the heard casing shape; Cloud skips spans Deepgram heard with high confidence. Local Transcripts also get correction by sound: a word or short run of words that sounds like an entry of two or more syllables ("voice you" for "Voisu") is replaced by the entry as written. A run never crosses punctuation, a spaced dash or a line break. A single ordinary English word, a run of everyday words ("way land", "I hear you"), an acronym and a function word are never swapped, and a run of ordinary English words must sound exactly like the entry, not just close to it. Cloud Transcripts get exact-match correction only.
 _Avoid_: Vocabulary list, glossary, custom words
 
 **Delivery**:
