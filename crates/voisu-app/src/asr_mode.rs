@@ -420,6 +420,7 @@ pub fn admit_recording_at(
     state_dir: &Path,
 ) -> Result<RecordingAdmission, AdmissionError> {
     let (mode, revision) = load_mode(config_path, state_dir)?;
+    crate::local_routing::note_engine_selection(mode, revision);
     match select_resources(mode) {
         AsrPathResources::Cloud => Ok(RecordingAdmission::Cloud { mode, revision }),
         AsrPathResources::Local { readiness } if readiness.admits_capture() => {
@@ -481,22 +482,27 @@ pub fn status_report_at(
         );
     };
     match load_mode(config_path, state_dir) {
-        Ok((mode, revision)) => AsrModeStatus {
-            pending: Some(mode),
-            active,
-            revision: Some(revision),
-            local_readiness: match mode {
-                AsrMode::Cloud => LocalReadiness::Absent,
-                AsrMode::Local => runtime_local_readiness(),
-            },
-            admission_error: None,
-            audio_retention: Some(crate::local_recovery::audio_retention_label(
-                std::env::var_os("VOISU_DEBUG_CAPTURE").is_some(),
-                crate::local_recovery::enabled(),
-            )),
-            local_path_clean: (mode == AsrMode::Local)
-                .then(crate::local_routing::sentinel_is_clean),
-        },
+        Ok((mode, revision)) => {
+            // Before any Local readiness refresh is queued, so that refresh
+            // sees this choice (or a newer one) and Cloud loads nothing.
+            crate::local_routing::note_engine_selection(mode, revision);
+            AsrModeStatus {
+                pending: Some(mode),
+                active,
+                revision: Some(revision),
+                local_readiness: match mode {
+                    AsrMode::Cloud => LocalReadiness::Absent,
+                    AsrMode::Local => runtime_local_readiness(),
+                },
+                admission_error: None,
+                audio_retention: Some(crate::local_recovery::audio_retention_label(
+                    std::env::var_os("VOISU_DEBUG_CAPTURE").is_some(),
+                    crate::local_recovery::enabled(),
+                )),
+                local_path_clean: (mode == AsrMode::Local)
+                    .then(crate::local_routing::sentinel_is_clean),
+            }
+        }
         Err(error) => blocked_status(active, error.message()),
     }
 }

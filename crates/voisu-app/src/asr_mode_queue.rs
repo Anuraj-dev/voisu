@@ -36,10 +36,22 @@ enum AsrModeJob {
     },
 }
 
+/// Applies each committed Engine choice to the Local gate before the reply
+/// and any later queued Start; a switch to Cloud unloads an idle Local worker.
+fn applying_engine(persist: PersistFn) -> PersistFn {
+    Box::new(move |mode| {
+        let commit = persist(mode);
+        if let Ok(commit) = &commit {
+            crate::local_routing::apply_engine_selection(commit.mode, commit.revision);
+        }
+        commit
+    })
+}
+
 impl AsrModeQueue {
     pub fn spawn() -> Self {
         Self::spawn_with(
-            Box::new(persist_asr_mode),
+            applying_engine(Box::new(persist_asr_mode)),
             Box::new(asr_mode::admit_capture),
         )
     }
@@ -215,5 +227,45 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_committed_cloud_switch_unloads_the_local_worker() {
+        use crate::local_routing::{
+            TEST_ENGINE_REVISION, inject_ready, join_cloud_unloads_for_tests,
+            local_worker_loaded_for_tests, test_session,
+        };
+        let _session = test_session();
+        inject_ready(
+            crate::local_model::from_entry(crate::local_model::ci_fixture_entry(), "queue"),
+            "hello",
+        );
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("config.toml");
+        // The committed revision stands in for persist_asr_mode's disk write;
+        // the wrapper is the one `spawn` installs.
+        let queue = AsrModeQueue::spawn_with(
+            applying_engine(Box::new(move |mode| {
+                Ok(AsrModeCommit {
+                    mode,
+                    revision: TEST_ENGINE_REVISION + 1,
+                    path: path.clone(),
+                })
+            })),
+            Box::new(|_kind, daemon_state, _active| {
+                Err(Box::new(Response::rejected(Some(daemon_state), "unused")))
+            }),
+        );
+        let (persist_tx, persist_rx) = oneshot::channel();
+        queue.persist(
+            AsrMode::Cloud,
+            DaemonState::Idle,
+            Some(AsrMode::Local),
+            persist_tx,
+        );
+        let persisted = persist_rx.blocking_recv().expect("persist reply");
+        assert!(persisted.ok, "{}", persisted.message);
+        join_cloud_unloads_for_tests();
+        assert!(!local_worker_loaded_for_tests());
     }
 }

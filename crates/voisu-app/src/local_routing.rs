@@ -37,6 +37,13 @@ pub use silent::{CloudFreeProvider, cloud_free_slots};
 
 const LOCAL_UNAVAILABLE: &str = "Local selected; model unavailable";
 const LOCAL_NOT_READY: &str = "Local ASR is unavailable; Start refused before capture";
+/// A Local worker process that would not exit when asked; it may still hold
+/// memory, so Local stays unavailable instead of relaunching beside it.
+const LOCAL_UNREAPED: &str = "previous Local worker unreaped; it may still hold memory";
+
+/// Latest Engine choice the daemon has seen, with its persisted revision. A
+/// stale reader (older revision) never overwrites a newer commit.
+type EngineSelection = Arc<Mutex<Option<(AsrMode, u64)>>>;
 
 #[cfg(test)]
 type GateWorker = FakeWorker;
@@ -67,6 +74,12 @@ struct Gate {
     coordinator: DeliveryCoordinator,
     sentinel: CloudCapabilitySentinel,
     published_sentinel: Arc<AtomicBool>,
+    /// Cloud selected: passive refresh never launches the worker and an idle
+    /// one is unloaded; busy work keeps it until release.
+    engine: EngineSelection,
+    /// Runs a Cloud unload off the caller's thread once the gate lock is free;
+    /// false means nothing was scheduled and the caller drains inline.
+    schedule_unload: Box<dyn Fn() -> bool + Send>,
     /// Pins this worker from admission through capture and inference. Refresh
     /// cannot replace or invalidate it until completion or abandonment.
     admitted_generation: Option<u64>,
@@ -112,6 +125,8 @@ impl Gate {
             coordinator: DeliveryCoordinator::new(),
             sentinel: CloudCapabilitySentinel::new(),
             published_sentinel: Arc::new(AtomicBool::new(true)),
+            engine: Arc::new(Mutex::new(None)),
+            schedule_unload: Box::new(|| false),
             admitted_generation: None,
             admitted_recording: None,
             pending_permit: None,
@@ -159,7 +174,79 @@ impl Gate {
                 self.not_ready()
             };
             self.publish(self.readiness.clone());
+            // Work admitted before a switch to Cloud has now finished. Release
+            // runs on the daemon actor, so the reap (seconds for a stuck
+            // worker) happens on the unload thread, under this same lock.
+            if self.cloud_unload_due() && !(self.schedule_unload)() {
+                self.unload_for_cloud();
+            }
         }
+    }
+
+    fn cloud_selected(&self) -> bool {
+        matches!(
+            *self
+                .engine
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()),
+            Some((AsrMode::Cloud, _))
+        )
+    }
+
+    /// Records a committed Engine switch; Cloud unloads an idle worker now.
+    #[cfg(test)]
+    fn select_engine(&mut self, mode: AsrMode, revision: u64) {
+        record_engine(&self.engine, mode, revision);
+        self.unload_for_cloud();
+    }
+
+    /// Cloud is selected and an idle worker is loaded with no admitted,
+    /// checked-out or in-flight work holding it.
+    fn cloud_unload_due(&self) -> bool {
+        self.cloud_selected()
+            && self.admitted_generation.is_none()
+            && !self.inference_checked_out
+            && self.lifecycle.has_child()
+            && !matches!(
+                self.lifecycle.state(),
+                WorkerState::Busy | WorkerState::Stopping
+            )
+    }
+
+    /// With Cloud selected, unload an idle worker. Admitted, checked-out or
+    /// in-flight work is never dropped: `release_admission` schedules this
+    /// again once that work is done. Every caller holds the gate lock, the
+    /// same lock admission takes, so a drain cannot interleave with an
+    /// admission.
+    fn unload_for_cloud(&mut self) {
+        if !self.cloud_unload_due() {
+            return;
+        }
+        // The receipt stays, so a switch back to Local relaunches the same
+        // model on the next refresh or admission. Only a child confirmed gone
+        // is Absent: a survivor may still hold VRAM.
+        self.readiness = match self.lifecycle.drain_for_cloud_selection() {
+            Ok(_) if !self.lifecycle.has_child() => LocalReadiness::Absent,
+            result => {
+                self.worker_failure = Some(match result {
+                    Err(error) => format!("{LOCAL_UNREAPED}: {error}"),
+                    Ok(_) => LOCAL_UNREAPED.to_owned(),
+                });
+                self.lifecycle.mark_unavailable();
+                self.not_ready()
+            }
+        };
+        self.publish(self.readiness.clone());
+    }
+
+    /// Cloud was selected while this refresh verified the model: launch
+    /// nothing. The receipt stays for a later switch back to Local.
+    fn cloud_preempts_launch(&mut self) -> bool {
+        if !self.cloud_selected() {
+            return false;
+        }
+        self.readiness = LocalReadiness::Absent;
+        true
     }
 
     fn admit(&mut self, kind_ready_required: bool) -> LocalAdmission {
@@ -189,6 +276,12 @@ impl Gate {
     }
 
     fn refresh_passive(&mut self) -> LocalReadiness {
+        if self.cloud_selected() {
+            // A refresh queued while Local was selected may run after the
+            // switch: Cloud never loads the Local worker, it only unloads one.
+            self.unload_for_cloud();
+            return self.readiness.clone();
+        }
         if crate::local_model::runtime_selection(&crate::local_model::shipped_catalog()).is_none()
             && !crate::local_model::development_local_enabled()
             && matches!(self.readiness, LocalReadiness::Unavailable { .. })
@@ -313,6 +406,9 @@ impl Gate {
                 self.readiness = self.not_ready();
                 return self.readiness.clone();
             }
+            if self.cloud_preempts_launch() {
+                return self.readiness.clone();
+            }
             if !self.install_selected_worker(&selected) {
                 self.lifecycle.mark_unavailable();
                 self.readiness = self.not_ready();
@@ -325,10 +421,17 @@ impl Gate {
             };
             return self.readiness.clone();
         } else if self.lifecycle.has_child() {
+            // A child that is not Ready and was never reaped (verification
+            // above clears the older failure detail).
+            self.worker_failure
+                .get_or_insert_with(|| LOCAL_UNREAPED.to_owned());
             self.lifecycle.mark_unavailable();
             self.readiness = self.not_ready();
             return self.readiness.clone();
         } else if self.lifecycle.can_launch_replacement() {
+            if self.cloud_preempts_launch() {
+                return self.readiness.clone();
+            }
             if self.install_selected_worker(&selected) {
                 self.receipt = Some(selected);
             } else {
@@ -845,6 +948,8 @@ fn gate() -> &'static Mutex<Gate> {
         let mut gate = Gate::new();
         gate.published = published_readiness().clone();
         gate.published_sentinel = published_sentinel().clone();
+        gate.engine = engine_selection().clone();
+        gate.schedule_unload = Box::new(spawn_cloud_unload);
         Mutex::new(gate)
     })
 }
@@ -864,6 +969,104 @@ fn published_snapshot(published: &Mutex<LocalReadiness>) -> LocalReadiness {
         .map(|readiness| readiness.clone())
         .unwrap_or_else(|_| refresh_failed_readiness())
 }
+
+fn engine_selection() -> &'static EngineSelection {
+    static ENGINE: OnceLock<EngineSelection> = OnceLock::new();
+    ENGINE.get_or_init(|| Arc::new(Mutex::new(None)))
+}
+
+fn record_engine(slot: &Mutex<Option<(AsrMode, u64)>>, mode: AsrMode, revision: u64) {
+    let mut seen = slot.lock().unwrap_or_else(|poison| poison.into_inner());
+    if seen.is_none_or(|(_, latest)| revision >= latest) {
+        *seen = Some((mode, revision));
+    }
+}
+
+/// The Engine choice as just read from disk (status or admission). Never
+/// blocks on the gate, so status polls stay cheap.
+pub fn note_engine_selection(mode: AsrMode, revision: u64) {
+    record_engine(engine_selection(), mode, revision);
+}
+
+/// A committed Engine switch. Cloud unloads an idle Local worker; busy work
+/// keeps it until that work is released. The choice is recorded before this
+/// returns; the unload waits for the gate on its own thread so the switch
+/// reply never waits behind a model verification. A late unload cannot undo
+/// a newer switch back to Local: it rechecks the revision-ordered choice
+/// under the gate lock.
+pub fn apply_engine_selection(mode: AsrMode, revision: u64) {
+    note_engine_selection(mode, revision);
+    if mode == AsrMode::Cloud && !spawn_cloud_unload() {
+        // No thread: drain here (the persist queue, not the daemon actor).
+        match gate().lock() {
+            Ok(mut gate) => gate.unload_for_cloud(),
+            Err(poison) => publish_poisoned_gate(poison),
+        }
+    }
+}
+
+/// Unloads an idle Local worker on its own thread once the global gate is
+/// free. False when the thread could not start; the caller drains inline.
+fn spawn_cloud_unload() -> bool {
+    let spawned = std::thread::Builder::new()
+        .name("local-cloud-unload".into())
+        .spawn(|| match gate().lock() {
+            Ok(mut gate) => gate.unload_for_cloud(),
+            Err(poison) => publish_poisoned_gate(poison),
+        });
+    match spawned {
+        Ok(handle) => {
+            #[cfg(test)]
+            cloud_unloads()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push(handle);
+            #[cfg(not(test))]
+            drop(handle);
+            true
+        }
+        Err(error) => {
+            eprintln!("Local worker unload thread failed to start ({error}); unloading inline");
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+fn cloud_unloads() -> &'static Mutex<Vec<std::thread::JoinHandle<()>>> {
+    static HANDLES: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
+    &HANDLES
+}
+
+/// Test-only: wait for every scheduled Cloud unload. Call without the gate.
+#[cfg(test)]
+pub fn join_cloud_unloads_for_tests() {
+    loop {
+        let handles = std::mem::take(
+            &mut *cloud_unloads()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()),
+        );
+        if handles.is_empty() {
+            return;
+        }
+        for handle in handles {
+            handle.join().expect("Cloud unload thread");
+        }
+    }
+}
+
+/// Test-only: whether the global gate holds a Local worker process.
+#[cfg(test)]
+pub fn local_worker_loaded_for_tests() -> bool {
+    gate().lock().expect("gate").lifecycle.has_child()
+}
+
+/// Test-only Engine revisions start above this. Unrelated tests read their own
+/// temp configs (small revisions) in parallel; the revision order keeps those
+/// reads out of the shared slot during a gate test session.
+#[cfg(test)]
+pub const TEST_ENGINE_REVISION: u64 = 1 << 40;
 
 fn published_sentinel() -> &'static Arc<AtomicBool> {
     static CLEAN: OnceLock<Arc<AtomicBool>> = OnceLock::new();
@@ -1524,10 +1727,21 @@ pub fn inject_ready(receipt: ActiveReceipt, text: &str) {
 
 #[cfg(test)]
 pub fn reset_gate_for_tests() {
+    // A previous test's unload must not reach this test's worker.
+    join_cloud_unloads_for_tests();
     if let Ok(mut gate) = gate().lock() {
         *gate = Gate::new();
         gate.published = published_readiness().clone();
         gate.published_sentinel = published_sentinel().clone();
+        // The production slot and scheduler. Seeded Local above every
+        // revision a parallel test's temp config can reach.
+        gate.engine = engine_selection().clone();
+        *gate
+            .engine
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) =
+            Some((AsrMode::Local, TEST_ENGINE_REVISION));
+        gate.schedule_unload = Box::new(spawn_cloud_unload);
         gate.reset_sentinel();
         gate.publish(LocalReadiness::Absent);
     }
@@ -1560,6 +1774,217 @@ mod tests {
             ..Default::default()
         });
         (state, gate, receipt)
+    }
+
+    fn next_consented_worker(receipt: &ActiveReceipt) -> FakeWorker {
+        FakeWorker {
+            model_receipt_hash: receipt.receipt_hash.clone(),
+            observed_device: "cuda:0".into(),
+            scripted_text: Some("still delivered".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn passive_refresh_with_cloud_selected_launches_nothing() {
+        let (_state, mut gate, _) = consented_gate();
+        // Status read Cloud; an older Local read arriving late cannot undo it.
+        record_engine(&gate.engine, AsrMode::Cloud, 2);
+        record_engine(&gate.engine, AsrMode::Local, 1);
+        for _ in 0..3 {
+            assert!(!gate.refresh_passive().admits_capture());
+        }
+        assert_eq!(gate.launch_count, 0);
+        assert_eq!(
+            gate.verification_count.get(),
+            0,
+            "Cloud must not hash models"
+        );
+        assert!(!gate.lifecycle.has_child());
+        // Switching back to Local loads on the next refresh as before.
+        record_engine(&gate.engine, AsrMode::Local, 3);
+        assert!(matches!(
+            gate.refresh_passive(),
+            LocalReadiness::Ready { .. }
+        ));
+        assert_eq!(gate.launch_count, 1);
+    }
+
+    #[test]
+    fn switch_to_cloud_unloads_an_idle_worker() {
+        let (_state, mut gate, receipt) = consented_gate();
+        assert!(matches!(gate.refresh(), LocalReadiness::Ready { .. }));
+        assert!(gate.lifecycle.has_child());
+        gate.select_engine(AsrMode::Cloud, 1);
+        assert!(!gate.lifecycle.has_child());
+        assert_eq!(gate.lifecycle.state(), WorkerState::Absent);
+        assert_eq!(published_snapshot(&gate.published), LocalReadiness::Absent);
+        assert_eq!(gate.refresh_passive(), LocalReadiness::Absent);
+        assert_eq!(gate.launch_count, 1);
+        // Back to Local: the same receipt relaunches.
+        gate.select_engine(AsrMode::Local, 2);
+        gate.test_next_worker = Some(next_consented_worker(&receipt));
+        assert!(matches!(gate.refresh(), LocalReadiness::Ready { .. }));
+        assert_eq!(gate.launch_count, 2);
+        assert!(gate.lifecycle.has_child());
+    }
+
+    #[test]
+    fn an_unreaped_cloud_unload_is_unavailable_with_a_reason() {
+        let (_state, mut gate, receipt) = consented_gate();
+        gate.test_next_worker = Some(FakeWorker {
+            reap: crate::local_worker::ReapOutcome::Unreaped,
+            ..next_consented_worker(&receipt)
+        });
+        assert!(matches!(gate.refresh(), LocalReadiness::Ready { .. }));
+        gate.select_engine(AsrMode::Cloud, 1);
+        // The process survived: it may still hold VRAM, so never "Absent".
+        assert!(gate.lifecycle.has_child());
+        let published = published_snapshot(&gate.published);
+        assert!(
+            matches!(&published, LocalReadiness::Unavailable { error } if error.contains("unreaped")),
+            "{published:?}"
+        );
+        // Back to Local: the surviving process blocks a relaunch and says why.
+        gate.select_engine(AsrMode::Local, 2);
+        let readiness = gate.refresh();
+        assert!(
+            matches!(&readiness, LocalReadiness::Unavailable { error } if error.contains("unreaped")),
+            "{readiness:?}"
+        );
+        assert_eq!(gate.launch_count, 1);
+    }
+
+    #[test]
+    fn clean_engine_cycles_never_exhaust_the_restart_budget() {
+        let (_state, mut gate, receipt) = consented_gate();
+        let cycles = crate::local_worker::MAX_RESTARTS + 2;
+        for cycle in 0..cycles {
+            let revision = 2 * cycle as u64;
+            gate.select_engine(AsrMode::Local, revision);
+            gate.test_next_worker = Some(next_consented_worker(&receipt));
+            let readiness = gate.refresh_passive();
+            assert!(
+                matches!(readiness, LocalReadiness::Ready { .. }),
+                "cycle {cycle}: {readiness:?}"
+            );
+            gate.select_engine(AsrMode::Cloud, revision + 1);
+            assert!(!gate.lifecycle.has_child(), "cycle {cycle}");
+        }
+        assert_eq!(gate.launch_count as usize, cycles);
+    }
+
+    #[test]
+    fn cloud_selected_while_a_refresh_verifies_launches_nothing() {
+        let (_state, mut gate, _) = consented_gate();
+        // Local when the refresh starts; Cloud lands while it verifies.
+        let engine = gate.engine.clone();
+        gate.test_before_refresh = Some(Box::new(move || {
+            record_engine(&engine, AsrMode::Cloud, 1);
+        }));
+        assert_eq!(gate.refresh_passive(), LocalReadiness::Absent);
+        assert_eq!(gate.launch_count, 0);
+        assert!(!gate.lifecycle.has_child());
+        assert_eq!(published_snapshot(&gate.published), LocalReadiness::Absent);
+    }
+
+    #[test]
+    fn committed_cloud_switch_unloads_the_global_worker() {
+        let _session = test_session();
+        inject_ready(fixture_receipt(), "hello");
+        assert!(local_worker_loaded_for_tests());
+        apply_engine_selection(AsrMode::Cloud, TEST_ENGINE_REVISION + 1);
+        join_cloud_unloads_for_tests();
+        assert!(!local_worker_loaded_for_tests());
+        assert_eq!(readiness_snapshot(), LocalReadiness::Absent);
+    }
+
+    #[test]
+    fn a_stale_cloud_unload_after_a_newer_local_switch_keeps_the_worker() {
+        let _session = test_session();
+        inject_ready(fixture_receipt(), "hello");
+        {
+            // The Cloud(N) unload thread waits behind the gate while Local(N+1)
+            // commits; it must see the newer choice when it finally runs.
+            let _held = gate().lock().unwrap();
+            apply_engine_selection(AsrMode::Cloud, TEST_ENGINE_REVISION + 1);
+            apply_engine_selection(AsrMode::Local, TEST_ENGINE_REVISION + 2);
+        }
+        join_cloud_unloads_for_tests();
+        assert!(local_worker_loaded_for_tests());
+        assert!(matches!(admit_local(true), LocalAdmission::Ready { .. }));
+    }
+
+    #[test]
+    fn work_admitted_before_a_cloud_switch_unloads_on_release_off_the_caller() {
+        let _session = test_session();
+        inject_ready(fixture_receipt(), "hello");
+        assert!(matches!(admit_local(true), LocalAdmission::Ready { .. }));
+        let unstarted = UnstartedAdmission::claim(true);
+        apply_engine_selection(AsrMode::Cloud, TEST_ENGINE_REVISION + 1);
+        join_cloud_unloads_for_tests();
+        assert!(local_worker_loaded_for_tests(), "admitted work keeps it");
+        {
+            // The release runs on this thread with the gate held throughout:
+            // the reap must wait for the unload thread, not happen inline.
+            let mut held = gate().lock().unwrap();
+            held.release_admission();
+            assert!(held.lifecycle.has_child());
+        }
+        unstarted.hand_off();
+        join_cloud_unloads_for_tests();
+        assert!(!local_worker_loaded_for_tests());
+        assert_eq!(readiness_snapshot(), LocalReadiness::Absent);
+    }
+
+    #[test]
+    fn switch_to_cloud_while_busy_finishes_the_work_then_unloads() {
+        let (_state, mut gate, receipt) = consented_gate();
+        gate.test_next_worker = Some(next_consented_worker(&receipt));
+        assert!(matches!(gate.refresh(), LocalReadiness::Ready { .. }));
+        assert!(matches!(gate.admit(true), LocalAdmission::Ready { .. }));
+        // Admitted, capture not finished: the switch keeps the worker.
+        gate.select_engine(AsrMode::Cloud, 1);
+        assert!(gate.lifecycle.has_child());
+        assert_eq!(gate.refresh_passive(), LocalReadiness::Busy);
+        assert!(gate.lifecycle.has_child());
+        // Inference checks the supervisor out exactly as take_inference_session.
+        let mut supervisor = gate.lifecycle.take_supervisor();
+        gate.inference_checked_out = true;
+        gate.select_engine(AsrMode::Cloud, 1);
+        assert_eq!(gate.refresh_passive(), LocalReadiness::Busy);
+        let outcome = transcribe_through_supervisor(
+            &mut supervisor,
+            correlation(&receipt.receipt_hash, "rec-busy", "rec-busy-asr"),
+            vec![1, 0, 3, 0],
+            &gate.sentinel,
+        )
+        .expect("in-flight work completes");
+        assert!(matches!(
+            outcome,
+            WorkerOutcome::Transcript { ref text, .. } if text == "still delivered"
+        ));
+        // restore_inference_session: the worker returns, then unloads once idle.
+        gate.lifecycle.restore_supervisor(supervisor);
+        gate.inference_checked_out = false;
+        assert!(gate.lifecycle.has_child());
+        // Release runs on the daemon actor: it schedules the drain instead of
+        // reaping inline.
+        let scheduled = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count = scheduled.clone();
+        gate.schedule_unload = Box::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            true
+        });
+        gate.release_admission();
+        assert_eq!(scheduled.load(Ordering::SeqCst), 1);
+        assert!(gate.lifecycle.has_child(), "no inline reap on release");
+        // The unload thread, under the gate lock.
+        gate.unload_for_cloud();
+        assert!(!gate.lifecycle.has_child());
+        assert_eq!(gate.lifecycle.state(), WorkerState::Absent);
+        assert_eq!(published_snapshot(&gate.published), LocalReadiness::Absent);
+        assert_eq!(gate.launch_count, 1);
     }
 
     #[test]
