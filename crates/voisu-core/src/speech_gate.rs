@@ -5,24 +5,29 @@
 //! product, so the recording the provider sees is always the one captured.
 //!
 //! It is the adaptive energy rule of VoxType's energy VAD (see
-//! `THIRD_PARTY_NOTICES.md`), run after DC removal:
+//! `THIRD_PARTY_NOTICES.md`), with DC removal added in front:
 //!
-//! 1. **DC removal.** The mean of the whole recording is subtracted. Some
-//!    microphones sit on a DC offset (about 600 LSB on one of ours), so a raw
-//!    peak or RMS reads "loud" on pure silence. Mean subtraction is chosen over
-//!    a one-pole high-pass because the decision covers the whole recording at
-//!    once, so the exact mean is available; a high-pass would add a start-up
-//!    transient (the step from zero to the offset rings through the first
-//!    frames and can read as speech), a cutoff to tune, and would attenuate
-//!    low-frequency speech energy. A slowly drifting offset is far smaller than
-//!    the 3 x noise-floor margin and is not worth that cost.
+//! 1. **DC removal (Voisu's addition; VoxType does none).** Each 20 ms frame's
+//!    own mean is subtracted before its RMS is taken, so a frame's RMS is its
+//!    standard deviation. Some microphones sit on a DC offset (about 600 LSB on
+//!    one of ours), so a raw peak or RMS reads "loud" on pure silence. The mean
+//!    is taken per frame, not over the whole recording, because the offset is
+//!    not constant: PipeWire can emit digital zeros before the offset appears
+//!    and the offset can drift, and one recording-wide mean left a 600 LSB
+//!    offset standing against those zeros as loud frames. A frame is far
+//!    shorter than any drift, and it needs no filter state, start-up
+//!    transient or cutoff, unlike a one-pole high-pass. The cost is that a
+//!    frame's own very-low-frequency content is removed with its mean, which
+//!    is below the speech band. A trailing partial frame is judged on its own
+//!    samples, so a few trailing samples read near zero.
 //! 2. **Frames.** 20 ms frames (the last may be partial), RMS of samples
 //!    normalized to -1..1.
-//! 3. **Adaptive threshold.** `effective = max(3 * p10, thr / 10, 0.001)
-//!    .min(thr)`, where `p10` is the 10th-percentile frame RMS (the recording's
-//!    own noise floor) and `thr` is [`SPEECH_THRESHOLD`]. The `.min(thr)` cap is
-//!    essential: without it a pause-free clip sets its own floor, because its
-//!    10th-percentile frame is already speech, and it is rejected as silence.
+//! 3. **Adaptive threshold.** `effective = max(3 * p10, thr / 30)
+//!    .clamp(0.0003, thr)`, where `p10` is the 10th-percentile frame RMS (the
+//!    recording's own noise floor) and `thr` is [`SPEECH_THRESHOLD`]. The
+//!    `.min(thr)` cap is essential: without it a pause-free clip sets its own
+//!    floor, because its 10th-percentile frame is already speech, and it is
+//!    rejected as silence.
 //! 4. **Speech** is at least [`MIN_SPEECH_FRAMES`] consecutive frames at or
 //!    above the effective threshold; one or two loud frames are a click or pop.
 //!
@@ -37,8 +42,15 @@
 //!   `map_threshold_to_energy` in `src/vad/energy.rs` to
 //!   `0.001 * 100^0.5 = 0.01`, which is [`SPEECH_THRESHOLD`].
 //!
-//! Deliberate difference: VoxType also requires `min_speech_duration_ms`
-//! (default 100 ms) of total speech. Voisu keeps only the three-frame run.
+//! Deliberate differences from VoxType:
+//! - VoxType also requires `min_speech_duration_ms` (default 100 ms) of total
+//!   speech. Voisu keeps only the three-frame run.
+//! - VoxType's lowest threshold is 0.001 (`MIN_ENERGY_THRESHOLD`, and
+//!   `thr / MAX_ADAPTIVE_DROP` with a drop of 10). Voisu lowers both: the
+//!   floor to 0.0003 and the drop to 30 (`thr / 30`, about 0.00033). A false
+//!   reject refuses a dictation, which costs more than a false accept, and a
+//!   mic with a 2 LSB noise floor must still accept a short quiet "yes" (RMS
+//!   about 0.0009). The `3 * p10` term still lifts the bar in a noisy room.
 
 /// The configured RMS threshold (normalized -1..1): VoxType's default setting
 /// 0.5 mapped through `0.001 * 100^t`.
@@ -51,10 +63,11 @@ pub const MIN_SPEECH_FRAMES: usize = 3;
 const NOISE_FLOOR_MULTIPLE: f32 = 3.0;
 /// Frame-RMS percentile taken as the noise floor.
 const NOISE_FLOOR_PERCENTILE: f32 = 0.10;
-/// The lowest effective threshold ever used.
-const MIN_ENERGY_THRESHOLD: f32 = 0.001;
-/// The adaptive threshold goes at most one decade below [`SPEECH_THRESHOLD`].
-const MAX_ADAPTIVE_DROP: f32 = 10.0;
+/// The lowest effective threshold ever used (VoxType: 0.001).
+const MIN_ENERGY_THRESHOLD: f32 = 0.0003;
+/// The adaptive threshold goes at most this far below [`SPEECH_THRESHOLD`]
+/// (VoxType: 10).
+const MAX_ADAPTIVE_DROP: f32 = 30.0;
 
 /// The gate's decision for one recording, with the numbers behind it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -80,22 +93,8 @@ pub fn detect_speech(samples: &[i16], sample_rate: u32) -> SpeechPresence {
             frames: 0,
         };
     }
-    // Accumulate in f64: a long recording's sum of squares loses precision in f32.
-    let mean = samples.iter().map(|&s| f64::from(s)).sum::<f64>() / samples.len() as f64;
     let frame_len = ((sample_rate * FRAME_MS / 1000) as usize).max(1);
-    let frame_rms: Vec<f32> = samples
-        .chunks(frame_len)
-        .map(|frame| {
-            let sum_squares: f64 = frame
-                .iter()
-                .map(|&s| {
-                    let centered = (f64::from(s) - mean) / 32768.0;
-                    centered * centered
-                })
-                .sum();
-            (sum_squares / frame.len() as f64).sqrt() as f32
-        })
-        .collect();
+    let frame_rms: Vec<f32> = samples.chunks(frame_len).map(centered_rms).collect();
 
     let mut sorted = frame_rms.clone();
     sorted.sort_by(f32::total_cmp);
@@ -105,21 +104,42 @@ pub fn detect_speech(samples: &[i16], sample_rate: u32) -> SpeechPresence {
         // max(MIN_ENERGY_THRESHOLD).min(SPEECH_THRESHOLD): the cap is essential.
         .clamp(MIN_ENERGY_THRESHOLD, SPEECH_THRESHOLD);
 
-    let (mut run, mut longest_run_frames) = (0usize, 0usize);
-    for &rms in &frame_rms {
-        if rms >= effective_threshold {
-            run += 1;
-            longest_run_frames = longest_run_frames.max(run);
-        } else {
-            run = 0;
-        }
-    }
+    let longest_run_frames = longest_run(&frame_rms, effective_threshold);
     SpeechPresence {
         has_speech: longest_run_frames >= MIN_SPEECH_FRAMES,
         effective_threshold,
         longest_run_frames,
         frames: frame_rms.len(),
     }
+}
+
+/// RMS of one frame after removing the frame's own mean, normalized to -1..1.
+/// Accumulates in f64: a long frame's sum of squares loses precision in f32.
+fn centered_rms(frame: &[i16]) -> f32 {
+    let n = frame.len() as f64;
+    let mean = frame.iter().map(|&s| f64::from(s)).sum::<f64>() / n;
+    let sum_squares: f64 = frame
+        .iter()
+        .map(|&s| {
+            let centered = (f64::from(s) - mean) / 32768.0;
+            centered * centered
+        })
+        .sum();
+    (sum_squares / n).sqrt() as f32
+}
+
+/// Longest run of consecutive frames with `rms >= threshold` (VoxType's `>=`).
+fn longest_run(frame_rms: &[f32], threshold: f32) -> usize {
+    let (mut run, mut longest) = (0usize, 0usize);
+    for &rms in frame_rms {
+        if rms >= threshold {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    longest
 }
 
 #[cfg(test)]
@@ -180,8 +200,9 @@ mod tests {
 
     #[test]
     fn quiet_speech_bursts_on_a_dc_offset_are_accepted() {
-        // Two 300 ms syllables at peak 250 LSB (RMS about 0.005) over a noise
-        // floor of 20 LSB and a 600 LSB offset: quiet, but 10 dB over the floor.
+        // Two 300 ms syllables at peak 250 LSB (RMS about 120 LSB, 0.0037) over
+        // a +-20 LSB noise floor (RMS about 12 LSB) and a 600 LSB offset: quiet,
+        // but well over the noise floor.
         let mut audio = noise(2 * RATE as usize, 20.0, 2);
         add(&mut audio, 6_400, &voiced(4_800, 250.0));
         add(&mut audio, 17_600, &voiced(4_800, 250.0));
@@ -220,5 +241,78 @@ mod tests {
         let mut audio = noise(RATE as usize, 20.0, 4);
         add(&mut audio, 3_840, &voiced(2 * 320, 3_000.0));
         assert!(!detect_speech(&pcm(&audio, 0.0), RATE).has_speech);
+    }
+
+    #[test]
+    fn leading_digital_zeros_on_a_dc_offset_mic_do_not_read_as_speech() {
+        // PipeWire start-up can emit zeros before the offset appears; the step
+        // from 0 to 600 must not read as loud frames. 200 ms of zeros is 5% of
+        // this 4 s clip, so p10 is still the noise floor.
+        let audio = noise(4 * RATE as usize, 20.0, 5);
+        let mut samples = pcm(&audio, 600.0);
+        samples[..3_200].fill(0);
+        let decision = detect_speech(&samples, RATE);
+        assert!(!decision.has_speech, "{decision:?}");
+    }
+
+    #[test]
+    fn a_slowly_drifting_dc_offset_is_rejected() {
+        // 600 -> 700 LSB over 10 s with +-20 noise: the drift inside one 20 ms
+        // frame is 0.2 LSB, so per-frame DC removal sees only noise.
+        let len = 10 * RATE as usize;
+        let audio = noise(len, 20.0, 6);
+        let drifting: Vec<i16> = audio
+            .iter()
+            .enumerate()
+            .map(|(i, sample)| (sample + 600.0 + 100.0 * i as f32 / len as f32).round() as i16)
+            .collect();
+        let decision = detect_speech(&drifting, RATE);
+        assert!(!decision.has_speech, "{decision:?}");
+    }
+
+    #[test]
+    fn a_quiet_mic_still_hears_a_short_yes() {
+        // 2 LSB noise floor, no DC, a 300 ms voiced burst at peak 60 LSB (RMS
+        // about 29 LSB, 0.0009): a false reject refuses a dictation.
+        let mut audio = noise(2 * RATE as usize, 2.0, 7);
+        add(&mut audio, 6_400, &voiced(4_800, 60.0));
+        let decision = detect_speech(&pcm(&audio, 0.0), RATE);
+        assert!(decision.has_speech, "{decision:?}");
+    }
+
+    #[test]
+    fn a_noise_only_room_is_rejected_but_speech_over_it_is_accepted() {
+        // Noise at about 0.003 RMS (98 LSB): the adaptive 3 x p10 term (about
+        // 0.009, under the 0.01 cap) puts the bar above the noise itself.
+        let amplitude = 0.003 * 32768.0 * 3f32.sqrt();
+        let room = noise(2 * RATE as usize, amplitude, 8);
+        let decision = detect_speech(&pcm(&room, 0.0), RATE);
+        assert!(!decision.has_speech, "{decision:?}");
+
+        // Speech about 10 dB over that floor (RMS about 0.01).
+        let mut audio = room;
+        add(&mut audio, 6_400, &voiced(4_800, 700.0));
+        add(&mut audio, 17_600, &voiced(4_800, 700.0));
+        let decision = detect_speech(&pcm(&audio, 0.0), RATE);
+        assert!(decision.has_speech, "{decision:?}");
+    }
+
+    #[test]
+    fn a_run_exactly_at_the_threshold_counts() {
+        assert_eq!(longest_run(&[0.01, 0.01, 0.01], 0.01), 3);
+        assert_eq!(longest_run(&[0.01, 0.0099, 0.01], 0.01), 1);
+    }
+
+    #[test]
+    fn a_tiny_trailing_partial_frame_does_not_extend_a_two_frame_burst() {
+        // Two loud frames, then 5 trailing samples: the partial frame's own
+        // mean is removed, so it reads about 0 and cannot make a third frame.
+        let mut audio = noise(3 * RATE as usize + 640, 20.0, 9);
+        add(&mut audio, 3 * RATE as usize, &voiced(640, 3_000.0));
+        let mut samples = pcm(&audio, 600.0);
+        samples.extend([600_i16; 5]);
+        let decision = detect_speech(&samples, RATE);
+        assert!(!decision.has_speech, "{decision:?}");
+        assert_eq!(decision.longest_run_frames, 2);
     }
 }

@@ -554,8 +554,10 @@ impl PipeWireActiveCapture {
                 format!("Recording contained {} PCM bytes", self.pcm.len()),
             ));
         }
-        // Capture is mono s16le at 16 kHz (the WAV scan enforces it). The gate
-        // removes DC first: a raw peak never fires on a mic with a DC offset.
+        // Capture is mono s16le at 16 kHz: on the `--raw` path the format comes
+        // from the `--rate 16000 --channels 1 --format s16` flags, and on the WAV
+        // path the header scan rejects anything else. The gate removes DC per
+        // frame first: a raw peak never fires on a mic with a DC offset.
         let samples: Vec<i16> = self
             .pcm
             .as_chunks::<2>()

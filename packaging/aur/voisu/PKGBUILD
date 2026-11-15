@@ -106,6 +106,8 @@ package() {
         "$pkgdir/usr/share/icons/hicolor/scalable/apps/voisu.svg"
 
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 THIRD_PARTY_NOTICES.md \
+        "$pkgdir/usr/share/licenses/$pkgname/THIRD_PARTY_NOTICES.md"
 
     # ring's license tree, kept at its upstream names/paths so the
     # cross-references inside ring's LICENSE manifest actually resolve.

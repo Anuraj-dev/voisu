@@ -154,6 +154,7 @@ install -D -m 0644 packaging/icons/voisu.svg %{buildroot}%{_datadir}/icons/hicol
 # ring DIRECTORY instead: rpm installs it recursively, preserving the upstream
 # paths so ring's LICENSE-manifest cross-references resolve.
 %license LICENSE
+%license THIRD_PARTY_NOTICES.md
 %license ring
 %doc README.md
 %{_bindir}/voisu

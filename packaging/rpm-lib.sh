@@ -129,7 +129,7 @@ voisu_vendor_and_verify() {
 
     # Source sanity: the files %prep / %files reference must be present.
     local f
-    for f in Cargo.lock LICENSE packaging/voisu.service packaging/voisu-overlay.service; do
+    for f in Cargo.lock LICENSE THIRD_PARTY_NOTICES.md packaging/voisu.service packaging/voisu-overlay.service; do
         if ! test -e "$src/$f"; then
             printf 'source tree is missing %s\n' "$f" >&2
             return 1

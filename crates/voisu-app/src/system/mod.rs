@@ -648,8 +648,12 @@ mod tests {
     #[tokio::test]
     async fn pipewire_buffer_cap_retains_the_exact_sample_aligned_prefix() {
         let mut emitted_pcm = Vec::new();
+        // Distinct, audible samples: a plain ramp is slow DC drift, which the
+        // speech-presence gate rightly calls silence at finish().
         for sample in 0_i16..3_520 {
-            emitted_pcm.extend_from_slice(&(sample.saturating_add(64)).to_le_bytes());
+            let level = sample + 1_000;
+            let signed = if sample % 2 == 0 { level } else { -level };
+            emitted_pcm.extend_from_slice(&signed.to_le_bytes());
         }
         let pcm_byte_cap = resolve_recording_maximum(Some("199".to_owned())).pcm_byte_cap;
         assert_eq!(pcm_byte_cap, 6_368);
