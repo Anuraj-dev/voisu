@@ -9600,13 +9600,19 @@ fn failed_recording_kills_its_in_flight_groq_request_before_the_next_recording()
     // request started BEFORE the failure" resting on microseconds. The first
     // burst alone (7_900_000 bytes, ~4 minutes) crosses the 120 s chunking
     // threshold, so curl.start is provably created during the pause.
+    //
+    // Constant PCM on purpose: the Recording fails on the read error before
+    // stop, so the speech-presence gate never sees it, and a constant signal
+    // FLAC-encodes in a trivial constant subframe. Audible PCM makes the debug
+    // build's chunk encode slow enough on one CI core to miss the marker
+    // deadline.
     write_fake_command(
         commands.path(),
         "pw-record",
         r#"#!/bin/sh
-yes "$(printf '\001\100\300')" | head -c 7900000
+head -c 7900000 /dev/zero | tr '\000' '\001'
 sleep 1
-yes "$(printf '\001\100\300')" | head -c 100000
+head -c 100000 /dev/zero | tr '\000' '\001'
 trap 'exit 0' INT TERM
 i=0
 while [ "$i" -lt 60 ]; do sleep 1; i=$((i + 1)); done
