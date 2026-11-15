@@ -14,6 +14,15 @@
 //! ```text
 //! cargo run -p voisu-core --example phonetic_swaps -- corpus.jsonl
 //! ```
+//!
+//! Reference mode counts false swaps over correct text: every non-empty line
+//! of the text file is a sentence that needs no correction, and the
+//! Dictionary file holds one entry per line. Every swap is false; the last
+//! line is `# lines … false-swaps …`.
+//!
+//! ```text
+//! cargo run -p voisu-core --example phonetic_swaps -- --text book.txt --dictionary names.txt
+//! ```
 
 use std::io::{self, BufRead, BufReader, Read};
 
@@ -28,7 +37,17 @@ struct Line {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let input: Box<dyn Read> = match std::env::args().nth(1) {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "--text") {
+        let [_, text, flag, dictionary] = args.as_slice() else {
+            return Err("usage: --text <file> --dictionary <file>".into());
+        };
+        if flag != "--dictionary" {
+            return Err("usage: --text <file> --dictionary <file>".into());
+        }
+        return reference_mode(text, dictionary);
+    }
+    let input: Box<dyn Read> = match args.first() {
         Some(path) => Box::new(std::fs::File::open(path)?),
         None => Box::new(io::stdin()),
     };
@@ -50,5 +69,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!("# lines {lines} swaps {swaps}");
+    Ok(())
+}
+
+fn reference_mode(text: &str, dictionary: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let dictionary: Vec<String> = std::fs::read_to_string(dictionary)?
+        .lines()
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let mut lines = 0usize;
+    let mut false_swaps = 0usize;
+    for (number, line) in std::fs::read_to_string(text)?.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        lines += 1;
+        let exact = voisu_core::apply_user_vocabulary(line, &dictionary, &[]);
+        for swap in voisu_core::phonetic_dictionary_swaps(&exact, &dictionary) {
+            false_swaps += 1;
+            println!("line-{}\t{}\t{}", number + 1, swap.heard, swap.replacement);
+        }
+    }
+    println!("# lines {lines} false-swaps {false_swaps}");
     Ok(())
 }

@@ -393,14 +393,23 @@ mod tests {
     }
 
     #[test]
-    fn local_exact_dictionary_match_wins_over_a_sound_match() {
+    fn local_spelled_entry_is_matched_exactly_never_by_sound() {
         // "voice you" sounds like Voisu, but the user also spelled it out as
-        // an entry; exact matching runs first and owns it.
-        let dictionary = ["Voisu".to_owned(), "voice-you".to_owned()];
-        assert_eq!(
-            apply_local_dictionary("say voice you", &dictionary),
-            "say voice-you"
-        );
+        // an entry. The sound pass alone never re-targets a spelled entry, in
+        // either Dictionary order; the exact pass then writes it as spelled.
+        for dictionary in [
+            ["Voisu".to_owned(), "voice-you".to_owned()],
+            ["voice-you".to_owned(), "Voisu".to_owned()],
+        ] {
+            assert_eq!(
+                voisu_core::apply_phonetic_dictionary("say voice you", &dictionary),
+                "say voice you"
+            );
+            assert_eq!(
+                apply_local_dictionary("say voice you", &dictionary),
+                "say voice-you"
+            );
+        }
     }
 
     #[test]

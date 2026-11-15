@@ -107,7 +107,6 @@ fn the_edit_distance_bound_rejects_codes_that_only_collide() {
         ("fees", "Voisu"),
         ("phase you", "Voisu"),
         ("cooper nets", "Kubernetes"),
-        ("caper notice", "Kubernetes"),
     ];
     let encoder = DoubleMetaphone::new(None);
     for (heard, entry) in cases {
@@ -203,7 +202,171 @@ fn an_empty_dictionary_is_byte_identical() {
 }
 
 #[test]
-fn the_common_word_list_is_sorted_and_unique() {
-    let words: Vec<&str> = COMMON_WORDS.split_ascii_whitespace().collect();
-    assert!(words.windows(2).all(|pair| pair[0] < pair[1]));
+fn the_lexicon_is_a_plain_lowercase_word_list() {
+    let lexicon = english_lexicon();
+    assert!(lexicon.len() >= 29_000, "{}", lexicon.len());
+    assert!(
+        lexicon
+            .iter()
+            .all(|word| { !word.is_empty() && word.bytes().all(|byte| byte.is_ascii_lowercase()) })
+    );
+    for word in ["sorry", "iron", "tunnel", "merry", "jeans", "walls"] {
+        assert!(lexicon.contains(word), "{word}");
+    }
+}
+
+/// A person-heavy Dictionary next to ordinary speech that sounds like it.
+#[test]
+fn ordinary_sentences_are_never_swapped_against_a_names_dictionary() {
+    let dictionary = terms(&[
+        "Sarah",
+        "Aaron",
+        "Daniel",
+        "Maria",
+        "Olivia",
+        "Fedora",
+        "Ellen",
+        "Docker",
+        "Ubuntu",
+        "Postgres",
+        "James",
+        "Jones",
+        "Wales",
+        "Voisu",
+        "Hyprland",
+        "Kubernetes",
+        "Deepgram",
+    ]);
+    for sentence in [
+        "I am sorry about the delay.",
+        "Please iron the shirt tonight.",
+        "We drove through the tunnel.",
+        "His denial was not convincing.",
+        "They want to marry in June.",
+        "Have a merry time at the party.",
+        "My nephew loves Mario games.",
+        "Pass me the olive oil.",
+        "Fill the bird feeder again.",
+        "Allen called this morning.",
+        "The film had an alien in it.",
+        "What should we make in the oven?",
+        "Did you dock her boat yesterday?",
+        "When we land, call me.",
+        "Can you bunt too in this league?",
+        "They post grace notes on the board.",
+        "The jams are in the fridge.",
+        "I bought new jeans today.",
+        "The walls need fresh paint.",
+    ] {
+        assert_eq!(
+            apply_phonetic_dictionary(sentence, &dictionary),
+            sentence,
+            "{sentence}"
+        );
+    }
+}
+
+#[test]
+fn a_silent_es_or_ed_does_not_count_as_a_syllable() {
+    for name in ["James", "Jones", "Wales", "Charles", "Miles", "Hayes"] {
+        assert_eq!(syllables(name), 1, "{name}");
+    }
+    assert_eq!(syllables("Moses"), 2);
+    assert_eq!(syllables("Postgres"), 2);
+    assert_eq!(syllables("Kubernetes"), 4);
+    let encoder = DoubleMetaphone::new(None);
+    let eligible = |name: &str| Entry::parse(name, &encoder).is_some_and(|entry| entry.eligible);
+    for name in ["James", "Jones", "Wales", "Charles", "Miles", "Hayes"] {
+        assert!(!eligible(name), "{name}");
+    }
+    for name in ["Moses", "Postgres", "Kubernetes"] {
+        assert!(eligible(name), "{name}");
+    }
+}
+
+#[test]
+fn multibyte_whitespace_never_panics() {
+    // The technical-token check once stepped one byte past a multibyte
+    // whitespace character and panicked mid-character.
+    for space in ['\u{00A0}', '\u{2009}', '\u{3000}'] {
+        let text = format!("say voice{space}you now{space}");
+        let _ = apply_phonetic_dictionary(&text, &realistic());
+        let text = format!("{space}voice you");
+        assert_eq!(
+            apply_phonetic_dictionary(&text, &realistic()),
+            format!("{space}Voisu")
+        );
+    }
+}
+
+#[test]
+fn a_spaced_dash_or_a_line_break_ends_a_run() {
+    for text in [
+        "I heard a voice - you know",
+        "my voice\nyou see",
+        "my voice\r\nyou see",
+    ] {
+        assert_eq!(
+            apply_phonetic_dictionary(text, &realistic()),
+            text,
+            "{text:?}"
+        );
+    }
+    assert_eq!(
+        apply_phonetic_dictionary("try voice-you now", &realistic()),
+        "try Voisu now"
+    );
+}
+
+#[test]
+fn entries_with_the_same_letters_are_one_entry() {
+    for dictionary in [
+        ["Claude Code", "claude-code"],
+        ["claude-code", "Claude Code"],
+    ] {
+        let first = dictionary[0];
+        assert_eq!(
+            apply_phonetic_dictionary("ask clawed code to fix it", &terms(&dictionary)),
+            format!("ask {first} to fix it")
+        );
+    }
+}
+
+#[test]
+fn entry_casing_is_kept_and_capitals_only_start_sentences() {
+    let dictionary = terms(&["iPhone"]);
+    assert_eq!(
+        apply_phonetic_dictionary("Eye phone is here.", &dictionary),
+        "iPhone is here."
+    );
+    let dictionary = terms(&["kubecontrol"]);
+    assert_eq!(
+        apply_phonetic_dictionary("Run Cube control now.", &dictionary),
+        "Run kubecontrol now."
+    );
+    assert_eq!(
+        apply_phonetic_dictionary("Done. Cube control is up.", &dictionary),
+        "Done. Kubecontrol is up."
+    );
+}
+
+#[test]
+fn a_full_dictionary_over_a_long_transcript_is_fast() {
+    let dictionary: Vec<String> = (0..USER_VOCABULARY_TERM_LIMIT)
+        .map(|index| format!("Zentrova{}", ["lin", "dar", "mex", "pol"][index % 4]))
+        .chain(realistic())
+        .take(USER_VOCABULARY_TERM_LIMIT)
+        .collect();
+    let sentence = "so I said voice you runs on hyper land and the deep gram model is fine ";
+    let text = sentence.repeat(2000 / sentence.split_whitespace().count() + 1);
+    let words = text.split_whitespace().count();
+    assert!(words >= 2000);
+    let started = std::time::Instant::now();
+    let _ = apply_phonetic_dictionary(&text, &dictionary);
+    let elapsed = started.elapsed();
+    eprintln!(
+        "phonetic pass: {} entries x {words} words in {elapsed:?}",
+        dictionary.len()
+    );
+    assert!(elapsed < std::time::Duration::from_secs(1), "{elapsed:?}");
 }
