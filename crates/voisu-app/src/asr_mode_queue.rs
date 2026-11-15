@@ -39,7 +39,15 @@ enum AsrModeJob {
 impl AsrModeQueue {
     pub fn spawn() -> Self {
         Self::spawn_with(
-            Box::new(persist_asr_mode),
+            Box::new(|mode| {
+                let commit = persist_asr_mode(mode);
+                // Records the choice before the reply and any later queued
+                // Start; a switch to Cloud unloads an idle Local worker.
+                if let Ok(commit) = &commit {
+                    crate::local_routing::apply_engine_selection(commit.mode, commit.revision);
+                }
+                commit
+            }),
             Box::new(asr_mode::admit_capture),
         )
     }
