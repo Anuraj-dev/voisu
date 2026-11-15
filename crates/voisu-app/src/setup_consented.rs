@@ -20,7 +20,6 @@ use crate::local_model::{
     CONSENTED_ENTRY, ConsentedConsent, ConsentedError, ConsentedInstallRequest, HostHardware,
     InstallClock, InstallIo, InstallPhase, InstallProgress, ModelStore, OfflineRuntimeBuilder,
     ProductionHttps, models_dir_from_state, remove_consented_install, suggest_local,
-    verify_consented_install,
 };
 use crate::local_setup::SetupMaintenance;
 use crate::local_worker::ConsentedWorkerHealth;
@@ -620,7 +619,7 @@ pub fn production_consented_status() -> ConsentedStatus {
         Ok(store) => store,
         Err(_) => return ConsentedStatus::Unknown("the model store is unavailable".into()),
     };
-    match verify_consented_install(&store) {
+    match crate::local_worker::verify_consented_install_refreshing(&store, || {}) {
         Ok(install) => ConsentedStatus::Installed {
             entry_id: install.receipt().entry_id.clone(),
             device: install.receipt().device.clone(),

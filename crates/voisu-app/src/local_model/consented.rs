@@ -1,10 +1,11 @@
 //! Explicit Consented Install; never production selection or daemon launch.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -395,6 +396,25 @@ fn install_with_receipt_sync(
     }
     cleanup_catalog_namespaces(request.store, entry)?;
     abort(&request, InstallAbort::AfterLock)?;
+    // Only stale worker files: rewrite them in place under the recorded consent
+    // instead of downloading every third-party artifact again.
+    if let Ok(prior) = load_receipt(request.store)
+        && let Ok((layout, true)) = check_receipt(request.store, entry, &prior)
+    {
+        request.progress.phase(if entry.device == "cpu" {
+            InstallPhase::CheckingCpu
+        } else {
+            InstallPhase::CheckingGpu
+        });
+        return refresh_worker(
+            request.store,
+            entry,
+            &layout,
+            &prior,
+            request.health,
+            receipt_sync,
+        );
+    }
     let required = 2 * (entry.total_download_bytes + entry.estimated_extracted_runtime_bytes);
     if request
         .io
@@ -569,7 +589,19 @@ pub(crate) fn verify_with_entry_notifying(
     entry: &ConsentedCatalogEntry,
     on_verifying: impl FnOnce(),
 ) -> Result<VerifiedConsentedInstall, ConsentedError> {
-    verify_with_entry_mode(store, entry, false, on_verifying)
+    verify_with_entry_mode(store, entry, false, None, on_verifying)
+}
+
+/// Per-launch admission that first rewrites stale worker files in place.
+/// Worker code is Voisu's own and updates with the binary (ADR 0012); the
+/// receipt's consent and third-party pins must otherwise match exactly.
+pub(crate) fn verify_with_entry_refreshing(
+    store: &ModelStore,
+    entry: &ConsentedCatalogEntry,
+    health: &dyn ConsentedHealth,
+    on_verifying: impl FnOnce(),
+) -> Result<VerifiedConsentedInstall, ConsentedError> {
+    verify_with_entry_mode(store, entry, false, Some(health), on_verifying)
 }
 
 /// Re-hash every runtime file and reject all unmanifested runtime entries.
@@ -577,17 +609,27 @@ pub(crate) fn verify_with_entry_notifying(
 pub fn verify_consented_install_full(
     store: &ModelStore,
 ) -> Result<VerifiedConsentedInstall, ConsentedError> {
-    verify_with_entry_mode(store, installed_entry(store)?, true, || {})
+    verify_with_entry_mode(store, installed_entry(store)?, true, None, || {})
 }
 
 fn verify_with_entry_mode(
     store: &ModelStore,
     entry: &ConsentedCatalogEntry,
     full: bool,
+    refresh: Option<&dyn ConsentedHealth>,
     on_verifying: impl FnOnce(),
 ) -> Result<VerifiedConsentedInstall, ConsentedError> {
     let _lock = store.lock_exclusive().map_err(ConsentedError::Store)?;
     resume_removal(store, entry, || Ok(()))?;
+    let mut on_verifying = Some(on_verifying);
+    if let Some(health) = refresh {
+        let receipt = load_receipt(store)?;
+        if let (layout, true) = check_receipt(store, entry, &receipt)? {
+            // A refresh runs a health check: report it as verification.
+            on_verifying.take().expect("unused")();
+            refresh_remembered(store, entry, &layout, &receipt, health)?;
+        }
+    }
     let receipt_identity = file_identity(&receipt_path(store)).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             ConsentedError::Missing
@@ -599,7 +641,9 @@ fn verify_with_entry_mode(
     let layout = validate_receipt(store, entry, &receipt)?;
     let lease = consented_install_lease(&layout)?;
     let observation = ConsentedObservation::capture(&layout)?;
-    on_verifying();
+    if let Some(on_verifying) = on_verifying {
+        on_verifying();
+    }
     if full {
         verify_layout_full(&layout, &receipt)?;
     } else {
@@ -691,11 +735,7 @@ fn validate_removal_target(
 ) -> Result<(), ConsentedError> {
     // Old pins and partially removed runtimes must remain uninstallable.
     if receipt.entry_id != entry.id
-        || receipt.content_hash.len() != 64
-        || !receipt
-            .content_hash
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || !is_hex_hash(&receipt.content_hash)
         || receipt.receipt_hash != receipt_hash(receipt)?
     {
         return Err(ConsentedError::Receipt);
@@ -874,22 +914,14 @@ fn make_receipt(
         files.insert(format!("weights/{}", item.name), pin(item));
     }
     files.insert("jfk.wav".into(), pin(&(entry.health_clip)()));
-    for (name, bytes) in WORKER_FILES {
-        files.insert(
-            format!("worker/{name}"),
-            ConsentedFilePin {
-                sha256: sha256_hex(bytes),
-                bytes: bytes.len() as u64,
-            },
-        );
-    }
+    files.extend(binary_worker_pins());
     let mut runtime_inputs = BTreeMap::new();
     runtime_inputs.insert(entry.python.name.into(), pin(&entry.python));
     for item in entry.wheels.iter().chain(entry.native_runtime.iter()) {
         runtime_inputs.insert(item.name.into(), pin(item));
     }
     ConsentedReceipt {
-        version: 2,
+        version: RECEIPT_VERSION,
         entry_id: entry.id.into(),
         revision: entry.revision.into(),
         content_hash: content_hash(entry),
@@ -905,9 +937,44 @@ fn make_receipt(
         receipt_hash: String::new(),
     }
 }
+/// v3 receipts name the folder `content_hash(entry)`. v2 receipts name a
+/// folder whose hash also covered worker files; it is kept in place.
+const RECEIPT_VERSION: u32 = 3;
+const LEGACY_RECEIPT_VERSION: u32 = 2;
+
+fn is_hex_hash(hash: &str) -> bool {
+    hash.len() == 64
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+fn binary_worker_pins() -> impl Iterator<Item = (String, ConsentedFilePin)> {
+    WORKER_FILES.iter().map(|(name, bytes)| {
+        (
+            format!("worker/{name}"),
+            ConsentedFilePin {
+                sha256: sha256_hex(bytes),
+                bytes: bytes.len() as u64,
+            },
+        )
+    })
+}
+fn is_worker_pin(name: &str) -> bool {
+    name.starts_with("worker/")
+}
+/// Short digest of a receipt's worker pins, for the local refresh diagnostic.
+fn worker_digest(receipt: &ConsentedReceipt) -> String {
+    let mut lines = String::new();
+    for (name, pin) in receipt.files.iter().filter(|(name, _)| is_worker_pin(name)) {
+        lines.push_str(&format!("{name}:{}:{}\n", pin.bytes, pin.sha256));
+    }
+    sha256_hex(lines.as_bytes())[..12].to_owned()
+}
+/// The folder hash covers only third-party inputs and their build settings.
+/// Worker files are Voisu's own code: pinned in the receipt, refreshed in place.
 fn content_hash(entry: &ConsentedCatalogEntry) -> String {
     let mut bytes = format!(
-        "consented-builder-v2\n{}\n{}\n{}\n{}\n",
+        "consented-builder-v3\n{}\n{}\n{}\n{}\n",
         entry.id, entry.revision, entry.device, entry.compute_type
     );
     for item in entry
@@ -920,9 +987,6 @@ fn content_hash(entry: &ConsentedCatalogEntry) -> String {
         bytes.push_str(&format!("{}:{}:{}\n", item.name, item.bytes, item.sha256));
     }
     bytes.push_str((entry.health_clip)().sha256);
-    for (name, data) in WORKER_FILES {
-        bytes.push_str(&format!("{name}:{}\n", sha256_hex(data)));
-    }
     sha256_hex(bytes.as_bytes())
 }
 fn receipt_hash(receipt: &ConsentedReceipt) -> Result<String, ConsentedError> {
@@ -937,27 +1001,59 @@ fn validate_receipt(
     entry: &ConsentedCatalogEntry,
     receipt: &ConsentedReceipt,
 ) -> Result<ConsentedLayout, ConsentedError> {
+    match check_receipt(store, entry, receipt)? {
+        (layout, false) => Ok(layout),
+        (_, true) => Err(ConsentedError::Receipt),
+    }
+}
+/// Returns the install layout and whether the receipt is stale: it differs
+/// from this binary's expectation only in its worker pins. Consent, every
+/// third-party pin, paths, device and runtime must match exactly either way.
+fn check_receipt(
+    store: &ModelStore,
+    entry: &ConsentedCatalogEntry,
+    receipt: &ConsentedReceipt,
+) -> Result<(ConsentedLayout, bool), ConsentedError> {
     if !entry.consent_installable
         || receipt.consent.text != entry.consent_text
         || receipt.consent.license_spdx != entry.license_spdx
     {
         return Err(ConsentedError::Receipt);
     }
-    let layout = ConsentedLayout::at(install_root(store, entry.id, &content_hash(entry)));
+    // A legacy hash is only ever a folder name directly under consented/<id>/.
+    let hash = match receipt.version {
+        RECEIPT_VERSION => content_hash(entry),
+        LEGACY_RECEIPT_VERSION if is_hex_hash(&receipt.content_hash) => {
+            receipt.content_hash.clone()
+        }
+        _ => return Err(ConsentedError::Receipt),
+    };
+    let layout = ConsentedLayout::at(install_root(store, entry.id, &hash));
     let mut expected = make_receipt(entry, receipt.consent.clone(), &layout);
+    expected.version = receipt.version;
+    expected.content_hash = hash;
     validate_runtime_manifest(&receipt.runtime_manifest)?;
     expected.runtime_manifest = receipt.runtime_manifest.clone();
     expected.receipt_hash = receipt_hash(&expected)?;
-    if *receipt != expected {
-        return Err(ConsentedError::Receipt);
-    }
+    let stale = if *receipt == expected {
+        false
+    } else {
+        let mut current = receipt.clone();
+        current.files.retain(|name, _| !is_worker_pin(name));
+        current.files.extend(binary_worker_pins());
+        current.receipt_hash = receipt_hash(&current)?;
+        if current != expected || receipt.receipt_hash != receipt_hash(receipt)? {
+            return Err(ConsentedError::Receipt);
+        }
+        true
+    };
     // Inspect ancestors before following any receipt-controlled runtime paths.
     // Ancestors are opened without following links; the full runtime audit
     // permits only internal relative links (e.g. venv lib64 -> lib).
     if !super::safe_fs::dir_present(&layout.root).map_err(ConsentedError::Fs)? {
         return Err(ConsentedError::Missing);
     }
-    Ok(layout)
+    Ok((layout, stale))
 }
 const MAX_RECORD_BYTES: u64 = 32 * 1024 * 1024;
 
@@ -1039,6 +1135,193 @@ fn store_receipt_with_sync(
         }
         return Err(error.into());
     }
+    Ok(())
+}
+/// Polling must not relaunch a failed refresh health run, or re-hash a damaged
+/// tree, while nothing changed. Any change to the tree or receipt, a new
+/// process, or this interval retries. Transient lease or GPU contention is
+/// never remembered.
+const REFRESH_RETRY_AFTER: Duration = Duration::from_secs(300);
+
+struct RefreshFailure {
+    observation: ConsentedObservation,
+    at: Instant,
+    error: RememberedError,
+}
+#[derive(Clone)]
+enum RememberedError {
+    Health(String),
+    HealthUnreaped,
+    Digest(String),
+    Tree(String),
+}
+impl RememberedError {
+    fn of(error: &ConsentedError) -> Option<Self> {
+        Some(match error {
+            ConsentedError::Health(message) => Self::Health(message.clone()),
+            ConsentedError::HealthUnreaped => Self::HealthUnreaped,
+            ConsentedError::Digest(name) => Self::Digest(name.clone()),
+            ConsentedError::Tree(message) => Self::Tree(message.clone()),
+            _ => return None,
+        })
+    }
+    fn error(&self) -> ConsentedError {
+        match self.clone() {
+            Self::Health(message) => ConsentedError::Health(message),
+            Self::HealthUnreaped => ConsentedError::HealthUnreaped,
+            Self::Digest(name) => ConsentedError::Digest(name),
+            Self::Tree(message) => ConsentedError::Tree(message),
+        }
+    }
+}
+
+fn refresh_failures() -> &'static Mutex<HashMap<PathBuf, RefreshFailure>> {
+    static FAILURES: OnceLock<Mutex<HashMap<PathBuf, RefreshFailure>>> = OnceLock::new();
+    FAILURES.get_or_init(Mutex::default)
+}
+
+// Caller holds the store lock.
+fn refresh_remembered(
+    store: &ModelStore,
+    entry: &ConsentedCatalogEntry,
+    layout: &ConsentedLayout,
+    prior: &ConsentedReceipt,
+    health: &dyn ConsentedHealth,
+) -> Result<(), ConsentedError> {
+    if let Some(failure) = refresh_failures()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&layout.root)
+        && failure.at.elapsed() < REFRESH_RETRY_AFTER
+        && failure.observation.unchanged()
+    {
+        return Err(failure.error.error());
+    }
+    let result = refresh_worker(store, entry, layout, prior, health, sync_dir).map(drop);
+    let mut failures = refresh_failures()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    failures.remove(&layout.root);
+    if let Err(error) = &result
+        && let Some(error) = RememberedError::of(error)
+        && let Ok(observation) = ConsentedObservation::capture(layout)
+    {
+        failures.insert(
+            layout.root.clone(),
+            RefreshFailure {
+                observation,
+                at: Instant::now(),
+                error,
+            },
+        );
+    }
+    result
+}
+
+/// Rewrites only `worker/` from this binary, in place, under the recorded
+/// consent. The caller holds the store lock and `check_receipt` found `prior`
+/// stale only in its worker pins. The old worker files are moved aside and
+/// deleted unread; nothing under `runtime/` or `weights/` changes.
+///
+/// Sequence: take the exclusive lease (no live worker); verify every
+/// non-worker file; stage the new worker; move the old one aside and rename the new one
+/// in; release the lease so health can take its shared lease while the store
+/// lock still excludes launches; health; store the receipt. A health failure
+/// puts the old worker back. A crash or receipt failure after the swap leaves
+/// new files under the stale receipt, which the next verification refreshes.
+fn refresh_worker(
+    store: &ModelStore,
+    entry: &ConsentedCatalogEntry,
+    layout: &ConsentedLayout,
+    prior: &ConsentedReceipt,
+    health: &dyn ConsentedHealth,
+    receipt_sync: impl Fn(&Path) -> std::io::Result<()>,
+) -> Result<ConsentedReceipt, ConsentedError> {
+    let lease = lease_file(store, &prior.content_hash)?;
+    flock(&lease, libc::LOCK_EX)?;
+    let mut receipt = prior.clone();
+    receipt.files.retain(|name, _| !is_worker_pin(name));
+    verify_layout(layout, &receipt)?;
+    let mut worker_only = receipt.clone();
+    worker_only.files = binary_worker_pins().collect();
+    receipt.files.extend(binary_worker_pins());
+    receipt.receipt_hash = receipt_hash(&receipt)?;
+    let parent = store.staging_dir("consented");
+    super::ensure_private_dir(&parent).map_err(ConsentedError::Fs)?;
+    let stage = tempfile::Builder::new()
+        .prefix("worker-")
+        .tempdir_in(parent)?;
+    let fresh = stage.path().join("worker");
+    for (name, bytes) in WORKER_FILES {
+        let path = fresh.join(name);
+        let dir = path.parent().expect("worker parent");
+        super::ensure_private_dir(dir).map_err(ConsentedError::Fs)?;
+        let leaf = path.file_name().and_then(|leaf| leaf.to_str());
+        write_new(dir, leaf.expect("UTF-8 worker name"), bytes)?;
+    }
+    sync_tree(&fresh)?;
+    let old = stage.path().join("old");
+    let had_old = match fs::rename(&layout.worker, &old) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    let mut lease = Some(lease);
+    let result = (|| {
+        super::safe_fs::durable_rename(&fresh, &layout.worker).map_err(ConsentedError::Fs)?;
+        verify_files(layout, &worker_only)?;
+        lease = None;
+        health.check(layout, &receipt)
+    })();
+    if let Err(error) = result {
+        // Like install rollback: never move files beneath a surviving unit.
+        if !matches!(error, ConsentedError::HealthUnreaped)
+            && let Err(restore) = restore_worker(store, prior, layout, lease, &old, had_old)
+        {
+            eprintln!(
+                "voisu: Consented Install worker refresh for {} could not restore the previous worker: {restore:?}",
+                entry.id
+            );
+        }
+        return Err(error);
+    }
+    store_receipt_with_sync(store, &receipt, &mut false, receipt_sync)?;
+    // Local diagnostic only: daemon stderr goes to the user's journal.
+    eprintln!(
+        "voisu: refreshed Consented Install worker files for {} in {}: worker {} -> {}",
+        entry.id,
+        prior.content_hash,
+        worker_digest(prior),
+        worker_digest(&receipt)
+    );
+    // Dropping the stage deletes the old worker, its bytecode included.
+    drop(stage);
+    Ok(receipt)
+}
+
+fn restore_worker(
+    store: &ModelStore,
+    prior: &ConsentedReceipt,
+    layout: &ConsentedLayout,
+    lease: Option<File>,
+    old: &Path,
+    had_old: bool,
+) -> Result<(), ConsentedError> {
+    let _lease = match lease {
+        Some(lease) => lease,
+        None => {
+            let lease = lease_file(store, &prior.content_hash)?;
+            flock(&lease, libc::LOCK_EX)?;
+            lease
+        }
+    };
+    if fs::symlink_metadata(&layout.worker).is_ok() {
+        fs::rename(&layout.worker, old.with_file_name("failed"))?;
+    }
+    if had_old {
+        fs::rename(old, &layout.worker)?;
+    }
+    sync_dir(&layout.root)?;
     Ok(())
 }
 fn verify_layout(
@@ -2330,7 +2613,7 @@ pub(crate) mod install_tests {
         let path = root.join("runtime/venv/lib/python3.11/site-packages/fixture/__init__.py");
         fs::write(&path, b"changed").unwrap(); // same length as "fixture"
         assert!(verify_with_entry(&store, &entry()).is_ok());
-        assert!(verify_with_entry_mode(&store, &entry(), true, || {}).is_err());
+        assert!(verify_with_entry_mode(&store, &entry(), true, None, || {}).is_err());
     }
     #[test]
     fn consented_launch_allows_audited_deep_cache_full_verifier_rejects_extras() {
@@ -2344,7 +2627,7 @@ pub(crate) mod install_tests {
         let observation = ConsentedObservation::after_verification(&install);
         drop(install);
         assert!(observation.unchanged());
-        assert!(verify_with_entry_mode(&store, &entry(), true, || {}).is_err());
+        assert!(verify_with_entry_mode(&store, &entry(), true, None, || {}).is_err());
         fs::set_permissions(cache.join("fixture.pyc"), fs::Permissions::from_mode(0o666)).unwrap();
         assert!(!observation.unchanged());
         assert!(verify_with_entry(&store, &entry()).is_err());
@@ -2613,6 +2896,372 @@ pub(crate) mod install_tests {
             );
         }
         assert!(verify_with_entry(&store, &cpu).is_ok());
+    }
+
+    // A release that edits worker code leaves the previous binary's pins and
+    // bytes on disk, plus bytecode the old worker compiled.
+    fn make_worker_stale(store: &ModelStore) -> ConsentedReceipt {
+        let mut receipt = load_receipt(store).unwrap();
+        let root = install_root(store, &receipt.entry_id, &receipt.content_hash);
+        stale_worker_files(&root, &mut receipt);
+        receipt.receipt_hash = receipt_hash(&receipt).unwrap();
+        store_receipt(store, &receipt).unwrap();
+        receipt
+    }
+    fn stale_worker_files(root: &Path, receipt: &mut ConsentedReceipt) {
+        for (name, _) in WORKER_FILES {
+            let old = format!("previous release {name}\n").into_bytes();
+            fs::write(root.join("worker").join(name), &old).unwrap();
+            receipt.files.insert(
+                format!("worker/{name}"),
+                ConsentedFilePin {
+                    sha256: sha256_hex(&old),
+                    bytes: old.len() as u64,
+                },
+            );
+        }
+        super::super::ensure_private_dir(&root.join("worker/__pycache__")).unwrap();
+        fs::write(root.join("worker/__pycache__/worker.pyc"), b"old bytecode").unwrap();
+    }
+    fn worker_matches_binary(root: &Path) -> bool {
+        WORKER_FILES
+            .iter()
+            .all(|(name, bytes)| fs::read(root.join("worker").join(name)).unwrap() == *bytes)
+            && !root.join("worker/__pycache__").exists()
+    }
+    fn health_at(root: PathBuf, fail: bool) -> FakeHealth {
+        FakeHealth {
+            fail,
+            called: Cell::new(false),
+            expected_root: root,
+        }
+    }
+    fn refresh_verify(
+        store: &ModelStore,
+        health: &FakeHealth,
+    ) -> Result<VerifiedConsentedInstall, ConsentedError> {
+        verify_with_entry_refreshing(store, &entry(), health, || {})
+    }
+
+    #[test]
+    fn stale_worker_pins_refresh_in_place_and_keep_consent() {
+        let (_temp, store) = store();
+        let original = install(&store);
+        let stale = make_worker_stale(&store);
+        let root = install_root(&store, &original.entry_id, &original.content_hash);
+        assert!(matches!(
+            verify_with_entry(&store, &entry()),
+            Err(ConsentedError::Receipt)
+        ));
+        let health = health(&store, &entry(), false);
+        let notified = Cell::new(false);
+        let verified =
+            verify_with_entry_refreshing(&store, &entry(), &health, || notified.set(true)).unwrap();
+        assert!(health.called.get() && notified.get());
+        // Same folder, same consent, and the binary's own worker pins.
+        assert_eq!(verified.layout().root, root);
+        assert_eq!(verified.receipt().consent, stale.consent);
+        assert_eq!(verified.receipt(), &original);
+        assert_eq!(load_receipt(&store).unwrap(), original);
+        assert!(worker_matches_binary(&root));
+        drop(verified);
+        assert!(verify_with_entry(&store, &entry()).is_ok());
+    }
+
+    #[test]
+    fn stale_worker_pins_with_any_other_mismatch_stay_invalid_and_untouched() {
+        for kind in 0..5 {
+            let (_temp, store) = store();
+            install(&store);
+            let mut receipt = make_worker_stale(&store);
+            let root = install_root(&store, &receipt.entry_id, &receipt.content_hash);
+            match kind {
+                0 => {
+                    receipt.files.get_mut("weights/model.bin").unwrap().sha256 = "1".repeat(64);
+                }
+                1 => receipt.consent.text.push('!'),
+                2 => receipt.runtime_inputs.clear(),
+                3 => receipt.revision = "2".into(),
+                _ => receipt.content_hash = "a".repeat(64),
+            }
+            receipt.receipt_hash = receipt_hash(&receipt).unwrap();
+            store_receipt(&store, &receipt).unwrap();
+            let health = health(&store, &entry(), false);
+            assert!(
+                matches!(
+                    refresh_verify(&store, &health),
+                    Err(ConsentedError::Receipt)
+                ),
+                "kind {kind}"
+            );
+            assert!(!health.called.get());
+            assert_eq!(load_receipt(&store).unwrap(), receipt);
+            assert!(root.join("worker/__pycache__/worker.pyc").exists());
+            assert!(!worker_matches_binary(&root));
+        }
+        // An unkeyed hash that does not match its body is never refreshed.
+        let (_temp, store) = store();
+        install(&store);
+        let mut receipt = make_worker_stale(&store);
+        receipt.receipt_hash = "0".repeat(64);
+        store_receipt(&store, &receipt).unwrap();
+        let health = health(&store, &entry(), false);
+        assert!(matches!(
+            refresh_verify(&store, &health),
+            Err(ConsentedError::Receipt)
+        ));
+        assert!(!health.called.get());
+    }
+
+    #[test]
+    fn failed_refresh_health_keeps_old_worker_and_receipt() {
+        let (_temp, store) = store();
+        install(&store);
+        let stale = make_worker_stale(&store);
+        let root = install_root(&store, &stale.entry_id, &stale.content_hash);
+        let failing = health(&store, &entry(), true);
+        assert!(matches!(
+            refresh_verify(&store, &failing),
+            Err(ConsentedError::Health(_))
+        ));
+        assert!(failing.called.get());
+        assert_eq!(load_receipt(&store).unwrap(), stale);
+        assert_eq!(
+            fs::read(root.join("worker/worker.py")).unwrap(),
+            b"previous release worker.py\n"
+        );
+        assert!(root.join("worker/__pycache__/worker.pyc").exists());
+        // Polling an unchanged tree does not relaunch the failed health run.
+        let passing = health(&store, &entry(), false);
+        assert!(matches!(
+            refresh_verify(&store, &passing),
+            Err(ConsentedError::Health(_))
+        ));
+        assert!(!passing.called.get());
+        // Any change to the tree or receipt retries immediately.
+        store_receipt(&store, &stale).unwrap();
+        assert!(refresh_verify(&store, &passing).is_ok());
+        assert!(passing.called.get());
+        assert!(worker_matches_binary(&root));
+    }
+
+    #[test]
+    fn stale_receipt_over_damaged_weights_is_digest_and_untouched() {
+        let (_temp, store) = store();
+        install(&store);
+        let stale = make_worker_stale(&store);
+        let root = install_root(&store, &stale.entry_id, &stale.content_hash);
+        let weights = root.join("weights/model.bin");
+        let mut bytes = fs::read(&weights).unwrap();
+        bytes[0] ^= 1;
+        fs::write(&weights, &bytes).unwrap();
+        let health = health(&store, &entry(), false);
+        for _ in 0..2 {
+            assert!(matches!(
+                refresh_verify(&store, &health),
+                Err(ConsentedError::Digest(name)) if name == "weights/model.bin"
+            ));
+        }
+        assert!(!health.called.get());
+        assert_eq!(load_receipt(&store).unwrap(), stale);
+        assert!(root.join("worker/__pycache__/worker.pyc").exists());
+    }
+
+    #[test]
+    fn refresh_is_idempotent_and_a_current_receipt_never_reruns_health() {
+        let (_temp, store) = store();
+        install(&store);
+        make_worker_stale(&store);
+        drop(refresh_verify(&store, &health(&store, &entry(), false)).unwrap());
+        let refreshed = load_receipt(&store).unwrap();
+        let identity = file_identity(&receipt_path(&store)).unwrap();
+        let untouched = health(&store, &entry(), true);
+        drop(refresh_verify(&store, &untouched).unwrap());
+        assert!(!untouched.called.get());
+        assert_eq!(load_receipt(&store).unwrap(), refreshed);
+        assert_eq!(file_identity(&receipt_path(&store)).unwrap(), identity);
+    }
+
+    #[test]
+    fn tampered_worker_under_a_current_receipt_is_digest_not_refreshed() {
+        for name in ["worker/worker.py", "worker/voisu_asr/candidates.py"] {
+            let (_temp, store) = store();
+            let receipt = install(&store);
+            let path = install_root(&store, &receipt.entry_id, &receipt.content_hash).join(name);
+            let mut bytes = fs::read(&path).unwrap();
+            bytes[0] ^= 1;
+            fs::write(&path, &bytes).unwrap();
+            let health = health(&store, &entry(), false);
+            assert!(matches!(
+                refresh_verify(&store, &health),
+                Err(ConsentedError::Digest(_))
+            ));
+            assert!(!health.called.get());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(load_receipt(&store).unwrap(), receipt);
+        }
+    }
+
+    #[test]
+    fn refresh_never_runs_beneath_a_live_worker_lease_or_store_lock() {
+        let (_temp, store) = store();
+        install(&store);
+        let stale = make_worker_stale(&store);
+        let root = install_root(&store, &stale.entry_id, &stale.content_hash);
+        let live = consented_install_lease(&ConsentedLayout::at(root.clone())).unwrap();
+        let health = health(&store, &entry(), false);
+        assert!(matches!(
+            refresh_verify(&store, &health),
+            Err(ConsentedError::Leased)
+        ));
+        assert!(!health.called.get());
+        assert_eq!(load_receipt(&store).unwrap(), stale);
+        assert!(root.join("worker/__pycache__/worker.pyc").exists());
+        drop(live);
+        let lock = store.lock_exclusive().unwrap();
+        assert!(matches!(
+            refresh_verify(&store, &health),
+            Err(ConsentedError::Store(_))
+        ));
+        drop(lock);
+        assert!(refresh_verify(&store, &health).is_ok());
+        assert!(worker_matches_binary(&root));
+    }
+
+    // Before worker files left the folder hash, receipts were v2 and named a
+    // folder hash that a later binary cannot recompute.
+    fn make_legacy(store: &ModelStore, hash: &str) -> (ConsentedReceipt, PathBuf) {
+        let mut receipt = load_receipt(store).unwrap();
+        let current = install_root(store, &receipt.entry_id, &receipt.content_hash);
+        let legacy = install_root(store, &receipt.entry_id, hash);
+        fs::rename(&current, &legacy).unwrap();
+        let layout = ConsentedLayout::at(legacy.clone());
+        receipt.version = 2;
+        receipt.content_hash = hash.into();
+        receipt.python_path = layout.python.join("bin/python3");
+        receipt.venv_path = layout.venv_python();
+        receipt.receipt_hash = receipt_hash(&receipt).unwrap();
+        store_receipt(store, &receipt).unwrap();
+        (receipt, legacy)
+    }
+
+    #[test]
+    fn legacy_folder_receipt_is_admitted_and_refreshed_in_place() {
+        let (_temp, store) = store();
+        install(&store);
+        let (legacy_receipt, legacy) = make_legacy(&store, &"ab".repeat(32));
+        let verified = verify_with_entry(&store, &entry()).unwrap();
+        assert_eq!(verified.layout().root, legacy);
+        drop(verified);
+        let stale = make_worker_stale(&store);
+        let health = health_at(legacy.clone(), false);
+        let verified = refresh_verify(&store, &health).unwrap();
+        assert!(health.called.get());
+        assert_eq!(verified.layout().root, legacy);
+        assert_eq!(verified.receipt(), &legacy_receipt);
+        assert_eq!(verified.receipt().version, 2);
+        assert_eq!(verified.receipt().consent, stale.consent);
+        assert!(worker_matches_binary(&legacy));
+    }
+
+    #[test]
+    fn bad_legacy_folder_receipts_are_rejected() {
+        let hash = "ab".repeat(32);
+        for kind in 0..7 {
+            let (_temp, store) = store();
+            install(&store);
+            let (mut receipt, legacy) = make_legacy(&store, &hash);
+            match kind {
+                0 => receipt.content_hash = "zz".repeat(32),
+                1 => receipt.content_hash = "AB".repeat(32),
+                2 => receipt.content_hash = "ab".repeat(31),
+                3 => receipt.content_hash = format!("../{hash}"),
+                4 => receipt.version = 3,
+                5 => receipt.version = 1,
+                _ => {
+                    // A legacy hash is a folder name, never a path elsewhere.
+                    receipt.venv_path = store
+                        .root()
+                        .join("consented/other")
+                        .join(&hash)
+                        .join("runtime/venv/bin/python");
+                }
+            }
+            receipt.receipt_hash = receipt_hash(&receipt).unwrap();
+            store_receipt(&store, &receipt).unwrap();
+            let health = health_at(legacy.clone(), false);
+            assert!(
+                matches!(
+                    refresh_verify(&store, &health),
+                    Err(ConsentedError::Receipt)
+                ),
+                "kind {kind}"
+            );
+            assert!(!health.called.get());
+        }
+        // A legacy hash names a folder that must exist directly in place.
+        let (_temp, store) = store();
+        install(&store);
+        let (_, legacy) = make_legacy(&store, &hash);
+        let parked = legacy.with_file_name("parked");
+        fs::rename(&legacy, &parked).unwrap();
+        symlink(&parked, &legacy).unwrap();
+        assert!(refresh_verify(&store, &health_at(legacy, false)).is_err());
+    }
+
+    #[test]
+    fn install_over_a_stale_worker_receipt_refreshes_without_downloads() {
+        let (_temp, store) = store();
+        let original = install(&store);
+        make_worker_stale(&store);
+        let root = install_root(&store, &original.entry_id, &original.content_hash);
+        let fetcher = ScriptedFetcher::default();
+        let builder = FakeBuilder::default();
+        let health = health(&store, &entry(), false);
+        let mut install = request(&store, &fetcher, &builder, &health);
+        install.consent.unix_time = 99;
+        let receipt = install_with_entry(install, &entry()).unwrap();
+        assert!(!builder.called.get());
+        assert!(health.called.get());
+        // The original consent stands; setup did not ask again.
+        assert_eq!(receipt, original);
+        assert_eq!(load_receipt(&store).unwrap(), original);
+        assert!(worker_matches_binary(&root));
+    }
+
+    #[test]
+    fn crash_between_worker_swap_and_receipt_store_refreshes_again() {
+        let (_temp, store) = store();
+        let original = install(&store);
+        let stale = make_worker_stale(&store);
+        let root = install_root(&store, &original.entry_id, &original.content_hash);
+        let fetcher = ScriptedFetcher::default();
+        let builder = FakeBuilder::default();
+        let install_health = health(&store, &entry(), false);
+        let calls = Cell::new(0);
+        let result = install_with_receipt_sync(
+            request(&store, &fetcher, &builder, &install_health),
+            &entry(),
+            |_| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    Err(std::io::Error::other("injected receipt fsync failure"))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(matches!(result, Err(ConsentedError::Io(_))));
+        // New worker files with the old receipt: exactly a crash after the swap.
+        assert_eq!(load_receipt(&store).unwrap(), stale);
+        assert!(worker_matches_binary(&root));
+        assert!(refresh_verify(&store, &health(&store, &entry(), false)).is_ok());
+        assert_eq!(load_receipt(&store).unwrap(), original);
+        // A crash between moving the old worker out and the new one in.
+        make_worker_stale(&store);
+        fs::remove_dir_all(root.join("worker")).unwrap();
+        assert!(refresh_verify(&store, &health(&store, &entry(), false)).is_ok());
+        assert!(worker_matches_binary(&root));
     }
 
     #[test]

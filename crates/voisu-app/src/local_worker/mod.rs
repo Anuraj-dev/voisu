@@ -38,7 +38,9 @@ pub use bounds::{
     worker_cpu_quota_cores, worker_memory_ceiling_bytes,
 };
 pub use consented::ConsentedWorkerHealth;
-pub(crate) use consented::{consented_active_receipt, select_consented_receipt};
+pub(crate) use consented::{
+    consented_active_receipt, select_consented_receipt, verify_consented_install_refreshing,
+};
 #[cfg(not(test))]
 pub(crate) use consented::{launch_consented_worker, verify_default_consented_install};
 #[cfg(not(test))]

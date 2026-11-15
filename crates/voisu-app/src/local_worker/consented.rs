@@ -14,13 +14,14 @@ use super::dev::DevWorker;
 use super::dev::GPU_BUSY;
 use super::protocol::{ControlFrame, Correlation, WorkerFrame};
 use super::supervisor::{ReapOutcome, SupervisorError, WorkerChild};
+use crate::local_model::consented::verify_consented_install_notifying;
 use crate::local_model::{ActiveReceipt, FilePin};
 use crate::local_model::{
     CONSENTED_ENTRY, ConsentedCatalogEntry, ConsentedError, ConsentedFilePin, ConsentedHealth,
     ConsentedLayout, ConsentedReceipt, ConsentedRuntimeEntry, DevFilePin, DevLimits, DevManifest,
     DevRuntimeManifest, EXPECTED_HEALTH_TEXT, ModelStore, VerifiedConsentedInstall,
     consented_worker_files, development_catalog_entry, ensure_private_dir, models_dir_from_state,
-    sha256_hex, verify_consented_install,
+    sha256_hex,
 };
 
 /// Installation's real, isolated health probe. `state_dir` is the Voisu
@@ -131,7 +132,26 @@ pub(crate) fn verify_default_consented_install() -> Result<VerifiedConsentedInst
     let dir = models_dir_from_state(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
         .map_err(ConsentedError::Store)?;
     let store = ModelStore::open(dir).map_err(ConsentedError::Store)?;
-    verify_consented_install(&store)
+    verify_consented_install_refreshing(&store, || {})
+}
+
+/// Production admission: stale worker files are rewritten from this binary and
+/// health-checked first (ADR 0012). Without a state directory there is no
+/// health run, so admission falls back to plain verification.
+pub(crate) fn verify_consented_install_refreshing(
+    store: &ModelStore,
+    on_verifying: impl FnOnce(),
+) -> Result<VerifiedConsentedInstall, ConsentedError> {
+    let entry = crate::local_model::consented::installed_entry(store)?;
+    match voisu_core::state_dir() {
+        Ok(state) => crate::local_model::consented::verify_with_entry_refreshing(
+            store,
+            entry,
+            &ConsentedWorkerHealth::for_entry(state, entry),
+            on_verifying,
+        ),
+        Err(_) => verify_consented_install_notifying(store, on_verifying),
+    }
 }
 
 pub(crate) fn select_consented_receipt(
