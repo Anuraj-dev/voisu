@@ -49,6 +49,14 @@ Comment:
  third_party/fiat, licensed Apache-2.0. The verbatim upstream text is installed
  as /usr/share/doc/voisu/ring/third_party/fiat/LICENSE.
 
+Files: crates/voisu-core/src/speech_gate.rs
+Copyright: 2025 Peter Jackson
+License: MIT
+Comment:
+ The speech-presence gate adapts VoxType's adaptive energy voice-activity rule
+ (https://github.com/peteonrails/voxtype, src/vad/energy.rs at commit fbedd62).
+ The notice is also kept in THIRD_PARTY_NOTICES.md in the source tree.
+
 License: MIT
  Permission is hereby granted, free of charge, to any person obtaining a copy
  of this software and associated documentation files (the "Software"), to deal

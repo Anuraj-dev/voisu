@@ -43,6 +43,7 @@ install="$pkgname.install"
 #   voisu.service, voisu-overlay.service
 #   voisu.desktop, voisu.svg
 #   LICENSE
+#   THIRD_PARTY_NOTICES.md
 #   ring/LICENSE
 #   ring/LICENSE-BoringSSL
 #   ring/LICENSE-other-bits
@@ -69,6 +70,8 @@ package() {
     install -Dm644 voisu.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/voisu.svg"
 
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 THIRD_PARTY_NOTICES.md \
+        "$pkgdir/usr/share/licenses/$pkgname/THIRD_PARTY_NOTICES.md"
 
     # Preserve ring's upstream license tree verbatim.
     local ringlic="$pkgdir/usr/share/licenses/$pkgname/ring"

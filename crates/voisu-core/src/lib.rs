@@ -25,6 +25,9 @@ pub use session::{
 mod wav;
 pub use wav::{WavScan, scan_wav_pcm};
 
+mod speech_gate;
+pub use speech_gate::{SPEECH_THRESHOLD, SpeechPresence, detect_speech};
+
 mod diagnostics;
 mod timing;
 pub use diagnostics::{

@@ -123,6 +123,7 @@ jobs:
           install -m644 packaging/voisu.desktop         "$troot/voisu.desktop"
           install -m644 packaging/icons/voisu.svg       "$troot/voisu.svg"
           install -m644 LICENSE                         "$troot/LICENSE"
+          install -m644 THIRD_PARTY_NOTICES.md          "$troot/THIRD_PARTY_NOTICES.md"
           install -m644 packaging/aur/voisu/LICENSE.ring            "$troot/ring/LICENSE"
           install -m644 packaging/aur/voisu/LICENSE.ring-BoringSSL  "$troot/ring/LICENSE-BoringSSL"
           install -m644 packaging/aur/voisu/LICENSE.ring-other-bits "$troot/ring/LICENSE-other-bits"

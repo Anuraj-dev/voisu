@@ -4,6 +4,9 @@
 
 use super::*;
 
+/// `pw-record` is asked for 16 kHz mono s16 (the `--rate` flag below).
+const CAPTURE_SAMPLE_RATE: u32 = 16_000;
+
 pub struct PipeWireCapture {
     reaper: ProviderReaper,
     levels: LevelRegistry,
@@ -551,16 +554,21 @@ impl PipeWireActiveCapture {
                 format!("Recording contained {} PCM bytes", self.pcm.len()),
             ));
         }
-        let audible = self
+        // Capture is mono s16le at 16 kHz: on the `--raw` path the format comes
+        // from the `--rate 16000 --channels 1 --format s16` flags, and on the WAV
+        // path the header scan rejects anything else. The gate removes DC per
+        // frame first: a raw peak never fires on a mic with a DC offset.
+        let samples: Vec<i16> = self
             .pcm
             .as_chunks::<2>()
             .0
             .iter()
-            .any(|sample| i16::from_le_bytes([sample[0], sample[1]]).unsigned_abs() > 32);
-        if !audible {
+            .map(|sample| i16::from_le_bytes(*sample))
+            .collect();
+        if !voisu_core::detect_speech(&samples, CAPTURE_SAMPLE_RATE).has_speech {
             return Err(BoundaryError::new(
                 BoundaryKind::SilentRecording,
-                "Recording peak amplitude did not exceed the silence floor",
+                "Recording contained no speech above the silence floor",
             ));
         }
         Ok(())
@@ -804,5 +812,71 @@ mod pw_record_command_tests {
         assert!(!stdbuf_usable(None, Duration::from_secs(5)));
         let empty = tempfile::tempdir().unwrap();
         assert!(!usable(empty.path()));
+    }
+}
+
+#[cfg(test)]
+mod silence_gate_tests {
+    use super::*;
+
+    const RATE: usize = 16_000;
+
+    fn capture_with(samples: &[i16]) -> PipeWireActiveCapture {
+        PipeWireActiveCapture {
+            child: None,
+            state: Arc::new(Mutex::new(CaptureReaderState {
+                chunks: VecDeque::new(),
+                received_bytes: 0,
+                eof: true,
+                error: None,
+                buffer_cap_reached: false,
+            })),
+            reader: None,
+            stderr_reader: None,
+            cleanup: None,
+            reaper: ProviderReaper::new(),
+            pcm: samples.iter().flat_map(|s| s.to_le_bytes()).collect(),
+            started: Instant::now(),
+            deadline: DEFAULT_RECORDING_DEADLINE,
+        }
+    }
+
+    /// Low pseudo-random noise (+-20 LSB) around `dc`, the shape of a quiet
+    /// room heard through a microphone with a DC offset.
+    fn quiet_room(dc: i32, len: usize) -> Vec<i16> {
+        let mut state = 7_u32;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (dc + ((state >> 16) % 41) as i32 - 20) as i16
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_silent_recording_on_a_dc_offset_mic_is_rejected() {
+        // Peak ~620: the old raw-peak check (> 32) passed this as audible.
+        let error = capture_with(&quiet_room(600, 2 * RATE))
+            .validate_audio()
+            .expect_err("silence with a DC offset is a silent recording");
+        assert_eq!(error.kind(), BoundaryKind::SilentRecording);
+    }
+
+    #[test]
+    fn speech_on_a_dc_offset_mic_is_accepted() {
+        let mut samples = quiet_room(600, 2 * RATE);
+        for (i, sample) in samples[RATE / 2..RATE].iter_mut().enumerate() {
+            let phase = 2.0 * std::f32::consts::PI * 140.0 * i as f32 / RATE as f32;
+            *sample += (3_000.0 * phase.sin()) as i16;
+        }
+        assert!(capture_with(&samples).validate_audio().is_ok());
+    }
+
+    #[test]
+    fn empty_and_too_short_recordings_keep_their_errors() {
+        let empty = capture_with(&[]).validate_audio().unwrap_err();
+        assert_eq!(empty.kind(), BoundaryKind::EmptyRecording);
+        let short = capture_with(&[1_000; 8]).validate_audio().unwrap_err();
+        assert_eq!(short.kind(), BoundaryKind::TooShortRecording);
     }
 }

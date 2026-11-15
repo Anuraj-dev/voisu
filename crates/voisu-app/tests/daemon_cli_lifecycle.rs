@@ -386,7 +386,7 @@ fn pipewire_groq_merge_result_and_clipboard_delivery_form_one_real_boundary_slic
 dir=$(dirname "$0")
 printf '%s\n' "$@" > "$dir/pw-record.args"
 env | sort > "$dir/pw-record.env"
-head -c 6400 /dev/zero | tr '\000' '\001'
+yes "$(printf '\001\100\300')" | head -c 6400
 trap 'printf "\002\003"; trap - EXIT; exit 1' INT TERM
 : > "$dir/pw-record.ready"
 i=0
@@ -477,7 +477,7 @@ fn clipboard_delivery_succeeds_while_wl_copy_serves_the_clipboard_past_exit() {
         "pw-record",
         r#"#!/bin/sh
 dir=$(dirname "$0")
-head -c 6400 /dev/zero | tr '\000' '\001'
+yes "$(printf '\001\100\300')" | head -c 6400
 trap 'printf "\002\003"; trap - EXIT; exit 1' INT TERM
 : > "$dir/pw-record.ready"
 i=0
@@ -775,7 +775,7 @@ fn x11_session_delivers_the_transcript_through_xclip_with_display_credentials() 
         "pw-record",
         r#"#!/bin/sh
 dir=$(dirname "$0")
-head -c 6400 /dev/zero | tr '\000' '\001'
+yes "$(printf '\001\100\300')" | head -c 6400
 trap 'exit 0' INT TERM
 : > "$dir/pw-record.ready"
 i=0
@@ -919,7 +919,7 @@ fn unknown_session_falls_back_to_xclip_after_a_hanging_wl_copy() {
         "pw-record",
         r#"#!/bin/sh
 dir=$(dirname "$0")
-head -c 6400 /dev/zero | tr '\000' '\001'
+yes "$(printf '\001\100\300')" | head -c 6400
 trap 'exit 0' INT TERM
 : > "$dir/pw-record.ready"
 i=0
@@ -1009,7 +1009,7 @@ fn dictionary_edits_between_recordings_reach_providers_and_the_comparator() {
     write_fake_command(
         commands.path(),
         "pw-record",
-        "#!/bin/sh\ndir=$(/usr/bin/dirname \"$0\")\n/usr/bin/head -c 6400 /dev/zero | /usr/bin/tr '\\000' '\\100'\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\ni=0\nwhile [ \"$i\" -lt 60 ]; do /usr/bin/sleep 1; i=$((i + 1)); done\n",
+        "#!/bin/sh\ndir=$(/usr/bin/dirname \"$0\")\n/usr/bin/yes \"$(printf '\\001\\100\\300')\" | /usr/bin/head -c 6400\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\ni=0\nwhile [ \"$i\" -lt 60 ]; do /usr/bin/sleep 1; i=$((i + 1)); done\n",
     );
     write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat > /dev/null\n");
     let deepgram_endpoint = spawn_mock_deepgram(
@@ -1129,7 +1129,7 @@ fn deepgram_source_transcript_delivers_when_groq_fails() {
         "pw-record",
         r#"#!/bin/sh
 dir=$(dirname "$0")
-head -c 32000 /dev/zero | tr '\000' '\001'
+yes "$(printf '\001\100\300')" | head -c 32000
 trap 'exit 0' INT TERM
 : > "$dir/pw-record.ready"
 i=0
@@ -1203,7 +1203,7 @@ fn provider_disconnect_malformed_response_and_quota_error_fall_back_and_recover(
             "pw-record",
             r#"#!/bin/sh
 dir=$(dirname "$0")
-head -c 6400 /dev/zero | tr '\000' '\100'
+yes "$(printf '\001\100\300')" | head -c 6400
 trap 'exit 0' INT TERM
 : > "$dir/pw-record.ready"
 i=0
@@ -1304,7 +1304,7 @@ fn groq_transcribes_a_short_recording_as_one_full_audio_request_at_finalize() {
         "pw-record",
         r#"#!/bin/sh
 dir=$(dirname "$0")
-head -c 32000 /dev/zero | tr '\000' '\001'
+yes "$(printf '\001\100\300')" | head -c 32000
 : > "$dir/pw-record.ready"
 trap 'printf "\002\003"; trap - EXIT; exit 1' INT TERM
 i=0
@@ -1380,7 +1380,7 @@ fn production_capture_is_reaped_after_provider_start_failure_and_the_next_record
         r#"#!/bin/sh
 dir=$(dirname "$0")
 printf '%s\n' "$$" >> "$dir/pw-record.pids"
-head -c 6400 /dev/zero | tr '\000' '\001'
+yes "$(printf '\001\100\300')" | head -c 6400
 trap 'printf "\002\003"; trap - EXIT; exit 1' INT TERM
 : > "$dir/pw-record.ready"
 i=0
@@ -1536,7 +1536,7 @@ fn status_stays_responsive_while_pw_record_stop_is_slow() {
         "pw-record",
         r#"#!/bin/sh
 dir=$(dirname "$0")
-head -c 6400 /dev/zero | tr '\000' '\100'
+yes "$(printf '\001\100\300')" | head -c 6400
 trap ': > "$dir/pw-record.stopping"; i=0; while [ ! -e "$dir/pw-record.release" ] && [ "$i" -lt 3000 ]; do sleep 0.02; i=$((i + 1)); done; exit 0' INT TERM
 : > "$dir/pw-record.ready"
 i=0
@@ -1663,7 +1663,7 @@ fn assert_production_groq_blank_reads_as(extra_environment: &[(&str, &str)], rea
     write_fake_command(
         commands.path(),
         "pw-record",
-        "#!/bin/sh\ndir=$(dirname \"$0\")\n/usr/bin/head -c 6400 /dev/zero | /usr/bin/tr '\\000' '\\100'\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\ni=0\nwhile [ \"$i\" -lt 60 ]; do sleep 1; i=$((i + 1)); done\n",
+        "#!/bin/sh\ndir=$(dirname \"$0\")\n/usr/bin/yes \"$(printf '\\001\\100\\300')\" | /usr/bin/head -c 6400\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\ni=0\nwhile [ \"$i\" -lt 60 ]; do sleep 1; i=$((i + 1)); done\n",
     );
     write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat > /dev/null\n");
     let (endpoint, request_rx, server) = local_groq_server("   ");
@@ -1710,7 +1710,7 @@ fn production_groq_5xx_is_recoverable_through_the_public_cli() {
     write_fake_command(
         commands.path(),
         "pw-record",
-        "#!/bin/sh\ndir=$(dirname \"$0\")\n/usr/bin/head -c 6400 /dev/zero | /usr/bin/tr '\\000' '\\100'\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\ni=0\nwhile [ \"$i\" -lt 60 ]; do sleep 1; i=$((i + 1)); done\n",
+        "#!/bin/sh\ndir=$(dirname \"$0\")\n/usr/bin/yes \"$(printf '\\001\\100\\300')\" | /usr/bin/head -c 6400\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\ni=0\nwhile [ \"$i\" -lt 60 ]; do sleep 1; i=$((i + 1)); done\n",
     );
     write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat > /dev/null\n");
     let (endpoint, request_rx, server) = local_groq_response_server(
@@ -1752,7 +1752,7 @@ fn production_slow_groq_endpoint_is_bounded_and_recoverable() {
     write_fake_command(
         commands.path(),
         "pw-record",
-        "#!/bin/sh\ndir=$(dirname \"$0\")\n/usr/bin/head -c 6400 /dev/zero | /usr/bin/tr '\\000' '\\100'\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\ni=0\nwhile [ \"$i\" -lt 60 ]; do sleep 1; i=$((i + 1)); done\n",
+        "#!/bin/sh\ndir=$(dirname \"$0\")\n/usr/bin/yes \"$(printf '\\001\\100\\300')\" | /usr/bin/head -c 6400\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\ni=0\nwhile [ \"$i\" -lt 60 ]; do sleep 1; i=$((i + 1)); done\n",
     );
     write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat > /dev/null\n");
     let (endpoint, request_rx, server) = local_groq_response_server(
@@ -1888,7 +1888,7 @@ if test "$count" = "1"; then
   trap - EXIT
   exit 7
 fi
-head -c 6400 /dev/zero | tr '\000' '\100'
+yes "$(printf '\001\100\300')" | head -c 6400
 trap 'exit 0' INT TERM
 : > "$dir/pw-record.reconnected"
 i=0
@@ -1955,7 +1955,7 @@ fn production_missing_wl_copy_is_reported_and_recoverable() {
     write_fake_command(
         commands.path(),
         "pw-record",
-        "#!/bin/sh\ndir=$(/usr/bin/dirname \"$0\")\n/usr/bin/head -c 6400 /dev/zero | /usr/bin/tr '\\000' '\\100'\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\ni=0\nwhile [ \"$i\" -lt 60 ]; do /usr/bin/sleep 1; i=$((i + 1)); done\n",
+        "#!/bin/sh\ndir=$(/usr/bin/dirname \"$0\")\n/usr/bin/yes \"$(printf '\\001\\100\\300')\" | /usr/bin/head -c 6400\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\ni=0\nwhile [ \"$i\" -lt 60 ]; do /usr/bin/sleep 1; i=$((i + 1)); done\n",
     );
     std::os::unix::fs::symlink("/usr/bin/curl", commands.path().join("curl")).unwrap();
     let (endpoint, request_rx, server) = local_groq_server("undeliverable Transcript");
@@ -2540,7 +2540,7 @@ fn a_capture_that_dies_silently_before_stop_never_delivers_a_transcript() {
     write_fake_command(
         commands.path(),
         "pw-record",
-        "#!/bin/sh\ndir=$(dirname \"$0\")\nhead -c 6400 /dev/zero | tr '\\000' '\\001'\n: > \"$dir/pw-record.ready\"\ntrap - EXIT\nexit 1\n",
+        "#!/bin/sh\ndir=$(dirname \"$0\")\nyes \"$(printf '\\001\\100\\300')\" | head -c 6400\n: > \"$dir/pw-record.ready\"\ntrap - EXIT\nexit 1\n",
     );
     write_fake_command(
         commands.path(),
@@ -2965,7 +2965,7 @@ cat "$dir/clipboard"
 case "$1" in
   --help) printf 'pw-record - capture\n  -a, --raw    RAW mode\n  --rate RATE\n  -h, --help\n'; exit 0 ;;
 esac
-head -c 6400 /dev/zero | tr '\000' '\001'
+yes "$(printf '\001\100\300')" | head -c 6400
 "#,
         );
         // A systemctl whose `--user show-environment` reports a manager that
@@ -3171,7 +3171,7 @@ fn start_portal_clipboard_daemon(runtime: &Path, commands: &Path, portal_address
         "pw-record",
         r#"#!/bin/sh
 dir=$(dirname "$0")
-head -c 6400 /dev/zero | tr '\000' '\100'
+yes "$(printf '\001\100\300')" | head -c 6400
 trap 'exit 0' INT TERM
 : > "$dir/pw-record.ready"
 while :; do sleep 0.01; done
@@ -6844,7 +6844,7 @@ fn production_material_disagreement_invokes_configured_reconciliation_model() {
         "pw-record",
         r#"#!/bin/sh
 dir=$(dirname "$0")
-head -c 32000 /dev/zero | tr '\000' '\001'
+yes "$(printf '\001\100\300')" | head -c 32000
 trap 'exit 0' INT TERM
 : > "$dir/pw-record.ready"
 i=0
@@ -6931,7 +6931,7 @@ fn default_qwen_reconciliation_request_includes_model_and_reasoning_effort_none(
         "pw-record",
         r#"#!/bin/sh
 dir=$(dirname "$0")
-head -c 32000 /dev/zero | tr '\000' '\001'
+yes "$(printf '\001\100\300')" | head -c 32000
 trap 'exit 0' INT TERM
 : > "$dir/pw-record.ready"
 i=0
@@ -7023,7 +7023,7 @@ fn elapsed_reconciliation_deadline_kills_and_reaps_the_in_flight_curl_before_idl
         "pw-record",
         r#"#!/bin/sh
 dir=$(dirname "$0")
-head -c 32000 /dev/zero | tr '\000' '\001'
+yes "$(printf '\001\100\300')" | head -c 32000
 trap 'exit 0' INT TERM
 : > "$dir/pw-record.ready"
 i=0
@@ -7162,7 +7162,7 @@ fn provider_deadline_closes_the_late_deepgram_stream_before_the_daemon_reports_i
         "pw-record",
         r#"#!/bin/sh
 dir=$(dirname "$0")
-head -c 32000 /dev/zero | tr '\000' '\001'
+yes "$(printf '\001\100\300')" | head -c 32000
 trap 'exit 0' INT TERM
 : > "$dir/pw-record.ready"
 i=0
@@ -7232,7 +7232,7 @@ fn deepgram_streaming_error_fails_the_provider_and_groq_still_delivers() {
         "pw-record",
         r#"#!/bin/sh
 dir=$(dirname "$0")
-head -c 32000 /dev/zero | tr '\000' '\001'
+yes "$(printf '\001\100\300')" | head -c 32000
 trap 'exit 0' INT TERM
 : > "$dir/pw-record.ready"
 i=0
@@ -8458,7 +8458,7 @@ fn capture_boundary_read_error_aborts_without_delivery_or_truncation() {
         commands.path(),
         "pw-record",
         r#"#!/bin/sh
-head -c 6400 /dev/zero | tr '\000' '\100'
+yes "$(printf '\001\100\300')" | head -c 6400
 trap 'exit 0' INT TERM
 while :; do sleep 0.01; done
 "#,
@@ -9213,7 +9213,7 @@ fn daemon_interruption_reaps_boundary_processes_and_restarts_in_a_safe_state() {
 dir=$(dirname "$0")
 printf '%s' "$$" > "$dir/pw-record.pid.$$"
 mv "$dir/pw-record.pid.$$" "$dir/pw-record.pid"
-head -c 4000000 /dev/zero | tr '\000' '\001'
+yes "$(printf '\001\100\300')" | head -c 4000000
 trap 'exit 0' INT TERM
 i=0
 while test "$i" -lt 6000; do sleep 0.01; i=$((i + 1)); done
@@ -9307,7 +9307,7 @@ mv "$dir/pw-record.pid.$$" "$dir/pw-record.pid"
 trap 'exit 0' INT TERM
 i=0
 while test "$i" -lt 600; do
-  head -c 3200 /dev/zero | tr '\000' '\001'
+  yes "$(printf '\001\100\300')" | head -c 3200
   sleep 0.01
   i=$((i + 1))
 done
@@ -9600,6 +9600,12 @@ fn failed_recording_kills_its_in_flight_groq_request_before_the_next_recording()
     // request started BEFORE the failure" resting on microseconds. The first
     // burst alone (7_900_000 bytes, ~4 minutes) crosses the 120 s chunking
     // threshold, so curl.start is provably created during the pause.
+    //
+    // Constant PCM on purpose: the Recording fails on the read error before
+    // stop, so the speech-presence gate never sees it, and a constant signal
+    // FLAC-encodes in a trivial constant subframe. Audible PCM makes the debug
+    // build's chunk encode slow enough on one CI core to miss the marker
+    // deadline.
     write_fake_command(
         commands.path(),
         "pw-record",
@@ -9698,7 +9704,7 @@ fn finalize_groq_request_is_killed_when_the_provider_deadline_fires() {
         "pw-record",
         r#"#!/bin/sh
 dir=$(dirname "$0")
-head -c 64000 /dev/zero | tr '\000' '\001'
+yes "$(printf '\001\100\300')" | head -c 64000
 : > "$dir/pw-record.ready"
 trap 'exit 0' INT TERM
 i=0
@@ -9788,9 +9794,9 @@ fn failed_recording_closes_its_deepgram_stream_before_the_next_recording() {
         commands.path(),
         "pw-record",
         r#"#!/bin/sh
-head -c 32000 /dev/zero | tr '\000' '\001'
+yes "$(printf '\001\100\300')" | head -c 32000
 sleep 1
-head -c 32000 /dev/zero | tr '\000' '\001'
+yes "$(printf '\001\100\300')" | head -c 32000
 trap 'exit 0' INT TERM
 i=0
 while [ "$i" -lt 6000 ]; do sleep 0.01; i=$((i + 1)); done
@@ -10484,7 +10490,7 @@ fn the_configured_transcription_language_reaches_both_provider_requests() {
     write_fake_command(
         commands.path(),
         "pw-record",
-        "#!/bin/sh\ndir=$(/usr/bin/dirname \"$0\")\n/usr/bin/head -c 6400 /dev/zero | /usr/bin/tr '\\000' '\\100'\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\ni=0\nwhile [ \"$i\" -lt 60 ]; do /usr/bin/sleep 1; i=$((i + 1)); done\n",
+        "#!/bin/sh\ndir=$(/usr/bin/dirname \"$0\")\n/usr/bin/yes \"$(printf '\\001\\100\\300')\" | /usr/bin/head -c 6400\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\ni=0\nwhile [ \"$i\" -lt 60 ]; do /usr/bin/sleep 1; i=$((i + 1)); done\n",
     );
     write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat > /dev/null\n");
     let deepgram_endpoint = spawn_mock_deepgram(
@@ -10542,7 +10548,7 @@ fn the_unset_transcription_language_keeps_the_historic_english_request() {
     write_fake_command(
         commands.path(),
         "pw-record",
-        "#!/bin/sh\ndir=$(/usr/bin/dirname \"$0\")\n/usr/bin/head -c 6400 /dev/zero | /usr/bin/tr '\\000' '\\100'\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\ni=0\nwhile [ \"$i\" -lt 60 ]; do /usr/bin/sleep 1; i=$((i + 1)); done\n",
+        "#!/bin/sh\ndir=$(/usr/bin/dirname \"$0\")\n/usr/bin/yes \"$(printf '\\001\\100\\300')\" | /usr/bin/head -c 6400\ntrap 'exit 0' INT TERM\n: > \"$dir/pw-record.ready\"\ni=0\nwhile [ \"$i\" -lt 60 ]; do /usr/bin/sleep 1; i=$((i + 1)); done\n",
     );
     write_fake_command(commands.path(), "wl-copy", "#!/bin/sh\ncat > /dev/null\n");
     let deepgram_endpoint = spawn_mock_deepgram(
@@ -12312,7 +12318,7 @@ fn a_disabled_deepgram_without_a_credential_still_completes_the_recording() {
         commands.path(),
         "pw-record",
         r#"#!/bin/sh
-head -c 6400 /dev/zero | tr '\000' '\001'
+yes "$(printf '\001\100\300')" | head -c 6400
 trap 'printf "\002\003"; trap - EXIT; exit 1' INT TERM
 i=0
 while [ "$i" -lt 6000 ]; do /usr/bin/sleep 0.01; i=$((i + 1)); done
@@ -12487,7 +12493,7 @@ fn copy_mode_says_copied(extra_environment: &[(&str, &str)]) {
         commands.path(),
         "pw-record",
         r#"#!/bin/sh
-head -c 6400 /dev/zero | tr '\000' '\001'
+yes "$(printf '\001\100\300')" | head -c 6400
 trap 'printf "\002\003"; trap - EXIT; exit 1' INT TERM
 i=0
 while [ "$i" -lt 6000 ]; do /usr/bin/sleep 0.01; i=$((i + 1)); done
