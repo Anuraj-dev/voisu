@@ -303,14 +303,21 @@ pub fn whisper_prompt_for_terms(terms: &[String]) -> String {
 /// (first spelling wins) and cut at [`LOCAL_PROMPT_MAX_BYTES`] by
 /// dropping whole terms, never by truncating one. Built-in terms are left out
 /// so an empty personal Dictionary yields `None` and the request stays exactly
-/// as it was before this prompt existed.
+/// as it was before this prompt existed. Whitespace and control characters
+/// inside a term collapse to single spaces, because the worker rejects a
+/// prompt with control characters and one stray tab would otherwise drop
+/// every term.
 pub fn local_prompt_for_terms(user_terms: &[String]) -> Option<String> {
     let mut seen: HashSet<String> = HashSet::new();
     let unique: Vec<String> = user_terms
         .iter()
-        .map(|term| term.trim())
+        .map(|term| {
+            term.split(|c: char| c.is_whitespace() || c.is_control())
+                .filter(|word| !word.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
         .filter(|term| !term.is_empty() && seen.insert(comparison_key(term)))
-        .map(str::to_owned)
         .collect();
     let prompt = glossary_within(&unique, LOCAL_PROMPT_MAX_BYTES);
     (!prompt.is_empty()).then_some(prompt)
@@ -752,6 +759,21 @@ Tokio   # inline comment
             local_prompt_for_terms(&terms).as_deref(),
             Some("Voisu, tokio")
         );
+    }
+
+    #[test]
+    fn local_prompt_turns_control_characters_into_spaces_per_term() {
+        // One stray tab must cost only its own term's spacing, never the
+        // whole prompt (the worker rejects a prompt with control characters).
+        let terms = vec![
+            "Voisu".to_owned(),
+            "Tokio\truntime".to_owned(),
+            "\u{7}".to_owned(),
+            "wayfinder".to_owned(),
+        ];
+        let prompt = local_prompt_for_terms(&terms).unwrap();
+        assert_eq!(prompt, "Voisu, Tokio runtime, wayfinder");
+        assert!(!prompt.chars().any(char::is_control));
     }
 
     #[test]

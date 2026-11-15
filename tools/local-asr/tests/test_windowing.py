@@ -5,6 +5,7 @@ CUDA memory, model quality, or boundary word accuracy.
 """
 
 import array
+import contextlib
 import io
 import json
 from pathlib import Path
@@ -398,6 +399,15 @@ class PromptEchoTests(unittest.TestCase):
         adapter = PromptAdapter(["real words", "Voisu, Tokio, wayfinder."])
         reply = serve(adapter, pcm_of(loud(WINDOW + RATE)), prompt=self.PROMPT)
         self.assertEqual((reply["status"], reply["text"]), ("transcript", "real words"))
+
+    def test_a_dropped_echo_is_logged_locally_without_the_dictionary(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.run_window("Voisu, Tokio")
+        log = stderr.getvalue()
+        self.assertIn("dropped a window that only listed Dictionary terms", log)
+        for term in ("Voisu", "Tokio", "wayfinder"):
+            self.assertNotIn(term, log)
 
     def test_without_a_prompt_nothing_is_filtered(self):
         reply = serve(PromptAdapter(["Voisu, Tokio"]), pcm_of(loud(RATE)))
