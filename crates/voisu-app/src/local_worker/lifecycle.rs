@@ -184,9 +184,28 @@ impl<C: WorkerChild, D: DeliverySeam> LocalLifecycle<C, D> {
     /// the owned child without transcribing. Never drops busy work and never
     /// falls back silently — after this call Local work needs an explicit
     /// Setup retry, and inference reports only the health-observed device.
+    ///
+    /// A child still attached in `Unavailable` (a faulted worker, or one an
+    /// earlier reap could not confirm gone) may still hold RAM/VRAM, so it is
+    /// cancelled and reaped too. That reap is not a clean planned unload: its
+    /// start stays counted in the restart budget. A child that still survives
+    /// keeps Local unavailable.
     pub fn drain_for_cloud_selection(&mut self) -> Result<ReapOutcome, SupervisorError> {
         self.invalidate();
-        self.supervisor.unload_idle()
+        if self.supervisor.state() != WorkerState::Unavailable || !self.supervisor.has_child() {
+            return self.supervisor.unload_idle();
+        }
+        let outcome = self.supervisor.cancel();
+        if outcome.is_err() || self.supervisor.has_child() {
+            // `cancel` leaves `Stopping` on a reap error; nothing is in flight.
+            self.supervisor.mark_unavailable();
+        }
+        match outcome {
+            Ok(_) if self.supervisor.has_child() => Err(SupervisorError::Unavailable(
+                "worker unreaped; reap before new work",
+            )),
+            result => result,
+        }
     }
 
     /// Idle-only development model switch. Retire the generation first so a
@@ -504,6 +523,40 @@ mod tests {
         // Loading, never straight back in Ready.
         life.attach(FakeWorker::default(), Instant::now()).unwrap();
         assert_eq!(life.state(), WorkerState::Loading);
+    }
+
+    #[test]
+    fn cloud_selection_reaps_a_live_unavailable_child_without_crediting_the_budget() {
+        let mut life = LocalLifecycle::harness();
+        let hash = fixture_receipt_hash();
+        life.pin_model_receipt_hash(hash.clone());
+        let now = Instant::now();
+        for _ in 0..MAX_RESTARTS - 1 {
+            life.attach(FakeWorker::default(), now).unwrap();
+            let _ = life.cancel();
+        }
+        let worker = FakeWorker {
+            scripted_text: Some("hello".into()),
+            model_receipt_hash: hash,
+            ..FakeWorker::default()
+        };
+        life.attach(worker, now).unwrap();
+        if let Some(child) = life.supervisor.child_mut() {
+            child.generation = life.generation;
+        }
+        life.prepare("rec-1", now).unwrap();
+        // A live worker that went Unavailable (e.g. a protocol fault) still
+        // holds its model in memory until it is reaped.
+        life.mark_unavailable();
+        assert!(life.has_child());
+        let outcome = life.drain_for_cloud_selection().unwrap();
+        assert_eq!(outcome, ReapOutcome::Exited);
+        assert!(!life.has_child());
+        assert_eq!(life.state(), WorkerState::Absent);
+        assert!(life.delivery_mut().delivered.is_empty());
+        // The failed worker's start stays counted: this unload is not a
+        // clean planned exit, so the budget is still spent.
+        assert!(life.restart_budget_exhausted(now));
     }
 
     #[test]
