@@ -497,7 +497,7 @@ impl Gate {
                 models_dir_from_state(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
                     .map_err(ConsentedError::Store)?;
             let store = ModelStore::open(dir).map_err(ConsentedError::Store)?;
-            crate::local_model::consented::verify_consented_install_notifying(&store, on_verifying)
+            crate::local_worker::verify_consented_install_refreshing(&store, on_verifying)
         }
     }
 

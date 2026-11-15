@@ -300,12 +300,6 @@ pub fn consented_runtime_admission(store: &crate::local_model::ModelStore) -> bo
         && crate::local_model::verify_consented_install(store).is_ok()
 }
 
-#[must_use]
-pub fn default_consented_runtime_admission() -> bool {
-    !crate::local_model::development_local_enabled()
-        && super::consented::verify_default_consented_install().is_ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

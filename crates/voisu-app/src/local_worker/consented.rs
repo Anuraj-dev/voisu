@@ -19,8 +19,7 @@ use crate::local_model::{
     CONSENTED_ENTRY, ConsentedCatalogEntry, ConsentedError, ConsentedFilePin, ConsentedHealth,
     ConsentedLayout, ConsentedReceipt, ConsentedRuntimeEntry, DevFilePin, DevLimits, DevManifest,
     DevRuntimeManifest, EXPECTED_HEALTH_TEXT, ModelStore, VerifiedConsentedInstall,
-    consented_worker_files, development_catalog_entry, ensure_private_dir, models_dir_from_state,
-    sha256_hex, verify_consented_install,
+    consented_worker_files, development_catalog_entry, ensure_private_dir, sha256_hex,
 };
 
 /// Installation's real, isolated health probe. `state_dir` is the Voisu
@@ -126,12 +125,35 @@ fn check_worker_health_on_device(
     result
 }
 
+#[cfg(not(test))]
 pub(crate) fn verify_default_consented_install() -> Result<VerifiedConsentedInstall, ConsentedError>
 {
-    let dir = models_dir_from_state(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
-        .map_err(ConsentedError::Store)?;
+    let dir = crate::local_model::models_dir_from_state(
+        std::env::var_os("XDG_STATE_HOME"),
+        std::env::var_os("HOME"),
+    )
+    .map_err(ConsentedError::Store)?;
     let store = ModelStore::open(dir).map_err(ConsentedError::Store)?;
-    verify_consented_install(&store)
+    verify_consented_install_refreshing(&store, || {})
+}
+
+/// Worker-launch admission: stale worker files are rewritten from this binary
+/// and health-checked first (ADR 0012). Only the process that launches workers
+/// calls this; status paths stay read-only. The state directory is the store's
+/// parent, as `launch_consented_worker` derives it.
+#[cfg(not(test))]
+pub(crate) fn verify_consented_install_refreshing(
+    store: &ModelStore,
+    on_verifying: impl FnOnce(),
+) -> Result<VerifiedConsentedInstall, ConsentedError> {
+    let entry = crate::local_model::consented::installed_entry(store)?;
+    let state = store.root().parent().ok_or(ConsentedError::Receipt)?;
+    crate::local_model::consented::verify_with_entry_refreshing(
+        store,
+        entry,
+        &ConsentedWorkerHealth::for_entry(state.to_path_buf(), entry),
+        on_verifying,
+    )
 }
 
 pub(crate) fn select_consented_receipt(
