@@ -397,23 +397,39 @@ fn install_with_receipt_sync(
     cleanup_catalog_namespaces(request.store, entry)?;
     abort(&request, InstallAbort::AfterLock)?;
     // Only stale worker files: rewrite them in place under the recorded consent
-    // instead of downloading every third-party artifact again.
+    // instead of downloading every third-party artifact again. Install is the
+    // explicit repair path, so the tree must pass the full verifier first; a
+    // tree that fails it is downloaded again and replaces the stale one.
+    let mut replace_stale = false;
     if let Ok(prior) = load_receipt(request.store)
         && let Ok((layout, true)) = check_receipt(request.store, entry, &prior)
     {
-        request.progress.phase(if entry.device == "cpu" {
-            InstallPhase::CheckingCpu
-        } else {
-            InstallPhase::CheckingGpu
-        });
-        return refresh_worker(
-            request.store,
-            entry,
-            &layout,
-            &prior,
-            request.health,
-            receipt_sync,
-        );
+        match verify_layout_full(&layout, &without_worker_pins(&prior)) {
+            Ok(()) => {
+                request.progress.phase(if entry.device == "cpu" {
+                    InstallPhase::CheckingCpu
+                } else {
+                    InstallPhase::CheckingGpu
+                });
+                return refresh_worker(
+                    request.store,
+                    entry,
+                    &layout,
+                    &prior,
+                    request.health,
+                    true,
+                    receipt_sync,
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "voisu: Consented Install {} in {} failed full verification ({error:?}); downloading it again",
+                    entry.id, prior.content_hash
+                );
+                replace_stale =
+                    layout.root == install_root(request.store, entry.id, &content_hash(entry));
+            }
+        }
     }
     let required = 2 * (entry.total_download_bytes + entry.estimated_extracted_runtime_bytes);
     if request
@@ -481,6 +497,21 @@ fn install_with_receipt_sync(
     receipt.runtime_manifest = runtime_manifest(&staging.root.join("runtime"))?;
     receipt.receipt_hash = receipt_hash(&receipt)?;
     verify_files(&staging, &receipt)?;
+    // A stale tree that failed full verification is moved aside under the
+    // exclusive lease (no live worker) and deleted unread when this returns.
+    let mut replaced_lease = None;
+    let _replaced = if replace_stale && fs::symlink_metadata(&published.root).is_ok() {
+        let lease = lease_file(request.store, &hash)?;
+        flock(&lease, libc::LOCK_EX)?;
+        let aside = tempfile::Builder::new()
+            .prefix("replaced-")
+            .tempdir_in(request.store.staging_dir("consented"))?;
+        fs::rename(&published.root, aside.path().join("tree"))?;
+        replaced_lease = Some(lease);
+        Some(aside)
+    } else {
+        None
+    };
     let existed = match fs::symlink_metadata(&published.root) {
         Ok(_) => {
             // Rebuilds produce different .pyc bytes (staging paths/timestamps).
@@ -502,6 +533,8 @@ fn install_with_receipt_sync(
         super::safe_fs::durable_rename(&staging.root, &published.root)
             .map_err(ConsentedError::Fs)?;
     }
+    // Health takes its own shared lease on the same path.
+    drop(replaced_lease);
     // Once receipt replacement is attempted, rollback must be durable before
     // this tree may be deleted. An uncertain rollback retains both trees.
     let mut may_reference_new = false;
@@ -589,7 +622,7 @@ pub(crate) fn verify_with_entry_notifying(
     entry: &ConsentedCatalogEntry,
     on_verifying: impl FnOnce(),
 ) -> Result<VerifiedConsentedInstall, ConsentedError> {
-    verify_with_entry_mode(store, entry, false, None, on_verifying)
+    verify_with_entry_mode(store, entry, false, StaleWorker::Reject, on_verifying)
 }
 
 /// Per-launch admission that first rewrites stale worker files in place.
@@ -601,7 +634,30 @@ pub(crate) fn verify_with_entry_refreshing(
     health: &dyn ConsentedHealth,
     on_verifying: impl FnOnce(),
 ) -> Result<VerifiedConsentedInstall, ConsentedError> {
-    verify_with_entry_mode(store, entry, false, Some(health), on_verifying)
+    verify_with_entry_mode(
+        store,
+        entry,
+        false,
+        StaleWorker::Refresh(health),
+        on_verifying,
+    )
+}
+
+/// Setup and TUI status. It never rewrites the install: an older daemon may
+/// still run the previous worker files, and only the process that launches
+/// workers (or an explicit install) refreshes them. A receipt stale only in
+/// its worker pins reports installed once every third-party file verifies.
+pub(crate) fn consented_install_status(
+    store: &ModelStore,
+) -> Result<ConsentedReceipt, ConsentedError> {
+    status_with_entry(store, installed_entry(store)?)
+}
+fn status_with_entry(
+    store: &ModelStore,
+    entry: &ConsentedCatalogEntry,
+) -> Result<ConsentedReceipt, ConsentedError> {
+    let install = verify_with_entry_mode(store, entry, false, StaleWorker::Accept, || {})?;
+    Ok(install.receipt.clone())
 }
 
 /// Re-hash every runtime file and reject all unmanifested runtime entries.
@@ -609,20 +665,37 @@ pub(crate) fn verify_with_entry_refreshing(
 pub fn verify_consented_install_full(
     store: &ModelStore,
 ) -> Result<VerifiedConsentedInstall, ConsentedError> {
-    verify_with_entry_mode(store, installed_entry(store)?, true, None, || {})
+    verify_with_entry_mode(
+        store,
+        installed_entry(store)?,
+        true,
+        StaleWorker::Reject,
+        || {},
+    )
+}
+
+/// What verification does with a receipt stale only in its worker pins.
+#[derive(Clone, Copy)]
+enum StaleWorker<'a> {
+    Reject,
+    /// Rewrite `worker/` from this binary and health-check it first.
+    Refresh(&'a dyn ConsentedHealth),
+    /// Status only: verify the third-party files and return the stale receipt.
+    /// The resulting install never reaches a worker launch.
+    Accept,
 }
 
 fn verify_with_entry_mode(
     store: &ModelStore,
     entry: &ConsentedCatalogEntry,
     full: bool,
-    refresh: Option<&dyn ConsentedHealth>,
+    stale_worker: StaleWorker<'_>,
     on_verifying: impl FnOnce(),
 ) -> Result<VerifiedConsentedInstall, ConsentedError> {
     let _lock = store.lock_exclusive().map_err(ConsentedError::Store)?;
     resume_removal(store, entry, || Ok(()))?;
     let mut on_verifying = Some(on_verifying);
-    if let Some(health) = refresh {
+    if let StaleWorker::Refresh(health) = stale_worker {
         let receipt = load_receipt(store)?;
         if let (layout, true) = check_receipt(store, entry, &receipt)? {
             // A refresh runs a health check: report it as verification.
@@ -638,16 +711,21 @@ fn verify_with_entry_mode(
         }
     })?;
     let receipt = load_receipt(store)?;
-    let layout = validate_receipt(store, entry, &receipt)?;
+    let (layout, stale) = check_receipt(store, entry, &receipt)?;
+    let checked = match (stale, stale_worker) {
+        (false, _) => receipt.clone(),
+        (true, StaleWorker::Accept) => without_worker_pins(&receipt),
+        (true, _) => return Err(ConsentedError::Receipt),
+    };
     let lease = consented_install_lease(&layout)?;
     let observation = ConsentedObservation::capture(&layout)?;
     if let Some(on_verifying) = on_verifying {
         on_verifying();
     }
     if full {
-        verify_layout_full(&layout, &receipt)?;
+        verify_layout_full(&layout, &checked)?;
     } else {
-        verify_layout(&layout, &receipt)?;
+        verify_layout(&layout, &checked)?;
     }
     if file_identity(&receipt_path(store))? != receipt_identity || !observation.unchanged() {
         return Err(ConsentedError::Tree(
@@ -1038,8 +1116,7 @@ fn check_receipt(
     let stale = if *receipt == expected {
         false
     } else {
-        let mut current = receipt.clone();
-        current.files.retain(|name, _| !is_worker_pin(name));
+        let mut current = without_worker_pins(receipt);
         current.files.extend(binary_worker_pins());
         current.receipt_hash = receipt_hash(&current)?;
         if current != expected || receipt.receipt_hash != receipt_hash(receipt)? {
@@ -1197,7 +1274,7 @@ fn refresh_remembered(
     {
         return Err(failure.error.error());
     }
-    let result = refresh_worker(store, entry, layout, prior, health, sync_dir).map(drop);
+    let result = refresh_worker(store, entry, layout, prior, health, false, sync_dir).map(drop);
     let mut failures = refresh_failures()
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
@@ -1224,7 +1301,7 @@ fn refresh_remembered(
 /// deleted unread; nothing under `runtime/` or `weights/` changes.
 ///
 /// Sequence: take the exclusive lease (no live worker); verify every
-/// non-worker file; stage the new worker; move the old one aside and rename the new one
+/// non-worker file (unless install already ran the full verifier); stage the new worker; move the old one aside and rename the new one
 /// in; release the lease so health can take its shared lease while the store
 /// lock still excludes launches; health; store the receipt. A health failure
 /// puts the old worker back. A crash or receipt failure after the swap leaves
@@ -1235,13 +1312,15 @@ fn refresh_worker(
     layout: &ConsentedLayout,
     prior: &ConsentedReceipt,
     health: &dyn ConsentedHealth,
+    third_party_verified: bool,
     receipt_sync: impl Fn(&Path) -> std::io::Result<()>,
 ) -> Result<ConsentedReceipt, ConsentedError> {
     let lease = lease_file(store, &prior.content_hash)?;
     flock(&lease, libc::LOCK_EX)?;
-    let mut receipt = prior.clone();
-    receipt.files.retain(|name, _| !is_worker_pin(name));
-    verify_layout(layout, &receipt)?;
+    let mut receipt = without_worker_pins(prior);
+    if !third_party_verified {
+        verify_layout(layout, &receipt)?;
+    }
     let mut worker_only = receipt.clone();
     worker_only.files = binary_worker_pins().collect();
     receipt.files.extend(binary_worker_pins());
@@ -1297,6 +1376,12 @@ fn refresh_worker(
     // Dropping the stage deletes the old worker, its bytecode included.
     drop(stage);
     Ok(receipt)
+}
+
+fn without_worker_pins(receipt: &ConsentedReceipt) -> ConsentedReceipt {
+    let mut receipt = receipt.clone();
+    receipt.files.retain(|name, _| !is_worker_pin(name));
+    receipt
 }
 
 fn restore_worker(
@@ -1901,9 +1986,20 @@ pub(crate) mod install_tests {
         fn check(
             &self,
             layout: &ConsentedLayout,
-            _receipt: &ConsentedReceipt,
+            receipt: &ConsentedReceipt,
         ) -> Result<(), ConsentedError> {
             self.called.set(true);
+            // Like the production probe: a shared lease on a fresh fd, so an
+            // exclusive lease still held by the caller fails here.
+            let _lease = consented_install_lease(layout)?;
+            assert!(
+                worker_matches_binary(&layout.root),
+                "health must run this binary's worker files"
+            );
+            assert!(
+                binary_worker_pins().all(|(name, pin)| receipt.files.get(&name) == Some(&pin)),
+                "health must see this binary's worker pins"
+            );
             assert!(layout.root.exists());
             assert!(!layout.root.join("inputs").exists());
             assert_eq!(layout.root, self.expected_root);
@@ -2613,7 +2709,9 @@ pub(crate) mod install_tests {
         let path = root.join("runtime/venv/lib/python3.11/site-packages/fixture/__init__.py");
         fs::write(&path, b"changed").unwrap(); // same length as "fixture"
         assert!(verify_with_entry(&store, &entry()).is_ok());
-        assert!(verify_with_entry_mode(&store, &entry(), true, None, || {}).is_err());
+        assert!(
+            verify_with_entry_mode(&store, &entry(), true, StaleWorker::Reject, || {}).is_err()
+        );
     }
     #[test]
     fn consented_launch_allows_audited_deep_cache_full_verifier_rejects_extras() {
@@ -2627,7 +2725,9 @@ pub(crate) mod install_tests {
         let observation = ConsentedObservation::after_verification(&install);
         drop(install);
         assert!(observation.unchanged());
-        assert!(verify_with_entry_mode(&store, &entry(), true, None, || {}).is_err());
+        assert!(
+            verify_with_entry_mode(&store, &entry(), true, StaleWorker::Reject, || {}).is_err()
+        );
         fs::set_permissions(cache.join("fixture.pyc"), fs::Permissions::from_mode(0o666)).unwrap();
         assert!(!observation.unchanged());
         assert!(verify_with_entry(&store, &entry()).is_err());
@@ -2924,10 +3024,9 @@ pub(crate) mod install_tests {
         fs::write(root.join("worker/__pycache__/worker.pyc"), b"old bytecode").unwrap();
     }
     fn worker_matches_binary(root: &Path) -> bool {
-        WORKER_FILES
-            .iter()
-            .all(|(name, bytes)| fs::read(root.join("worker").join(name)).unwrap() == *bytes)
-            && !root.join("worker/__pycache__").exists()
+        WORKER_FILES.iter().all(|(name, bytes)| {
+            fs::read(root.join("worker").join(name)).ok().as_deref() == Some(*bytes)
+        }) && !root.join("worker/__pycache__").exists()
     }
     fn health_at(root: PathBuf, fail: bool) -> FakeHealth {
         FakeHealth {
@@ -3206,7 +3305,11 @@ pub(crate) mod install_tests {
         let parked = legacy.with_file_name("parked");
         fs::rename(&legacy, &parked).unwrap();
         symlink(&parked, &legacy).unwrap();
-        assert!(refresh_verify(&store, &health_at(legacy, false)).is_err());
+        let health = health_at(legacy, false);
+        let result = refresh_verify(&store, &health);
+        // Opening the folder without following the link fails.
+        assert!(matches!(result, Err(ConsentedError::Fs(_))), "{result:?}");
+        assert!(!health.called.get());
     }
 
     #[test]
@@ -3262,6 +3365,82 @@ pub(crate) mod install_tests {
         fs::remove_dir_all(root.join("worker")).unwrap();
         assert!(refresh_verify(&store, &health(&store, &entry(), false)).is_ok());
         assert!(worker_matches_binary(&root));
+    }
+
+    #[test]
+    fn unreaped_refresh_health_leaves_the_new_worker_and_the_stale_receipt() {
+        struct Unreaped(Cell<bool>);
+        impl ConsentedHealth for Unreaped {
+            fn check(
+                &self,
+                layout: &ConsentedLayout,
+                _: &ConsentedReceipt,
+            ) -> Result<(), ConsentedError> {
+                self.0.set(true);
+                let _lease = consented_install_lease(layout)?;
+                Err(ConsentedError::HealthUnreaped)
+            }
+        }
+        let (_temp, store) = store();
+        let original = install(&store);
+        let stale = make_worker_stale(&store);
+        let root = install_root(&store, &original.entry_id, &original.content_hash);
+        let health = Unreaped(Cell::new(false));
+        assert!(matches!(
+            verify_with_entry_refreshing(&store, &entry(), &health, || {}),
+            Err(ConsentedError::HealthUnreaped)
+        ));
+        assert!(health.0.get());
+        // Never move files beneath a unit that may still run them.
+        assert!(worker_matches_binary(&root));
+        assert_eq!(load_receipt(&store).unwrap(), stale);
+    }
+
+    #[test]
+    fn status_over_a_stale_worker_receipt_is_installed_and_touches_nothing() {
+        let (_temp, store) = store();
+        let original = install(&store);
+        let stale = make_worker_stale(&store);
+        let root = install_root(&store, &original.entry_id, &original.content_hash);
+        let snapshot = || {
+            let mut files = vec![fs::read(receipt_path(&store)).unwrap()];
+            for (name, _) in WORKER_FILES {
+                files.push(fs::read(root.join("worker").join(name)).unwrap());
+            }
+            files.push(fs::read(root.join("worker/__pycache__/worker.pyc")).unwrap());
+            files
+        };
+        let before = snapshot();
+        assert_eq!(status_with_entry(&store, &entry()).unwrap(), stale);
+        assert_eq!(snapshot(), before);
+        // Status still verifies every third-party file.
+        fs::write(root.join("weights/model.bin"), b"XXXXXXXXXXXXXXXX").unwrap();
+        assert!(matches!(
+            status_with_entry(&store, &entry()),
+            Err(ConsentedError::Digest(_))
+        ));
+    }
+
+    #[test]
+    fn install_over_a_stale_receipt_with_a_damaged_runtime_downloads_again() {
+        let (_temp, store) = store();
+        let original = install(&store);
+        make_worker_stale(&store);
+        let root = install_root(&store, &original.entry_id, &original.content_hash);
+        let runtime_file =
+            root.join("runtime/venv/lib/python3.11/site-packages/fixture/__init__.py");
+        fs::write(&runtime_file, b"changed").unwrap(); // same length as "fixture"
+        let fetcher = fetcher();
+        let builder = FakeBuilder::default();
+        let health = health(&store, &entry(), false);
+        let receipt =
+            install_with_entry(request(&store, &fetcher, &builder, &health), &entry()).unwrap();
+        assert!(builder.called.get() && health.called.get());
+        assert_eq!(receipt.content_hash, original.content_hash);
+        assert_eq!(load_receipt(&store).unwrap(), receipt);
+        assert_eq!(fs::read(&runtime_file).unwrap(), b"fixture");
+        assert!(worker_matches_binary(&root));
+        assert!(verify_with_entry_mode(&store, &entry(), true, StaleWorker::Reject, || {}).is_ok());
     }
 
     #[test]

@@ -619,10 +619,11 @@ pub fn production_consented_status() -> ConsentedStatus {
         Ok(store) => store,
         Err(_) => return ConsentedStatus::Unknown("the model store is unavailable".into()),
     };
-    match crate::local_worker::verify_consented_install_refreshing(&store, || {}) {
-        Ok(install) => ConsentedStatus::Installed {
-            entry_id: install.receipt().entry_id.clone(),
-            device: install.receipt().device.clone(),
+    // Read-only: an older daemon may still run the previous worker files.
+    match crate::local_model::consented::consented_install_status(&store) {
+        Ok(receipt) => ConsentedStatus::Installed {
+            entry_id: receipt.entry_id,
+            device: receipt.device,
         },
         Err(ConsentedError::Missing) => ConsentedStatus::NotInstalled,
         Err(error) => ConsentedStatus::Unknown(consented_error_line(&error)),
