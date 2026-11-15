@@ -321,6 +321,8 @@ mod tests {
             "Bye bye.",
             "Bye-bye!",
             "Thank   you ...",
+            "Thank you. Thank you.",
+            "Thank you thank you thank you.",
         ] {
             assert_eq!(decide(text, &[]), no_text("no words heard"), "{text:?}");
         }
@@ -331,6 +333,10 @@ mod tests {
         assert_eq!(
             decide("Please send the report. Thank you.", &[]),
             TerminalDecision::Transcript("Please send the report. Thank you.".to_owned())
+        );
+        assert_eq!(
+            decide("Thank you. See you tomorrow.", &[]),
+            TerminalDecision::Transcript("Thank you. See you tomorrow.".to_owned())
         );
         assert_eq!(
             decide("Thank you for the update", &[]),

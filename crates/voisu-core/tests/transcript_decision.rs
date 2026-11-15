@@ -7,7 +7,7 @@ use voisu_core::{
     IntentReconstructionOutcome, IntentReconstructionRequest, MAX_STORED_TEXT, MergeResult,
     PreparedTranscriptDecision, Provider, ProviderWordConfidences, ReconciliationKind,
     ReconciliationModel, SourceTranscript, TranscriptDecisionPipeline, TranscriptSelection,
-    sanitize_source_transcript_text, sanitize_source_transcripts,
+    is_whisper_silence_phrase, sanitize_source_transcript_text, sanitize_source_transcripts,
 };
 
 struct IntentModel {
@@ -3732,6 +3732,78 @@ fn whisper_silence_phrases_clear_when_deepgram_heard_nothing() {
             "{phrase:?} over Deepgram silence must clear: {sanitized:?}"
         );
     }
+}
+
+#[test]
+fn repeated_silence_phrase_is_silence() {
+    for text in [
+        "Thank you. Thank you.",
+        "Thank you thank you thank you.",
+        "THANK YOU, thank you!",
+        "thank-you. Thank you...",
+        "Thanks. Thanks. Thanks.",
+        "Thank you very much. Thank you very much.",
+        "You. You.",
+        "Bye. Bye. Bye.",
+        "Bye-bye. Bye-bye.",
+        "  \"Thank you.\"  \"Thank you.\"  ",
+        // Exactly at the repeat cap (8); nine is rejected below.
+        "Thank you thank you thank you thank you thank you thank you thank you thank you.",
+    ] {
+        assert!(is_whisper_silence_phrase(text), "{text:?} is a repeat");
+    }
+}
+
+#[test]
+fn single_silence_phrase_is_still_silence() {
+    for text in ["Thank you.", "thanks", "Bye-bye.", "You"] {
+        assert!(is_whisper_silence_phrase(text), "{text:?}");
+    }
+}
+
+#[test]
+fn repeats_beyond_the_bound_or_mixed_phrases_are_not_silence() {
+    // Narrow reading: one list phrase repeated; a mix of different phrases
+    // could be a real sign-off.
+    for text in [
+        "Thank you. Bye.",
+        "Thanks. Thank you.",
+        "Thank you. Thank you very much.",
+        "Thank you thank you thank you thank you thank you thank you thank you thank you thank you.",
+    ] {
+        assert!(!is_whisper_silence_phrase(text), "{text:?} is not silence");
+    }
+}
+
+#[test]
+fn real_speech_around_silence_phrases_is_not_silence() {
+    for text in [
+        "Thank you for the help",
+        "Thank you. See you tomorrow.",
+        "Thank you. Thank you Raja.",
+        "Send it. Thank you. Thank you.",
+        "Thank you thank you for coming",
+    ] {
+        assert!(!is_whisper_silence_phrase(text), "{text:?} is real speech");
+    }
+}
+
+#[test]
+fn empty_or_punctuation_only_text_is_not_a_silence_phrase() {
+    for text in ["", "   ", "...", "-- !!"] {
+        assert!(!is_whisper_silence_phrase(text), "{text:?}");
+    }
+}
+
+#[test]
+fn repeated_silence_phrase_clears_when_deepgram_heard_nothing() {
+    let sanitized = sanitize_source_transcripts(deepgram_and_groq("", "Thank you. Thank you."));
+    assert!(sanitized.iter().all(|source| source.text.is_empty()));
+    let kept = sanitize_source_transcripts(deepgram_and_groq(
+        "Thank you. Thank you.",
+        "Thank you. Thank you.",
+    ));
+    assert_eq!(kept[1].text, "Thank you. Thank you.");
 }
 
 #[test]

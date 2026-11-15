@@ -1274,18 +1274,40 @@ const WHISPER_SILENCE_PHRASES: [&str; 8] = [
     "bye bye",
 ];
 
-/// True when the WHOLE text is a Whisper silence phrase. Every
-/// non-alphanumeric character is a word break, so case, punctuation, quotes
-/// and "Bye-bye." do not matter.
+/// Most times one silence phrase may repeat and still count as silence.
+/// Whisper loops over silence ("Thank you. Thank you. Thank you."), but a
+/// long run is more likely a deliberate rant than a hallucination.
+const MAX_SILENCE_PHRASE_REPEATS: usize = 8;
+
+/// True when the WHOLE text is one Whisper silence phrase, or that same
+/// phrase repeated up to `MAX_SILENCE_PHRASE_REPEATS` times ("Thank you.
+/// Thank you."). Every non-alphanumeric character is a word break, so case,
+/// punctuation, quotes and "Bye-bye." do not matter.
+///
+/// Mixed phrases ("Thank you. Bye.") are deliberately not silence: only a
+/// repeat of one phrase is the Whisper loop signature, and a mix may be a
+/// real sign-off. Any other word ("Thank you. See you tomorrow.") is speech.
 #[must_use]
 pub fn is_whisper_silence_phrase(text: &str) -> bool {
-    let normalized = text
+    let words = text
         .split(|character: char| !character.is_alphanumeric())
         .filter(|word| !word.is_empty())
         .map(str::to_lowercase)
-        .collect::<Vec<_>>()
-        .join(" ");
-    WHISPER_SILENCE_PHRASES.contains(&normalized.as_str())
+        .collect::<Vec<_>>();
+    if words.is_empty() {
+        return false;
+    }
+    WHISPER_SILENCE_PHRASES.iter().any(|phrase| {
+        let phrase_words = phrase.split(' ').collect::<Vec<_>>();
+        words.len() % phrase_words.len() == 0
+            && words.len() / phrase_words.len() <= MAX_SILENCE_PHRASE_REPEATS
+            && words.chunks(phrase_words.len()).all(|chunk| {
+                chunk
+                    .iter()
+                    .map(String::as_str)
+                    .eq(phrase_words.iter().copied())
+            })
+    })
 }
 
 #[derive(Debug)]
