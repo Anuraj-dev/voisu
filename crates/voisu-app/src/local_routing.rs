@@ -864,15 +864,37 @@ fn silence_outcome(observed_device: &str) -> Result<WorkerOutcome, LocalError> {
     })
 }
 
+/// The model that honours an `initial_prompt`. Parakeet and the other Local
+/// models ignore prompts, so they are never sent one.
+const DISTIL_CATALOG_ID: &str = "distil-large-v3.5-int8";
+
+/// The `initial_prompt` for one Local request: the user's Dictionary terms for
+/// distil, nothing for any other model and nothing for an empty Dictionary.
+/// The Dictionary is the Recording's own snapshot, taken when it started.
+fn initial_prompt_for(catalog_id: &str, user_terms: &[String]) -> Option<String> {
+    if catalog_id != DISTIL_CATALOG_ID {
+        return None;
+    }
+    crate::dictionary::local_prompt_for_terms(user_terms)
+}
+
 fn infer_unlocked(
     session: &mut InferenceSession,
     recording_id: &str,
     request_id: &str,
     pcm: Vec<u8>,
+    user_terms: &[String],
 ) -> Result<WorkerOutcome, LocalError> {
     let correlation = correlation(&session.receipt_hash, recording_id, request_id);
-    transcribe_through_supervisor(&mut session.supervisor, correlation, pcm, &session.sentinel)
-        .map_err(|error| LocalError::Inference(error.to_string()))
+    let prompt = initial_prompt_for(&session.catalog_id, user_terms);
+    transcribe_through_supervisor(
+        &mut session.supervisor,
+        correlation,
+        pcm,
+        prompt,
+        &session.sentinel,
+    )
+    .map_err(|error| LocalError::Inference(error.to_string()))
 }
 
 fn assert_gate_unlocked() {
@@ -1314,7 +1336,13 @@ pub fn complete_recording(
         }
     }
     let request_id = format!("{recording_id}-asr");
-    let outcome = match infer_unlocked(&mut session, recording_id, &request_id, pcm.clone()) {
+    let outcome = match infer_unlocked(
+        &mut session,
+        recording_id,
+        &request_id,
+        pcm.clone(),
+        user_terms,
+    ) {
         Ok(outcome) => outcome,
         Err(_) if is_silence_pcm(&pcm) => {
             match silence_outcome(session.supervisor.observed_device()) {
@@ -1371,7 +1399,13 @@ pub fn complete_replay(
     let mut session = take_inference_session()?;
     assert_gate_unlocked();
     let request_id = format!("{recording_id}-replay");
-    let outcome = match infer_unlocked(&mut session, recording_id, &request_id, pcm.clone()) {
+    let outcome = match infer_unlocked(
+        &mut session,
+        recording_id,
+        &request_id,
+        pcm.clone(),
+        user_terms,
+    ) {
         Ok(outcome) => outcome,
         Err(error) => {
             restore_inference_session(session);
@@ -1957,6 +1991,7 @@ mod tests {
             &mut supervisor,
             correlation(&receipt.receipt_hash, "rec-busy", "rec-busy-asr"),
             vec![1, 0, 3, 0],
+            None,
             &gate.sentinel,
         )
         .expect("in-flight work completes");
@@ -2611,6 +2646,54 @@ mod tests {
         assert!(sentinel_is_clean());
     }
 
+    fn distil_receipt() -> ActiveReceipt {
+        let mut receipt = fixture_receipt();
+        receipt.catalog_id = DISTIL_CATALOG_ID.into();
+        receipt.artifact_id = "distil-artifact".into();
+        receipt
+    }
+
+    fn prompt_seen_by_worker(receipt: ActiveReceipt, terms: &[&str]) -> Option<String> {
+        inject_ready(receipt, "hello");
+        begin_live("rec-prompt");
+        let terms: Vec<String> = terms.iter().map(|term| (*term).to_owned()).collect();
+        complete_recording(
+            "rec-prompt",
+            vec![1, 0, 2, 0],
+            &terms,
+            WritingMode::Literal,
+            false,
+            false,
+        )
+        .unwrap();
+        let mut gate = gate().lock().expect("gate");
+        gate.lifecycle.child_mut().unwrap().last_prompt.clone()
+    }
+
+    #[test]
+    fn distil_gets_the_dictionary_as_its_initial_prompt() {
+        let _lock = test_session();
+        assert_eq!(
+            prompt_seen_by_worker(distil_receipt(), &["Voisu", "Tokio"]).as_deref(),
+            Some("Voisu, Tokio")
+        );
+    }
+
+    #[test]
+    fn distil_with_an_empty_dictionary_sends_no_prompt() {
+        let _lock = test_session();
+        assert_eq!(prompt_seen_by_worker(distil_receipt(), &[]), None);
+    }
+
+    #[test]
+    fn parakeet_never_gets_a_prompt() {
+        let _lock = test_session();
+        assert_eq!(
+            prompt_seen_by_worker(parakeet_receipt(), &["Voisu", "Tokio"]),
+            None
+        );
+    }
+
     #[test]
     fn public_readiness_stays_unavailable_with_an_injected_test_worker() {
         let _lock = test_session();
@@ -2914,7 +2997,8 @@ mod tests {
             model_receipt_hash: "h".into(),
         };
         assert!(
-            transcribe_through_supervisor(&mut supervisor, corr, vec![1, 0], &sentinel).is_err()
+            transcribe_through_supervisor(&mut supervisor, corr, vec![1, 0], None, &sentinel)
+                .is_err()
         );
     }
 }

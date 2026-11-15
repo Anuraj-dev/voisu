@@ -19,6 +19,11 @@ pub const MAX_JSON_DEPTH: usize = 8;
 pub const MAX_JSON_FIELDS: usize = 64;
 pub const MAX_METADATA_BYTES: usize = 16 * 1024;
 
+/// Cap on the optional `initial_prompt` a Transcribe request carries. The
+/// Dictionary builder stays far below it (about 224 bytes); this only bounds
+/// what a frame may claim.
+pub const MAX_PROMPT_BYTES: usize = 1024;
+
 /// UTF-8 Transcript cap. Empty/silence is an explicit no-text outcome.
 pub const MAX_TRANSCRIPT_BYTES: usize = 24 * 1024;
 

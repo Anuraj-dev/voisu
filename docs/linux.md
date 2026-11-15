@@ -66,7 +66,7 @@ Run `voisu` with no arguments in a terminal. It is a full-screen, keyboard-only 
 
 - **Home** shows what matters now: ready to dictate, or the one problem and the single key that fixes it. `d` runs every `voisu doctor` check.
 - **Settings** covers Engine, Delivery, Writing, Layout, Tone, Deepgram and your keys. Each choice is explained beside it, and Settings offers a restart when the service needs one.
-- **Dictionary** holds the words Voisu should spell your way. `a` adds, `d` removes. Local mode also corrects by sound: a name it wrote as it heard it ("voice you") becomes your entry ("Voisu") when the entry has two or more syllables. Cloud mode corrects exact spellings only.
+- **Dictionary** holds the words Voisu should spell your way. `a` adds, `d` removes. Local mode on the Whisper-based model also hands your words to the model as a hint before it transcribes, and corrects by sound: a name it wrote as it heard it ("voice you") becomes your entry ("Voisu") when the entry has two or more syllables. Cloud mode corrects exact spellings only.
 - **History** lists recent Recordings. `c` copies one.
 
 If nothing is set up yet, `voisu` opens on the setup screens: Cloud or Local, your Groq and Deepgram keys (checked as you save them; paste with `Ctrl+V`), and the Trigger Key. `Esc` leaves setup, and Home offers it again. `voisu setup` opens the same screens directly.

@@ -185,6 +185,8 @@ pub struct FakeWorker {
     /// Transcribe stays in-flight until cancel; a late Transcript may follow.
     pub hold_until_cancel: bool,
     pub queued_late: Option<String>,
+    /// The `initial_prompt` of the latest accepted Transcribe frame.
+    pub last_prompt: Option<String>,
 }
 
 impl Default for FakeWorker {
@@ -202,6 +204,7 @@ impl Default for FakeWorker {
             ignore_cancel: false,
             hold_until_cancel: false,
             queued_late: None,
+            last_prompt: None,
             prepare_count: 0,
             transcribe_count: 0,
         }
@@ -240,6 +243,7 @@ impl WorkerChild for FakeWorker {
             ControlFrame::Transcribe {
                 correlation,
                 pcm_bytes,
+                prompt,
             } => {
                 if self.hold_until_cancel {
                     self.queued_late = self.scripted_text.clone();
@@ -266,6 +270,7 @@ impl WorkerChild for FakeWorker {
                 correlations_match(&expected, &correlation).map_err(SupervisorError::Protocol)?;
                 let correlation = self.outbound_correlation(correlation);
                 self.transcribe_count = self.transcribe_count.saturating_add(1);
+                self.last_prompt = prompt;
                 let frame = if is_silence_pcm(pcm) {
                     WorkerFrame::NoText {
                         correlation,
@@ -632,12 +637,23 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
         &mut self,
         request: TranscribeRequest,
     ) -> Result<WorkerOutcome, SupervisorError> {
-        self.transcribe_until(request, Instant::now() + STOP_PROCESSING)
+        self.transcribe_with_prompt(request, None)
+    }
+
+    /// Like [`Self::transcribe`], with an optional `initial_prompt` for models
+    /// that honour one. `None` sends the same request as before prompts existed.
+    pub fn transcribe_with_prompt(
+        &mut self,
+        request: TranscribeRequest,
+        prompt: Option<String>,
+    ) -> Result<WorkerOutcome, SupervisorError> {
+        self.transcribe_until(request, prompt, Instant::now() + STOP_PROCESSING)
     }
 
     pub(crate) fn transcribe_until(
         &mut self,
         request: TranscribeRequest,
+        prompt: Option<String>,
         deadline: Instant,
     ) -> Result<WorkerOutcome, SupervisorError> {
         if self.state != WorkerState::Ready {
@@ -657,6 +673,7 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
             ControlFrame::Transcribe {
                 correlation: request.correlation,
                 pcm_bytes: request.pcm.len(),
+                prompt,
             },
             Some(&request.pcm),
             deadline,
@@ -772,6 +789,33 @@ mod tests {
             })
             .unwrap();
         assert!(matches!(outcome, WorkerOutcome::NoText { .. }));
+    }
+
+    #[test]
+    fn the_prompt_reaches_the_worker_only_when_given() {
+        let mut supervisor = ready_supervisor(Some("hi"));
+        supervisor
+            .transcribe(TranscribeRequest {
+                correlation: corr(),
+                pcm: vec![1, 0],
+            })
+            .unwrap();
+        assert_eq!(supervisor.child_mut().unwrap().last_prompt, None);
+        let mut next = corr();
+        next.request_id = "q2".into();
+        supervisor
+            .transcribe_with_prompt(
+                TranscribeRequest {
+                    correlation: next,
+                    pcm: vec![1, 0],
+                },
+                Some("Voisu, Tokio".to_owned()),
+            )
+            .unwrap();
+        assert_eq!(
+            supervisor.child_mut().unwrap().last_prompt.as_deref(),
+            Some("Voisu, Tokio")
+        );
     }
 
     #[test]
@@ -1305,6 +1349,7 @@ mod tests {
                     correlation: corr(),
                     pcm: vec![1, 0],
                 },
+                None,
                 Instant::now() + Duration::from_millis(1),
             )
             .unwrap_err();

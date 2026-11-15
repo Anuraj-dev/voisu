@@ -200,7 +200,14 @@ def frame(value: dict) -> bytes:
     return len(payload).to_bytes(4, "little") + payload
 
 
-def serve(adapter: BaseAdapter, pcm: bytes) -> dict:
+def transcribe_request(pcm_bytes: int, prompt=None) -> dict:
+    request = {"v": 1, "op": "transcribe", "id": "t", "pcm_bytes": pcm_bytes}
+    if prompt is not None:
+        request["prompt"] = prompt
+    return request
+
+
+def serve(adapter: BaseAdapter, pcm: bytes, prompt=None) -> dict:
     with tempfile.TemporaryDirectory() as tmp:
         health = Path(tmp) / "health.wav"
         with wave.open(str(health), "wb") as handle:
@@ -214,7 +221,7 @@ def serve(adapter: BaseAdapter, pcm: bytes) -> dict:
         )
         reader = io.BytesIO(
             frame({"v": 1, "op": "prepare", "id": "p"})
-            + frame({"v": 1, "op": "transcribe", "id": "t", "pcm_bytes": len(pcm)})
+            + frame(transcribe_request(len(pcm), prompt))
             + pcm
         )
         writer = io.BytesIO()
@@ -270,3 +277,43 @@ class ServiceWindowingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PromptAdapter(ScriptedAdapter):
+    """A prompt-capable adapter (like the faster-whisper one) that records prompts."""
+
+    accepts_initial_prompt = True
+
+    def __init__(self, replies):
+        super().__init__(replies)
+        self.prompts: list = []
+
+    def transcribe(self, pcm: bytes, initial_prompt=None) -> str:
+        self.prompts.append(initial_prompt)
+        return super().transcribe(pcm)
+
+
+class InitialPromptTests(unittest.TestCase):
+    def test_a_prompt_reaches_a_prompt_capable_adapter_for_every_window(self):
+        adapter = PromptAdapter(["one", "two"])
+        reply = serve(adapter, pcm_of(loud(WINDOW + RATE)), prompt="Voisu, Tokio")
+        self.assertEqual(reply["text"], "one two")
+        # The health window carries no prompt; both request windows do.
+        self.assertEqual(adapter.prompts, [None, "Voisu, Tokio", "Voisu, Tokio"])
+
+    def test_a_request_without_a_prompt_passes_none(self):
+        adapter = PromptAdapter(["one"])
+        serve(adapter, pcm_of(loud(RATE)))
+        self.assertEqual(adapter.prompts, [None, None])
+
+    def test_an_adapter_that_ignores_prompts_is_never_called_with_one(self):
+        # ScriptedAdapter.transcribe(pcm) would raise TypeError on a prompt kwarg.
+        adapter = ScriptedAdapter(["one"])
+        reply = serve(adapter, pcm_of(loud(RATE)), prompt="Voisu")
+        self.assertEqual((reply["status"], reply["text"]), ("transcript", "one"))
+
+    def test_a_malformed_prompt_is_an_invalid_request(self):
+        for bad in ["", 7, ["a"], "x" * 1025]:
+            with self.subTest(bad=bad):
+                reply = serve(PromptAdapter(["one"]), pcm_of(loud(RATE)), prompt=bad)
+                self.assertEqual((reply["status"], reply["code"]), ("error", "invalid_request"))

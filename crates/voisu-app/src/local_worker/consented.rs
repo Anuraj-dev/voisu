@@ -515,6 +515,7 @@ mod tests {
                 ControlFrame::Transcribe {
                     correlation,
                     pcm_bytes: pcm.stdout.len(),
+                    prompt: None,
                 },
                 Some(&pcm.stdout),
                 Instant::now() + super::super::bounds::STOP_PROCESSING,

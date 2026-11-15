@@ -518,6 +518,17 @@ impl DevWorker {
     }
 }
 
+/// The wire request for one Transcribe. The `prompt` key exists only when a
+/// prompt was given, so a request without one is byte-identical to what
+/// workers received before prompts existed.
+fn transcribe_request(id: &str, pcm_bytes: usize, prompt: Option<&str>) -> Value {
+    let mut request = json!({"v": 1, "op": "transcribe", "id": id, "pcm_bytes": pcm_bytes});
+    if let Some(prompt) = prompt {
+        request["prompt"] = Value::from(prompt);
+    }
+    request
+}
+
 impl WorkerChild for DevWorker {
     fn last_inference_metrics(&self) -> super::supervisor::InferenceMetrics {
         super::supervisor::InferenceMetrics {
@@ -536,17 +547,21 @@ impl WorkerChild for DevWorker {
         pcm: Option<&[u8]>,
         deadline: Instant,
     ) -> Result<WorkerFrame, SupervisorError> {
-        let (op, id, pcm_bytes) = match &control {
-            ControlFrame::Prepare(correlation) => ("prepare", correlation.request_id.clone(), None),
+        let (op, id, pcm_bytes, prompt) = match &control {
+            ControlFrame::Prepare(correlation) => {
+                ("prepare", correlation.request_id.clone(), None, None)
+            }
             ControlFrame::Transcribe {
                 correlation,
                 pcm_bytes,
+                prompt,
             } => (
                 "transcribe",
                 correlation.request_id.clone(),
                 Some(*pcm_bytes),
+                prompt.clone(),
             ),
-            ControlFrame::Cancel { request_id } => ("shutdown", request_id.clone(), None),
+            ControlFrame::Cancel { request_id } => ("shutdown", request_id.clone(), None, None),
         };
         let correlation = match control {
             ControlFrame::Prepare(correlation) | ControlFrame::Transcribe { correlation, .. } => {
@@ -568,10 +583,10 @@ impl WorkerChild for DevWorker {
                 actual: pcm.map_or(0, <[u8]>::len),
             }));
         }
-        let mut request = json!({"v": 1, "op": op, "id": id});
-        if let Some(pcm_bytes) = pcm_bytes {
-            request["pcm_bytes"] = Value::from(pcm_bytes);
-        }
+        let request = match pcm_bytes {
+            Some(pcm_bytes) => transcribe_request(&id, pcm_bytes, prompt.as_deref()),
+            None => json!({"v": 1, "op": op, "id": id}),
+        };
         let reply = match self.exchange_json(request, pcm, deadline) {
             Ok(reply) => reply,
             Err(error) => {
@@ -1090,6 +1105,21 @@ fn lock_exclusive(
 mod tests {
     use super::*;
     use crate::local_model::{DevLimits, DevRuntimeManifest};
+
+    #[test]
+    fn transcribe_request_adds_a_prompt_only_when_given() {
+        assert_eq!(
+            transcribe_request("q", 4, None),
+            json!({"v": 1, "op": "transcribe", "id": "q", "pcm_bytes": 4})
+        );
+        assert_eq!(
+            transcribe_request("q", 4, Some("Voisu, Tokio")),
+            json!({
+                "v": 1, "op": "transcribe", "id": "q", "pcm_bytes": 4,
+                "prompt": "Voisu, Tokio",
+            })
+        );
+    }
 
     #[test]
     fn cpu_consented_unit_takes_exclusive_cpu_lock_and_shared_lease() {

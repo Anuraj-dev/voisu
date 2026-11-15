@@ -66,6 +66,9 @@ class AdapterMetadata:
 
 class BaseAdapter:
     metadata: AdapterMetadata
+    # True only for adapters whose transcribe() takes `initial_prompt`; the
+    # service never passes a prompt to any other adapter.
+    accepts_initial_prompt = False
 
     def prepare(self) -> AdapterMetadata:
         raise NotImplementedError

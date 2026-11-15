@@ -323,9 +323,12 @@ impl WorkerChild for WhisperCppWorker {
     ) -> Result<WorkerFrame, SupervisorError> {
         match control {
             ControlFrame::Prepare(correlation) => self.prepare_inner(&correlation, deadline),
+            // whisper.cpp takes no `initial_prompt` here; Dictionary prompting
+            // is for the distil Python worker, so a prompt is ignored.
             ControlFrame::Transcribe {
                 correlation,
                 pcm_bytes,
+                ..
             } => {
                 let pcm = pcm.unwrap_or_default();
                 if pcm.len() != pcm_bytes {
@@ -677,6 +680,7 @@ mod tests {
                 ControlFrame::Transcribe {
                     correlation: correlation("hash"),
                     pcm_bytes: 4,
+                    prompt: None,
                 },
                 Some(&[0, 0, 0, 0]),
                 Instant::now() + Duration::from_secs(5),
@@ -694,6 +698,7 @@ mod tests {
                 ControlFrame::Transcribe {
                     correlation: correlation("hash"),
                     pcm_bytes: 99,
+                    prompt: None,
                 },
                 Some(&[1, 0]),
                 Instant::now() + Duration::from_secs(5),
@@ -910,6 +915,7 @@ mod tests {
                     ControlFrame::Transcribe {
                         correlation: id,
                         pcm_bytes: speech.len(),
+                        prompt: None,
                     },
                     Some(&speech),
                     Instant::now() + Duration::from_secs(30),
@@ -929,6 +935,7 @@ mod tests {
                 ControlFrame::Transcribe {
                     correlation: silent,
                     pcm_bytes: 4,
+                    prompt: None,
                 },
                 Some(&[0, 0, 0, 0]),
                 Instant::now() + Duration::from_secs(5),

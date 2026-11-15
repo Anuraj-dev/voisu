@@ -292,6 +292,25 @@ pub fn whisper_prompt_for_terms(terms: &[String]) -> String {
     whisper_prompt_from_terms(terms)
 }
 
+/// The Local `initial_prompt` for models that honour one (distil-whisper):
+/// the user's own Dictionary terms as the bare comma-separated glossary the
+/// Cloud Whisper prompt uses, in stored order, de-duplicated case-insensitively
+/// (first spelling wins) and cut at the [`WHISPER_PROMPT_TOKEN_BUDGET`] by
+/// dropping whole terms, never by truncating one. Built-in terms are left out
+/// so an empty personal Dictionary yields `None` and the request stays exactly
+/// as it was before this prompt existed.
+pub fn local_prompt_for_terms(user_terms: &[String]) -> Option<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let unique: Vec<String> = user_terms
+        .iter()
+        .map(|term| term.trim())
+        .filter(|term| !term.is_empty() && seen.insert(comparison_key(term)))
+        .map(str::to_owned)
+        .collect();
+    let prompt = whisper_prompt_from_terms(&unique);
+    (!prompt.is_empty()).then_some(prompt)
+}
+
 /// The resolved user dictionary path: `$XDG_CONFIG_HOME/voisu/dictionary.txt`,
 /// falling back to `~/.config/voisu/dictionary.txt`.
 fn user_dictionary_path() -> PathBuf {
@@ -689,6 +708,64 @@ Tokio   # inline comment
             WHISPER_PROMPT_TOKEN_BUDGET
         );
         assert!(!prompt.is_empty(), "some multibyte terms still fit");
+    }
+
+    #[test]
+    fn local_prompt_lists_user_terms_in_stored_order() {
+        let terms = vec![
+            "Voisu".to_owned(),
+            "Tokio".to_owned(),
+            "wayfinder".to_owned(),
+        ];
+        assert_eq!(
+            local_prompt_for_terms(&terms).as_deref(),
+            Some("Voisu, Tokio, wayfinder")
+        );
+    }
+
+    #[test]
+    fn local_prompt_is_none_for_an_empty_dictionary() {
+        assert_eq!(local_prompt_for_terms(&[]), None);
+        assert_eq!(local_prompt_for_terms(&["  ".to_owned()]), None);
+    }
+
+    #[test]
+    fn local_prompt_dedupes_case_insensitively_keeping_the_first_spelling() {
+        let terms = vec![
+            "Voisu".to_owned(),
+            "tokio".to_owned(),
+            "voisu".to_owned(),
+            " Tokio ".to_owned(),
+        ];
+        assert_eq!(
+            local_prompt_for_terms(&terms).as_deref(),
+            Some("Voisu, tokio")
+        );
+    }
+
+    #[test]
+    fn local_prompt_never_includes_built_in_terms() {
+        let prompt = local_prompt_for_terms(&["Voisu".to_owned()]).unwrap();
+        assert_eq!(prompt, "Voisu");
+    }
+
+    #[test]
+    fn local_prompt_drops_whole_terms_past_the_cap() {
+        let terms: Vec<String> = (0..2000).map(|i| format!("term{i:04}")).collect();
+        let prompt = local_prompt_for_terms(&terms).unwrap();
+        assert!(prompt.len() <= WHISPER_PROMPT_TOKEN_BUDGET);
+        assert!(prompt.starts_with("term0000, term0001"));
+        // Every listed term is whole: the cap never cuts one mid-way.
+        for listed in prompt.split(", ") {
+            assert_eq!(listed.len(), "term0000".len(), "{listed:?} was truncated");
+        }
+        assert!(!prompt.contains("term1999"));
+    }
+
+    #[test]
+    fn local_prompt_is_none_when_the_first_term_alone_exceeds_the_cap() {
+        let huge = "x".repeat(WHISPER_PROMPT_TOKEN_BUDGET + 1);
+        assert_eq!(local_prompt_for_terms(&[huge]), None);
     }
 
     #[test]
