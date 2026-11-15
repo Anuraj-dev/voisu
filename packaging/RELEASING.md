@@ -131,7 +131,7 @@ wrong, rather than in the first AUR user's terminal. voisu and voisu-bin declare
 mutual conflict, so the two arch legs run in separate containers.
 
 The release tarball is **flat** — `voisu`, `voisu-daemon`, `voisu-overlay`, the two
-units, `LICENSE` and `ring/` sit at the archive root — because voisu-bin's PKGBUILD
+units, `LICENSE`, `THIRD_PARTY_NOTICES.md` and `ring/` sit at the archive root — because voisu-bin's PKGBUILD
 installs them directly from `$srcdir` with no versioned subdir.
 
 ### Deliberate degradations (accepted, documented here)

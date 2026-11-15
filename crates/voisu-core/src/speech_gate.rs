@@ -24,8 +24,8 @@
 //!    normalized to -1..1.
 //! 3. **Adaptive threshold.** `effective = max(3 * p10, thr / 30)
 //!    .clamp(0.0003, thr)`, where `p10` is the 10th-percentile RMS of the
-//!    non-zero frames (the recording's own noise floor; digital-zero frames
-//!    are skipped) and `thr` is [`SPEECH_THRESHOLD`]. The
+//!    frames from the first non-zero frame on (the recording's own noise
+//!    floor; a leading run of digital zeros is skipped) and `thr` is [`SPEECH_THRESHOLD`]. The
 //!    `.min(thr)` cap is essential: without it a pause-free clip sets its own
 //!    floor, because its 10th-percentile frame is already speech, and it is
 //!    rejected as silence.
@@ -94,12 +94,19 @@ pub fn detect_speech(samples: &[i16], sample_rate: u32) -> SpeechPresence {
             frames: 0,
         };
     }
-    let frame_len = ((sample_rate * FRAME_MS / 1000) as usize).max(1);
+    let frame_len = ((u64::from(sample_rate) * u64::from(FRAME_MS) / 1000) as usize).max(1);
     let frame_rms: Vec<f32> = samples.chunks(frame_len).map(centered_rms).collect();
 
-    // Digital-zero frames (PipeWire start-up gaps) say nothing about the
-    // room's noise floor; counting them would drag p10 to 0 on a short clip.
-    let mut sorted: Vec<f32> = frame_rms.iter().copied().filter(|rms| *rms > 0.0).collect();
+    // A leading run of digital-zero frames (the PipeWire start-up gap) says
+    // nothing about the room's noise floor; counting it would drag p10 to 0
+    // on a short clip. Later zero frames stay: behind a noise gate they are the
+    // real floor, and dropping them would make p10 the speech level and refuse
+    // quiet speech.
+    let start = frame_rms
+        .iter()
+        .position(|rms| *rms > 0.0)
+        .unwrap_or(frame_rms.len());
+    let mut sorted = frame_rms[start..].to_vec();
     sorted.sort_by(f32::total_cmp);
     let floor = sorted
         .get(((sorted.len().saturating_sub(1)) as f32 * NOISE_FLOOR_PERCENTILE) as usize)
@@ -275,6 +282,16 @@ mod tests {
             .collect();
         let decision = detect_speech(&drifting, RATE);
         assert!(!decision.has_speech, "{decision:?}");
+    }
+
+    #[test]
+    fn a_noise_gated_mic_still_hears_a_short_yes() {
+        // A noise gate outputs exact zeros around words; the zeros after the
+        // first sound are the floor, so the quiet "yes" must still pass.
+        let mut audio = vec![0.0; 2 * RATE as usize];
+        add(&mut audio, 6_400, &voiced(4_800, 60.0));
+        let decision = detect_speech(&pcm(&audio, 0.0), RATE);
+        assert!(decision.has_speech, "{decision:?}");
     }
 
     #[test]
