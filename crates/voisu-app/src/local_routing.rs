@@ -3,8 +3,8 @@
 mod silent;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use voisu_core::{
     AsrMode, DaemonState, DeliveryOutcome, LifecycleEvidence, LifecycleStage, LocalAsrDiagnostic,
@@ -94,6 +94,21 @@ struct Gate {
     /// Why the last worker install failed to reach Ready (for example the
     /// worker's own `vram_admission` refusal), shown with the not-ready error.
     worker_failure: Option<String>,
+    /// When the loaded worker last finished work (or became Ready). The idle
+    /// timer unloads it once this is older than the configured timeout.
+    idle_since: Option<Instant>,
+    /// Unloaded by the idle timer with the receipt kept: Local still reports
+    /// ready, and the next admission reloads it while capture runs.
+    parked: bool,
+    /// The supervisor is checked out to a reload thread. Refresh, release
+    /// and the idle timer leave the absent stand-in alone; inference waits.
+    loading_in_background: bool,
+    /// A reload `admit` started, for its caller to run off the gate lock.
+    pending_load: Option<PendingLoad>,
+    #[cfg(test)]
+    test_clock: Option<Instant>,
+    #[cfg(test)]
+    test_load_hook: Option<LoadHook>,
     #[cfg(test)]
     test_selected: Option<ActiveReceipt>,
     #[cfg(test)]
@@ -135,6 +150,14 @@ impl Gate {
             runtime: None,
             requested_device: None,
             worker_failure: None,
+            idle_since: None,
+            parked: false,
+            loading_in_background: false,
+            pending_load: None,
+            #[cfg(test)]
+            test_clock: None,
+            #[cfg(test)]
+            test_load_hook: None,
             #[cfg(test)]
             test_selected: None,
             #[cfg(test)]
@@ -162,11 +185,28 @@ impl Gate {
         self.published_sentinel.store(true, Ordering::Release);
     }
 
+    /// The idle timer's clock; tests inject it.
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(now) = self.test_clock {
+            return now;
+        }
+        Instant::now()
+    }
+
     fn release_admission(&mut self) {
         self.admitted_generation = None;
         self.admitted_recording = None;
+        if self.loading_in_background {
+            // The reload thread restores the supervisor and settles readiness.
+            self.readiness = LocalReadiness::Loading;
+            self.publish(self.readiness.clone());
+            return;
+        }
         if !self.inference_checked_out {
             self.readiness = if self.lifecycle.state() == WorkerState::Ready {
+                // Finished work restarts the idle timer.
+                self.idle_since = Some(self.now());
                 LocalReadiness::Ready {
                     model_identity: self.receipt.as_ref().map(local_model_identity),
                 }
@@ -206,6 +246,7 @@ impl Gate {
         self.cloud_selected()
             && self.admitted_generation.is_none()
             && !self.inference_checked_out
+            && !self.loading_in_background
             && self.lifecycle.has_child()
             && !matches!(
                 self.lifecycle.state(),
@@ -219,6 +260,12 @@ impl Gate {
     /// same lock admission takes, so a drain cannot interleave with an
     /// admission.
     fn unload_for_cloud(&mut self) {
+        if self.parked && self.cloud_selected() {
+            // Already unloaded by the idle timer: Cloud shows it as Absent.
+            self.parked = false;
+            self.readiness = LocalReadiness::Absent;
+            self.publish(self.readiness.clone());
+        }
         if !self.cloud_unload_due() {
             return;
         }
@@ -261,6 +308,14 @@ impl Gate {
         }
         match (self.receipt.clone(), readiness) {
             (Some(receipt), LocalReadiness::Ready { model_identity }) => {
+                if self.parked && !self.begin_reload(&receipt) {
+                    return LocalAdmission::Unavailable {
+                        error: match &self.readiness {
+                            LocalReadiness::Unavailable { error } => error.clone(),
+                            _ => LOCAL_NOT_READY.to_owned(),
+                        },
+                    };
+                }
                 self.admitted_generation = Some(self.lifecycle.generation());
                 self.readiness = LocalReadiness::Busy;
                 self.publish(self.readiness.clone());
@@ -306,6 +361,7 @@ impl Gate {
         let observation = if consented_path
             && self.admitted_generation.is_none()
             && !self.inference_checked_out
+            && !self.loading_in_background
         {
             self.observe_consented()
         } else {
@@ -356,7 +412,7 @@ impl Gate {
             self.readiness = LocalReadiness::Busy;
             return self.readiness.clone();
         }
-        if self.inference_checked_out {
+        if self.inference_checked_out || self.loading_in_background {
             return self.readiness.clone();
         }
         match self.lifecycle.state() {
@@ -416,6 +472,17 @@ impl Gate {
             }
             self.receipt = Some(selected);
         } else if self.lifecycle.state() == WorkerState::Ready && self.receipt.is_some() {
+            self.readiness = LocalReadiness::Ready {
+                model_identity: self.receipt.as_ref().map(local_model_identity),
+            };
+            return self.readiness.clone();
+        } else if self.parked
+            && self.receipt.is_some()
+            && !self.cloud_selected()
+            && self.lifecycle.can_launch_replacement()
+        {
+            // Unloaded after the idle timeout, same model still selected:
+            // ready to record. Admission reloads it while the user speaks.
             self.readiness = LocalReadiness::Ready {
                 model_identity: self.receipt.as_ref().map(local_model_identity),
             };
@@ -575,7 +642,25 @@ impl Gate {
     }
 
     fn install_selected_worker(&mut self, selected: &ActiveReceipt) -> bool {
+        if !self.attach_selected_worker(selected) {
+            return false;
+        }
+        let prepared = self.lifecycle.prepare("l4-prepare", Instant::now());
+        if let Err(error) = &prepared {
+            self.worker_failure = Some(error.to_string());
+        }
+        let ready = prepared.is_ok() && self.lifecycle.state() == WorkerState::Ready;
+        if ready {
+            self.capture_runtime_identity(selected);
+            self.idle_since = Some(self.now());
+        }
+        ready
+    }
+
+    /// Verify, launch and attach the selected worker; it still owes `Prepare`.
+    fn attach_selected_worker(&mut self, selected: &ActiveReceipt) -> bool {
         self.worker_failure = None;
+        self.parked = false;
         if !self.lifecycle.can_launch_replacement() {
             return false;
         }
@@ -601,15 +686,115 @@ impl Gate {
                 child.model_receipt_hash = hash;
             }
         }
-        let prepared = self.lifecycle.prepare("l4-prepare", Instant::now());
-        if let Err(error) = &prepared {
-            self.worker_failure = Some(error.to_string());
+        true
+    }
+
+    /// Recording start with the worker idle-unloaded: launch it now and leave
+    /// its load (`Prepare`, up to `LOAD_DEADLINE`) to run off the gate lock,
+    /// so it overlaps speech and the daemon actor never waits on it. A
+    /// launch failure refuses the Start before capture, as a failed load
+    /// always has. Cloud selected launches nothing.
+    fn begin_reload(&mut self, selected: &ActiveReceipt) -> bool {
+        self.parked = false;
+        if self.cloud_preempts_launch() {
+            self.publish(self.readiness.clone());
+            return false;
         }
-        let ready = prepared.is_ok() && self.lifecycle.state() == WorkerState::Ready;
-        if ready {
-            self.capture_runtime_identity(selected);
+        if !self.attach_selected_worker(selected) {
+            self.lifecycle.mark_unavailable();
+            self.readiness = self.not_ready();
+            self.publish(self.readiness.clone());
+            return false;
         }
-        ready
+        let correlation = self.lifecycle.prepare_correlation("l4-prepare");
+        self.loading_in_background = true;
+        self.pending_load = Some(PendingLoad {
+            supervisor: self.lifecycle.take_supervisor(),
+            correlation,
+            selected: selected.clone(),
+            #[cfg(test)]
+            hook: self.test_load_hook.take(),
+        });
+        true
+    }
+
+    /// The reload thread is done: return its supervisor and settle readiness.
+    /// A failed or overdue load leaves Local unavailable, so the waiting
+    /// Recording fails closed; nothing falls back to Cloud.
+    fn finish_load(&mut self, done: FinishedLoad) {
+        self.lifecycle.restore_supervisor(done.supervisor);
+        self.loading_in_background = false;
+        match done.result {
+            Ok(()) if self.lifecycle.state() == WorkerState::Ready => {
+                self.capture_runtime_identity(&done.selected);
+                self.idle_since = Some(self.now());
+            }
+            result => {
+                self.worker_failure = Some(match result {
+                    Err(error) => error.to_string(),
+                    Ok(()) => "Local worker did not become ready".to_owned(),
+                });
+                self.lifecycle.mark_unavailable();
+                self.readiness = self.not_ready();
+                self.publish(self.readiness.clone());
+            }
+        }
+        if self.admitted_generation.is_none() {
+            // The Recording was abandoned during the load; Cloud selected in
+            // the meantime unloads it here.
+            self.release_admission();
+        }
+    }
+
+    /// The reload thread panicked and took the supervisor with it.
+    fn abort_load(&mut self) {
+        self.loading_in_background = false;
+        self.worker_failure = Some("Local worker load failed".to_owned());
+        self.lifecycle.mark_unavailable();
+        self.readiness = self.not_ready();
+        self.publish(self.readiness.clone());
+    }
+
+    /// The idle timer: unload a Ready worker no work has used for `timeout`
+    /// (`None` = never). Admitted, checked-out or loading work is never
+    /// dropped, and Cloud selection owns its own unload. Returns how long
+    /// until this worker is due, or `None` when no idle worker waits.
+    fn unload_if_idle(&mut self, now: Instant, timeout: Option<Duration>) -> Option<Duration> {
+        let idle = self.lifecycle.has_child()
+            && self.lifecycle.state() == WorkerState::Ready
+            && self.admitted_generation.is_none()
+            && !self.inference_checked_out
+            && !self.loading_in_background
+            && !self.cloud_selected();
+        if !idle {
+            return None;
+        }
+        let timeout = timeout?;
+        let due = *self.idle_since.get_or_insert(now) + timeout;
+        if now < due {
+            return Some(due - now);
+        }
+        self.idle_since = None;
+        // A confirmed exit keeps the receipt and still reports ready; only a
+        // process that survived the reap (it may hold VRAM) is unavailable.
+        self.readiness = match self.lifecycle.unload_idle() {
+            Ok(_) if !self.lifecycle.has_child() => {
+                self.parked = true;
+                LocalReadiness::Ready {
+                    model_identity: self.receipt.as_ref().map(local_model_identity),
+                }
+            }
+            result => {
+                self.worker_failure = Some(match result {
+                    Err(error) => format!("{LOCAL_UNREAPED}: {error}"),
+                    Ok(_) => LOCAL_UNREAPED.to_owned(),
+                });
+                self.lifecycle.mark_unavailable();
+                self.not_ready()
+            }
+        };
+        self.publish(self.readiness.clone());
+        None
     }
 
     fn capture_runtime_identity(&mut self, selected: &ActiveReceipt) {
@@ -794,6 +979,118 @@ impl Gate {
     }
 }
 
+#[cfg(test)]
+type LoadHook = Box<dyn FnOnce(&mut WorkerSupervisor<GateWorker>) + Send>;
+
+/// A reload checked out of the gate: its `Prepare` runs with the lock free.
+struct PendingLoad {
+    supervisor: WorkerSupervisor<GateWorker>,
+    correlation: Correlation,
+    selected: ActiveReceipt,
+    #[cfg(test)]
+    hook: Option<LoadHook>,
+}
+
+struct FinishedLoad {
+    supervisor: WorkerSupervisor<GateWorker>,
+    selected: ActiveReceipt,
+    result: Result<(), crate::local_worker::SupervisorError>,
+}
+
+impl PendingLoad {
+    /// Bounded by the supervisor's `LOAD_DEADLINE`.
+    fn run(mut self) -> FinishedLoad {
+        let result = self
+            .supervisor
+            .prepare(self.correlation, Instant::now())
+            .map(|_| ());
+        #[cfg(test)]
+        if let Some(hook) = self.hook.take() {
+            hook(&mut self.supervisor);
+        }
+        FinishedLoad {
+            supervisor: self.supervisor,
+            selected: self.selected,
+            result,
+        }
+    }
+}
+
+/// Signalled under the gate lock whenever a reload finishes.
+fn load_finished() -> &'static Condvar {
+    static DONE: Condvar = Condvar::new();
+    &DONE
+}
+
+/// How long a Stop waits for a reload: the load's own bound plus margin, so
+/// a stuck load thread still fails closed instead of hanging the Recording.
+const LOAD_WAIT: Duration = Duration::from_secs(65);
+
+#[cfg(test)]
+static LOAD_WAITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Runs a reload `admit` started on its own thread. If the thread cannot
+/// start, the load runs here, which only delays this Start as before.
+fn spawn_background_load(load: PendingLoad) {
+    let (send, receive) = std::sync::mpsc::channel::<PendingLoad>();
+    let spawned = std::thread::Builder::new()
+        .name("local-load".into())
+        .spawn(move || {
+            if let Ok(load) = receive.recv() {
+                run_background_load(load);
+            }
+        });
+    match spawned {
+        Ok(handle) => {
+            #[cfg(test)]
+            background_loads()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push(handle);
+            #[cfg(not(test))]
+            drop(handle);
+            if let Err(std::sync::mpsc::SendError(load)) = send.send(load) {
+                run_background_load(load);
+            }
+        }
+        Err(error) => {
+            eprintln!("Local worker load thread failed to start ({error}); loading inline");
+            run_background_load(load);
+        }
+    }
+}
+
+fn run_background_load(load: PendingLoad) {
+    let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load.run()));
+    match gate().lock() {
+        Ok(mut gate) => match done {
+            Ok(done) => gate.finish_load(done),
+            Err(_) => gate.abort_load(),
+        },
+        Err(poison) => publish_poisoned_gate(poison),
+    }
+    load_finished().notify_all();
+}
+
+#[cfg(test)]
+fn background_loads() -> &'static Mutex<Vec<std::thread::JoinHandle<()>>> {
+    static HANDLES: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
+    &HANDLES
+}
+
+/// Test-only: wait for every reload thread. Call without the gate.
+#[cfg(test)]
+pub fn join_background_loads_for_tests() {
+    let handles = std::mem::take(
+        &mut *background_loads()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()),
+    );
+    for handle in handles {
+        handle.join().expect("Local load thread");
+    }
+}
+
 struct InferenceSession {
     receipt_hash: String,
     catalog_id: String,
@@ -807,6 +1104,15 @@ struct InferenceSession {
 
 fn take_inference_session() -> Result<InferenceSession, LocalError> {
     let mut gate = gate().lock().map_err(|_| LocalError::Unavailable)?;
+    if gate.loading_in_background {
+        // The worker reloaded at Start is still loading: wait for it.
+        #[cfg(test)]
+        LOAD_WAITS.fetch_add(1, Ordering::SeqCst);
+        gate = load_finished()
+            .wait_timeout_while(gate, LOAD_WAIT, |gate| gate.loading_in_background)
+            .map_err(|_| LocalError::Unavailable)?
+            .0;
+    }
     if !gate.sentinel.local_path_clean() {
         gate.release_admission();
         return Err(LocalError::CloudCapability);
@@ -961,8 +1267,38 @@ fn gate() -> &'static Mutex<Gate> {
         gate.published_sentinel = published_sentinel().clone();
         gate.engine = engine_selection().clone();
         gate.schedule_unload = Box::new(spawn_cloud_unload);
+        #[cfg(not(test))]
+        spawn_idle_unload_timer();
         Mutex::new(gate)
     })
+}
+
+/// The idle-unload timer: one daemon thread that wakes at most every 30 s
+/// (sooner when a worker is nearly due) and unloads an idle worker. The
+/// setting is read each pass outside the gate lock, so a change applies
+/// within 30 s without a restart. The thread sleeps first, so it never
+/// touches the gate before `gate()` finishes initializing.
+#[cfg(not(test))]
+fn spawn_idle_unload_timer() {
+    const POLL: Duration = Duration::from_secs(30);
+    let spawned = std::thread::Builder::new()
+        .name("local-idle-unload".into())
+        .spawn(|| {
+            let mut wait = POLL;
+            loop {
+                std::thread::sleep(wait);
+                let timeout = crate::config::local_idle_unload();
+                let Ok(mut gate) = gate().lock() else {
+                    return;
+                };
+                wait = gate
+                    .unload_if_idle(Instant::now(), timeout)
+                    .map_or(POLL, |due| due.clamp(Duration::from_secs(1), POLL));
+            }
+        });
+    if let Err(error) = spawned {
+        eprintln!("Local idle-unload timer failed to start ({error}); idle workers stay loaded");
+    }
 }
 
 fn published_readiness() -> &'static Arc<Mutex<LocalReadiness>> {
@@ -1192,15 +1528,22 @@ pub fn admission_readiness() -> LocalReadiness {
 
 #[must_use]
 pub fn admit_local(kind_ready_required: bool) -> LocalAdmission {
-    match gate().lock() {
-        Ok(mut gate) => gate.admit(kind_ready_required),
+    let (admission, load) = match gate().lock() {
+        Ok(mut gate) => {
+            let admission = gate.admit(kind_ready_required);
+            (admission, gate.pending_load.take())
+        }
         Err(poison) => {
             publish_poisoned_gate(poison);
-            LocalAdmission::Unavailable {
+            return LocalAdmission::Unavailable {
                 error: LOCAL_NOT_READY.to_owned(),
-            }
+            };
         }
+    };
+    if let Some(load) = load {
+        spawn_background_load(load);
     }
+    admission
 }
 
 pub fn begin_live(recording_id: &str) {
@@ -1757,8 +2100,9 @@ pub fn inject_ready_with_prompt_support(receipt: ActiveReceipt, text: &str, acce
 
 #[cfg(test)]
 pub fn reset_gate_for_tests() {
-    // A previous test's unload must not reach this test's worker.
+    // A previous test's unload or reload must not reach this test's worker.
     join_cloud_unloads_for_tests();
+    join_background_loads_for_tests();
     if let Ok(mut gate) = gate().lock() {
         *gate = Gate::new();
         gate.published = published_readiness().clone();
@@ -2997,6 +3341,208 @@ mod tests {
         assert!(
             transcribe_through_supervisor(&mut supervisor, corr, vec![1, 0], None, &sentinel)
                 .is_err()
+        );
+    }
+
+    const IDLE: Option<std::time::Duration> = Some(std::time::Duration::from_secs(300));
+
+    fn secs(n: u64) -> std::time::Duration {
+        std::time::Duration::from_secs(n)
+    }
+
+    /// A consented gate with a Ready worker loaded at `base` on the fake clock.
+    fn idle_consented_gate() -> (tempfile::TempDir, Gate, ActiveReceipt, Instant) {
+        let (state, mut gate, receipt) = consented_gate();
+        let base = Instant::now();
+        gate.test_clock = Some(base);
+        assert!(matches!(gate.refresh(), LocalReadiness::Ready { .. }));
+        assert!(gate.lifecycle.has_child());
+        (state, gate, receipt, base)
+    }
+
+    #[test]
+    fn an_idle_worker_unloads_after_the_timeout_and_stays_ready() {
+        let (_state, mut gate, _, base) = idle_consented_gate();
+        assert_eq!(gate.unload_if_idle(base + secs(299), IDLE), Some(secs(1)));
+        assert!(gate.lifecycle.has_child());
+        assert_eq!(gate.unload_if_idle(base + secs(300), IDLE), None);
+        // The child was cancelled and reaped: nothing holds RAM/VRAM.
+        assert!(!gate.lifecycle.has_child());
+        assert_eq!(gate.lifecycle.state(), WorkerState::Absent);
+        // Status still says ready: the next Recording reloads it.
+        let published = published_snapshot(&gate.published);
+        assert!(
+            matches!(published, LocalReadiness::Ready { .. }),
+            "{published:?}"
+        );
+        assert!(matches!(gate.refresh(), LocalReadiness::Ready { .. }));
+        assert!(matches!(
+            gate.refresh_passive(),
+            LocalReadiness::Ready { .. }
+        ));
+        assert_eq!(gate.launch_count, 1, "status refresh does not reload");
+    }
+
+    #[test]
+    fn activity_before_the_timeout_restarts_the_timer() {
+        let (_state, mut gate, _, base) = idle_consented_gate();
+        gate.test_clock = Some(base + secs(200));
+        assert!(matches!(gate.admit(true), LocalAdmission::Ready { .. }));
+        gate.release_admission();
+        assert_eq!(gate.unload_if_idle(base + secs(350), IDLE), Some(secs(150)));
+        assert!(gate.lifecycle.has_child());
+        assert_eq!(gate.unload_if_idle(base + secs(500), IDLE), None);
+        assert!(!gate.lifecycle.has_child());
+    }
+
+    #[test]
+    fn busy_work_at_the_timeout_is_never_unloaded() {
+        let (_state, mut gate, _, base) = idle_consented_gate();
+        assert!(matches!(gate.admit(true), LocalAdmission::Ready { .. }));
+        assert_eq!(gate.unload_if_idle(base + secs(10_000), IDLE), None);
+        assert!(gate.lifecycle.has_child());
+        // Inference has the supervisor checked out, as take_inference_session.
+        let supervisor = gate.lifecycle.take_supervisor();
+        gate.inference_checked_out = true;
+        assert_eq!(gate.unload_if_idle(base + secs(10_000), IDLE), None);
+        gate.lifecycle.restore_supervisor(supervisor);
+        gate.inference_checked_out = false;
+        assert!(gate.lifecycle.has_child());
+    }
+
+    #[test]
+    fn idle_unload_off_never_unloads() {
+        let (_state, mut gate, _, base) = idle_consented_gate();
+        assert_eq!(gate.unload_if_idle(base + secs(86_400 * 30), None), None);
+        assert!(gate.lifecycle.has_child());
+    }
+
+    #[test]
+    fn recording_start_reloads_an_idle_unloaded_worker_while_capture_runs() {
+        let (_state, mut gate, receipt, base) = idle_consented_gate();
+        gate.unload_if_idle(base + secs(300), IDLE);
+        gate.test_next_worker = Some(next_consented_worker(&receipt));
+        // Start admits at once; the load runs off the gate while the user speaks.
+        assert!(matches!(gate.admit(true), LocalAdmission::Ready { .. }));
+        assert_eq!(gate.launch_count, 2);
+        let load = gate.pending_load.take().expect("load started at Start");
+        assert!(gate.loading_in_background);
+        assert_eq!(gate.refresh(), LocalReadiness::Busy);
+        assert_eq!(gate.launch_count, 2, "refresh never launches beside it");
+        gate.finish_load(load.run());
+        assert!(!gate.loading_in_background);
+        assert_eq!(gate.lifecycle.state(), WorkerState::Ready);
+        assert!(gate.lifecycle.has_child());
+        assert_eq!(
+            gate.admitted_generation,
+            Some(gate.lifecycle.generation()),
+            "the reservation pins the reloaded worker"
+        );
+        gate.release_admission();
+        assert!(matches!(
+            published_snapshot(&gate.published),
+            LocalReadiness::Ready { .. }
+        ));
+    }
+
+    #[test]
+    fn recording_start_with_cloud_selected_launches_nothing() {
+        let (_state, mut gate, receipt, base) = idle_consented_gate();
+        gate.unload_if_idle(base + secs(300), IDLE);
+        gate.test_next_worker = Some(next_consented_worker(&receipt));
+        record_engine(&gate.engine, AsrMode::Cloud, 1);
+        assert!(matches!(
+            gate.admit(true),
+            LocalAdmission::Unavailable { .. }
+        ));
+        assert!(gate.pending_load.is_none());
+        assert_eq!(gate.launch_count, 1);
+        assert!(!gate.lifecycle.has_child());
+        // Q0: Cloud shows an unloaded worker as Absent, not ready.
+        gate.unload_for_cloud();
+        assert_eq!(published_snapshot(&gate.published), LocalReadiness::Absent);
+    }
+
+    /// The global gate after an idle unload, with the reload worker queued.
+    fn idle_unloaded_global(next: FakeWorker) -> Instant {
+        inject_ready(fixture_receipt(), "first");
+        let mut held = gate().lock().unwrap();
+        let base = Instant::now();
+        held.test_clock = Some(base);
+        held.idle_since = Some(base);
+        held.unload_if_idle(base + secs(300), IDLE);
+        assert!(!held.lifecycle.has_child());
+        held.test_next_worker = Some(next);
+        base
+    }
+
+    #[test]
+    fn stop_waits_for_a_load_still_running_then_transcribes() {
+        let _session = test_session();
+        idle_unloaded_global(FakeWorker {
+            scripted_text: Some("reloaded".into()),
+            ..FakeWorker::default()
+        });
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        gate().lock().unwrap().test_load_hook = Some(Box::new(move |supervisor| {
+            hold.recv().unwrap();
+            // infer_unlocked's fixed test correlation names generation 1.
+            if let Some(child) = supervisor.child_mut() {
+                child.generation = 1;
+            }
+        }));
+        let waits_before = LOAD_WAITS.load(Ordering::SeqCst);
+        assert!(matches!(admit_local(true), LocalAdmission::Ready { .. }));
+        begin_live("rec-reload");
+        let stop = std::thread::spawn(|| {
+            complete_recording(
+                "rec-reload",
+                vec![1, 0, 2, 0],
+                &[],
+                WritingMode::Literal,
+                false,
+                false,
+            )
+        });
+        // Stop is parked on the load, not failed: wait until it waits.
+        while LOAD_WAITS.load(Ordering::SeqCst) == waits_before {
+            std::thread::yield_now();
+        }
+        assert!(!stop.is_finished());
+        release.send(()).unwrap();
+        let completion = stop.join().unwrap().expect("transcribed after the load");
+        assert_eq!(
+            completion.decision,
+            TerminalDecision::Transcript("reloaded".to_owned())
+        );
+        join_background_loads_for_tests();
+        assert!(local_worker_loaded_for_tests());
+    }
+
+    #[test]
+    fn a_load_past_the_bound_fails_closed_at_stop() {
+        let _session = test_session();
+        idle_unloaded_global(FakeWorker {
+            scripted_text: Some("never".into()),
+            block_for: Some(crate::local_worker::LOAD_DEADLINE + secs(1)),
+            ..FakeWorker::default()
+        });
+        assert!(matches!(admit_local(true), LocalAdmission::Ready { .. }));
+        begin_live("rec-slow");
+        let result = complete_recording(
+            "rec-slow",
+            vec![1, 0, 2, 0],
+            &[],
+            WritingMode::Literal,
+            false,
+            false,
+        );
+        assert!(matches!(result, Err(LocalError::Unavailable)), "{result:?}");
+        join_background_loads_for_tests();
+        let published = readiness_snapshot();
+        assert!(
+            matches!(published, LocalReadiness::Unavailable { .. }),
+            "{published:?}"
         );
     }
 }

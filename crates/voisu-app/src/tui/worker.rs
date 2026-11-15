@@ -173,6 +173,15 @@ pub fn execute(job: Job, replies: &Sender<Reply>) {
                 Refresh::PendingRestart(SettingsRow::Deepgram),
             ],
         )),
+        Job::SetLocalIdleUnload(after) => send(applied_setting(
+            config::set_local_idle_unload(after),
+            format!(
+                "Local unload set to {}.",
+                config::local_idle_unload_label(after)
+            ),
+            "It applies within 30 seconds.",
+            &[Refresh::Settings],
+        )),
         Job::SetUpdateCheck(on) => send(applied_setting(
             config::set_switch(config::Switch::UpdateCheck, on),
             format!("Update check turned {}.", if on { "on" } else { "off" }),
@@ -246,6 +255,7 @@ fn load_settings() -> SettingsSnapshot {
         rendering: config::rendering_policy(),
         tone: config::tone(),
         deepgram: config::deepgram_enabled(),
+        local_idle_unload: config::local_idle_unload(),
         update_check: config::switch(config::Switch::UpdateCheck),
         star_prompt,
         // Judged against today on every read, so a line closed 30 days ago

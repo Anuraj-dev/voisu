@@ -20,6 +20,7 @@ enum CliAction {
     KeyCheck(Provider),
     SetDeepgram(bool),
     Switch(Switch, Option<bool>),
+    LocalUnload(Option<Option<std::time::Duration>>),
     Star,
     SetAsrMode(AsrMode),
     Delivery(Option<DeliveryMode>),
@@ -54,6 +55,7 @@ fn main() -> ExitCode {
         Ok(CliAction::KeyCheck(provider)) => key_check(provider),
         Ok(CliAction::SetDeepgram(enabled)) => set_deepgram(enabled),
         Ok(CliAction::Switch(switch, state)) => switch_command(switch, state),
+        Ok(CliAction::LocalUnload(after)) => local_unload(after),
         Ok(CliAction::Star) => star(),
         Ok(CliAction::SetAsrMode(mode)) => set_asr_mode(mode),
         Ok(CliAction::Delivery(mode)) => delivery(mode),
@@ -402,6 +404,39 @@ fn switch_command(switch: Switch, state: Option<bool>) -> ExitCode {
     }
 }
 
+/// Shows or sets how long an idle Local worker keeps its model loaded. The
+/// daemon's idle timer rereads the setting, so a change applies within 30 s.
+fn local_unload(after: Option<Option<std::time::Duration>>) -> ExitCode {
+    use voisu_app::config::{local_idle_unload_label, set_local_idle_unload};
+    let meaning = |after: Option<std::time::Duration>| {
+        if after.is_some() {
+            "an idle Local model frees its memory and reloads when you start recording"
+        } else {
+            "the Local model stays loaded until Voisu stops or you choose Cloud"
+        }
+    };
+    let Some(after) = after else {
+        let after = voisu_app::config::local_idle_unload();
+        println!(
+            "Local unload: {} ({})",
+            local_idle_unload_label(after),
+            meaning(after)
+        );
+        return ExitCode::SUCCESS;
+    };
+    match set_local_idle_unload(after) {
+        Ok(_) => {
+            println!(
+                "Local unload set to {} ({}).",
+                local_idle_unload_label(after),
+                meaning(after)
+            );
+            ExitCode::SUCCESS
+        }
+        Err(message) => fail(4, &message),
+    }
+}
+
 fn switch_label(switch: Switch) -> &'static str {
     match switch {
         Switch::UpdateCheck => "Update check",
@@ -719,6 +754,11 @@ fn parse_command() -> Result<CliAction, String> {
             Some(parse_on_off(state, "update-check")?),
         )),
         [command] if command == "star" => Ok(CliAction::Star),
+        [command] if command == "local-unload" => Ok(CliAction::LocalUnload(None)),
+        [command, after] if command == "local-unload" => Ok(CliAction::LocalUnload(Some(
+            voisu_app::config::parse_local_idle_unload(after)
+                .map_err(|error| format!("local-unload: {error}"))?,
+        ))),
         [command] if command == "star-prompt" => Ok(CliAction::Switch(Switch::StarPrompt, None)),
         [command, state] if command == "star-prompt" => Ok(CliAction::Switch(
             Switch::StarPrompt,
@@ -867,6 +907,7 @@ commands:
   service <install|start|stop|restart|status|uninstall>
                                 manage the Voisu service
   local remove [--yes]          delete the Local model
+  local-unload [off|SECONDS]    free an idle Local model's memory after this long
   update [--check|--dry-run] [--switch-to-bin]
                                 update Voisu
   update-check [on|off]         check once a day for a newer version
