@@ -145,7 +145,7 @@ class _NativeWhisperAdapter(BaseAdapter):
     def _load(self) -> None:
         raise NotImplementedError
 
-    def _run(self, audio: Any) -> str:
+    def _run(self, audio: Any, initial_prompt: str | None = None) -> str:
         raise NotImplementedError
 
     def _backend_reports_gpu(self) -> bool:
@@ -170,12 +170,12 @@ class _NativeWhisperAdapter(BaseAdapter):
             self._peak_gpu,
         )
 
-    def transcribe(self, pcm: bytes) -> str:
+    def transcribe(self, pcm: bytes, initial_prompt: str | None = None) -> str:
         import numpy as np
 
         audio = np.asarray(pcm_to_float32(pcm), dtype=np.float32)
         try:
-            text = self._run(audio)
+            text = self._run(audio, initial_prompt)
         except AdapterError:
             raise
         except Exception as exc:
@@ -231,7 +231,8 @@ class WhisperCppAdapter(_NativeWhisperAdapter):
     def _backend_reports_gpu(self) -> bool:
         return "CUDA" in self._system_info
 
-    def _run(self, audio: Any) -> str:
+    def _run(self, audio: Any, initial_prompt: str | None = None) -> str:
+        # whisper.cpp never receives a prompt (accepts_initial_prompt stays False).
         if self.model is None:
             raise AdapterError("not_ready", "whisper.cpp model is not loaded")
         segments = self.model.transcribe(audio)
@@ -247,6 +248,9 @@ class FasterWhisperAdapter(_NativeWhisperAdapter):
     """CTranslate2 Whisper model through faster-whisper; weights quantize on load."""
 
     backend = "ctranslate2:faster-whisper"
+    # Whisper conditions its decoding on a prompt: the daemon sends the user's
+    # Dictionary terms here so distil spells them.
+    accepts_initial_prompt = True
 
     def __init__(self, manifest: Manifest):
         candidate = candidate_for(manifest, CTRANSLATE2)
@@ -278,7 +282,7 @@ class FasterWhisperAdapter(_NativeWhisperAdapter):
     def _backend_reports_gpu(self) -> bool:
         return self.model is not None and str(self.model.model.device) == "cuda"
 
-    def _run(self, audio: Any) -> str:
+    def _run(self, audio: Any, initial_prompt: str | None = None) -> str:
         if self.model is None:
             raise AdapterError("not_ready", "CTranslate2 model is not loaded")
         segments, _info = self.model.transcribe(
@@ -289,6 +293,7 @@ class FasterWhisperAdapter(_NativeWhisperAdapter):
             best_of=BEST_OF,
             temperature=0.0,
             vad_filter=False,
+            initial_prompt=initial_prompt,
         )
         return " ".join(segment.text.strip() for segment in segments if segment.text.strip())
 

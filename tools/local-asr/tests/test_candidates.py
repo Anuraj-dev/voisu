@@ -237,6 +237,43 @@ class CandidateAdapterTest(unittest.TestCase):
                 self.assertEqual(caught.exception.code, "wrong_checkpoint")
 
 
+class FasterWhisperPromptTest(unittest.TestCase):
+    """The distil adapter hands `initial_prompt` to faster-whisper; others never take one."""
+
+    def adapter_with_fake_model(self):
+        from voisu_asr import candidate_adapters
+
+        seen = {}
+
+        class FakeModel:
+            def transcribe(self, audio, **kwargs):
+                seen.update(kwargs)
+                return iter([mock.Mock(text=" hello ")]), None
+
+        adapter = candidate_adapters.FasterWhisperAdapter.__new__(candidate_adapters.FasterWhisperAdapter)
+        adapter.model = FakeModel()
+        adapter.language = "en"
+        adapter._inferences = 0
+        adapter._observe = lambda after_inference: asr_adapters.AdapterMetadata("fake", "cpu", False, "fake")
+        return candidate_adapters, adapter, seen
+
+    def test_the_prompt_reaches_the_model(self):
+        _, adapter, seen = self.adapter_with_fake_model()
+        self.assertEqual(adapter.transcribe(b"\x01\x00" * 160, initial_prompt="Voisu, Tokio"), "hello")
+        self.assertEqual(seen["initial_prompt"], "Voisu, Tokio")
+
+    def test_no_prompt_is_the_models_own_default(self):
+        _, adapter, seen = self.adapter_with_fake_model()
+        adapter.transcribe(b"\x01\x00" * 160)
+        self.assertIsNone(seen["initial_prompt"])
+
+    def test_only_the_faster_whisper_adapter_accepts_prompts(self):
+        candidate_adapters, _, _ = self.adapter_with_fake_model()
+        self.assertTrue(candidate_adapters.FasterWhisperAdapter.accepts_initial_prompt)
+        self.assertFalse(candidate_adapters.WhisperCppAdapter.accepts_initial_prompt)
+        self.assertFalse(asr_adapters.BaseAdapter.accepts_initial_prompt)
+
+
 class WorkerStdoutTest(unittest.TestCase):
     def test_buffered_native_printf_never_reaches_the_protocol_stream(self):
         # C stdio fully buffers a pipe, so this printf is flushed only at

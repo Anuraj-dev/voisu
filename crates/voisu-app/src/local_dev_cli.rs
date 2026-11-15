@@ -536,6 +536,7 @@ fn replay_batch_with_stream<C: WorkerChild>(
                 correlation: correlation(hash, &format!("transcribe-{index}")),
                 pcm,
             },
+            None,
             started + timeout,
         );
         report.observed_device = supervisor.observed_device().to_owned();

@@ -185,6 +185,10 @@ pub struct FakeWorker {
     /// Transcribe stays in-flight until cancel; a late Transcript may follow.
     pub hold_until_cancel: bool,
     pub queued_late: Option<String>,
+    /// The `initial_prompt` of the latest accepted Transcribe frame.
+    pub last_prompt: Option<String>,
+    /// Whether this worker's Ready advertises prompt support.
+    pub accepts_prompt: bool,
 }
 
 impl Default for FakeWorker {
@@ -202,6 +206,8 @@ impl Default for FakeWorker {
             ignore_cancel: false,
             hold_until_cancel: false,
             queued_late: None,
+            last_prompt: None,
+            accepts_prompt: false,
             prepare_count: 0,
             transcribe_count: 0,
         }
@@ -235,11 +241,13 @@ impl WorkerChild for FakeWorker {
                 Ok(WorkerFrame::Ready {
                     correlation: self.outbound_correlation(correlation),
                     observed_device: self.observed_device.clone(),
+                    accepts_prompt: self.accepts_prompt,
                 })
             }
             ControlFrame::Transcribe {
                 correlation,
                 pcm_bytes,
+                prompt,
             } => {
                 if self.hold_until_cancel {
                     self.queued_late = self.scripted_text.clone();
@@ -266,6 +274,7 @@ impl WorkerChild for FakeWorker {
                 correlations_match(&expected, &correlation).map_err(SupervisorError::Protocol)?;
                 let correlation = self.outbound_correlation(correlation);
                 self.transcribe_count = self.transcribe_count.saturating_add(1);
+                self.last_prompt = prompt;
                 let frame = if is_silence_pcm(pcm) {
                     WorkerFrame::NoText {
                         correlation,
@@ -339,6 +348,9 @@ pub struct WorkerSupervisor<C> {
     /// reaps it. Cleared whenever the child goes, so a crash keeps its count.
     child_started: Option<Instant>,
     observed_device: String,
+    /// From the latest Ready: the worker's adapter honours a Transcribe
+    /// `prompt`. An old worker never says so, and then no prompt is sent.
+    accepts_prompt: bool,
     last_terminal_request: Option<String>,
 }
 
@@ -351,6 +363,7 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
             restarts: RestartBudget::default(),
             child_started: None,
             observed_device: "unknown".into(),
+            accepts_prompt: false,
             last_terminal_request: None,
         }
     }
@@ -608,12 +621,14 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
             WorkerFrame::Ready {
                 correlation,
                 observed_device,
+                accepts_prompt,
             } => {
                 if let Err(err) = correlations_match(&expected, &correlation) {
                     self.state = WorkerState::Unavailable;
                     return Err(SupervisorError::Protocol(err));
                 }
                 self.observed_device = observed_device;
+                self.accepts_prompt = accepts_prompt;
                 self.state = WorkerState::Ready;
                 Ok(now.elapsed())
             }
@@ -632,12 +647,25 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
         &mut self,
         request: TranscribeRequest,
     ) -> Result<WorkerOutcome, SupervisorError> {
-        self.transcribe_until(request, Instant::now() + STOP_PROCESSING)
+        self.transcribe_with_prompt(request, None)
+    }
+
+    /// Like [`Self::transcribe`], with an optional `initial_prompt`. The prompt
+    /// is sent only to a worker whose Ready advertised support (an old worker
+    /// rejects the unknown key and loses the stream); otherwise it is dropped
+    /// and the request is the one sent before prompts existed.
+    pub fn transcribe_with_prompt(
+        &mut self,
+        request: TranscribeRequest,
+        prompt: Option<String>,
+    ) -> Result<WorkerOutcome, SupervisorError> {
+        self.transcribe_until(request, prompt, Instant::now() + STOP_PROCESSING)
     }
 
     pub(crate) fn transcribe_until(
         &mut self,
         request: TranscribeRequest,
+        prompt: Option<String>,
         deadline: Instant,
     ) -> Result<WorkerOutcome, SupervisorError> {
         if self.state != WorkerState::Ready {
@@ -653,10 +681,12 @@ impl<C: WorkerChild> WorkerSupervisor<C> {
         }
         self.state = WorkerState::Busy;
         let expected = request.correlation.clone();
+        let prompt = prompt.filter(|_| self.accepts_prompt);
         let exchanged = self.child.as_mut().expect("child checked").exchange(
             ControlFrame::Transcribe {
                 correlation: request.correlation,
                 pcm_bytes: request.pcm.len(),
+                prompt,
             },
             Some(&request.pcm),
             deadline,
@@ -752,8 +782,16 @@ mod tests {
     }
 
     fn ready_supervisor(text: Option<&str>) -> WorkerSupervisor<FakeWorker> {
+        ready_supervisor_with(text, false)
+    }
+
+    fn ready_supervisor_with(
+        text: Option<&str>,
+        accepts_prompt: bool,
+    ) -> WorkerSupervisor<FakeWorker> {
         let worker = FakeWorker {
             scripted_text: text.map(ToOwned::to_owned),
+            accepts_prompt,
             ..FakeWorker::default()
         };
         let mut supervisor = WorkerSupervisor::absent();
@@ -772,6 +810,61 @@ mod tests {
             })
             .unwrap();
         assert!(matches!(outcome, WorkerOutcome::NoText { .. }));
+    }
+
+    fn transcribe_with(
+        supervisor: &mut WorkerSupervisor<FakeWorker>,
+        request_id: &str,
+        prompt: Option<&str>,
+    ) {
+        let mut correlation = corr();
+        correlation.request_id = request_id.into();
+        supervisor
+            .transcribe_with_prompt(
+                TranscribeRequest {
+                    correlation,
+                    pcm: vec![1, 0],
+                },
+                prompt.map(ToOwned::to_owned),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn the_prompt_reaches_a_worker_that_advertised_support() {
+        let mut supervisor = ready_supervisor_with(Some("hi"), true);
+        transcribe_with(&mut supervisor, "q1", None);
+        assert_eq!(supervisor.child_mut().unwrap().last_prompt, None);
+        // Seed a sentinel so "never reached the fake" cannot pass as "no prompt".
+        supervisor.child_mut().unwrap().last_prompt = Some("stale".into());
+        transcribe_with(&mut supervisor, "q2", Some("Voisu, Tokio"));
+        let child = supervisor.child_mut().unwrap();
+        assert_eq!(child.transcribe_count, 2);
+        assert_eq!(child.last_prompt.as_deref(), Some("Voisu, Tokio"));
+    }
+
+    #[test]
+    fn an_old_style_ready_without_the_flag_never_gets_a_prompt() {
+        let mut supervisor = ready_supervisor_with(Some("hi"), false);
+        supervisor.child_mut().unwrap().last_prompt = Some("stale".into());
+        transcribe_with(&mut supervisor, "q1", Some("Voisu, Tokio"));
+        let child = supervisor.child_mut().unwrap();
+        assert_eq!(
+            child.transcribe_count, 1,
+            "the Transcribe did reach the worker"
+        );
+        assert_eq!(child.last_prompt, None);
+    }
+
+    #[test]
+    fn prompt_support_is_forgotten_when_a_fresh_prepare_does_not_advertise_it() {
+        let mut supervisor = ready_supervisor_with(Some("hi"), true);
+        supervisor.child_mut().unwrap().accepts_prompt = false;
+        let mut again = corr();
+        again.request_id = "prepare-again".into();
+        supervisor.prepare(again, Instant::now()).unwrap();
+        transcribe_with(&mut supervisor, "q1", Some("Voisu"));
+        assert_eq!(supervisor.child_mut().unwrap().last_prompt, None);
     }
 
     #[test]
@@ -1305,6 +1398,7 @@ mod tests {
                     correlation: corr(),
                     pcm: vec![1, 0],
                 },
+                None,
                 Instant::now() + Duration::from_millis(1),
             )
             .unwrap_err();

@@ -108,6 +108,7 @@ pub fn transcribe_through_supervisor<C: WorkerChild>(
     supervisor: &mut WorkerSupervisor<C>,
     correlation: Correlation,
     pcm: Vec<u8>,
+    prompt: Option<String>,
     sentinel: &CloudCapabilitySentinel,
 ) -> Result<WorkerOutcome, SupervisorError> {
     if !sentinel.local_path_clean() {
@@ -118,7 +119,7 @@ pub fn transcribe_through_supervisor<C: WorkerChild>(
     if supervisor.state() != WorkerState::Ready {
         return Err(SupervisorError::NotReady(supervisor.state()));
     }
-    supervisor.transcribe(TranscribeRequest { correlation, pcm })
+    supervisor.transcribe_with_prompt(TranscribeRequest { correlation, pcm }, prompt)
 }
 
 #[cfg(test)]
@@ -198,8 +199,9 @@ mod tests {
             .attach_ready(FakeWorker::default(), Instant::now())
             .unwrap();
         supervisor.prepare(corr(), Instant::now()).unwrap();
-        let error = transcribe_through_supervisor(&mut supervisor, corr(), vec![1, 0], &sentinel)
-            .unwrap_err();
+        let error =
+            transcribe_through_supervisor(&mut supervisor, corr(), vec![1, 0], None, &sentinel)
+                .unwrap_err();
         assert!(matches!(error, SupervisorError::Unavailable(_)));
     }
 
@@ -207,8 +209,9 @@ mod tests {
     fn local_path_refuses_work_before_the_worker_is_ready() {
         let sentinel = CloudCapabilitySentinel::new();
         let mut supervisor = WorkerSupervisor::<FakeWorker>::absent();
-        let error = transcribe_through_supervisor(&mut supervisor, corr(), vec![1, 0], &sentinel)
-            .unwrap_err();
+        let error =
+            transcribe_through_supervisor(&mut supervisor, corr(), vec![1, 0], None, &sentinel)
+                .unwrap_err();
         assert!(matches!(
             error,
             SupervisorError::NotReady(WorkerState::Absent)

@@ -5,7 +5,7 @@
 
 use super::bounds::{
     MAX_ERROR_METADATA_BYTES, MAX_JSON_DEPTH, MAX_JSON_FIELDS, MAX_JSON_FRAME_BYTES,
-    MAX_METADATA_BYTES, MAX_PCM_BYTES, MAX_TRANSCRIPT_BYTES,
+    MAX_METADATA_BYTES, MAX_PCM_BYTES, MAX_PROMPT_BYTES, MAX_TRANSCRIPT_BYTES,
 };
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -50,6 +50,9 @@ pub enum ControlFrame {
     Transcribe {
         correlation: Correlation,
         pcm_bytes: usize,
+        /// Optional `initial_prompt` for models that honour one. `None` keeps
+        /// the frame exactly as it was before prompts existed.
+        prompt: Option<String>,
     },
     Cancel {
         request_id: String,
@@ -61,6 +64,9 @@ pub enum WorkerFrame {
     Ready {
         correlation: Correlation,
         observed_device: String,
+        /// The worker's loaded adapter honours a Transcribe `prompt`. Absent
+        /// from an old worker's ready, which reads as `false`.
+        accepts_prompt: bool,
     },
     Transcript {
         correlation: Correlation,
@@ -175,6 +181,7 @@ pub fn parse_control(value: &serde_json::Value) -> Result<ControlFrame, FrameErr
             Ok(ControlFrame::Transcribe {
                 correlation: correlation_from(value)?,
                 pcm_bytes,
+                prompt: optional_prompt(value)?,
             })
         }
         Some("cancel") => Ok(ControlFrame::Cancel {
@@ -190,6 +197,10 @@ pub fn parse_worker(value: &serde_json::Value) -> Result<WorkerFrame, FrameError
         Some("ready") => Ok(WorkerFrame::Ready {
             correlation: correlation_from(value)?,
             observed_device: required_string(value, "observed_device")?,
+            accepts_prompt: value
+                .get("accepts_prompt")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
         }),
         Some("transcript") => {
             let text = required_string(value, "text")?;
@@ -238,6 +249,28 @@ fn required_string(value: &serde_json::Value, key: &str) -> Result<String, Frame
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned)
         .ok_or(FrameError::InvalidJson)
+}
+
+/// The one prompt rule, shared with the Python worker: non-empty after
+/// trimming, at most [`MAX_PROMPT_BYTES`], and no control characters.
+#[must_use]
+pub fn is_valid_prompt(prompt: &str) -> bool {
+    !prompt.trim().is_empty()
+        && prompt.len() <= MAX_PROMPT_BYTES
+        && !prompt.chars().any(char::is_control)
+}
+
+/// The optional `prompt` of a Transcribe frame: valid per [`is_valid_prompt`],
+/// or absent.
+fn optional_prompt(value: &serde_json::Value) -> Result<Option<String>, FrameError> {
+    let Some(raw) = value.get("prompt") else {
+        return Ok(None);
+    };
+    let prompt = raw.as_str().ok_or(FrameError::InvalidJson)?;
+    if !is_valid_prompt(prompt) {
+        return Err(FrameError::InvalidJson);
+    }
+    Ok(Some(prompt.to_owned()))
 }
 
 fn correlation_from(value: &serde_json::Value) -> Result<Correlation, FrameError> {
@@ -422,6 +455,88 @@ mod tests {
             parse_worker(&value),
             Err(FrameError::MetadataTooLarge { .. })
         ));
+    }
+
+    fn transcribe_json() -> serde_json::Value {
+        let mut value = control_json();
+        value["kind"] = serde_json::json!("transcribe");
+        value["pcm_bytes"] = serde_json::json!(4);
+        value
+    }
+
+    #[test]
+    fn transcribe_without_a_prompt_parses_as_none() {
+        assert_eq!(
+            parse_control(&transcribe_json()).unwrap(),
+            ControlFrame::Transcribe {
+                correlation: corr(),
+                pcm_bytes: 4,
+                prompt: None,
+            }
+        );
+    }
+
+    #[test]
+    fn transcribe_carries_an_optional_prompt() {
+        let mut value = transcribe_json();
+        value["prompt"] = serde_json::json!("Voisu, Tokio");
+        assert_eq!(
+            parse_control(&value).unwrap(),
+            ControlFrame::Transcribe {
+                correlation: corr(),
+                pcm_bytes: 4,
+                prompt: Some("Voisu, Tokio".to_owned()),
+            }
+        );
+    }
+
+    fn ready_json() -> serde_json::Value {
+        let mut value = control_json();
+        value["kind"] = serde_json::json!("ready");
+        value["observed_device"] = serde_json::json!("cpu");
+        value
+    }
+
+    #[test]
+    fn ready_advertises_prompt_support_only_with_a_true_flag() {
+        let accepts = |value: &serde_json::Value| match parse_worker(value).unwrap() {
+            WorkerFrame::Ready { accepts_prompt, .. } => accepts_prompt,
+            other => panic!("not ready: {other:?}"),
+        };
+        let mut value = ready_json();
+        assert!(!accepts(&value), "an old ready has no flag");
+        value["accepts_prompt"] = serde_json::json!(true);
+        assert!(accepts(&value));
+        value["accepts_prompt"] = serde_json::json!(false);
+        assert!(!accepts(&value));
+        value["accepts_prompt"] = serde_json::json!("yes");
+        assert!(!accepts(&value), "a non-boolean flag is not support");
+    }
+
+    #[test]
+    fn one_prompt_rule_for_both_sides() {
+        assert!(is_valid_prompt("Voisu, Tokio"));
+        assert!(is_valid_prompt(&"x".repeat(MAX_PROMPT_BYTES)));
+        for bad in ["", "  \t ", "a\nb", "a\u{0}b", "a\u{7}b", "a\u{85}b"] {
+            assert!(!is_valid_prompt(bad), "{bad:?}");
+        }
+        assert!(!is_valid_prompt(&"x".repeat(MAX_PROMPT_BYTES + 1)));
+    }
+
+    #[test]
+    fn a_malformed_prompt_fails_closed() {
+        for bad in [
+            serde_json::json!(7),
+            serde_json::json!("a\u{0}b"),
+            serde_json::json!("a\u{7}b"),
+            serde_json::json!("a\nb"),
+            serde_json::json!("  "),
+            serde_json::json!("x".repeat(MAX_PROMPT_BYTES + 1)),
+        ] {
+            let mut value = transcribe_json();
+            value["prompt"] = bad;
+            assert!(parse_control(&value).is_err(), "{value}");
+        }
     }
 
     #[test]

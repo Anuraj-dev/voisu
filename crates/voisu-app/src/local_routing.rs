@@ -762,12 +762,13 @@ impl Gate {
     }
 
     #[cfg(test)]
-    fn attach_ready_worker(&mut self, hash: String, text: &str) {
+    fn attach_ready_worker(&mut self, hash: String, text: &str, accepts_prompt: bool) {
         let mut supervisor = WorkerSupervisor::absent();
         let worker = FakeWorker {
             scripted_text: Some(text.to_owned()),
             generation: 1,
             model_receipt_hash: hash.clone(),
+            accepts_prompt,
             ..FakeWorker::default()
         };
         if supervisor.attach_ready(worker, Instant::now()).is_err() {
@@ -869,10 +870,20 @@ fn infer_unlocked(
     recording_id: &str,
     request_id: &str,
     pcm: Vec<u8>,
+    user_terms: &[String],
 ) -> Result<WorkerOutcome, LocalError> {
     let correlation = correlation(&session.receipt_hash, recording_id, request_id);
-    transcribe_through_supervisor(&mut session.supervisor, correlation, pcm, &session.sentinel)
-        .map_err(|error| LocalError::Inference(error.to_string()))
+    // The supervisor drops the prompt unless this worker advertised support,
+    // so Parakeet and an old worker are sent exactly what they always were.
+    let prompt = crate::dictionary::local_prompt_for_terms(user_terms);
+    transcribe_through_supervisor(
+        &mut session.supervisor,
+        correlation,
+        pcm,
+        prompt,
+        &session.sentinel,
+    )
+    .map_err(|error| LocalError::Inference(error.to_string()))
 }
 
 fn assert_gate_unlocked() {
@@ -1314,7 +1325,13 @@ pub fn complete_recording(
         }
     }
     let request_id = format!("{recording_id}-asr");
-    let outcome = match infer_unlocked(&mut session, recording_id, &request_id, pcm.clone()) {
+    let outcome = match infer_unlocked(
+        &mut session,
+        recording_id,
+        &request_id,
+        pcm.clone(),
+        user_terms,
+    ) {
         Ok(outcome) => outcome,
         Err(_) if is_silence_pcm(&pcm) => {
             match silence_outcome(session.supervisor.observed_device()) {
@@ -1371,7 +1388,13 @@ pub fn complete_replay(
     let mut session = take_inference_session()?;
     assert_gate_unlocked();
     let request_id = format!("{recording_id}-replay");
-    let outcome = match infer_unlocked(&mut session, recording_id, &request_id, pcm.clone()) {
+    let outcome = match infer_unlocked(
+        &mut session,
+        recording_id,
+        &request_id,
+        pcm.clone(),
+        user_terms,
+    ) {
         Ok(outcome) => outcome,
         Err(error) => {
             restore_inference_session(session);
@@ -1712,10 +1735,17 @@ pub fn sentinel_is_clean() -> bool {
 /// Test-only: attach a Ready worker and verified receipt without env.
 #[cfg(test)]
 pub fn inject_ready(receipt: ActiveReceipt, text: &str) {
+    inject_ready_with_prompt_support(receipt, text, false);
+}
+
+/// Test-only: like [`inject_ready`], with a worker whose Ready does or does
+/// not advertise prompt support.
+#[cfg(test)]
+pub fn inject_ready_with_prompt_support(receipt: ActiveReceipt, text: &str, accepts_prompt: bool) {
     let mut gate = gate().lock().expect("gate");
     let hash = receipt.receipt_hash.clone();
     gate.receipt = Some(receipt.clone());
-    gate.attach_ready_worker(hash, text);
+    gate.attach_ready_worker(hash, text, accepts_prompt);
     gate.readiness = LocalReadiness::Ready {
         model_identity: Some(receipt.catalog_id),
     };
@@ -1957,6 +1987,7 @@ mod tests {
             &mut supervisor,
             correlation(&receipt.receipt_hash, "rec-busy", "rec-busy-asr"),
             vec![1, 0, 3, 0],
+            None,
             &gate.sentinel,
         )
         .expect("in-flight work completes");
@@ -2611,6 +2642,56 @@ mod tests {
         assert!(sentinel_is_clean());
     }
 
+    /// Runs one Recording through an injected worker and reports what the
+    /// worker saw: `(transcribe_count, last_prompt)`. The fake starts with a
+    /// sentinel prompt, so a Transcribe that never arrived cannot read as "no
+    /// prompt".
+    fn worker_saw(accepts_prompt: bool, terms: &[&str]) -> (u32, Option<String>) {
+        inject_ready_with_prompt_support(fixture_receipt(), "hello", accepts_prompt);
+        gate()
+            .lock()
+            .expect("gate")
+            .lifecycle
+            .child_mut()
+            .unwrap()
+            .last_prompt = Some("sentinel".into());
+        begin_live("rec-prompt");
+        let terms: Vec<String> = terms.iter().map(|term| (*term).to_owned()).collect();
+        complete_recording(
+            "rec-prompt",
+            vec![1, 0, 2, 0],
+            &terms,
+            WritingMode::Literal,
+            false,
+            false,
+        )
+        .unwrap();
+        let mut gate = gate().lock().expect("gate");
+        let child = gate.lifecycle.child_mut().unwrap();
+        (child.transcribe_count, child.last_prompt.clone())
+    }
+
+    #[test]
+    fn a_prompt_capable_worker_gets_the_dictionary_as_its_initial_prompt() {
+        let _lock = test_session();
+        assert_eq!(
+            worker_saw(true, &["Voisu", "Tokio"]),
+            (1, Some("Voisu, Tokio".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_prompt_capable_worker_with_an_empty_dictionary_gets_no_prompt() {
+        let _lock = test_session();
+        assert_eq!(worker_saw(true, &[]), (1, None));
+    }
+
+    #[test]
+    fn a_worker_that_did_not_advertise_prompt_support_never_gets_one() {
+        let _lock = test_session();
+        assert_eq!(worker_saw(false, &["Voisu", "Tokio"]), (1, None));
+    }
+
     #[test]
     fn public_readiness_stays_unavailable_with_an_injected_test_worker() {
         let _lock = test_session();
@@ -2914,7 +2995,8 @@ mod tests {
             model_receipt_hash: "h".into(),
         };
         assert!(
-            transcribe_through_supervisor(&mut supervisor, corr, vec![1, 0], &sentinel).is_err()
+            transcribe_through_supervisor(&mut supervisor, corr, vec![1, 0], None, &sentinel)
+                .is_err()
         );
     }
 }

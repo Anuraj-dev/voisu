@@ -200,7 +200,16 @@ def frame(value: dict) -> bytes:
     return len(payload).to_bytes(4, "little") + payload
 
 
-def serve(adapter: BaseAdapter, pcm: bytes) -> dict:
+def transcribe_request(pcm_bytes: int, prompt=None, request_id: str = "t", **extra) -> dict:
+    request = {"v": 1, "op": "transcribe", "id": request_id, "pcm_bytes": pcm_bytes, **extra}
+    if prompt is not None:
+        request["prompt"] = prompt
+    return request
+
+
+def serve_requests(adapter: BaseAdapter, requests: list[tuple[dict, bytes]]) -> list[dict]:
+    """Prepare, then send each (request, pcm) in order; return ready + every reply."""
+
     with tempfile.TemporaryDirectory() as tmp:
         health = Path(tmp) / "health.wav"
         with wave.open(str(health), "wb") as handle:
@@ -212,19 +221,23 @@ def serve(adapter: BaseAdapter, pcm: bytes) -> dict:
             model_id="fake",
             options={"health_audio": str(health), "health_expected": "health phrase"},
         )
-        reader = io.BytesIO(
-            frame({"v": 1, "op": "prepare", "id": "p"})
-            + frame({"v": 1, "op": "transcribe", "id": "t", "pcm_bytes": len(pcm)})
-            + pcm
-        )
+        wire = frame({"v": 1, "op": "prepare", "id": "p"})
+        for request, pcm in requests:
+            wire += frame(request) + pcm
         writer = io.BytesIO()
-        asr_service.serve_stream(manifest, adapter, reader, writer)
-    replies = io.BytesIO(writer.getvalue())
-    ready = read_json_frame(replies)
-    assert ready is not None and ready["status"] == "ready", ready
-    reply = read_json_frame(replies)
-    assert reply is not None
-    return reply
+        asr_service.serve_stream(manifest, adapter, io.BytesIO(wire), writer)
+    stream = io.BytesIO(writer.getvalue())
+    frames = []
+    while (reply := read_json_frame(stream)) is not None:
+        frames.append(reply)
+    assert frames and frames[0]["status"] == "ready", frames
+    return frames
+
+
+def serve(adapter: BaseAdapter, pcm: bytes, prompt=None) -> dict:
+    frames = serve_requests(adapter, [(transcribe_request(len(pcm), prompt), pcm)])
+    assert len(frames) == 2, frames
+    return frames[1]
 
 
 class ServiceWindowingTests(unittest.TestCase):
@@ -266,6 +279,129 @@ class ServiceWindowingTests(unittest.TestCase):
         big = "x" * (windowing.MAX_TRANSCRIPT_BYTES // 2 + 1)
         reply = serve(ScriptedAdapter([big, big]), pcm_of(loud(2 * WINDOW)))
         self.assertEqual((reply["status"], reply["code"]), ("error", "transcript_too_large"))
+
+
+class PromptAdapter(ScriptedAdapter):
+    """A prompt-capable adapter (like the faster-whisper one) that records prompts."""
+
+    accepts_initial_prompt = True
+
+    def __init__(self, replies):
+        super().__init__(replies)
+        self.prompts: list = []
+
+    def transcribe(self, pcm: bytes, initial_prompt=None) -> str:
+        self.prompts.append(initial_prompt)
+        return super().transcribe(pcm)
+
+
+class InitialPromptTests(unittest.TestCase):
+    def test_a_prompt_reaches_a_prompt_capable_adapter_for_every_window(self):
+        adapter = PromptAdapter(["one", "two"])
+        reply = serve(adapter, pcm_of(loud(WINDOW + RATE)), prompt="Voisu, Tokio")
+        self.assertEqual(reply["text"], "one two")
+        # The health window carries no prompt; both request windows do.
+        self.assertEqual(adapter.prompts, [None, "Voisu, Tokio", "Voisu, Tokio"])
+
+    def test_a_request_without_a_prompt_passes_none(self):
+        adapter = PromptAdapter(["one"])
+        serve(adapter, pcm_of(loud(RATE)))
+        self.assertEqual(adapter.prompts, [None, None])
+
+    def test_an_adapter_that_ignores_prompts_is_never_called_with_one(self):
+        # ScriptedAdapter.transcribe(pcm) would raise TypeError on a prompt kwarg.
+        adapter = ScriptedAdapter(["one"])
+        reply = serve(adapter, pcm_of(loud(RATE)), prompt="Voisu")
+        self.assertEqual((reply["status"], reply["text"]), ("transcript", "one"))
+
+    def assert_rejected_then_stream_stays_in_sync(self, bad_request: dict, pcm: bytes):
+        good_pcm = pcm_of(loud(RATE))
+        frames = serve_requests(
+            PromptAdapter(["after"]),
+            [(bad_request, pcm), (transcribe_request(len(good_pcm), request_id="good"), good_pcm)],
+        )
+        self.assertEqual(len(frames), 3, frames)
+        self.assertEqual((frames[1]["status"], frames[1]["code"]), ("error", "invalid_request"))
+        # The PCM of the rejected request was consumed, so the next one parses.
+        self.assertEqual((frames[2]["status"], frames[2]["text"]), ("transcript", "after"))
+
+    def test_a_malformed_prompt_is_rejected_and_the_stream_stays_in_sync(self):
+        pcm = pcm_of(loud(RATE))
+        for bad in ["", "  ", 7, ["a"], "x" * 1025, "a\nb", "a\x00b", "a\u0085b"]:
+            with self.subTest(bad=bad):
+                request = transcribe_request(len(pcm), request_id="bad")
+                request["prompt"] = bad
+                self.assert_rejected_then_stream_stays_in_sync(request, pcm)
+
+    def test_an_unknown_key_is_rejected_and_the_stream_stays_in_sync(self):
+        pcm = pcm_of(loud(RATE))
+        request = transcribe_request(len(pcm), request_id="bad", bogus=1)
+        self.assert_rejected_then_stream_stays_in_sync(request, pcm)
+
+
+class PromptCapabilityTests(unittest.TestCase):
+    def test_ready_advertises_prompt_support_only_for_a_prompt_capable_adapter(self):
+        pcm = pcm_of(loud(RATE))
+        capable = serve_requests(PromptAdapter(["x"]), [(transcribe_request(len(pcm)), pcm)])
+        self.assertIs(capable[0]["accepts_prompt"], True)
+        plain = serve_requests(ScriptedAdapter(["x"]), [(transcribe_request(len(pcm)), pcm)])
+        self.assertNotIn("accepts_prompt", plain[0])
+
+    def test_only_faster_whisper_declares_prompt_support(self):
+        from voisu_asr import adapters, candidate_adapters
+
+        def subclasses(cls):
+            for sub in cls.__subclasses__():
+                yield sub
+                yield from subclasses(sub)
+
+        shipped = [cls for cls in subclasses(BaseAdapter) if cls.__module__.startswith("voisu_asr")]
+        capable = {cls.__name__ for cls in shipped if cls.accepts_initial_prompt}
+        self.assertEqual(capable, {"FasterWhisperAdapter"})
+        # Parakeet is served by the NeMo adapter; it must never advertise prompts.
+        self.assertFalse(adapters.NemoSpeechCAdapter.accepts_initial_prompt)
+        self.assertNotIn("NemoSpeechCAdapter", capable)
+
+
+class PromptEchoTests(unittest.TestCase):
+    """A quiet window can make Whisper recite its prompt; that is not speech."""
+
+    PROMPT = "Voisu, Tokio, wayfinder"
+
+    def run_window(self, text: str) -> dict:
+        return serve(PromptAdapter([text]), pcm_of(loud(RATE)), prompt=self.PROMPT)
+
+    def test_a_window_that_only_recites_the_glossary_is_no_text(self):
+        for echo in [
+            "Voisu, Tokio",
+            "Voisu, Tokio, wayfinder",
+            "Voisu, Tokio, wayfinder.",
+            "voisu tokio",
+            "WAYFINDER,  tokio ,voisu .",
+        ]:
+            with self.subTest(echo=echo):
+                self.assertEqual(self.run_window(echo)["status"], "no_text")
+
+    def test_a_single_dictionary_term_is_real_speech(self):
+        reply = self.run_window("Voisu")
+        self.assertEqual((reply["status"], reply["text"]), ("transcript", "Voisu"))
+
+    def test_real_speech_that_mentions_terms_is_kept(self):
+        for text in ["Voisu is great", "Voisu, Tokio and more", "Voisu, Tokio, and Rust"]:
+            with self.subTest(text=text):
+                self.assertEqual(self.run_window(text)["text"], text)
+
+    def test_the_same_term_twice_is_not_a_glossary_echo(self):
+        self.assertEqual(self.run_window("Voisu Voisu")["text"], "Voisu Voisu")
+
+    def test_only_the_echo_window_is_dropped_from_a_long_recording(self):
+        adapter = PromptAdapter(["real words", "Voisu, Tokio, wayfinder."])
+        reply = serve(adapter, pcm_of(loud(WINDOW + RATE)), prompt=self.PROMPT)
+        self.assertEqual((reply["status"], reply["text"]), ("transcript", "real words"))
+
+    def test_without_a_prompt_nothing_is_filtered(self):
+        reply = serve(PromptAdapter(["Voisu, Tokio"]), pcm_of(loud(RATE)))
+        self.assertEqual(reply["text"], "Voisu, Tokio")
 
 
 if __name__ == "__main__":
