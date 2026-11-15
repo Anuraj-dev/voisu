@@ -21,15 +21,13 @@ mirror `crates/voisu-app/src/local_worker/bakeoff.rs`:
 | Tuning English speech | ≤ 20 |
 | Negative clips (silence, room noise, no speech) | ≥ 20 |
 | Speech in each of 1–10 s, 10–30 s, 30–120 s | ≥ 1 |
-| Long clips | ≥ 5 (see profiles) |
+| Long clips (120–600 s, i.e. 2–10 min) | ≥ 5 |
 | Speech with no split, duplicate audio, clips over 600 s | 0 |
 
 Hinglish clips can stay in the corpus. They are listed but never count.
 
-There are two profiles:
-
-- `--profile p0a` (the default) wants 5 clips of 60–120 s, the P0a target.
-- `--profile bakeoff` is the Rust lock. Its longest band is 120–600 s.
+One corpus serves both the Rust bakeoff lock and the local-accuracy P0a
+target.
 
 The RSS growth bound (≤ 128 MiB over a 200-recording soak) is a soak gate,
 not a corpus property. The run record reports peak RSS for each run.
@@ -40,11 +38,13 @@ not a corpus property. The run record reports peak RSS for each run.
 - Name files by kind, for example `en-scripted-0042.wav`, `en-long-0003.wav`
   or `neg-0007.wav`. The file name becomes the record ID, so never reuse or
   rename one after a freeze.
-- Spread clip lengths: mostly 1–30 s dictation, some 30–60 s, and at least 5
-  clips of 60–120 s of continuous speech.
+- Spread clip lengths: mostly 1–30 s dictation, some 30–120 s, and at least 5
+  clips of 2–5 min of continuous speech. Clips of 60–120 s do not count
+  toward the long-clip threshold.
 - For negatives, record room tone, keyboard noise, a fan, or a far-off TV
   with no nearby speech. The reference is `""`.
-- Every speaker needs a consent receipt. Clips without consent are refused.
+- The corpus is a single speaker for now: you. Record only your own voice.
+  The consent receipt covers you; clips without consent are refused.
 
 ## References
 
@@ -58,9 +58,11 @@ shows each kind. The fields:
     reference, and fix it wherever you slipped.
   - `"adjudicated"` means spontaneous speech, transcribed by listening.
 - `split`: `"heldout"` (scored for the decision) or `"tuning"` (free for
-  settings work, at most 20). Pin every new clip `"heldout"` unless you plan
-  to tune on it. A row with no split gets a hashed split at freeze time.
-  That cannot guarantee 80 held out.
+  settings work, at most 20). New clips are held out by default: put
+  `"split": "heldout"` in every new row (the example rows do, and
+  `add-captures` drafts already carry it). Use `"tuning"` only on purpose.
+  Rows already in the corpus without a split keep the hashed split they got
+  at freeze time; leave them as they are so their splits do not change.
 - `critical_tokens` lists the words a wrong transcript must not get wrong.
   Use numbers as spoken ("forty two"), names, negations ("do not"), and
   required phrases. Each entry is one unit and may span several words.
@@ -133,5 +135,4 @@ configuration. Each record holds:
 Each metric is reported over all English clips (`english_all`, which matches
 the earlier tables) and over held-out English (`english_heldout`, the
 decision scope). The file also has paired comparisons and a winner-rule
-verdict. A metric that is not implemented yet shows as `n/i`, and the
-verdict then stays `pending`.
+verdict.

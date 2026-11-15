@@ -1053,7 +1053,6 @@ def _command_parser() -> argparse.ArgumentParser:
     source = check_parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--corpus", type=Path, help="frozen corpus manifest")
     source.add_argument("--inventory", type=Path, help="inventory manifest (unpinned splits stay unassigned unless --seed is given)")
-    check_parser.add_argument("--profile", choices=("p0a", "bakeoff"), default="p0a")
     check_parser.add_argument("--seed", help="with --inventory: project the splits freeze would hash for this seed")
     check_parser.add_argument("--heldout-fraction", type=float, default=0.2)
     check_parser.add_argument("--json", action="store_true", help="print the check as JSON")
@@ -1098,7 +1097,7 @@ def _check_corpus_command(args: argparse.Namespace) -> int:
                 if record.get("split") not in {"development", "heldout"}:
                     bucket = split_bucket(args.seed, record["language"], record["record_id"])
                     record["split"] = "heldout" if bucket < args.heldout_fraction else "development"
-    result = corpus_lock.check_corpus(records, args.profile)
+    result = corpus_lock.check_corpus(records)
     print(json.dumps(result, ensure_ascii=False, indent=2) if args.json else corpus_lock.format_check(result))
     return 0 if result["ok"] else 1
 

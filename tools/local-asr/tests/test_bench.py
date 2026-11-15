@@ -122,6 +122,7 @@ class AddCapturesTests(unittest.TestCase):
             entry = refs["cap-rec-1-1.wav"]
             self.assertEqual(entry["reference"], "first delivered text")
             self.assertEqual(entry["review_status"], "unreviewed")
+            self.assertEqual(entry["split"], "heldout")
             self.assertEqual(entry["language"], bench.UNREVIEWED_LANGUAGE)
             self.assertEqual(result["unreviewed_total"], 2)
             wav = eval_dir / "audio" / "cap-rec-1-1.wav"

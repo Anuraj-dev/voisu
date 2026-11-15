@@ -528,6 +528,7 @@ def _draft_entry(row: Mapping[str, Any]) -> dict[str, Any]:
         "language": UNREVIEWED_LANGUAGE,
         "reference": row["final_transcript"],
         "review_status": "unreviewed",
+        "split": "heldout",  # new clips are held out by default; set "tuning" only to tune on one
         "tags": ["capture", "unreviewed"],
         "source": {
             "kind": "debug-capture", "correlation_id": row["correlation_id"],

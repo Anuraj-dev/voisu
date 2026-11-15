@@ -66,17 +66,14 @@ class BandTests(unittest.TestCase):
 
 
 class CheckTests(unittest.TestCase):
-    def test_a_corpus_at_every_threshold_passes_its_profile(self):
-        self.assertTrue(corpus_lock.check_corpus(full_corpus(90_000), "p0a")["ok"])
-        self.assertTrue(corpus_lock.check_corpus(full_corpus(150_000), "bakeoff")["ok"])
+    def test_a_corpus_at_every_threshold_passes(self):
+        self.assertTrue(corpus_lock.check_corpus(full_corpus(150_000))["ok"])
 
-    def test_profiles_differ_only_in_the_long_clip_rule(self):
-        p0a_corpus = corpus_lock.check_corpus(full_corpus(90_000), "bakeoff")
-        self.assertFalse(p0a_corpus["ok"])
-        self.assertEqual(p0a_corpus["missing"], ["5 more clips of 120-600 s"])
-        long_corpus = corpus_lock.check_corpus(full_corpus(150_000), "p0a")
-        self.assertFalse(long_corpus["ok"])
-        self.assertEqual(long_corpus["missing"], ["5 more clips of 60-120 s"])
+    def test_long_clips_must_be_in_the_longest_band(self):
+        result = corpus_lock.check_corpus(full_corpus(90_000))  # 60-120 s clips do not count
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["missing"], ["5 more clips of 120-600 s"])
+        self.assertTrue(corpus_lock.check_corpus(full_corpus(300_000))["ok"])  # 2-5 min recordings
 
     def test_missing_report_names_each_gap(self):
         records = [speech(i, 5_000, "heldout" if i < 30 else "development") for i in range(40)] + [negative(i) for i in range(3)]
@@ -86,7 +83,7 @@ class CheckTests(unittest.TestCase):
         self.assertEqual(result["counts"]["speech"], 41)
         self.assertEqual(result["counts"]["hinglish_excluded"], 1)
         missing = "\n".join(result["missing"])
-        for expected in ("59 more English speech clips", "49 more held-out", "17 more negative", "1 fewer duplicate", "1 more clip of 10-30 s", "1 more clip of 30-120 s", "5 more clips of 60-120 s"):
+        for expected in ("59 more English speech clips", "49 more held-out", "17 more negative", "1 fewer duplicate", "1 more clip of 10-30 s", "1 more clip of 30-120 s", "5 more clips of 120-600 s"):
             self.assertIn(expected, missing)
         self.assertEqual([item["name"] for item in result["checks"] if not item["ok"] and item["name"].startswith("tuning")], [])
         text = corpus_lock.format_check(result)
@@ -94,7 +91,7 @@ class CheckTests(unittest.TestCase):
         self.assertIn("missing:", text)
 
     def test_too_many_tuning_clips_and_unassigned_clips_fail(self):
-        records = full_corpus(90_000)
+        records = full_corpus(150_000)
         records[0]["split"] = "development"
         records[1]["split"] = None
         result = corpus_lock.check_corpus(records)
@@ -106,10 +103,6 @@ class CheckTests(unittest.TestCase):
         counts = corpus_lock.corpus_counts(records)
         self.assertEqual((counts["speech_with_critical_tokens"], counts["critical_tokens"]), (1, 2))
         self.assertEqual(counts["reference_sources"], {"adjudicated": 1, "scripted": 1, "unspecified": 1})
-
-    def test_unknown_profile_is_rejected(self):
-        with self.assertRaises(ValueError):
-            corpus_lock.check_corpus([], "strict")
 
 
 class ManifestTests(unittest.TestCase):
