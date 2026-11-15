@@ -68,6 +68,10 @@ The user-approved global shortcut whose first activation starts a Recording and
 whose next activation stops it.
 _Avoid_: Hold key, push-to-talk key
 
+**Dictionary**:
+The user's own list of words, names and terms that Voisu should spell the user's way. Every Transcript gets exact-match correction: a heard span that already spells an entry, ignoring case and spacing, is rewritten to the entry's written form. Local Transcripts also get correction by sound: a word or short run of words that sounds like an entry of two or more syllables ("voice you" for "Voisu") is replaced by it. This never crosses punctuation and never swaps a common word on its own. Cloud Transcripts get exact-match correction only.
+_Avoid_: Vocabulary list, glossary, custom words
+
 **Delivery**:
 Placing the final Transcript into the focused application, with clipboard
 preservation as the fallback.

@@ -174,9 +174,13 @@ pub fn decide_replay(
     Ok(decision)
 }
 
-/// User-vocabulary replacements via the Cloud span-aware matcher, ungated.
+/// Dictionary correction for Local: the Cloud span-aware exact matcher
+/// (ungated, no word confidences), then correction by sound for names the
+/// model wrote as it heard them ("voice you" -> "Voisu"). Cloud keeps exact
+/// matching only.
 pub fn apply_local_dictionary(text: &str, user_terms: &[String]) -> String {
-    voisu_core::apply_user_vocabulary(text, user_terms, &[])
+    let exact = voisu_core::apply_user_vocabulary(text, user_terms, &[]);
+    voisu_core::apply_phonetic_dictionary(&exact, user_terms)
 }
 
 #[cfg(test)]
@@ -376,6 +380,46 @@ mod tests {
         assert_eq!(
             apply_local_dictionary("open Claude code please", &["Claude Code".to_owned()]),
             "open Claude Code please"
+        );
+    }
+
+    #[test]
+    fn local_dictionary_corrects_by_sound_after_exact_matches() {
+        let dictionary = ["Voisu".to_owned(), "Hyprland".to_owned()];
+        assert_eq!(
+            apply_local_dictionary("voice you runs on hyper land", &dictionary),
+            "Voisu runs on Hyprland"
+        );
+    }
+
+    #[test]
+    fn local_exact_dictionary_match_wins_over_a_sound_match() {
+        // "voice you" sounds like Voisu, but the user also spelled it out as
+        // an entry; exact matching runs first and owns it.
+        let dictionary = ["Voisu".to_owned(), "voice-you".to_owned()];
+        assert_eq!(
+            apply_local_dictionary("say voice you", &dictionary),
+            "say voice-you"
+        );
+    }
+
+    #[test]
+    fn local_tail_delivers_the_sound_corrected_transcript() {
+        let mut coordinator = DeliveryCoordinator::new();
+        let pcm = [1, 0, 2, 0];
+        let decision = decide_transcript(
+            "rec-1",
+            &pcm,
+            outcome("open voice you settings"),
+            &["Voisu".to_owned()],
+            WritingMode::Literal,
+            &mut coordinator,
+            &CloudCapabilitySentinel::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            decision,
+            TerminalDecision::Transcript("open Voisu settings".to_owned())
         );
     }
 

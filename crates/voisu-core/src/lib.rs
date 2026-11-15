@@ -114,7 +114,9 @@ pub use intent_routing::{
 };
 
 mod vocabulary;
-pub use vocabulary::apply_user_vocabulary;
+pub use vocabulary::{
+    PhoneticSwap, apply_phonetic_dictionary, apply_user_vocabulary, phonetic_dictionary_swaps,
+};
 
 mod compose_gate;
 pub use compose_gate::{
