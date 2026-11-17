@@ -24,12 +24,14 @@ use std::sync::OnceLock;
 const SILERO_VAD_ONNX: &[u8] = include_bytes!("../assets/silero_vad_v6.onnx");
 
 /// A Recording speaks when any window scores at least this. Silero's own
-/// speech threshold is 0.5 and its release threshold 0.35; this sits below
-/// both because a wrong refusal loses words while a wrong pass only lets the
-/// model's own no-text and hallucination filters decide. On 166 real
-/// captures the weakest speech peaked at 0.46 and the loudest no-speech clip
-/// at 0.15.
-pub const SPEECH_THRESHOLD: f32 = 0.3;
+/// speech threshold is 0.5 and its release threshold 0.35; this sits well
+/// below both because a wrong refusal loses words while a wrong pass only
+/// lets the model's own no-text and hallucination filters decide. On 220
+/// real captures (after the loudness gain below), the weakest clip Deepgram
+/// transcribed peaked at 0.48 (0.39 when attenuated 30x), a Local "Okay"
+/// clip at 0.28, and the loudest clip with no speech at 0.154. 0.2 sits
+/// below the midpoint of that 0.154-0.28 gap, leaning toward accepting.
+pub const SPEECH_THRESHOLD: f32 = 0.2;
 
 /// Samples per Silero window at 16 kHz (32 ms).
 const WINDOW: usize = 512;
@@ -480,7 +482,10 @@ mod onnx {
             .iter()
             .map(|b| f32::from_le_bytes(*b))
             .collect();
-        let expected: i64 = dims.iter().product();
+        let expected = dims
+            .iter()
+            .try_fold(1_i64, |product, &dim| product.checked_mul(dim))
+            .ok_or_else(|| format!("{name} dims {dims:?} overflow"))?;
         if expected != values.len() as i64 {
             return Err(format!(
                 "{name} has {} floats for dims {dims:?}",
@@ -606,20 +611,30 @@ mod tests {
     #[test]
     fn matches_onnx_runtime_on_speech() {
         // onnxruntime 1.23 (faster-whisper venv) on the same fixture, raw
-        // audio, zero state: first twelve window probabilities.
-        let reference = [
-            0.02383, 0.01903, 0.09860, 0.10293, 0.06893, 0.05610, 0.08503, 0.12082, 0.09901,
-            0.07417, 0.61621, 0.78807,
+        // audio, zero state, state carried window to window: every window.
+        let reference: [f32; 93] = [
+            0.023829, 0.019030, 0.098604, 0.102932, 0.068931, 0.056102, 0.085032, 0.120822,
+            0.099011, 0.074175, 0.616215, 0.788068, 0.787933, 0.760164, 0.750316, 0.795237,
+            0.863461, 0.873309, 0.876148, 0.810174, 0.735714, 0.828934, 0.897008, 0.889406,
+            0.874432, 0.849969, 0.841480, 0.817791, 0.811410, 0.802600, 0.806158, 0.846223,
+            0.864623, 0.860145, 0.855120, 0.777617, 0.771985, 0.778178, 0.834353, 0.862345,
+            0.829833, 0.738505, 0.723865, 0.846875, 0.838809, 0.852345, 0.837202, 0.810412,
+            0.797756, 0.794398, 0.796365, 0.777622, 0.813705, 0.857974, 0.879564, 0.883810,
+            0.869795, 0.865048, 0.859014, 0.832599, 0.811005, 0.809660, 0.862066, 0.870897,
+            0.739685, 0.827550, 0.773016, 0.617598, 0.516529, 0.370322, 0.276992, 0.189874,
+            0.144322, 0.129084, 0.080651, 0.071299, 0.075516, 0.066246, 0.058064, 0.055848,
+            0.061769, 0.045266, 0.035851, 0.040070, 0.035062, 0.031688, 0.030026, 0.032139,
+            0.028542, 0.027457, 0.036354, 0.024336, 0.021521,
         ];
         let audio: Vec<f32> = jfk_samples()
             .iter()
             .map(|&s| f32::from(s) / 32_768.0)
             .collect();
         let probabilities = window_probabilities(&audio);
-        assert_eq!(probabilities.len(), 48_000 / WINDOW);
+        assert_eq!(probabilities.len(), reference.len());
         for (index, (got, want)) in probabilities.iter().zip(reference).enumerate() {
             assert!(
-                (got - want).abs() < 1e-3,
+                (got - want).abs() < 1e-4,
                 "window {index}: {got} vs onnxruntime {want}"
             );
         }
@@ -644,8 +659,11 @@ mod tests {
             .zip(noise(len, 200.0, 3))
             .map(|(a, b)| a.saturating_add(b))
             .collect();
+        // Synthetic white hiss is left out on purpose: after the loudness
+        // gain about one 3 s clip in five has a window at 0.2 or above
+        // (onnxruntime, 20 seeds per level), so it passes on to the model.
+        // Real room-noise captures all stayed at or below 0.154.
         let cases = [
-            ("quiet hiss", noise(len, 50.0, 1)),
             ("mains hum", hum),
             ("1 kHz tone", sine(len, 1_000.0, 5_000.0)),
             ("DC offset", vec![3_000; len]),

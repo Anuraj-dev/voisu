@@ -311,6 +311,16 @@ pub struct LocalAsrDiagnostic {
     pub peak_host_ram_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peak_gpu_memory_bytes: Option<u64>,
+    /// Local speech check: highest window speech probability it saw, in
+    /// thousandths. A pass stops at the first speech window, so this is that
+    /// window's score; a refusal scans everything, so it is the Recording's
+    /// maximum. Absent when the check did not run (digital silence, error).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speech_peak_permille: Option<u16>,
+    /// Loudness gain the speech check applied to its own copy, in hundredths
+    /// (100 = unchanged). The model always receives the original audio.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speech_gain_percent: Option<u16>,
 }
 
 impl LocalAsrDiagnostic {

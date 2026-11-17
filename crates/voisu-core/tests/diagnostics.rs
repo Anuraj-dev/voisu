@@ -1989,6 +1989,8 @@ fn local_asr_diagnostic_is_additive_on_the_record_wire() {
         inference_ms: Some(412),
         peak_host_ram_bytes: Some(1_048_576),
         peak_gpu_memory_bytes: Some(891_289_600),
+        speech_peak_permille: None,
+        speech_gain_percent: None,
     });
     let encoded = serde_json::to_string(&record).unwrap();
     assert!(encoded.contains("\"local_asr\""));
@@ -2020,6 +2022,8 @@ fn export_scrubs_secrets_from_local_asr_fields() {
         inference_ms: None,
         peak_host_ram_bytes: None,
         peak_gpu_memory_bytes: None,
+        speech_peak_permille: None,
+        speech_gain_percent: None,
     });
     let export = export_record(
         record,
