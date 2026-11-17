@@ -873,7 +873,10 @@ async fn actor_loop(
                         next_id += 1;
                         state = ActorState::Replaying(id);
                         let replay_snapshot = voisu_app::dictionary::dictionary_snapshot();
-                        let writing_mode = voisu_app::config::writing_mode();
+                        let formatting = local_routing::LocalFormatting::new(
+                            voisu_app::config::writing_mode(),
+                            dpr_enabled.then(voisu_app::config::rendering_policy),
+                        );
                         let fixture_dir = diagnostics
                             .as_ref()
                             .expect("diagnostics availability checked above")
@@ -888,7 +891,7 @@ async fn actor_loop(
                                 &voisu_core::correlation_id(id),
                                 &fixture_name,
                                 replay_snapshot.user_terms,
-                                writing_mode,
+                                formatting,
                                 |name| {
                                     read_fixture(&fixture_dir, name)
                                         .map_err(|error| error.diagnostic().to_owned())
@@ -2619,7 +2622,13 @@ async fn process_recording(
             let _ = providers.abort().await;
             let rec_id = correlation_id.clone();
             let recovery = local_recovery::enabled();
-            match local_routing::finish_local_stop(&rec_id, pcm, writing_mode, recovery) {
+            // Same DPR gate as Cloud below; the Local tail applies English
+            // eligibility from the Local model's language.
+            let formatting = local_routing::LocalFormatting::new(
+                writing_mode,
+                dpr_enabled.then_some(rendering_policy),
+            );
+            match local_routing::finish_local_stop(&rec_id, pcm, formatting, recovery) {
                 Ok(LocalStopResult::NoText {
                     reason,
                     local_asr: asr,

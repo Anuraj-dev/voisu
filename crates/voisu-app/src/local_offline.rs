@@ -17,6 +17,7 @@ mod tests {
     use voisu_core::AsrMode;
 
     use crate::config::WritingMode;
+    use crate::local_routing::LocalFormatting;
 
     use crate::cloud_ownership::construct_for_cloud;
     use crate::local_routing::{
@@ -50,7 +51,7 @@ mod tests {
             "rec-off",
             vec![1, 0, 3, 0],
             &["Voisu".to_owned()],
-            WritingMode::Smart,
+            LocalFormatting::new(WritingMode::Smart, None),
             false,
             false,
         )
@@ -67,7 +68,7 @@ mod tests {
             "rec-off-replay",
             vec![1, 0],
             &[],
-            WritingMode::Literal,
+            LocalFormatting::new(WritingMode::Literal, None),
             false,
             false,
         )
@@ -77,7 +78,7 @@ mod tests {
             "rec-cloud",
             vec![1, 0],
             &[],
-            WritingMode::Literal,
+            LocalFormatting::new(WritingMode::Literal, None),
             true,
             true,
         );

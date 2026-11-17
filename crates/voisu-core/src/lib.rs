@@ -44,8 +44,8 @@ pub use diagnostics::{
     SmartWritingReasonCode, SourceCoverageRecord, SourceSelectionConfidence,
     SourceSelectionDiagnostic, SourceTranscriptRecord, TELEMETRY_SCHEMA,
     TEXT_SHA256_FINGERPRINT_LEN, clamp_stored_transcript_text, clamp_utf8_bytes, correlation_id,
-    export_record, is_secret_env_key, is_text_sha256_fingerprint, redacted_environment,
-    replay_capture, sanitize_url, scrub_embedded_urls, scrub_secret_values,
+    export_record, is_explicit_english, is_secret_env_key, is_text_sha256_fingerprint,
+    redacted_environment, replay_capture, sanitize_url, scrub_embedded_urls, scrub_secret_values,
     text_sha256_fingerprint, unix_millis_now,
 };
 pub(crate) use timing::duration_millis;

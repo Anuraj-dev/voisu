@@ -1,13 +1,18 @@
 //! Deterministic Local tail: dictionary replacements, local formatting, Delivery.
 //!
-//! Dictionary replacements and `format_validated` are local-only. Empty or
+//! Dictionary replacements and formatting are local-only: the Developer Prompt
+//! Rendering local baseline when DPR owns formatting (as in Cloud), otherwise
+//! `format_validated` in the Writing Mode. Empty or
 //! silence is explicit no-text, as are ASR outro hallucinations (the shared
 //! Source Transcript sanitizer) and whole-transcript Whisper silence phrases.
 //! Replay never receives a Delivery permit.
 
 use std::collections::BTreeSet;
 
-use voisu_core::{Transcript, WritingMode, format_validated};
+use voisu_core::{
+    IntentObservation, ProviderState, RenderingPolicy, Transcript, WritingMode, format_validated,
+    is_explicit_english,
+};
 
 use crate::local_worker::{CloudCapabilitySentinel, WorkerOutcome, is_silence_pcm};
 
@@ -15,6 +20,67 @@ use crate::local_worker::{CloudCapabilitySentinel, WorkerOutcome, is_silence_pcm
 pub enum TerminalDecision {
     Transcript(String),
     NoText { reason: String },
+}
+
+/// How the Local tail formats a dictionary-corrected Transcript, snapshotted
+/// per Recording. It mirrors Cloud's `dpr_owns_formatting` gate: with DPR on
+/// for an English Recording the DPR local baseline formats (spoken "new line",
+/// "new paragraph", marks, quotes and lists) and Writing Mode is not used;
+/// otherwise `format_validated` runs in the Writing Mode. Tone stays with the
+/// caller, after formatting, as in Cloud.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalFormatting {
+    writing_mode: WritingMode,
+    /// The Rendering Policy when DPR owns formatting.
+    dpr: Option<RenderingPolicy>,
+}
+
+impl LocalFormatting {
+    /// `dpr` is the Rendering Policy when DPR is enabled for this daemon.
+    #[must_use]
+    pub const fn new(
+        writing_mode: crate::config::WritingMode,
+        dpr: Option<RenderingPolicy>,
+    ) -> Self {
+        let writing_mode = match writing_mode {
+            crate::config::WritingMode::Smart => WritingMode::Smart,
+            crate::config::WritingMode::Literal => WritingMode::Literal,
+        };
+        Self { writing_mode, dpr }
+    }
+
+    /// DPR only formats English, so a Local model of another language falls
+    /// back to the Writing Mode (Cloud's EnglishEligibility gate).
+    #[must_use]
+    pub fn for_model_language(self, language: &str) -> Self {
+        if is_explicit_english(language) {
+            self
+        } else {
+            Self { dpr: None, ..self }
+        }
+    }
+
+    fn render(self, text: &str) -> String {
+        match self.dpr {
+            // Network-free: the same local baseline Cloud delivers when no
+            // cloud formatting candidate is accepted. One Local source.
+            Some(policy) => {
+                let (_, baseline) =
+                    voisu_cloud::dpr_local::route_and_organize_local(&IntentObservation {
+                        policy,
+                        primary_text: text.to_owned(),
+                        provider_state: ProviderState::SingleProvider,
+                        surface_hint: None,
+                        process_hint: None,
+                        timing: None,
+                    });
+                baseline.rendered().to_owned()
+            }
+            None => format_validated(text, self.writing_mode)
+                .rendered()
+                .to_owned(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -96,13 +162,13 @@ impl DeliveryCoordinator {
 }
 
 /// One terminal decision: no-text, or hallucination sanitizing, dictionary,
-/// then local formatting.
+/// then local formatting ([`LocalFormatting`]).
 pub fn decide_transcript(
     recording_id: &str,
     pcm: &[u8],
     outcome: WorkerOutcome,
     user_terms: &[String],
-    writing_mode: WritingMode,
+    formatting: LocalFormatting,
     coordinator: &mut DeliveryCoordinator,
     sentinel: &CloudCapabilitySentinel,
 ) -> Result<TerminalDecision, TailError> {
@@ -136,8 +202,8 @@ pub fn decide_transcript(
                 });
             }
             let replaced = apply_local_dictionary(&sanitized, user_terms);
-            let formatted = format_validated(&replaced, writing_mode);
-            let rendered = formatted.rendered().trim();
+            let formatted = formatting.render(&replaced);
+            let rendered = formatted.trim();
             if rendered.is_empty() {
                 Ok(TerminalDecision::NoText {
                     reason: "empty".to_owned(),
@@ -155,7 +221,7 @@ pub fn decide_replay(
     pcm: &[u8],
     outcome: WorkerOutcome,
     user_terms: &[String],
-    writing_mode: WritingMode,
+    formatting: LocalFormatting,
     coordinator: &mut DeliveryCoordinator,
     sentinel: &CloudCapabilitySentinel,
 ) -> Result<TerminalDecision, TailError> {
@@ -164,7 +230,7 @@ pub fn decide_replay(
         pcm,
         outcome,
         user_terms,
-        writing_mode,
+        formatting,
         coordinator,
         sentinel,
     )?;
@@ -187,6 +253,11 @@ pub fn apply_local_dictionary(text: &str, user_terms: &[String]) -> String {
 mod tests {
     use super::*;
 
+    const LITERAL: LocalFormatting = LocalFormatting {
+        writing_mode: WritingMode::Literal,
+        dpr: None,
+    };
+
     fn outcome(text: &str) -> WorkerOutcome {
         WorkerOutcome::Transcript {
             text: text.to_owned(),
@@ -203,7 +274,7 @@ mod tests {
             &[0, 0, 0, 0],
             outcome("invented"),
             &[],
-            WritingMode::Literal,
+            LITERAL,
             &mut coordinator,
             &CloudCapabilitySentinel::new(),
         )
@@ -225,7 +296,7 @@ mod tests {
             &pcm,
             outcome("   "),
             &[],
-            WritingMode::Literal,
+            LITERAL,
             &mut coordinator,
             &CloudCapabilitySentinel::new(),
         )
@@ -247,7 +318,7 @@ mod tests {
             &pcm,
             outcome("run the daemon reload now"),
             &["daemon-reload".to_owned()],
-            WritingMode::Literal,
+            LITERAL,
             &mut coordinator,
             &CloudCapabilitySentinel::new(),
         )
@@ -262,7 +333,7 @@ mod tests {
                 &pcm,
                 outcome("again"),
                 &[],
-                WritingMode::Literal,
+                LITERAL,
                 &mut coordinator,
                 &CloudCapabilitySentinel::new(),
             ),
@@ -271,16 +342,113 @@ mod tests {
     }
 
     fn decide(text: &str, user_terms: &[String]) -> TerminalDecision {
+        decide_formatted(text, user_terms, LITERAL)
+    }
+
+    fn decide_formatted(
+        text: &str,
+        user_terms: &[String],
+        formatting: LocalFormatting,
+    ) -> TerminalDecision {
         decide_transcript(
             "rec-1",
             &[1, 0],
             outcome(text),
             user_terms,
-            WritingMode::Literal,
+            formatting,
             &mut DeliveryCoordinator::new(),
             &CloudCapabilitySentinel::new(),
         )
         .unwrap()
+    }
+
+    fn transcript(text: &str) -> TerminalDecision {
+        TerminalDecision::Transcript(text.to_owned())
+    }
+
+    /// The packaged default: DPR on, Literal Writing Mode, English model.
+    fn dpr_literal() -> LocalFormatting {
+        LocalFormatting::new(
+            crate::config::WritingMode::Literal,
+            Some(RenderingPolicy::Adaptive),
+        )
+        .for_model_language("en")
+    }
+
+    /// A real Local dictation (distil-large-v3.5 writes it unpunctuated).
+    const SPOKEN_BREAKS: &str = "Okay so I am now talking in the first line new line \
+        this is a second line new line this is a third line new paragraph so this \
+        is a new paragraph that should be visible";
+
+    #[test]
+    fn spoken_new_line_and_new_paragraph_break_the_local_transcript() {
+        // DPR treats the second "new paragraph" as a cue too; that is its
+        // designed behavior, shared with Cloud.
+        assert_eq!(
+            decide_formatted(SPOKEN_BREAKS, &[], dpr_literal()),
+            transcript(
+                "Okay so I am now talking in the first line.\nThis is a second line.\n\
+                 This is a third line.\n\nSo this is a.\n\nThat should be visible."
+            )
+        );
+    }
+
+    #[test]
+    fn local_dpr_formatting_matches_cloud_dpr_rendering() {
+        let validated = "first point is cache second point is latency";
+        let cloud = voisu_cloud::dpr_local::render_dpr_local(
+            validated,
+            &[voisu_core::SourceTranscript {
+                provider: voisu_core::Provider::Groq,
+                text: validated.to_owned(),
+            }],
+            &[],
+            RenderingPolicy::Adaptive,
+        )
+        .expect("one Source Transcript with text");
+        assert_eq!(
+            decide_formatted(validated, &[], dpr_literal()),
+            transcript(&cloud)
+        );
+    }
+
+    #[test]
+    fn dpr_formats_after_the_dictionary() {
+        assert_eq!(
+            decide_formatted(
+                "ask voice you new line done",
+                &["Voisu".to_owned()],
+                dpr_literal()
+            ),
+            transcript("Ask Voisu.\nDone")
+        );
+    }
+
+    #[test]
+    fn without_dpr_local_keeps_the_writing_mode() {
+        let rolled_back = LocalFormatting::new(crate::config::WritingMode::Literal, None);
+        assert_eq!(
+            decide_formatted(SPOKEN_BREAKS, &[], rolled_back),
+            transcript(SPOKEN_BREAKS)
+        );
+        let smart = LocalFormatting::new(crate::config::WritingMode::Smart, None);
+        assert_eq!(
+            decide_formatted("ship it", &[], smart),
+            transcript("Ship it.")
+        );
+    }
+
+    #[test]
+    fn a_non_english_local_model_does_not_use_dpr() {
+        let formatting = LocalFormatting::new(
+            crate::config::WritingMode::Literal,
+            Some(RenderingPolicy::Adaptive),
+        )
+        .for_model_language("hi");
+        assert_eq!(
+            decide_formatted(SPOKEN_BREAKS, &[], formatting),
+            transcript(SPOKEN_BREAKS)
+        );
     }
 
     fn no_text(reason: &str) -> TerminalDecision {
@@ -421,7 +589,7 @@ mod tests {
             &pcm,
             outcome("open voice you settings"),
             &["Voisu".to_owned()],
-            WritingMode::Literal,
+            LITERAL,
             &mut coordinator,
             &CloudCapabilitySentinel::new(),
         )
@@ -470,7 +638,7 @@ mod tests {
             &pcm,
             outcome("hello"),
             &[],
-            WritingMode::Literal,
+            LITERAL,
             &mut coordinator,
             &CloudCapabilitySentinel::new(),
         )
@@ -493,7 +661,7 @@ mod tests {
                 &[1, 0],
                 outcome("hello"),
                 &[],
-                WritingMode::Literal,
+                LITERAL,
                 &mut coordinator,
                 &sentinel,
             ),
