@@ -374,11 +374,10 @@ class PromptEchoTests(unittest.TestCase):
 
     def test_a_window_that_only_recites_the_glossary_is_no_text(self):
         for echo in [
-            "Voisu, Tokio",
             "Voisu, Tokio, wayfinder",
             "Voisu, Tokio, wayfinder.",
-            "voisu tokio",
-            "WAYFINDER,  tokio ,voisu .",
+            "voisu tokio wayfinder",
+            "VOISU,  tokio ,wayfinder .",
         ]:
             with self.subTest(echo=echo):
                 self.assertEqual(self.run_window(echo)["status"], "no_text")
@@ -389,6 +388,13 @@ class PromptEchoTests(unittest.TestCase):
 
     def test_real_speech_that_mentions_terms_is_kept(self):
         for text in ["Voisu is great", "Voisu, Tokio and more", "Voisu, Tokio, and Rust"]:
+            with self.subTest(text=text):
+                self.assertEqual(self.run_window(text)["text"], text)
+
+    def test_two_terms_or_terms_out_of_prompt_order_are_real_speech(self):
+        # Traded away: a recital of only two terms, or of terms in another
+        # order, is no longer dropped. People dictate short lists of names.
+        for text in ["Voisu, Tokio", "voisu tokio", "wayfinder, Tokio, Voisu."]:
             with self.subTest(text=text):
                 self.assertEqual(self.run_window(text)["text"], text)
 
@@ -403,19 +409,19 @@ class PromptEchoTests(unittest.TestCase):
     def test_a_dropped_echo_is_logged_locally_without_the_dictionary(self):
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
-            self.run_window("Voisu, Tokio")
+            self.run_window("Voisu, Tokio, wayfinder")
         log = stderr.getvalue()
         self.assertIn("dropped a window that only listed Dictionary terms", log)
         for term in ("Voisu", "Tokio", "wayfinder"):
             self.assertNotIn(term, log)
 
     def test_a_glossary_sentence_prompt_is_recognised_when_recited(self):
-        prompt = "Glossary: Voisu, Tokio, wayfinder."
+        prompt = "Glossary: Voisu, Tokio, wayfinder, Rust."
         for echo in [
-            "Voisu, Tokio",
-            "Tokio, wayfinder.",
-            "Glossary: Voisu, Tokio, wayfinder.",
-            "glossary voisu tokio",
+            "Voisu, Tokio, wayfinder",
+            "Tokio, wayfinder, Rust.",
+            "Glossary: Voisu, Tokio, wayfinder, Rust.",
+            "glossary voisu tokio wayfinder",
         ]:
             with self.subTest(echo=echo):
                 reply = serve(PromptAdapter([echo]), pcm_of(loud(RATE)), prompt=prompt)
@@ -427,6 +433,18 @@ class PromptEchoTests(unittest.TestCase):
             with self.subTest(text=text):
                 reply = serve(PromptAdapter([text]), pcm_of(loud(RATE)), prompt=prompt)
                 self.assertEqual(reply["text"], text)
+
+    def test_the_built_in_glossary_prompt_keeps_short_dictated_name_lists(self):
+        # The daemon's English prompt with an empty Dictionary starts so.
+        prompt = "Glossary: Claude, Claude Code, Codex, OpenAI, Anthropic, GPT, LLM, Groq, Deepgram, Whisper, systemctl."
+        for text in ["OpenAI, Anthropic.", "GPT LLM", "Whisper Deepgram", "Claude Code, Codex."]:
+            with self.subTest(text=text):
+                reply = serve(PromptAdapter([text]), pcm_of(loud(RATE)), prompt=prompt)
+                self.assertEqual((reply["status"], reply["text"]), ("transcript", text))
+        for echo in ["Claude, Claude Code, Codex, OpenAI.", "Glossary: Claude, Claude Code, Codex."]:
+            with self.subTest(echo=echo):
+                reply = serve(PromptAdapter([echo]), pcm_of(loud(RATE)), prompt=prompt)
+                self.assertEqual(reply["status"], "no_text")
 
     def test_without_a_prompt_nothing_is_filtered(self):
         reply = serve(PromptAdapter(["Voisu, Tokio"]), pcm_of(loud(RATE)))
