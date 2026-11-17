@@ -24,6 +24,7 @@ pub mod local_routing;
 pub mod local_setup;
 pub mod local_status;
 pub mod local_tail;
+pub mod local_vad;
 pub mod local_worker;
 pub mod minimal_grammar;
 pub mod overlay;

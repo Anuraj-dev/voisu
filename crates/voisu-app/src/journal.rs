@@ -436,6 +436,8 @@ mod tests {
             inference_ms: Some(412),
             peak_host_ram_bytes: Some(2_147_483_648),
             peak_gpu_memory_bytes: Some(891_289_600),
+            speech_peak_permille: None,
+            speech_gain_percent: None,
         });
         let lines = recording_journal_lines(7, &evidence, None);
         assert!(

@@ -1354,16 +1354,73 @@ fn restore_inference_session(session: InferenceSession) {
 }
 
 fn silence_outcome(observed_device: &str) -> Result<WorkerOutcome, LocalError> {
+    no_text_outcome("silence", observed_device)
+}
+
+fn no_text_outcome(reason: &str, observed_device: &str) -> Result<WorkerOutcome, LocalError> {
     if observed_device.is_empty() || observed_device == "unknown" {
-        return Err(LocalError::Inference(
-            "silence inference lacked an observed device".into(),
-        ));
+        return Err(LocalError::Inference(format!(
+            "{reason} inference lacked an observed device"
+        )));
     }
     Ok(WorkerOutcome::NoText {
-        reason: "silence".to_owned(),
+        reason: reason.to_owned(),
         observed_device: observed_device.to_owned(),
         metrics: crate::local_worker::InferenceMetrics::default(),
     })
+}
+
+/// Run the speech check on a Recording. Digital silence skips it (`None`):
+/// the existing silence path already names it "silence". Every result is
+/// logged, pass or refusal, so a wrong refusal can be traced to its score.
+fn speech_check(pcm: &[u8]) -> Option<crate::local_vad::SpeechCheck> {
+    if is_silence_pcm(pcm) {
+        return None;
+    }
+    let started = Instant::now();
+    let check = crate::local_vad::check_speech(pcm);
+    eprintln!(
+        "Local speech check: {} (peak {:.3} over {} windows, gain {:.1}, {} ms)",
+        if check.has_speech {
+            "speech"
+        } else {
+            "no speech"
+        },
+        check.peak_probability,
+        check.windows_scored,
+        check.gain,
+        started.elapsed().as_millis()
+    );
+    Some(check)
+}
+
+/// Refuse a Recording the speech check heard no speech in, so no Local
+/// model can turn room noise into "you" or "Okay.". `None` sends it to the
+/// model unchanged, as does a worker whose device is not yet known.
+fn no_speech_outcome(
+    check: Option<crate::local_vad::SpeechCheck>,
+    observed_device: &str,
+) -> Option<WorkerOutcome> {
+    match check {
+        Some(check) if !check.has_speech => no_text_outcome("no speech", observed_device).ok(),
+        _ => None,
+    }
+}
+
+/// Put the speech check's score on the Recording's Local ASR history entry.
+fn record_speech_check(
+    diagnostic: &mut LocalAsrDiagnostic,
+    check: Option<crate::local_vad::SpeechCheck>,
+) {
+    if let Some(check) = check {
+        diagnostic.speech_peak_permille = Some(scaled_u16(check.peak_probability, 1000.0));
+        diagnostic.speech_gain_percent = Some(scaled_u16(check.gain, 100.0));
+    }
+}
+
+fn scaled_u16(value: f32, scale: f32) -> u16 {
+    // `as` saturates and maps NaN to 0, which is what a history field wants.
+    (value * scale).round() as u16
 }
 
 fn infer_unlocked(
@@ -1910,13 +1967,19 @@ pub fn complete_recording(
     };
     assert_gate_unlocked();
     let request_id = format!("{recording_id}-asr");
-    let outcome = match infer_unlocked(
-        &mut session,
-        recording_id,
-        &request_id,
-        pcm.clone(),
-        user_terms,
-    ) {
+    // Replay stays ungated: it is an explicit request to transcribe again.
+    let speech = speech_check(&pcm);
+    let inferred = match no_speech_outcome(speech, session.supervisor.observed_device()) {
+        Some(outcome) => Ok(outcome),
+        None => infer_unlocked(
+            &mut session,
+            recording_id,
+            &request_id,
+            pcm.clone(),
+            user_terms,
+        ),
+    };
+    let outcome = match inferred {
         Ok(outcome) => outcome,
         Err(_) if is_silence_pcm(&pcm) => {
             match silence_outcome(session.supervisor.observed_device()) {
@@ -1938,7 +2001,8 @@ pub fn complete_recording(
             return Err(error);
         }
     };
-    let local_asr = local_asr_from_session(&session, &outcome);
+    let mut local_asr = local_asr_from_session(&session, &outcome);
+    record_speech_check(&mut local_asr, speech);
     let decision = decide_transcript(
         recording_id,
         &pcm,
@@ -2198,6 +2262,8 @@ pub fn current_local_asr_error(reason: &str) -> Option<LocalAsrDiagnostic> {
         inference_ms: None,
         peak_host_ram_bytes: None,
         peak_gpu_memory_bytes: None,
+        speech_peak_permille: None,
+        speech_gain_percent: None,
     };
     diagnostic.normalize();
     Some(diagnostic)
@@ -2251,6 +2317,8 @@ fn local_asr_from_session(
         inference_ms,
         peak_host_ram_bytes,
         peak_gpu_memory_bytes,
+        speech_peak_permille: None,
+        speech_gain_percent: None,
     };
     diagnostic.normalize();
     diagnostic
@@ -3329,13 +3397,100 @@ mod tests {
             false,
         )
         .unwrap();
-        assert!(matches!(
+        // Digital silence skips the speech check and keeps its own reason.
+        assert_eq!(
             completion.decision,
-            TerminalDecision::NoText { .. }
-        ));
+            TerminalDecision::NoText {
+                reason: "silence".into()
+            }
+        );
+        assert_eq!(completion.local_asr.speech_peak_permille, None);
         let err = complete_replay("rec-old", vec![1, 0], &[], WritingMode::Literal, true, true)
             .unwrap_err();
         assert!(matches!(err, LocalError::CloudSelected));
+    }
+
+    fn pcm_bytes(samples: impl IntoIterator<Item = i16>) -> Vec<u8> {
+        samples.into_iter().flat_map(i16::to_le_bytes).collect()
+    }
+
+    /// Two seconds of loud mains hum: the capture energy gate passes it.
+    fn mains_hum() -> Vec<u8> {
+        pcm_bytes((0..32_000).map(|n| {
+            (6_000.0 * (2.0 * std::f64::consts::PI * 50.0 * f64::from(n) / 16_000.0).sin()) as i16
+        }))
+    }
+
+    #[test]
+    fn steady_noise_is_refused_before_the_local_model_transcribes() {
+        let _lock = test_session();
+        // The scripted worker answers every request with this text, as
+        // Whisper answers room noise with "Okay.", which no phrase filter
+        // can drop without dropping a real "Okay.".
+        inject_ready(fixture_receipt(), "Okay.");
+        begin_live("rec-hum");
+        let completion = complete_recording(
+            "rec-hum",
+            mains_hum(),
+            &[],
+            WritingMode::Literal,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            completion.decision,
+            TerminalDecision::NoText {
+                reason: "no speech".into()
+            }
+        );
+        assert_eq!(completion.local_asr.reason.as_deref(), Some("no speech"));
+        let peak = completion.local_asr.speech_peak_permille.unwrap();
+        assert!(peak < 200, "refused at peak {peak}");
+        assert!(completion.local_asr.speech_gain_percent.is_some());
+    }
+
+    #[test]
+    fn replay_of_steady_noise_still_reaches_the_local_model() {
+        let _lock = test_session();
+        inject_ready(fixture_receipt(), "Okay.");
+        // Replay is an explicit request to transcribe again, so the speech
+        // check must not stand between it and the model.
+        let decision = complete_replay(
+            "rec-hum-replay",
+            mains_hum(),
+            &[],
+            WritingMode::Literal,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(decision, TerminalDecision::Transcript("Okay.".into()));
+    }
+
+    #[test]
+    fn speech_still_reaches_the_local_model() {
+        let _lock = test_session();
+        inject_ready(fixture_receipt(), "hello there");
+        begin_live("rec-speech");
+        let wav = include_bytes!("../tests/fixtures/jfk-3s.wav");
+        let completion = complete_recording(
+            "rec-speech",
+            wav[44..].to_vec(),
+            &[],
+            WritingMode::Literal,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            completion.decision,
+            TerminalDecision::Transcript("hello there".into())
+        );
+        // A pass is recorded too: the first window at or above the threshold.
+        let peak = completion.local_asr.speech_peak_permille.unwrap();
+        assert!(peak >= 200, "passed at peak {peak}");
+        assert_eq!(completion.local_asr.speech_gain_percent, Some(100));
     }
 
     #[test]
