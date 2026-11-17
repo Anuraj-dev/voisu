@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.86.0
+Version:        0.87.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -168,6 +168,9 @@ install -D -m 0644 packaging/icons/voisu.svg %{buildroot}%{_datadir}/icons/hicol
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Tue Nov 17 2026 Voisu maintainers <voisu@example.invalid> - 0.87.0-1
+- feat(local): give Local mode spoken new lines, punctuation and built-in boost words (#338)
+
 * Tue Nov 17 2026 Voisu maintainers <voisu@example.invalid> - 0.86.0-1
 - feat(local): stop Local mode typing words on silent Recordings (#337)
 
