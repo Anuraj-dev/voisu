@@ -1354,16 +1354,39 @@ fn restore_inference_session(session: InferenceSession) {
 }
 
 fn silence_outcome(observed_device: &str) -> Result<WorkerOutcome, LocalError> {
+    no_text_outcome("silence", observed_device)
+}
+
+fn no_text_outcome(reason: &str, observed_device: &str) -> Result<WorkerOutcome, LocalError> {
     if observed_device.is_empty() || observed_device == "unknown" {
-        return Err(LocalError::Inference(
-            "silence inference lacked an observed device".into(),
-        ));
+        return Err(LocalError::Inference(format!(
+            "{reason} inference lacked an observed device"
+        )));
     }
     Ok(WorkerOutcome::NoText {
-        reason: "silence".to_owned(),
+        reason: reason.to_owned(),
         observed_device: observed_device.to_owned(),
         metrics: crate::local_worker::InferenceMetrics::default(),
     })
+}
+
+/// Refuse a Recording the speech check hears no speech in, so no Local
+/// model can turn room noise into "you" or "Okay.". `None` sends it to the
+/// model unchanged, as does a worker whose device is not yet known.
+fn no_speech_outcome(pcm: &[u8], observed_device: &str) -> Option<WorkerOutcome> {
+    let started = Instant::now();
+    let check = crate::local_vad::check_speech(pcm);
+    if check.has_speech {
+        return None;
+    }
+    eprintln!(
+        "Local speech check: no speech (peak {:.3} over {} windows, gain {:.1}, {} ms)",
+        check.peak_probability,
+        check.windows_scored,
+        check.gain,
+        started.elapsed().as_millis()
+    );
+    no_text_outcome("no speech", observed_device).ok()
 }
 
 fn infer_unlocked(
@@ -1910,13 +1933,18 @@ pub fn complete_recording(
     };
     assert_gate_unlocked();
     let request_id = format!("{recording_id}-asr");
-    let outcome = match infer_unlocked(
-        &mut session,
-        recording_id,
-        &request_id,
-        pcm.clone(),
-        user_terms,
-    ) {
+    // Replay stays ungated: it is an explicit request to transcribe again.
+    let inferred = match no_speech_outcome(&pcm, session.supervisor.observed_device()) {
+        Some(outcome) => Ok(outcome),
+        None => infer_unlocked(
+            &mut session,
+            recording_id,
+            &request_id,
+            pcm.clone(),
+            user_terms,
+        ),
+    };
+    let outcome = match inferred {
         Ok(outcome) => outcome,
         Err(_) if is_silence_pcm(&pcm) => {
             match silence_outcome(session.supervisor.observed_device()) {
@@ -3336,6 +3364,54 @@ mod tests {
         let err = complete_replay("rec-old", vec![1, 0], &[], WritingMode::Literal, true, true)
             .unwrap_err();
         assert!(matches!(err, LocalError::CloudSelected));
+    }
+
+    fn pcm_bytes(samples: impl IntoIterator<Item = i16>) -> Vec<u8> {
+        samples.into_iter().flat_map(i16::to_le_bytes).collect()
+    }
+
+    #[test]
+    fn steady_noise_is_refused_before_the_local_model_transcribes() {
+        let _lock = test_session();
+        // The scripted worker answers every request with this text, as
+        // Whisper answers room noise with "Okay.", which no phrase filter
+        // can drop without dropping a real "Okay.".
+        inject_ready(fixture_receipt(), "Okay.");
+        begin_live("rec-hum");
+        // Two seconds of loud mains hum: the capture energy gate passes it.
+        let hum = pcm_bytes((0..32_000).map(|n| {
+            (6_000.0 * (2.0 * std::f64::consts::PI * 50.0 * f64::from(n) / 16_000.0).sin()) as i16
+        }));
+        let completion =
+            complete_recording("rec-hum", hum, &[], WritingMode::Literal, false, false).unwrap();
+        assert_eq!(
+            completion.decision,
+            TerminalDecision::NoText {
+                reason: "no speech".into()
+            }
+        );
+        assert_eq!(completion.local_asr.reason.as_deref(), Some("no speech"));
+    }
+
+    #[test]
+    fn speech_still_reaches_the_local_model() {
+        let _lock = test_session();
+        inject_ready(fixture_receipt(), "hello there");
+        begin_live("rec-speech");
+        let wav = include_bytes!("../tests/fixtures/jfk-3s.wav");
+        let completion = complete_recording(
+            "rec-speech",
+            wav[44..].to_vec(),
+            &[],
+            WritingMode::Literal,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            completion.decision,
+            TerminalDecision::Transcript("hello there".into())
+        );
     }
 
     #[test]
