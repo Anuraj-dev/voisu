@@ -243,10 +243,14 @@ pub fn decide_replay(
 /// Dictionary correction for Local: the Cloud span-aware exact matcher
 /// (ungated, no word confidences), then correction by sound for names the
 /// model wrote as it heard them ("voice you" -> "Voisu"). Cloud keeps exact
-/// matching only.
+/// matching of user terms only. Local also corrects toward the built-in
+/// developer glossary, after the user's terms, because a Local model hears
+/// those names no better than the user's own (Cloud gets them as provider
+/// keyterms and prompt instead).
 pub fn apply_local_dictionary(text: &str, user_terms: &[String]) -> String {
-    let exact = voisu_core::apply_user_vocabulary(text, user_terms, &[]);
-    voisu_core::apply_phonetic_dictionary(&exact, user_terms)
+    let terms = crate::dictionary::local_correction_terms(user_terms);
+    let exact = voisu_core::apply_user_vocabulary(text, &terms, &[]);
+    voisu_core::apply_phonetic_dictionary(&exact, &terms)
 }
 
 #[cfg(test)]
@@ -549,6 +553,50 @@ mod tests {
             apply_local_dictionary("open Claude code please", &["Claude Code".to_owned()]),
             "open Claude Code please"
         );
+    }
+
+    #[test]
+    fn built_in_terms_correct_local_text_with_an_empty_dictionary() {
+        assert_eq!(
+            decide("we can apply this for voysu local", &[]),
+            transcript("we can apply this for Voisu local")
+        );
+        assert_eq!(
+            apply_local_dictionary("check the change log in Voisoo", &[]),
+            "check the changelog in Voisu"
+        );
+    }
+
+    #[test]
+    fn a_user_term_heard_exactly_is_not_rewritten_to_a_built_in_term() {
+        assert_eq!(
+            apply_local_dictionary("ask voysu", &["voysu".to_owned()]),
+            "ask voysu"
+        );
+    }
+
+    #[test]
+    fn built_in_terms_leave_ordinary_words_alone() {
+        // Sound-alikes and spellings of built-in terms (Rust, Whisper, kernel,
+        // trait, Docker, Plasma, Fedora, cargo, async, await, struct, Groq,
+        // compiler) used as ordinary English.
+        for sentence in [
+            "the rust on the car and the cash in the drawer",
+            "she said it in a whisper and closed the closet",
+            "a kernel of truth and a colonel in the army",
+            "the trade deal and the tray on the table and the trait",
+            "cloud storage and the clod of dirt and the claws",
+            "the docker at the port and the doctor at the clinic",
+            "blood plasma and a plaza downtown and fedora hats",
+            "the deployment of troops and the gateway arch",
+            "the gross profit and the groceries",
+            "cargo pants and the cardigan and the car go",
+            "a sink and await the results and a weight",
+            "the struck match and the structure",
+            "the compiler and the complier and the system is down",
+        ] {
+            assert_eq!(apply_local_dictionary(sentence, &[]), sentence);
+        }
     }
 
     #[test]

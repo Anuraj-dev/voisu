@@ -159,10 +159,11 @@ pub fn merged_terms() -> Vec<String> {
 /// all derivatives of a single snapshot — one Recording can never mix
 /// vocabulary versions, and the dictionary file is never read twice.
 pub struct DictionarySnapshot {
-    /// The user's personal terms, in stored order. The user-vocabulary
+    /// The user's personal terms, in stored order. The Cloud user-vocabulary
     /// correction pass consumes exactly this list: only user-owned terms may
-    /// rewrite a Transcript, so an empty personal dictionary disables
-    /// corrections entirely (byte-identical output).
+    /// rewrite a Cloud Transcript, so an empty personal dictionary disables
+    /// Cloud corrections entirely (byte-identical output). Local correction
+    /// adds the built-ins after them ([`local_correction_terms`]).
     pub user_terms: Vec<String>,
     /// User terms ahead of the built-in developer glossary, de-duplicated.
     pub merged: Vec<String>,
@@ -321,6 +322,16 @@ pub fn local_prompt_for_terms(user_terms: &[String]) -> Option<String> {
         .collect();
     let prompt = glossary_within(&unique, LOCAL_PROMPT_MAX_BYTES);
     (!prompt.is_empty()).then_some(prompt)
+}
+
+/// The terms Local post-ASR correction matches: the user's terms ahead of the
+/// built-in developer glossary, de-duplicated like [`merged_terms`]. Over the
+/// gate corpus the built-ins only fixed `Voisu` hearings and changed no
+/// correct words; one-syllable built-ins (`Rust`, `Groq`, `trait`) are never
+/// matched by sound.
+#[must_use]
+pub fn local_correction_terms(user_terms: &[String]) -> Vec<String> {
+    merged_terms_with(user_terms.to_vec())
 }
 
 /// The resolved user dictionary path: `$XDG_CONFIG_HOME/voisu/dictionary.txt`,
