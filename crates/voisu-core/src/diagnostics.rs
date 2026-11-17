@@ -479,7 +479,10 @@ impl ResolvedRecordingLanguages {
     }
 }
 
-fn is_explicit_english(language: &str) -> bool {
+/// Whether a language tag is explicitly English (`en` or `en-<region>`), the
+/// test EnglishEligibility applies to every declaration.
+#[must_use]
+pub fn is_explicit_english(language: &str) -> bool {
     let normalized = language.trim().to_ascii_lowercase();
     normalized == "en"
         || normalized.strip_prefix("en-").is_some_and(|region| {

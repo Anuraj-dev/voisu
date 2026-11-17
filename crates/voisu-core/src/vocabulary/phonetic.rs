@@ -122,7 +122,25 @@ pub struct PhoneticSwap {
 /// Applies phonetic Dictionary correction to `text` (see the module docs).
 /// Run it after exact-match correction.
 pub fn apply_phonetic_dictionary(text: &str, terms: &[String]) -> String {
-    let swaps = phonetic_dictionary_swaps(text, terms);
+    apply_swaps(text, phonetic_dictionary_swaps(text, terms))
+}
+
+/// Phonetic correction toward names the speaker did not choose (Voisu's
+/// built-in glossary), stricter than [`apply_phonetic_dictionary`]: a run is
+/// replaced only when at least one heard word is outside the English lexicon
+/// ("voysu", "Vosu"), so a hearing made only of real words ("the voice you
+/// hear", "the deep gram of salt", "type script") is never rewritten. Words
+/// that exactly spell a `protected` term (the user's own Dictionary, applied
+/// first) are never re-targeted.
+pub fn apply_unfamiliar_phonetic_dictionary(
+    text: &str,
+    terms: &[String],
+    protected: &[String],
+) -> String {
+    apply_swaps(text, swaps(text, terms, protected, Hearing::Unfamiliar))
+}
+
+fn apply_swaps(text: &str, swaps: Vec<PhoneticSwap>) -> String {
     if swaps.is_empty() {
         return text.to_owned();
     }
@@ -137,9 +155,27 @@ pub fn apply_phonetic_dictionary(text: &str, terms: &[String]) -> String {
     out
 }
 
+/// Which hearings a pass may correct.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Hearing {
+    /// Every rule in the module docs.
+    Any,
+    /// Additionally, at least one heard word outside the English lexicon.
+    Unfamiliar,
+}
+
 /// The non-overlapping swaps [`apply_phonetic_dictionary`] would make, in
 /// text order. Exposed so evidence tools can list every swap.
 pub fn phonetic_dictionary_swaps(text: &str, terms: &[String]) -> Vec<PhoneticSwap> {
+    swaps(text, terms, &[], Hearing::Any)
+}
+
+fn swaps(
+    text: &str,
+    terms: &[String],
+    protected: &[String],
+    hearing: Hearing,
+) -> Vec<PhoneticSwap> {
     let encoder = DoubleMetaphone::new(None);
     // Entries that spell the same letters ("Claude Code", "claude-code") are
     // one entry, first wins; otherwise each would make the other ambiguous.
@@ -163,7 +199,12 @@ pub fn phonetic_dictionary_swaps(text: &str, terms: &[String]) -> Vec<PhoneticSw
     }
     let context = Context {
         text,
-        blocked: exact_match_words(text, &words, terms),
+        blocked: exact_match_words(text, &words, terms)
+            .into_iter()
+            .zip(exact_match_words(text, &words, protected))
+            .map(|(term, protected)| term || protected)
+            .collect(),
+        hearing,
         usable: usable_words(text, &words),
         sounds: words.iter().map(|word| word_sound(&word.letters)).collect(),
         words,
@@ -407,6 +448,7 @@ struct Context<'a> {
     by_code: HashMap<&'a str, Vec<&'a Entry>>,
     lexicon: &'static HashMap<&'static str, usize>,
     encoder: DoubleMetaphone,
+    hearing: Hearing,
 }
 
 impl<'a> Context<'a> {
@@ -458,6 +500,9 @@ impl<'a> Context<'a> {
             all_english &= rank.is_some();
             all_everyday &= rank.is_some_and(|rank| rank < EVERYDAY_RANK);
             if (count == 1 && rank.is_some()) || all_everyday {
+                continue;
+            }
+            if self.hearing == Hearing::Unfamiliar && all_english {
                 continue;
             }
             let primary = self.encoder.encode(&joined);

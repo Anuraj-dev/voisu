@@ -1,13 +1,18 @@
 //! Deterministic Local tail: dictionary replacements, local formatting, Delivery.
 //!
-//! Dictionary replacements and `format_validated` are local-only. Empty or
+//! Dictionary replacements and formatting are local-only: the Developer Prompt
+//! Rendering local baseline when DPR owns formatting (as in Cloud), otherwise
+//! `format_validated` in the Writing Mode. Empty or
 //! silence is explicit no-text, as are ASR outro hallucinations (the shared
 //! Source Transcript sanitizer) and whole-transcript Whisper silence phrases.
 //! Replay never receives a Delivery permit.
 
 use std::collections::BTreeSet;
 
-use voisu_core::{Transcript, WritingMode, format_validated};
+use voisu_core::{
+    IntentObservation, ProviderState, RenderingPolicy, Transcript, WritingMode, format_validated,
+    is_explicit_english,
+};
 
 use crate::local_worker::{CloudCapabilitySentinel, WorkerOutcome, is_silence_pcm};
 
@@ -15,6 +20,79 @@ use crate::local_worker::{CloudCapabilitySentinel, WorkerOutcome, is_silence_pcm
 pub enum TerminalDecision {
     Transcript(String),
     NoText { reason: String },
+}
+
+/// How the Local tail formats a dictionary-corrected Transcript, snapshotted
+/// per Recording. It mirrors Cloud's `dpr_owns_formatting` gate: with DPR on
+/// for an English Recording the DPR local baseline formats (spoken "new line",
+/// "new paragraph", marks, quotes and lists) and Writing Mode is not used;
+/// otherwise `format_validated` runs in the Writing Mode. Tone stays with the
+/// caller, after formatting, as in Cloud.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalFormatting {
+    writing_mode: WritingMode,
+    /// The Rendering Policy when DPR owns formatting.
+    dpr: Option<RenderingPolicy>,
+    /// The Local model is explicitly English: built-in Dictionary terms
+    /// correct its transcript.
+    english: bool,
+}
+
+impl LocalFormatting {
+    /// `dpr` is the Rendering Policy when DPR is enabled for this daemon.
+    #[must_use]
+    pub const fn new(
+        writing_mode: crate::config::WritingMode,
+        dpr: Option<RenderingPolicy>,
+    ) -> Self {
+        let writing_mode = match writing_mode {
+            crate::config::WritingMode::Smart => WritingMode::Smart,
+            crate::config::WritingMode::Literal => WritingMode::Literal,
+        };
+        Self {
+            writing_mode,
+            dpr,
+            english: false,
+        }
+    }
+
+    /// DPR only formats English, so a Local model of another language falls
+    /// back to the Writing Mode (Cloud's EnglishEligibility gate). The same
+    /// gate keeps the English built-in glossary off its transcript.
+    #[must_use]
+    pub fn for_model_language(self, language: &str) -> Self {
+        let english = is_explicit_english(language);
+        Self {
+            dpr: if english { self.dpr } else { None },
+            english,
+            ..self
+        }
+    }
+
+    fn render(self, text: &str) -> String {
+        match self.dpr {
+            // Network-free: the same local baseline Cloud delivers when no
+            // cloud formatting candidate is accepted. One Local source.
+            Some(policy) => {
+                let (_, baseline) =
+                    voisu_cloud::dpr_local::route_and_organize_local(&IntentObservation {
+                        policy,
+                        primary_text: text.to_owned(),
+                        provider_state: ProviderState::SingleProvider,
+                        surface_hint: None,
+                        process_hint: None,
+                        timing: None,
+                    });
+                // Untrimmed, as Cloud delivers it: a spoken "new line" at
+                // either end stays a line break ("Hello.\n").
+                baseline.rendered().to_owned()
+            }
+            None => format_validated(text, self.writing_mode)
+                .rendered()
+                .trim()
+                .to_owned(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -96,13 +174,13 @@ impl DeliveryCoordinator {
 }
 
 /// One terminal decision: no-text, or hallucination sanitizing, dictionary,
-/// then local formatting.
+/// then local formatting ([`LocalFormatting`]).
 pub fn decide_transcript(
     recording_id: &str,
     pcm: &[u8],
     outcome: WorkerOutcome,
     user_terms: &[String],
-    writing_mode: WritingMode,
+    formatting: LocalFormatting,
     coordinator: &mut DeliveryCoordinator,
     sentinel: &CloudCapabilitySentinel,
 ) -> Result<TerminalDecision, TailError> {
@@ -135,15 +213,14 @@ pub fn decide_transcript(
                     reason: "no words heard".to_owned(),
                 });
             }
-            let replaced = apply_local_dictionary(&sanitized, user_terms);
-            let formatted = format_validated(&replaced, writing_mode);
-            let rendered = formatted.rendered().trim();
-            if rendered.is_empty() {
+            let replaced = apply_local_dictionary(&sanitized, user_terms, formatting.english);
+            let formatted = formatting.render(&replaced);
+            if formatted.trim().is_empty() {
                 Ok(TerminalDecision::NoText {
                     reason: "empty".to_owned(),
                 })
             } else {
-                Ok(TerminalDecision::Transcript(rendered.to_owned()))
+                Ok(TerminalDecision::Transcript(formatted))
             }
         }
     }
@@ -155,7 +232,7 @@ pub fn decide_replay(
     pcm: &[u8],
     outcome: WorkerOutcome,
     user_terms: &[String],
-    writing_mode: WritingMode,
+    formatting: LocalFormatting,
     coordinator: &mut DeliveryCoordinator,
     sentinel: &CloudCapabilitySentinel,
 ) -> Result<TerminalDecision, TailError> {
@@ -164,7 +241,7 @@ pub fn decide_replay(
         pcm,
         outcome,
         user_terms,
-        writing_mode,
+        formatting,
         coordinator,
         sentinel,
     )?;
@@ -174,18 +251,37 @@ pub fn decide_replay(
     Ok(decision)
 }
 
-/// Dictionary correction for Local: the Cloud span-aware exact matcher
-/// (ungated, no word confidences), then correction by sound for names the
-/// model wrote as it heard them ("voice you" -> "Voisu"). Cloud keeps exact
-/// matching only.
-pub fn apply_local_dictionary(text: &str, user_terms: &[String]) -> String {
+/// Dictionary correction for Local, in two passes so the user's terms always
+/// win. First the user's terms, as Cloud would apply them (the span-aware
+/// exact matcher, ungated, no word confidences), then correction by sound for
+/// names the model wrote as it heard them ("voice you" -> "Voisu"). Then, when
+/// `built_ins` (an English model), the built-in developer glossary: exact
+/// matches, and by sound only for hearings with a word outside the English
+/// lexicon ("voysu", "Vosu"), never a run of real words ("the voice you hear",
+/// "type script"), and never over a term the user pass wrote. A Local model
+/// hears those names no better than the user's own; Cloud gets them as
+/// provider keyterms and prompt instead and corrects user terms only.
+pub fn apply_local_dictionary(text: &str, user_terms: &[String], built_ins: bool) -> String {
     let exact = voisu_core::apply_user_vocabulary(text, user_terms, &[]);
-    voisu_core::apply_phonetic_dictionary(&exact, user_terms)
+    let user = voisu_core::apply_phonetic_dictionary(&exact, user_terms);
+    if !built_ins {
+        return user;
+    }
+    let terms = crate::dictionary::local_built_in_terms(user_terms);
+    let exact = voisu_core::apply_user_vocabulary(&user, &terms, &[]);
+    voisu_core::apply_unfamiliar_phonetic_dictionary(&exact, &terms, user_terms)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// DPR off, Literal Writing Mode, English model.
+    const LITERAL: LocalFormatting = LocalFormatting {
+        writing_mode: WritingMode::Literal,
+        dpr: None,
+        english: true,
+    };
 
     fn outcome(text: &str) -> WorkerOutcome {
         WorkerOutcome::Transcript {
@@ -203,7 +299,7 @@ mod tests {
             &[0, 0, 0, 0],
             outcome("invented"),
             &[],
-            WritingMode::Literal,
+            LITERAL,
             &mut coordinator,
             &CloudCapabilitySentinel::new(),
         )
@@ -225,7 +321,7 @@ mod tests {
             &pcm,
             outcome("   "),
             &[],
-            WritingMode::Literal,
+            LITERAL,
             &mut coordinator,
             &CloudCapabilitySentinel::new(),
         )
@@ -247,7 +343,7 @@ mod tests {
             &pcm,
             outcome("run the daemon reload now"),
             &["daemon-reload".to_owned()],
-            WritingMode::Literal,
+            LITERAL,
             &mut coordinator,
             &CloudCapabilitySentinel::new(),
         )
@@ -262,7 +358,7 @@ mod tests {
                 &pcm,
                 outcome("again"),
                 &[],
-                WritingMode::Literal,
+                LITERAL,
                 &mut coordinator,
                 &CloudCapabilitySentinel::new(),
             ),
@@ -271,16 +367,168 @@ mod tests {
     }
 
     fn decide(text: &str, user_terms: &[String]) -> TerminalDecision {
+        decide_formatted(text, user_terms, LITERAL)
+    }
+
+    fn decide_formatted(
+        text: &str,
+        user_terms: &[String],
+        formatting: LocalFormatting,
+    ) -> TerminalDecision {
         decide_transcript(
             "rec-1",
             &[1, 0],
             outcome(text),
             user_terms,
-            WritingMode::Literal,
+            formatting,
             &mut DeliveryCoordinator::new(),
             &CloudCapabilitySentinel::new(),
         )
         .unwrap()
+    }
+
+    /// Local Dictionary correction for an English model.
+    fn apply_local_dictionary_en(text: &str, user_terms: &[String]) -> String {
+        apply_local_dictionary(text, user_terms, true)
+    }
+
+    fn transcript(text: &str) -> TerminalDecision {
+        TerminalDecision::Transcript(text.to_owned())
+    }
+
+    /// The packaged default: DPR on, Literal Writing Mode, English model.
+    fn dpr_literal() -> LocalFormatting {
+        LocalFormatting::new(
+            crate::config::WritingMode::Literal,
+            Some(RenderingPolicy::Adaptive),
+        )
+        .for_model_language("en")
+    }
+
+    /// A real Local dictation (distil-large-v3.5 writes it unpunctuated).
+    const SPOKEN_BREAKS: &str = "Okay so I am now talking in the first line new line \
+        this is a second line new line this is a third line new paragraph so this \
+        is a new paragraph that should be visible";
+
+    #[test]
+    fn spoken_new_line_and_new_paragraph_break_the_local_transcript() {
+        // DPR treats the second "new paragraph" as a cue too; that is its
+        // designed behavior, shared with Cloud.
+        assert_eq!(
+            decide_formatted(SPOKEN_BREAKS, &[], dpr_literal()),
+            transcript(
+                "Okay so I am now talking in the first line.\nThis is a second line.\n\
+                 This is a third line.\n\nSo this is a.\n\nThat should be visible."
+            )
+        );
+    }
+
+    #[test]
+    fn local_dpr_formatting_matches_cloud_dpr_rendering() {
+        // Spoken quotes and an edge "new line" are DPR-only: Smart and Literal
+        // `format_validated` leave both as words.
+        for (validated, expected) in [
+            (
+                "i said quote hello unquote to him",
+                "I said \"hello\" to him.",
+            ),
+            ("hello new line", "Hello.\n"),
+        ] {
+            let cloud = voisu_cloud::dpr_local::render_dpr_local(
+                validated,
+                &[voisu_core::SourceTranscript {
+                    provider: voisu_core::Provider::Groq,
+                    text: validated.to_owned(),
+                }],
+                &[],
+                RenderingPolicy::Adaptive,
+            )
+            .expect("one Source Transcript with text");
+            assert_eq!(cloud, expected);
+            assert_eq!(
+                decide_formatted(validated, &[], dpr_literal()),
+                transcript(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn a_spoken_break_at_either_end_is_delivered_as_cloud_delivers_it() {
+        // Cloud's DPR path delivers the baseline untrimmed ("Hello.\n").
+        assert_eq!(
+            decide_formatted("hello new line", &[], dpr_literal()),
+            transcript("Hello.\n")
+        );
+        assert_eq!(
+            decide_formatted("new line hello", &[], dpr_literal()),
+            transcript("\nHello")
+        );
+        assert_eq!(
+            decide_formatted("hello new paragraph", &[], dpr_literal()),
+            transcript("Hello.\n\n")
+        );
+    }
+
+    #[test]
+    fn dpr_formats_after_the_dictionary() {
+        assert_eq!(
+            decide_formatted(
+                "ask voice you new line done",
+                &["Voisu".to_owned()],
+                dpr_literal()
+            ),
+            transcript("Ask Voisu.\nDone")
+        );
+    }
+
+    #[test]
+    fn without_dpr_local_keeps_the_writing_mode() {
+        let rolled_back = LocalFormatting::new(crate::config::WritingMode::Literal, None);
+        assert_eq!(
+            decide_formatted(SPOKEN_BREAKS, &[], rolled_back),
+            transcript(SPOKEN_BREAKS)
+        );
+        let smart = LocalFormatting::new(crate::config::WritingMode::Smart, None);
+        assert_eq!(
+            decide_formatted("ship it", &[], smart),
+            transcript("Ship it.")
+        );
+    }
+
+    #[test]
+    fn a_non_english_local_model_does_not_use_dpr() {
+        let formatting = LocalFormatting::new(
+            crate::config::WritingMode::Literal,
+            Some(RenderingPolicy::Adaptive),
+        )
+        .for_model_language("hi");
+        assert_eq!(
+            decide_formatted(SPOKEN_BREAKS, &[], formatting),
+            transcript(SPOKEN_BREAKS)
+        );
+    }
+
+    #[test]
+    fn a_non_english_or_auto_local_model_gets_no_built_in_correction() {
+        for language in ["hi", "auto"] {
+            let formatting = LocalFormatting::new(crate::config::WritingMode::Literal, None)
+                .for_model_language(language);
+            assert_eq!(
+                decide_formatted("ask voysu now", &[], formatting),
+                transcript("ask voysu now"),
+                "{language}"
+            );
+            // The user's own terms still correct, as before built-ins existed.
+            assert_eq!(
+                decide_formatted("ask voice you now", &["Voisu".to_owned()], formatting),
+                transcript("ask Voisu now"),
+                "{language}"
+            );
+        }
+        assert_eq!(
+            apply_local_dictionary("ask voysu now", &[], false),
+            "ask voysu now"
+        );
     }
 
     fn no_text(reason: &str) -> TerminalDecision {
@@ -370,24 +618,102 @@ mod tests {
     #[test]
     fn dictionary_matches_hyphenated_multiword_and_punctuated_terms() {
         assert_eq!(
-            apply_local_dictionary("run the daemon reload job", &["daemon-reload".to_owned()]),
+            apply_local_dictionary_en("run the daemon reload job", &["daemon-reload".to_owned()]),
             "run the daemon-reload job"
         );
         assert_eq!(
-            apply_local_dictionary("open Node js docs", &["Node.js".to_owned()]),
+            apply_local_dictionary_en("open Node js docs", &["Node.js".to_owned()]),
             "open Node.js docs"
         );
         assert_eq!(
-            apply_local_dictionary("open Claude code please", &["Claude Code".to_owned()]),
+            apply_local_dictionary_en("open Claude code please", &["Claude Code".to_owned()]),
             "open Claude Code please"
         );
+    }
+
+    #[test]
+    fn built_in_terms_correct_local_text_with_an_empty_dictionary() {
+        assert_eq!(
+            decide("we can apply this for voysu local", &[]),
+            transcript("we can apply this for Voisu local")
+        );
+        assert_eq!(
+            apply_local_dictionary_en("check the change log in Voisoo", &[]),
+            "check the change log in Voisu"
+        );
+    }
+
+    #[test]
+    fn a_user_term_heard_exactly_is_not_rewritten_to_a_built_in_term() {
+        assert_eq!(
+            apply_local_dictionary_en("ask voysu", &["voysu".to_owned()]),
+            "ask voysu"
+        );
+    }
+
+    #[test]
+    fn user_terms_win_the_phonetic_pass_over_built_ins() {
+        // A user term that sounds like a built-in is not made ambiguous by it,
+        // and the built-in never re-targets what the user term matched.
+        assert_eq!(
+            apply_local_dictionary_en("ask voice you now", &["Voysu".to_owned()]),
+            "ask Voysu now"
+        );
+        assert_eq!(
+            apply_local_dictionary_en("the deep gram app", &["Deepgramm".to_owned()]),
+            "the Deepgramm app"
+        );
+    }
+
+    #[test]
+    fn built_in_terms_never_correct_a_hearing_of_real_english_words() {
+        for sentence in [
+            "the voice you hear is mine",
+            "pick any voice you like",
+            "the code ex boyfriend",
+            "the deep gram of salt",
+            "the gate way",
+            "the pipe wire",
+            "I love the type script",
+        ] {
+            assert_eq!(apply_local_dictionary_en(sentence, &[]), sentence);
+        }
+        // The same hearing still corrects to a user's own term.
+        assert_eq!(
+            apply_local_dictionary_en("the deep gram app", &["Deepgram".to_owned()]),
+            "the Deepgram app"
+        );
+    }
+
+    #[test]
+    fn built_in_terms_leave_ordinary_words_alone() {
+        // Sound-alikes and spellings of built-in terms (Rust, Whisper, kernel,
+        // trait, Docker, Plasma, Fedora, cargo, async, await, struct, Groq,
+        // compiler) used as ordinary English.
+        for sentence in [
+            "the rust on the car and the cash in the drawer",
+            "she said it in a whisper and closed the closet",
+            "a kernel of truth and a colonel in the army",
+            "the trade deal and the tray on the table and the trait",
+            "cloud storage and the clod of dirt and the claws",
+            "the docker at the port and the doctor at the clinic",
+            "blood plasma and a plaza downtown and fedora hats",
+            "the deployment of troops and the gateway arch",
+            "the gross profit and the groceries",
+            "cargo pants and the cardigan and the car go",
+            "a sink and await the results and a weight",
+            "the struck match and the structure",
+            "the compiler and the complier and the system is down",
+        ] {
+            assert_eq!(apply_local_dictionary_en(sentence, &[]), sentence);
+        }
     }
 
     #[test]
     fn local_dictionary_corrects_by_sound_after_exact_matches() {
         let dictionary = ["Voisu".to_owned(), "Hyprland".to_owned()];
         assert_eq!(
-            apply_local_dictionary("voice you runs on hyper land", &dictionary),
+            apply_local_dictionary_en("voice you runs on hyper land", &dictionary),
             "Voisu runs on Hyprland"
         );
     }
@@ -406,7 +732,7 @@ mod tests {
                 "say voice you"
             );
             assert_eq!(
-                apply_local_dictionary("say voice you", &dictionary),
+                apply_local_dictionary_en("say voice you", &dictionary),
                 "say voice-you"
             );
         }
@@ -421,7 +747,7 @@ mod tests {
             &pcm,
             outcome("open voice you settings"),
             &["Voisu".to_owned()],
-            WritingMode::Literal,
+            LITERAL,
             &mut coordinator,
             &CloudCapabilitySentinel::new(),
         )
@@ -470,7 +796,7 @@ mod tests {
             &pcm,
             outcome("hello"),
             &[],
-            WritingMode::Literal,
+            LITERAL,
             &mut coordinator,
             &CloudCapabilitySentinel::new(),
         )
@@ -493,7 +819,7 @@ mod tests {
                 &[1, 0],
                 outcome("hello"),
                 &[],
-                WritingMode::Literal,
+                LITERAL,
                 &mut coordinator,
                 &sentinel,
             ),

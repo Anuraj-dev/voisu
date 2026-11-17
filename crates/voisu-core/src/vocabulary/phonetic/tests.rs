@@ -833,3 +833,46 @@ fn a_full_dictionary_over_a_long_transcript_is_fast() {
     );
     assert!(elapsed < std::time::Duration::from_secs(1), "{elapsed:?}");
 }
+
+#[test]
+fn the_unfamiliar_pass_needs_a_heard_word_outside_the_lexicon() {
+    let entries = terms(&["Voisu", "Deepgram", "Codex", "TypeScript"]);
+    for (heard, corrected) in [
+        ("ask voysu now", "ask Voisu now"),
+        ("ask Vosu now", "ask Voisu now"),
+        ("open kodex", "open Codex"),
+    ] {
+        assert_eq!(
+            apply_unfamiliar_phonetic_dictionary(heard, &entries, &[]),
+            corrected
+        );
+    }
+    for english in [
+        "the voice you hear is mine",
+        "the deep gram of salt",
+        "the code ex boyfriend",
+        "I love the type script",
+    ] {
+        assert_eq!(
+            apply_unfamiliar_phonetic_dictionary(english, &entries, &[]),
+            english
+        );
+    }
+}
+
+#[test]
+fn the_unfamiliar_pass_never_touches_a_protected_term() {
+    // "Voysu" is the user's own spelling, already written by an earlier pass.
+    assert_eq!(
+        apply_unfamiliar_phonetic_dictionary(
+            "ask Voysu now",
+            &terms(&["Voisu"]),
+            &terms(&["Voysu"])
+        ),
+        "ask Voysu now"
+    );
+    assert_eq!(
+        apply_unfamiliar_phonetic_dictionary("ask Voysu now", &terms(&["Voisu"]), &[]),
+        "ask Voisu now"
+    );
+}

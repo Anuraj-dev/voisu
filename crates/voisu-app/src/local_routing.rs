@@ -11,8 +11,6 @@ use voisu_core::{
     LocalAsrOutcome, LocalReadiness, Response, Transcript, stop_anchored_timings,
 };
 
-use crate::config::WritingMode;
-
 use crate::local_model::ActiveReceipt;
 #[cfg(not(test))]
 use crate::local_model::{
@@ -20,6 +18,7 @@ use crate::local_model::{
     models_dir, runtime_selection, shipped_catalog,
 };
 use crate::local_recovery::{RecoveryClock, RecoveryError, RecoveryStore};
+pub use crate::local_tail::LocalFormatting;
 use crate::local_tail::{
     DeliveryCoordinator, DeliveryPermit, TailError, TerminalDecision, decide_replay,
     decide_transcript,
@@ -1433,7 +1432,10 @@ fn infer_unlocked(
     let correlation = correlation(&session.receipt_hash, recording_id, request_id);
     // The supervisor drops the prompt unless this worker advertised support,
     // so Parakeet and an old worker are sent exactly what they always were.
-    let prompt = crate::dictionary::local_prompt_for_terms(user_terms);
+    let prompt = crate::dictionary::local_prompt_for_terms(
+        user_terms,
+        voisu_core::is_explicit_english(&session.language),
+    );
     transcribe_through_supervisor(
         &mut session.supervisor,
         correlation,
@@ -1451,13 +1453,6 @@ fn assert_gate_unlocked() {
             gate().try_lock().is_ok(),
             "gate lock must not be held across persist/inference/tail"
         );
-    }
-}
-
-fn core_writing_mode(mode: WritingMode) -> voisu_core::WritingMode {
-    match mode {
-        WritingMode::Smart => voisu_core::WritingMode::Smart,
-        WritingMode::Literal => voisu_core::WritingMode::Literal,
     }
 }
 
@@ -1931,7 +1926,7 @@ pub fn complete_recording(
     recording_id: &str,
     pcm: Vec<u8>,
     user_terms: &[String],
-    writing_mode: WritingMode,
+    formatting: LocalFormatting,
     recovery_enabled: bool,
     cloud_selected: bool,
 ) -> Result<LocalCompletion, LocalError> {
@@ -2008,7 +2003,7 @@ pub fn complete_recording(
         &pcm,
         outcome,
         user_terms,
-        core_writing_mode(writing_mode),
+        formatting.for_model_language(&session.language),
         &mut session.coordinator,
         &session.sentinel,
     );
@@ -2025,7 +2020,7 @@ pub fn complete_replay(
     recording_id: &str,
     pcm: Vec<u8>,
     user_terms: &[String],
-    writing_mode: WritingMode,
+    formatting: LocalFormatting,
     cloud_selected: bool,
     from_recovery: bool,
 ) -> Result<TerminalDecision, LocalError> {
@@ -2053,7 +2048,7 @@ pub fn complete_replay(
         &pcm,
         outcome,
         user_terms,
-        core_writing_mode(writing_mode),
+        formatting.for_model_language(&session.language),
         &mut session.coordinator,
         &session.sentinel,
     );
@@ -2076,7 +2071,7 @@ pub enum LocalStopResult {
 pub fn finish_local_stop(
     recording_id: &str,
     pcm: Vec<u8>,
-    writing_mode: WritingMode,
+    formatting: LocalFormatting,
     recovery_enabled: bool,
 ) -> Result<LocalStopResult, LocalError> {
     let user_terms = gate()
@@ -2087,7 +2082,7 @@ pub fn finish_local_stop(
         recording_id,
         pcm,
         &user_terms,
-        writing_mode,
+        formatting,
         recovery_enabled,
         false,
     )?;
@@ -2113,7 +2108,7 @@ pub fn replay_local(
     recording_id: &str,
     fixture_name: &str,
     user_terms: Vec<String>,
-    writing_mode: WritingMode,
+    formatting: LocalFormatting,
     load_diagnostic: impl FnOnce(&str) -> Result<Vec<u8>, String>,
 ) -> Response {
     begin_local_session();
@@ -2139,7 +2134,7 @@ pub fn replay_local(
         recording_id,
         bytes,
         &user_terms,
-        writing_mode,
+        formatting,
         false,
         from_recovery,
     ) {
@@ -2443,6 +2438,9 @@ pub fn test_session() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const LITERAL: LocalFormatting =
+        LocalFormatting::new(crate::config::WritingMode::Literal, None);
 
     fn consented_gate() -> (tempfile::TempDir, Gate, ActiveReceipt) {
         let state = tempfile::tempdir().unwrap();
@@ -3092,7 +3090,7 @@ mod tests {
             "reserved-completion",
             vec![1, 0],
             &[],
-            WritingMode::Literal,
+            LITERAL,
             false,
             false,
         )
@@ -3274,15 +3272,8 @@ mod tests {
         drop(right);
         assert!(sentinel_is_clean());
         begin_live("rec-1");
-        let completion = complete_recording(
-            "rec-1",
-            vec![1, 0, 2, 0],
-            &[],
-            WritingMode::Literal,
-            false,
-            false,
-        )
-        .unwrap();
+        let completion =
+            complete_recording("rec-1", vec![1, 0, 2, 0], &[], LITERAL, false, false).unwrap();
         assert_eq!(
             completion.decision,
             TerminalDecision::Transcript("hello".to_owned())
@@ -3302,7 +3293,15 @@ mod tests {
     /// sentinel prompt, so a Transcribe that never arrived cannot read as "no
     /// prompt".
     fn worker_saw(accepts_prompt: bool, terms: &[&str]) -> (u32, Option<String>) {
-        inject_ready_with_prompt_support(fixture_receipt(), "hello", accepts_prompt);
+        worker_saw_for(fixture_receipt(), accepts_prompt, terms)
+    }
+
+    fn worker_saw_for(
+        receipt: ActiveReceipt,
+        accepts_prompt: bool,
+        terms: &[&str],
+    ) -> (u32, Option<String>) {
+        inject_ready_with_prompt_support(receipt, "hello", accepts_prompt);
         gate()
             .lock()
             .expect("gate")
@@ -3316,7 +3315,7 @@ mod tests {
             "rec-prompt",
             vec![1, 0, 2, 0],
             &terms,
-            WritingMode::Literal,
+            LITERAL,
             false,
             false,
         )
@@ -3329,16 +3328,36 @@ mod tests {
     #[test]
     fn a_prompt_capable_worker_gets_the_dictionary_as_its_initial_prompt() {
         let _lock = test_session();
+        let terms = ["Voisu".to_owned(), "Tokio".to_owned()];
+        let (count, prompt) = worker_saw(true, &["Voisu", "Tokio"]);
+        assert_eq!(count, 1);
+        let prompt = prompt.expect("a prompt");
+        assert!(prompt.starts_with("Glossary: Voisu, Tokio, "), "{prompt:?}");
         assert_eq!(
-            worker_saw(true, &["Voisu", "Tokio"]),
-            (1, Some("Voisu, Tokio".to_owned()))
+            Some(prompt),
+            crate::dictionary::local_prompt_for_terms(&terms, true)
         );
     }
 
     #[test]
-    fn a_prompt_capable_worker_with_an_empty_dictionary_gets_no_prompt() {
+    fn a_prompt_capable_worker_with_an_empty_dictionary_gets_the_built_in_glossary() {
         let _lock = test_session();
-        assert_eq!(worker_saw(true, &[]), (1, None));
+        assert_eq!(
+            worker_saw(true, &[]),
+            (1, crate::dictionary::local_prompt_for_terms(&[], true))
+        );
+    }
+
+    #[test]
+    fn a_non_english_model_gets_only_the_bare_user_terms_as_its_prompt() {
+        let _lock = test_session();
+        let mut receipt = fixture_receipt();
+        receipt.language = "auto".to_owned();
+        assert_eq!(
+            worker_saw_for(receipt.clone(), true, &["Voisu", "Tokio"]),
+            (1, Some("Voisu, Tokio".to_owned()))
+        );
+        assert_eq!(worker_saw_for(receipt, true, &[]), (1, None));
     }
 
     #[test]
@@ -3388,15 +3407,8 @@ mod tests {
         let _lock = test_session();
         inject_ready(fixture_receipt(), "hello");
         begin_live("rec-silent");
-        let completion = complete_recording(
-            "rec-silent",
-            vec![0, 0, 0, 0],
-            &[],
-            WritingMode::Literal,
-            false,
-            false,
-        )
-        .unwrap();
+        let completion =
+            complete_recording("rec-silent", vec![0, 0, 0, 0], &[], LITERAL, false, false).unwrap();
         // Digital silence skips the speech check and keeps its own reason.
         assert_eq!(
             completion.decision,
@@ -3405,8 +3417,7 @@ mod tests {
             }
         );
         assert_eq!(completion.local_asr.speech_peak_permille, None);
-        let err = complete_replay("rec-old", vec![1, 0], &[], WritingMode::Literal, true, true)
-            .unwrap_err();
+        let err = complete_replay("rec-old", vec![1, 0], &[], LITERAL, true, true).unwrap_err();
         assert!(matches!(err, LocalError::CloudSelected));
     }
 
@@ -3429,15 +3440,8 @@ mod tests {
         // can drop without dropping a real "Okay.".
         inject_ready(fixture_receipt(), "Okay.");
         begin_live("rec-hum");
-        let completion = complete_recording(
-            "rec-hum",
-            mains_hum(),
-            &[],
-            WritingMode::Literal,
-            false,
-            false,
-        )
-        .unwrap();
+        let completion =
+            complete_recording("rec-hum", mains_hum(), &[], LITERAL, false, false).unwrap();
         assert_eq!(
             completion.decision,
             TerminalDecision::NoText {
@@ -3456,15 +3460,8 @@ mod tests {
         inject_ready(fixture_receipt(), "Okay.");
         // Replay is an explicit request to transcribe again, so the speech
         // check must not stand between it and the model.
-        let decision = complete_replay(
-            "rec-hum-replay",
-            mains_hum(),
-            &[],
-            WritingMode::Literal,
-            false,
-            false,
-        )
-        .unwrap();
+        let decision =
+            complete_replay("rec-hum-replay", mains_hum(), &[], LITERAL, false, false).unwrap();
         assert_eq!(decision, TerminalDecision::Transcript("Okay.".into()));
     }
 
@@ -3474,15 +3471,9 @@ mod tests {
         inject_ready(fixture_receipt(), "hello there");
         begin_live("rec-speech");
         let wav = include_bytes!("../tests/fixtures/jfk-3s.wav");
-        let completion = complete_recording(
-            "rec-speech",
-            wav[44..].to_vec(),
-            &[],
-            WritingMode::Literal,
-            false,
-            false,
-        )
-        .unwrap();
+        let completion =
+            complete_recording("rec-speech", wav[44..].to_vec(), &[], LITERAL, false, false)
+                .unwrap();
         assert_eq!(
             completion.decision,
             TerminalDecision::Transcript("hello there".into())
@@ -3895,14 +3886,7 @@ mod tests {
         assert!(matches!(admit_local(true), LocalAdmission::Ready { .. }));
         begin_live("rec-reload");
         let stop = std::thread::spawn(|| {
-            complete_recording(
-                "rec-reload",
-                vec![1, 0, 2, 0],
-                &[],
-                WritingMode::Literal,
-                false,
-                false,
-            )
+            complete_recording("rec-reload", vec![1, 0, 2, 0], &[], LITERAL, false, false)
         });
         // Stop is parked on the load, not failed: wait until it waits.
         while LOAD_WAITS.load(Ordering::SeqCst) == waits_before {
@@ -3929,14 +3913,7 @@ mod tests {
         });
         assert!(matches!(admit_local(true), LocalAdmission::Ready { .. }));
         begin_live("rec-slow");
-        let result = complete_recording(
-            "rec-slow",
-            vec![1, 0, 2, 0],
-            &[],
-            WritingMode::Literal,
-            false,
-            false,
-        );
+        let result = complete_recording("rec-slow", vec![1, 0, 2, 0], &[], LITERAL, false, false);
         assert!(matches!(result, Err(LocalError::Unavailable)), "{result:?}");
         join_background_loads_for_tests();
         let published = readiness_snapshot();
@@ -4024,7 +4001,7 @@ mod tests {
             "rec-no-launch",
             vec![1, 0, 2, 0],
             &[],
-            WritingMode::Literal,
+            LITERAL,
             false,
             false,
         );
@@ -4053,14 +4030,7 @@ mod tests {
         begin_live("rec-joined");
         let waits_before = LOAD_WAITS.load(Ordering::SeqCst);
         let stop = std::thread::spawn(|| {
-            complete_recording(
-                "rec-joined",
-                vec![1, 0, 2, 0],
-                &[],
-                WritingMode::Literal,
-                false,
-                false,
-            )
+            complete_recording("rec-joined", vec![1, 0, 2, 0], &[], LITERAL, false, false)
         });
         while LOAD_WAITS.load(Ordering::SeqCst) == waits_before {
             std::thread::yield_now();
@@ -4083,14 +4053,8 @@ mod tests {
         assert!(matches!(admit_local(true), LocalAdmission::Ready { .. }));
         begin_live("rec-overdue");
         let waits_before = LOAD_WAITS.load(Ordering::SeqCst);
-        let result = complete_recording(
-            "rec-overdue",
-            vec![1, 0, 2, 0],
-            &[],
-            WritingMode::Literal,
-            false,
-            false,
-        );
+        let result =
+            complete_recording("rec-overdue", vec![1, 0, 2, 0], &[], LITERAL, false, false);
         assert!(matches!(result, Err(LocalError::Unavailable)), "{result:?}");
         assert!(LOAD_WAITS.load(Ordering::SeqCst) > waits_before);
         release.send(()).unwrap();
@@ -4111,14 +4075,7 @@ mod tests {
         assert!(matches!(admit_local(true), LocalAdmission::Ready { .. }));
         begin_live("rec-kept");
         let pcm = vec![1, 0, 2, 0];
-        let result = complete_recording(
-            "rec-kept",
-            pcm.clone(),
-            &[],
-            WritingMode::Literal,
-            true,
-            false,
-        );
+        let result = complete_recording("rec-kept", pcm.clone(), &[], LITERAL, true, false);
         assert!(matches!(result, Err(LocalError::Unavailable)), "{result:?}");
         join_background_loads_for_tests();
         let store = RecoveryStore::open(

@@ -57,7 +57,10 @@ use std::collections::HashMap;
 use crate::local_baseline::{metalinguistic_mask, quote_pairs_and_skip, word_tokens};
 
 mod phonetic;
-pub use phonetic::{PhoneticSwap, apply_phonetic_dictionary, phonetic_dictionary_swaps};
+pub use phonetic::{
+    PhoneticSwap, apply_phonetic_dictionary, apply_unfamiliar_phonetic_dictionary,
+    phonetic_dictionary_swaps,
+};
 
 /// Deepgram word confidence at or above which a word counts as confidently
 /// transcribed. A matched span whose words are ALL at least this confident is

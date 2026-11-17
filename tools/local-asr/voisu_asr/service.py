@@ -75,19 +75,29 @@ def _validated_prompt(request: dict) -> str | None:
 def _is_prompt_echo(text: str, prompt: str) -> bool:
     """True when `text` only recites the prompt glossary.
 
-    A quiet window can make Whisper emit its own prompt. That is two or more
-    distinct prompt terms joined by commas or spaces, optionally ending in a
-    period. A single term stays: people do dictate one name.
+    A quiet window can make Whisper emit its own prompt: a run of three or
+    more consecutive prompt terms, in prompt order, joined by commas or spaces,
+    optionally ending in a period, and optionally led by the daemon's
+    `Glossary:` sentence opener. Shorter or reordered lists stay, because
+    people do dictate a name or two ("OpenAI, Anthropic.", "GPT LLM").
     """
 
-    terms = sorted({term.strip() for term in prompt.split(",") if term.strip()}, key=len, reverse=True)
-    if len(terms) < 2:
+    glossary = re.fullmatch(r"\s*Glossary:\s*(.*?)\.?\s*", prompt, re.DOTALL)
+    listed = glossary.group(1) if glossary else prompt
+    position: dict[str, int] = {}
+    for item in (term.strip() for term in listed.split(",")):
+        if item:
+            position.setdefault(item.lower(), len(position))
+    if len(position) < 3:
         return False
-    term = "|".join(re.escape(item) for item in terms)
-    recital = re.fullmatch(rf"\s*((?:{term})(?:[\s,]+(?:{term}))+)[\s,]*\.?\s*", text, re.IGNORECASE)
+    term = "|".join(re.escape(item) for item in sorted(position, key=len, reverse=True))
+    recital = re.fullmatch(
+        rf"\s*(?:glossary:?\s*)?((?:{term})(?:[\s,]+(?:{term}))+)[\s,]*\.?\s*", text, re.IGNORECASE
+    )
     if recital is None:
         return False
-    return len({found.lower() for found in re.findall(term, recital.group(1), re.IGNORECASE)}) >= 2
+    order = [position[found.lower()] for found in re.findall(term, recital.group(1), re.IGNORECASE)]
+    return len(order) >= 3 and all(after == before + 1 for before, after in zip(order, order[1:]))
 
 
 def _transcribe(

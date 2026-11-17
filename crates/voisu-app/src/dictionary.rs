@@ -159,10 +159,11 @@ pub fn merged_terms() -> Vec<String> {
 /// all derivatives of a single snapshot — one Recording can never mix
 /// vocabulary versions, and the dictionary file is never read twice.
 pub struct DictionarySnapshot {
-    /// The user's personal terms, in stored order. The user-vocabulary
+    /// The user's personal terms, in stored order. The Cloud user-vocabulary
     /// correction pass consumes exactly this list: only user-owned terms may
-    /// rewrite a Transcript, so an empty personal dictionary disables
-    /// corrections entirely (byte-identical output).
+    /// rewrite a Cloud Transcript, so an empty personal dictionary disables
+    /// Cloud corrections entirely (byte-identical output). Local correction
+    /// adds the built-ins after them ([`local_built_in_terms`]).
     pub user_terms: Vec<String>,
     /// User terms ahead of the built-in developer glossary, de-duplicated.
     pub merged: Vec<String>,
@@ -297,20 +298,34 @@ pub fn whisper_prompt_for_terms(terms: &[String]) -> String {
     whisper_prompt_from_terms(terms)
 }
 
-/// The Local `initial_prompt` for models that honour one (distil-whisper):
-/// the user's own Dictionary terms as the bare comma-separated glossary the
-/// Cloud Whisper prompt uses, in stored order, de-duplicated case-insensitively
-/// (first spelling wins) and cut at [`LOCAL_PROMPT_MAX_BYTES`] by
-/// dropping whole terms, never by truncating one. Built-in terms are left out
-/// so an empty personal Dictionary yields `None` and the request stays exactly
-/// as it was before this prompt existed. Whitespace and control characters
-/// inside a term collapse to single spaces, because the worker rejects a
-/// prompt with control characters and one stray tab would otherwise drop
-/// every term.
-pub fn local_prompt_for_terms(user_terms: &[String]) -> Option<String> {
+/// The Local `initial_prompt` for models that honour one (distil-whisper).
+///
+/// For an English model it is a one-sentence glossary, `Glossary: <terms>.`,
+/// of the user's Dictionary terms in stored order followed by the built-in
+/// developer glossary. A punctuated prompt makes Whisper punctuate its
+/// transcript, and the built-ins teach it names such as Voisu; over the gate
+/// corpus both lowered WER against Cloud references. Any other model language
+/// (including `auto`) gets the bare comma-separated list of user terms only,
+/// and `None` for an empty Dictionary: an English sentence of English tech
+/// names would pull such a model toward English.
+///
+/// Terms are de-duplicated case-insensitively (first spelling wins), and the
+/// whole prompt fits [`LOCAL_PROMPT_MAX_BYTES`]: terms past the cap are
+/// dropped whole, never truncated. Whitespace and control characters inside a
+/// term collapse to single spaces, because the worker rejects a prompt with
+/// control characters and one stray tab would otherwise drop every term.
+/// `None` when no term fits.
+pub fn local_prompt_for_terms(user_terms: &[String], english: bool) -> Option<String> {
+    let (open, close, built_ins) = if english {
+        ("Glossary: ", ".", builtin_terms())
+    } else {
+        ("", "", Vec::new())
+    };
     let mut seen: HashSet<String> = HashSet::new();
     let unique: Vec<String> = user_terms
         .iter()
+        .cloned()
+        .chain(built_ins)
         .map(|term| {
             term.split(|c: char| c.is_whitespace() || c.is_control())
                 .filter(|word| !word.is_empty())
@@ -319,8 +334,21 @@ pub fn local_prompt_for_terms(user_terms: &[String]) -> Option<String> {
         })
         .filter(|term| !term.is_empty() && seen.insert(comparison_key(term)))
         .collect();
-    let prompt = glossary_within(&unique, LOCAL_PROMPT_MAX_BYTES);
-    (!prompt.is_empty()).then_some(prompt)
+    let list = glossary_within(&unique, LOCAL_PROMPT_MAX_BYTES - open.len() - close.len());
+    (!list.is_empty()).then(|| format!("{open}{list}{close}"))
+}
+
+/// The built-in developer glossary terms Local correction matches after the
+/// user's own, leaving out any the user already lists under any casing (the
+/// user's spelling wins). One-syllable built-ins (`Rust`, `Groq`, `trait`) are
+/// never matched by sound.
+#[must_use]
+pub fn local_built_in_terms(user_terms: &[String]) -> Vec<String> {
+    let user: HashSet<String> = user_terms.iter().map(|term| comparison_key(term)).collect();
+    merged_terms_with(Vec::new())
+        .into_iter()
+        .filter(|term| !user.contains(&comparison_key(term)))
+        .collect()
 }
 
 /// The resolved user dictionary path: `$XDG_CONFIG_HOME/voisu/dictionary.txt`,
@@ -728,37 +756,66 @@ Tokio   # inline comment
         assert!(!prompt.is_empty(), "some multibyte terms still fit");
     }
 
-    #[test]
-    fn local_prompt_lists_user_terms_in_stored_order() {
-        let terms = vec![
-            "Voisu".to_owned(),
-            "Tokio".to_owned(),
-            "wayfinder".to_owned(),
-        ];
-        assert_eq!(
-            local_prompt_for_terms(&terms).as_deref(),
-            Some("Voisu, Tokio, wayfinder")
-        );
+    /// The Local prompt for an English model.
+    fn local_prompt_for_terms_en(user_terms: &[String]) -> Option<String> {
+        local_prompt_for_terms(user_terms, true)
     }
 
     #[test]
-    fn local_prompt_is_none_for_an_empty_dictionary() {
-        assert_eq!(local_prompt_for_terms(&[]), None);
-        assert_eq!(local_prompt_for_terms(&["  ".to_owned()]), None);
+    fn a_non_english_model_gets_the_bare_user_term_prompt() {
+        let terms = vec!["Voisu".to_owned(), "Tokio".to_owned()];
+        assert_eq!(
+            local_prompt_for_terms(&terms, false).as_deref(),
+            Some("Voisu, Tokio")
+        );
+        assert_eq!(local_prompt_for_terms(&[], false), None);
+        assert_eq!(local_prompt_for_terms(&["  ".to_owned()], false), None);
+    }
+
+    /// The glossary terms of a Local prompt, with the sentence wrapper removed.
+    fn local_prompt_terms(prompt: &str) -> Vec<&str> {
+        prompt
+            .strip_prefix("Glossary: ")
+            .and_then(|list| list.strip_suffix('.'))
+            .unwrap_or_else(|| panic!("{prompt:?} is not a glossary sentence"))
+            .split(", ")
+            .collect()
+    }
+
+    #[test]
+    fn local_prompt_is_a_glossary_sentence_of_user_terms_then_built_ins() {
+        let terms = vec!["Tokio".to_owned(), "wayfinder".to_owned()];
+        let prompt = local_prompt_for_terms_en(&terms).unwrap();
+        assert!(
+            prompt.starts_with("Glossary: Tokio, wayfinder, Claude, Claude Code, "),
+            "{prompt:?}"
+        );
+        assert!(prompt.ends_with('.'), "{prompt:?}");
+        assert!(prompt.len() <= LOCAL_PROMPT_MAX_BYTES);
+    }
+
+    #[test]
+    fn an_empty_dictionary_still_prompts_the_built_in_glossary() {
+        let prompt = local_prompt_for_terms_en(&[]).unwrap();
+        assert!(prompt.starts_with("Glossary: Claude, "), "{prompt:?}");
+        assert!(local_prompt_terms(&prompt).contains(&"Voisu"), "{prompt:?}");
+        assert!(prompt.len() <= LOCAL_PROMPT_MAX_BYTES);
+        assert_eq!(local_prompt_for_terms_en(&["  ".to_owned()]), Some(prompt));
     }
 
     #[test]
     fn local_prompt_dedupes_case_insensitively_keeping_the_first_spelling() {
         let terms = vec![
-            "Voisu".to_owned(),
-            "tokio".to_owned(),
             "voisu".to_owned(),
+            "tokio".to_owned(),
+            "Voisu".to_owned(),
             " Tokio ".to_owned(),
         ];
-        assert_eq!(
-            local_prompt_for_terms(&terms).as_deref(),
-            Some("Voisu, tokio")
-        );
+        let prompt = local_prompt_for_terms_en(&terms).unwrap();
+        let listed = local_prompt_terms(&prompt);
+        assert_eq!(listed[..3], ["voisu", "tokio", "Claude"]);
+        assert!(!listed.contains(&"Voisu"), "{prompt:?}");
+        assert!(!listed.contains(&"Tokio"), "{prompt:?}");
     }
 
     #[test]
@@ -766,56 +823,57 @@ Tokio   # inline comment
         // One stray tab must cost only its own term's spacing, never the
         // whole prompt (the worker rejects a prompt with control characters).
         let terms = vec![
-            "Voisu".to_owned(),
+            "Tokio".to_owned(),
             "Tokio\truntime".to_owned(),
             "\u{7}".to_owned(),
             "wayfinder".to_owned(),
         ];
-        let prompt = local_prompt_for_terms(&terms).unwrap();
-        assert_eq!(prompt, "Voisu, Tokio runtime, wayfinder");
+        let prompt = local_prompt_for_terms_en(&terms).unwrap();
+        assert!(
+            prompt.starts_with("Glossary: Tokio, Tokio runtime, wayfinder, Claude, "),
+            "{prompt:?}"
+        );
         assert!(!prompt.chars().any(char::is_control));
-    }
-
-    #[test]
-    fn local_prompt_never_includes_built_in_terms() {
-        let prompt = local_prompt_for_terms(&["Voisu".to_owned()]).unwrap();
-        assert_eq!(prompt, "Voisu");
     }
 
     #[test]
     fn local_prompt_drops_whole_terms_past_the_cap() {
         let terms: Vec<String> = (0..2000).map(|i| format!("term{i:04}")).collect();
-        let prompt = local_prompt_for_terms(&terms).unwrap();
+        let prompt = local_prompt_for_terms_en(&terms).unwrap();
         assert!(prompt.len() <= LOCAL_PROMPT_MAX_BYTES);
-        assert!(prompt.starts_with("term0000, term0001"));
+        let listed = local_prompt_terms(&prompt);
+        assert_eq!(listed[..2], ["term0000", "term0001"]);
         // Every listed term is whole: the cap never cuts one mid-way.
-        for listed in prompt.split(", ") {
-            assert_eq!(listed.len(), "term0000".len(), "{listed:?} was truncated");
+        for term in listed {
+            assert_eq!(term.len(), "term0000".len(), "{term:?} was truncated");
         }
         assert!(!prompt.contains("term1999"));
     }
 
     #[test]
     fn local_prompt_is_none_when_the_first_term_alone_exceeds_the_cap() {
-        let huge = "x".repeat(LOCAL_PROMPT_MAX_BYTES + 1);
-        assert_eq!(local_prompt_for_terms(&[huge]), None);
+        let huge = "x".repeat(LOCAL_PROMPT_MAX_BYTES);
+        assert_eq!(local_prompt_for_terms_en(&[huge]), None);
     }
 
     #[test]
-    fn local_prompt_is_capped_at_222_bytes_so_the_first_term_is_never_cut() {
+    fn local_prompt_is_capped_at_222_bytes_wrapper_included() {
         // faster-whisper prepends a space and keeps the last 223 tokens, so
-        // 222 bytes is the most that survives intact.
+        // 222 bytes is the most that survives intact; "Glossary: " and the
+        // closing period leave 211 bytes for the list.
         assert_eq!(LOCAL_PROMPT_MAX_BYTES, 222);
-        let exact = "x".repeat(222);
-        let terms = [exact];
-        assert_eq!(local_prompt_for_terms(&terms), terms.first().cloned());
-        assert_eq!(local_prompt_for_terms(&["x".repeat(223)]), None);
-        // Two terms whose glossary would be 223 bytes: the second is dropped.
-        let first = "a".repeat(110);
-        let second = "b".repeat(111);
+        let exact = "x".repeat(211);
+        let prompt = local_prompt_for_terms_en(std::slice::from_ref(&exact)).unwrap();
+        assert_eq!(prompt, format!("Glossary: {exact}."));
+        assert_eq!(prompt.len(), LOCAL_PROMPT_MAX_BYTES);
+        assert_eq!(local_prompt_for_terms_en(&["x".repeat(212)]), None);
+        // Two terms whose list would be 212 bytes: the second is dropped, and
+        // so is every lower-priority built-in after it.
+        let first = "a".repeat(100);
+        let second = "b".repeat(110);
         assert_eq!(
-            local_prompt_for_terms(&[first.clone(), second]),
-            Some(first)
+            local_prompt_for_terms_en(&[first.clone(), second]),
+            Some(format!("Glossary: {first}."))
         );
     }
 
