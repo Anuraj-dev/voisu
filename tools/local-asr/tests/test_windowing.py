@@ -409,6 +409,25 @@ class PromptEchoTests(unittest.TestCase):
         for term in ("Voisu", "Tokio", "wayfinder"):
             self.assertNotIn(term, log)
 
+    def test_a_glossary_sentence_prompt_is_recognised_when_recited(self):
+        prompt = "Glossary: Voisu, Tokio, wayfinder."
+        for echo in [
+            "Voisu, Tokio",
+            "Tokio, wayfinder.",
+            "Glossary: Voisu, Tokio, wayfinder.",
+            "glossary voisu tokio",
+        ]:
+            with self.subTest(echo=echo):
+                reply = serve(PromptAdapter([echo]), pcm_of(loud(RATE)), prompt=prompt)
+                self.assertEqual(reply["status"], "no_text")
+
+    def test_a_glossary_sentence_prompt_keeps_real_speech(self):
+        prompt = "Glossary: Voisu, Tokio, wayfinder."
+        for text in ["Voisu", "Glossary: Voisu", "the glossary has Voisu, Tokio", "Voisu, Tokio and more"]:
+            with self.subTest(text=text):
+                reply = serve(PromptAdapter([text]), pcm_of(loud(RATE)), prompt=prompt)
+                self.assertEqual(reply["text"], text)
+
     def test_without_a_prompt_nothing_is_filtered(self):
         reply = serve(PromptAdapter(["Voisu, Tokio"]), pcm_of(loud(RATE)))
         self.assertEqual(reply["text"], "Voisu, Tokio")

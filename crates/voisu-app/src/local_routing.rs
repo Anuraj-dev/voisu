@@ -3317,16 +3317,24 @@ mod tests {
     #[test]
     fn a_prompt_capable_worker_gets_the_dictionary_as_its_initial_prompt() {
         let _lock = test_session();
+        let terms = ["Voisu".to_owned(), "Tokio".to_owned()];
+        let (count, prompt) = worker_saw(true, &["Voisu", "Tokio"]);
+        assert_eq!(count, 1);
+        let prompt = prompt.expect("a prompt");
+        assert!(prompt.starts_with("Glossary: Voisu, Tokio, "), "{prompt:?}");
         assert_eq!(
-            worker_saw(true, &["Voisu", "Tokio"]),
-            (1, Some("Voisu, Tokio".to_owned()))
+            Some(prompt),
+            crate::dictionary::local_prompt_for_terms(&terms)
         );
     }
 
     #[test]
-    fn a_prompt_capable_worker_with_an_empty_dictionary_gets_no_prompt() {
+    fn a_prompt_capable_worker_with_an_empty_dictionary_gets_the_built_in_glossary() {
         let _lock = test_session();
-        assert_eq!(worker_saw(true, &[]), (1, None));
+        assert_eq!(
+            worker_saw(true, &[]),
+            (1, crate::dictionary::local_prompt_for_terms(&[]))
+        );
     }
 
     #[test]

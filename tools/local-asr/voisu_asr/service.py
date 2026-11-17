@@ -77,14 +77,19 @@ def _is_prompt_echo(text: str, prompt: str) -> bool:
 
     A quiet window can make Whisper emit its own prompt. That is two or more
     distinct prompt terms joined by commas or spaces, optionally ending in a
-    period. A single term stays: people do dictate one name.
+    period, and optionally led by the daemon's `Glossary:` sentence opener.
+    A single term stays: people do dictate one name.
     """
 
-    terms = sorted({term.strip() for term in prompt.split(",") if term.strip()}, key=len, reverse=True)
+    glossary = re.fullmatch(r"\s*Glossary:\s*(.*?)\.?\s*", prompt, re.DOTALL)
+    listed = glossary.group(1) if glossary else prompt
+    terms = sorted({term.strip() for term in listed.split(",") if term.strip()}, key=len, reverse=True)
     if len(terms) < 2:
         return False
     term = "|".join(re.escape(item) for item in terms)
-    recital = re.fullmatch(rf"\s*((?:{term})(?:[\s,]+(?:{term}))+)[\s,]*\.?\s*", text, re.IGNORECASE)
+    recital = re.fullmatch(
+        rf"\s*(?:glossary:?\s*)?((?:{term})(?:[\s,]+(?:{term}))+)[\s,]*\.?\s*", text, re.IGNORECASE
+    )
     if recital is None:
         return False
     return len({found.lower() for found in re.findall(term, recital.group(1), re.IGNORECASE)}) >= 2
