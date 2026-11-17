@@ -1432,7 +1432,10 @@ fn infer_unlocked(
     let correlation = correlation(&session.receipt_hash, recording_id, request_id);
     // The supervisor drops the prompt unless this worker advertised support,
     // so Parakeet and an old worker are sent exactly what they always were.
-    let prompt = crate::dictionary::local_prompt_for_terms(user_terms);
+    let prompt = crate::dictionary::local_prompt_for_terms(
+        user_terms,
+        voisu_core::is_explicit_english(&session.language),
+    );
     transcribe_through_supervisor(
         &mut session.supervisor,
         correlation,
@@ -3290,7 +3293,15 @@ mod tests {
     /// sentinel prompt, so a Transcribe that never arrived cannot read as "no
     /// prompt".
     fn worker_saw(accepts_prompt: bool, terms: &[&str]) -> (u32, Option<String>) {
-        inject_ready_with_prompt_support(fixture_receipt(), "hello", accepts_prompt);
+        worker_saw_for(fixture_receipt(), accepts_prompt, terms)
+    }
+
+    fn worker_saw_for(
+        receipt: ActiveReceipt,
+        accepts_prompt: bool,
+        terms: &[&str],
+    ) -> (u32, Option<String>) {
+        inject_ready_with_prompt_support(receipt, "hello", accepts_prompt);
         gate()
             .lock()
             .expect("gate")
@@ -3324,7 +3335,7 @@ mod tests {
         assert!(prompt.starts_with("Glossary: Voisu, Tokio, "), "{prompt:?}");
         assert_eq!(
             Some(prompt),
-            crate::dictionary::local_prompt_for_terms(&terms)
+            crate::dictionary::local_prompt_for_terms(&terms, true)
         );
     }
 
@@ -3333,8 +3344,20 @@ mod tests {
         let _lock = test_session();
         assert_eq!(
             worker_saw(true, &[]),
-            (1, crate::dictionary::local_prompt_for_terms(&[]))
+            (1, crate::dictionary::local_prompt_for_terms(&[], true))
         );
+    }
+
+    #[test]
+    fn a_non_english_model_gets_only_the_bare_user_terms_as_its_prompt() {
+        let _lock = test_session();
+        let mut receipt = fixture_receipt();
+        receipt.language = "auto".to_owned();
+        assert_eq!(
+            worker_saw_for(receipt.clone(), true, &["Voisu", "Tokio"]),
+            (1, Some("Voisu, Tokio".to_owned()))
+        );
+        assert_eq!(worker_saw_for(receipt, true, &[]), (1, None));
     }
 
     #[test]

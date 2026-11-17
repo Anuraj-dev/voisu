@@ -33,6 +33,9 @@ pub struct LocalFormatting {
     writing_mode: WritingMode,
     /// The Rendering Policy when DPR owns formatting.
     dpr: Option<RenderingPolicy>,
+    /// The Local model is explicitly English: built-in Dictionary terms
+    /// correct its transcript.
+    english: bool,
 }
 
 impl LocalFormatting {
@@ -46,17 +49,23 @@ impl LocalFormatting {
             crate::config::WritingMode::Smart => WritingMode::Smart,
             crate::config::WritingMode::Literal => WritingMode::Literal,
         };
-        Self { writing_mode, dpr }
+        Self {
+            writing_mode,
+            dpr,
+            english: false,
+        }
     }
 
     /// DPR only formats English, so a Local model of another language falls
-    /// back to the Writing Mode (Cloud's EnglishEligibility gate).
+    /// back to the Writing Mode (Cloud's EnglishEligibility gate). The same
+    /// gate keeps the English built-in glossary off its transcript.
     #[must_use]
     pub fn for_model_language(self, language: &str) -> Self {
-        if is_explicit_english(language) {
-            self
-        } else {
-            Self { dpr: None, ..self }
+        let english = is_explicit_english(language);
+        Self {
+            dpr: if english { self.dpr } else { None },
+            english,
+            ..self
         }
     }
 
@@ -74,10 +83,13 @@ impl LocalFormatting {
                         process_hint: None,
                         timing: None,
                     });
+                // Untrimmed, as Cloud delivers it: a spoken "new line" at
+                // either end stays a line break ("Hello.\n").
                 baseline.rendered().to_owned()
             }
             None => format_validated(text, self.writing_mode)
                 .rendered()
+                .trim()
                 .to_owned(),
         }
     }
@@ -201,15 +213,14 @@ pub fn decide_transcript(
                     reason: "no words heard".to_owned(),
                 });
             }
-            let replaced = apply_local_dictionary(&sanitized, user_terms);
+            let replaced = apply_local_dictionary(&sanitized, user_terms, formatting.english);
             let formatted = formatting.render(&replaced);
-            let rendered = formatted.trim();
-            if rendered.is_empty() {
+            if formatted.trim().is_empty() {
                 Ok(TerminalDecision::NoText {
                     reason: "empty".to_owned(),
                 })
             } else {
-                Ok(TerminalDecision::Transcript(rendered.to_owned()))
+                Ok(TerminalDecision::Transcript(formatted))
             }
         }
     }
@@ -240,26 +251,36 @@ pub fn decide_replay(
     Ok(decision)
 }
 
-/// Dictionary correction for Local: the Cloud span-aware exact matcher
-/// (ungated, no word confidences), then correction by sound for names the
-/// model wrote as it heard them ("voice you" -> "Voisu"). Cloud keeps exact
-/// matching of user terms only. Local also corrects toward the built-in
-/// developer glossary, after the user's terms, because a Local model hears
-/// those names no better than the user's own (Cloud gets them as provider
-/// keyterms and prompt instead).
-pub fn apply_local_dictionary(text: &str, user_terms: &[String]) -> String {
-    let terms = crate::dictionary::local_correction_terms(user_terms);
-    let exact = voisu_core::apply_user_vocabulary(text, &terms, &[]);
-    voisu_core::apply_phonetic_dictionary(&exact, &terms)
+/// Dictionary correction for Local, in two passes so the user's terms always
+/// win. First the user's terms, as Cloud would apply them (the span-aware
+/// exact matcher, ungated, no word confidences), then correction by sound for
+/// names the model wrote as it heard them ("voice you" -> "Voisu"). Then, when
+/// `built_ins` (an English model), the built-in developer glossary: exact
+/// matches, and by sound only for hearings with a word outside the English
+/// lexicon ("voysu", "Vosu"), never a run of real words ("the voice you hear",
+/// "type script"), and never over a term the user pass wrote. A Local model
+/// hears those names no better than the user's own; Cloud gets them as
+/// provider keyterms and prompt instead and corrects user terms only.
+pub fn apply_local_dictionary(text: &str, user_terms: &[String], built_ins: bool) -> String {
+    let exact = voisu_core::apply_user_vocabulary(text, user_terms, &[]);
+    let user = voisu_core::apply_phonetic_dictionary(&exact, user_terms);
+    if !built_ins {
+        return user;
+    }
+    let terms = crate::dictionary::local_built_in_terms(user_terms);
+    let exact = voisu_core::apply_user_vocabulary(&user, &terms, &[]);
+    voisu_core::apply_unfamiliar_phonetic_dictionary(&exact, &terms, user_terms)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// DPR off, Literal Writing Mode, English model.
     const LITERAL: LocalFormatting = LocalFormatting {
         writing_mode: WritingMode::Literal,
         dpr: None,
+        english: true,
     };
 
     fn outcome(text: &str) -> WorkerOutcome {
@@ -366,6 +387,11 @@ mod tests {
         .unwrap()
     }
 
+    /// Local Dictionary correction for an English model.
+    fn apply_local_dictionary_en(text: &str, user_terms: &[String]) -> String {
+        apply_local_dictionary(text, user_terms, true)
+    }
+
     fn transcript(text: &str) -> TerminalDecision {
         TerminalDecision::Transcript(text.to_owned())
     }
@@ -399,20 +425,47 @@ mod tests {
 
     #[test]
     fn local_dpr_formatting_matches_cloud_dpr_rendering() {
-        let validated = "first point is cache second point is latency";
-        let cloud = voisu_cloud::dpr_local::render_dpr_local(
-            validated,
-            &[voisu_core::SourceTranscript {
-                provider: voisu_core::Provider::Groq,
-                text: validated.to_owned(),
-            }],
-            &[],
-            RenderingPolicy::Adaptive,
-        )
-        .expect("one Source Transcript with text");
+        // Spoken quotes and an edge "new line" are DPR-only: Smart and Literal
+        // `format_validated` leave both as words.
+        for (validated, expected) in [
+            (
+                "i said quote hello unquote to him",
+                "I said \"hello\" to him.",
+            ),
+            ("hello new line", "Hello.\n"),
+        ] {
+            let cloud = voisu_cloud::dpr_local::render_dpr_local(
+                validated,
+                &[voisu_core::SourceTranscript {
+                    provider: voisu_core::Provider::Groq,
+                    text: validated.to_owned(),
+                }],
+                &[],
+                RenderingPolicy::Adaptive,
+            )
+            .expect("one Source Transcript with text");
+            assert_eq!(cloud, expected);
+            assert_eq!(
+                decide_formatted(validated, &[], dpr_literal()),
+                transcript(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn a_spoken_break_at_either_end_is_delivered_as_cloud_delivers_it() {
+        // Cloud's DPR path delivers the baseline untrimmed ("Hello.\n").
         assert_eq!(
-            decide_formatted(validated, &[], dpr_literal()),
-            transcript(&cloud)
+            decide_formatted("hello new line", &[], dpr_literal()),
+            transcript("Hello.\n")
+        );
+        assert_eq!(
+            decide_formatted("new line hello", &[], dpr_literal()),
+            transcript("\nHello")
+        );
+        assert_eq!(
+            decide_formatted("hello new paragraph", &[], dpr_literal()),
+            transcript("Hello.\n\n")
         );
     }
 
@@ -452,6 +505,29 @@ mod tests {
         assert_eq!(
             decide_formatted(SPOKEN_BREAKS, &[], formatting),
             transcript(SPOKEN_BREAKS)
+        );
+    }
+
+    #[test]
+    fn a_non_english_or_auto_local_model_gets_no_built_in_correction() {
+        for language in ["hi", "auto"] {
+            let formatting = LocalFormatting::new(crate::config::WritingMode::Literal, None)
+                .for_model_language(language);
+            assert_eq!(
+                decide_formatted("ask voysu now", &[], formatting),
+                transcript("ask voysu now"),
+                "{language}"
+            );
+            // The user's own terms still correct, as before built-ins existed.
+            assert_eq!(
+                decide_formatted("ask voice you now", &["Voisu".to_owned()], formatting),
+                transcript("ask Voisu now"),
+                "{language}"
+            );
+        }
+        assert_eq!(
+            apply_local_dictionary("ask voysu now", &[], false),
+            "ask voysu now"
         );
     }
 
@@ -542,15 +618,15 @@ mod tests {
     #[test]
     fn dictionary_matches_hyphenated_multiword_and_punctuated_terms() {
         assert_eq!(
-            apply_local_dictionary("run the daemon reload job", &["daemon-reload".to_owned()]),
+            apply_local_dictionary_en("run the daemon reload job", &["daemon-reload".to_owned()]),
             "run the daemon-reload job"
         );
         assert_eq!(
-            apply_local_dictionary("open Node js docs", &["Node.js".to_owned()]),
+            apply_local_dictionary_en("open Node js docs", &["Node.js".to_owned()]),
             "open Node.js docs"
         );
         assert_eq!(
-            apply_local_dictionary("open Claude code please", &["Claude Code".to_owned()]),
+            apply_local_dictionary_en("open Claude code please", &["Claude Code".to_owned()]),
             "open Claude Code please"
         );
     }
@@ -562,16 +638,50 @@ mod tests {
             transcript("we can apply this for Voisu local")
         );
         assert_eq!(
-            apply_local_dictionary("check the change log in Voisoo", &[]),
-            "check the changelog in Voisu"
+            apply_local_dictionary_en("check the change log in Voisoo", &[]),
+            "check the change log in Voisu"
         );
     }
 
     #[test]
     fn a_user_term_heard_exactly_is_not_rewritten_to_a_built_in_term() {
         assert_eq!(
-            apply_local_dictionary("ask voysu", &["voysu".to_owned()]),
+            apply_local_dictionary_en("ask voysu", &["voysu".to_owned()]),
             "ask voysu"
+        );
+    }
+
+    #[test]
+    fn user_terms_win_the_phonetic_pass_over_built_ins() {
+        // A user term that sounds like a built-in is not made ambiguous by it,
+        // and the built-in never re-targets what the user term matched.
+        assert_eq!(
+            apply_local_dictionary_en("ask voice you now", &["Voysu".to_owned()]),
+            "ask Voysu now"
+        );
+        assert_eq!(
+            apply_local_dictionary_en("the deep gram app", &["Deepgramm".to_owned()]),
+            "the Deepgramm app"
+        );
+    }
+
+    #[test]
+    fn built_in_terms_never_correct_a_hearing_of_real_english_words() {
+        for sentence in [
+            "the voice you hear is mine",
+            "pick any voice you like",
+            "the code ex boyfriend",
+            "the deep gram of salt",
+            "the gate way",
+            "the pipe wire",
+            "I love the type script",
+        ] {
+            assert_eq!(apply_local_dictionary_en(sentence, &[]), sentence);
+        }
+        // The same hearing still corrects to a user's own term.
+        assert_eq!(
+            apply_local_dictionary_en("the deep gram app", &["Deepgram".to_owned()]),
+            "the Deepgram app"
         );
     }
 
@@ -595,7 +705,7 @@ mod tests {
             "the struck match and the structure",
             "the compiler and the complier and the system is down",
         ] {
-            assert_eq!(apply_local_dictionary(sentence, &[]), sentence);
+            assert_eq!(apply_local_dictionary_en(sentence, &[]), sentence);
         }
     }
 
@@ -603,7 +713,7 @@ mod tests {
     fn local_dictionary_corrects_by_sound_after_exact_matches() {
         let dictionary = ["Voisu".to_owned(), "Hyprland".to_owned()];
         assert_eq!(
-            apply_local_dictionary("voice you runs on hyper land", &dictionary),
+            apply_local_dictionary_en("voice you runs on hyper land", &dictionary),
             "Voisu runs on Hyprland"
         );
     }
@@ -622,7 +732,7 @@ mod tests {
                 "say voice you"
             );
             assert_eq!(
-                apply_local_dictionary("say voice you", &dictionary),
+                apply_local_dictionary_en("say voice you", &dictionary),
                 "say voice-you"
             );
         }
