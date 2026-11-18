@@ -22,6 +22,7 @@ enum CliAction {
     Switch(Switch, Option<bool>),
     LocalUnload(Option<Option<std::time::Duration>>),
     LocalDevice(Option<voisu_app::config::LocalDevice>),
+    LocalModel(Option<voisu_app::config::LocalModel>),
     Star,
     SetAsrMode(AsrMode),
     Delivery(Option<DeliveryMode>),
@@ -58,6 +59,7 @@ fn main() -> ExitCode {
         Ok(CliAction::Switch(switch, state)) => switch_command(switch, state),
         Ok(CliAction::LocalUnload(after)) => local_unload(after),
         Ok(CliAction::LocalDevice(device)) => local_device(device),
+        Ok(CliAction::LocalModel(setting)) => local_model(setting),
         Ok(CliAction::Star) => star(),
         Ok(CliAction::SetAsrMode(mode)) => set_asr_mode(mode),
         Ok(CliAction::Delivery(mode)) => delivery(mode),
@@ -471,6 +473,54 @@ fn local_device(device: Option<voisu_app::config::LocalDevice>) -> ExitCode {
     }
 }
 
+/// Shows or switches the Local model tier. A tier that is not installed is
+/// downloaded only after a yes at its consent, never from a script.
+fn local_model(setting: Option<voisu_app::config::LocalModel>) -> ExitCode {
+    use std::io::IsTerminal;
+    use voisu_app::local_model::runs_on_gpu;
+    use voisu_app::setup::StdioWizard;
+    use voisu_app::setup_consented::{
+        LocalRemoveStatus, local_model_status_lines, production_consented_status,
+        production_install, production_restart_daemon, production_sweep_replaced,
+        run_local_model_switch,
+    };
+
+    let on_gpu = runs_on_gpu(voisu_app::config::local_device());
+    let installed = production_consented_status();
+    let Some(setting) = setting else {
+        let setting = voisu_app::config::local_model();
+        for line in local_model_status_lines(setting, on_gpu, &installed) {
+            println!("{line}");
+        }
+        if let Some(unknown) = voisu_app::config::unknown_local_model() {
+            eprintln!(
+                "warning: config sets local_model = \"{unknown}\", which is not auto, accurate or fast; it runs as auto. Run `voisu local-model auto`, `accurate` or `fast` to fix it."
+            );
+        }
+        return ExitCode::SUCCESS;
+    };
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    match run_local_model_switch(
+        &mut StdioWizard,
+        std::io::stdin().is_terminal(),
+        setting,
+        on_gpu,
+        &installed,
+        now_unix,
+        |setting| voisu_app::config::set_local_model(setting).map(|_| ()),
+        production_install,
+        production_restart_daemon,
+        production_sweep_replaced,
+    ) {
+        LocalRemoveStatus::Success => ExitCode::SUCCESS,
+        LocalRemoveStatus::Usage(message) => fail(2, message),
+        LocalRemoveStatus::Failed(message) => fail(4, &message),
+    }
+}
+
 fn switch_label(switch: Switch) -> &'static str {
     match switch {
         Switch::UpdateCheck => "Update check",
@@ -798,6 +848,11 @@ fn parse_command() -> Result<CliAction, String> {
             voisu_app::config::parse_local_device(device)
                 .map_err(|error| format!("local-device: {error}"))?,
         ))),
+        [command] if command == "local-model" => Ok(CliAction::LocalModel(None)),
+        [command, setting] if command == "local-model" => Ok(CliAction::LocalModel(Some(
+            voisu_app::config::parse_local_model(setting)
+                .map_err(|error| format!("local-model: {error}"))?,
+        ))),
         [command] if command == "star-prompt" => Ok(CliAction::Switch(Switch::StarPrompt, None)),
         [command, state] if command == "star-prompt" => Ok(CliAction::Switch(
             Switch::StarPrompt,
@@ -948,6 +1003,8 @@ commands:
   local remove [--yes]          delete the Local model
   local-unload [off|SECONDS]    free an idle Local model's memory after this long
   local-device [auto|gpu|cpu]   run the Local model on your GPU or the CPU
+  local-model [auto|accurate|fast]
+                                choose the Local model: Accurate, or Fast for the CPU
   update [--check|--dry-run] [--switch-to-bin]
                                 update Voisu
   update-check [on|off]         check once a day for a newer version

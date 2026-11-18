@@ -36,6 +36,8 @@ commands:
   local remove [--yes]          delete the Local model
   local-unload [off|SECONDS]    free an idle Local model's memory after this long
   local-device [auto|gpu|cpu]   run the Local model on your GPU or the CPU
+  local-model [auto|accurate|fast]
+                                choose the Local model: Accurate, or Fast for the CPU
   update [--check|--dry-run] [--switch-to-bin]
                                 update Voisu
   update-check [on|off]         check once a day for a newer version

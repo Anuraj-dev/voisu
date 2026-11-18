@@ -644,6 +644,214 @@ pub fn run_local_remove(
     }
 }
 
+/// What a new `local_model` setting needs before it can run.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalModelChange {
+    /// The tier it resolves to is the installed one: saving is the switch.
+    InUse(LocalTier),
+    /// The tier is not installed; it runs only after a consented download.
+    Download {
+        tier: LocalTier,
+        device: SetupDevice,
+    },
+    /// The model store could not be read, so nothing is decided.
+    Unknown(String),
+}
+
+/// Plans the switch to `setting` where Local runs (`on_gpu`, from
+/// [`crate::local_model::runs_on_gpu`]). One Local model is installed at a
+/// time, so only the installed tier switches without a download.
+#[must_use]
+pub fn plan_local_model(
+    setting: LocalModel,
+    on_gpu: bool,
+    installed: &ConsentedStatus,
+) -> LocalModelChange {
+    let tier = LocalTier::resolve(setting, on_gpu);
+    match installed {
+        ConsentedStatus::Installed { entry_id, .. } if entry_id == tier.entry().id => {
+            LocalModelChange::InUse(tier)
+        }
+        ConsentedStatus::Unknown(reason) => LocalModelChange::Unknown(reason.clone()),
+        ConsentedStatus::Installed { .. } | ConsentedStatus::NotInstalled => {
+            LocalModelChange::Download {
+                tier,
+                device: if on_gpu {
+                    SetupDevice::Gpu
+                } else {
+                    SetupDevice::Cpu
+                },
+            }
+        }
+    }
+}
+
+/// The consent the CLI and the TUI show before a tier download: its name,
+/// then setup's summary (size, the Accurate-on-CPU warning, offline).
+#[must_use]
+pub fn local_model_consent(tier: LocalTier, device: SetupDevice) -> Vec<String> {
+    let mut lines = vec![format!(
+        "{} is not installed. Installing it replaces the installed Local model.",
+        tier.title()
+    )];
+    lines.extend(consent_summary(tier.entry(), device));
+    lines
+}
+
+/// `voisu local-model` with no argument: the setting, the tier it resolves
+/// to, and what runs instead when that tier is not installed.
+#[must_use]
+pub fn local_model_status_lines(
+    setting: LocalModel,
+    on_gpu: bool,
+    installed: &ConsentedStatus,
+) -> Vec<String> {
+    let tier = LocalTier::resolve(setting, on_gpu);
+    let mut lines = vec![format!(
+        "Local model: {} ({})",
+        setting.as_str(),
+        tier.label(on_gpu)
+    )];
+    match (plan_local_model(setting, on_gpu, installed), installed) {
+        (LocalModelChange::InUse(_), _) => {}
+        (LocalModelChange::Unknown(reason), _) => {
+            lines.push(format!(
+                "Could not read the installed Local model: {reason}"
+            ));
+        }
+        (LocalModelChange::Download { .. }, ConsentedStatus::Installed { entry_id, .. }) => {
+            let running = LocalTier::of_entry_id(entry_id)
+                .map_or_else(|| entry_id.clone(), |other| other.label(on_gpu));
+            lines.push(format!(
+                "{} is not installed, so {running} runs. Run `voisu local-model {}` to install it.",
+                tier.title(),
+                setting.as_str()
+            ));
+        }
+        (LocalModelChange::Download { .. }, _) => lines.push(format!(
+            "{} is not installed. Run `voisu local-model {}` to install it.",
+            tier.title(),
+            setting.as_str()
+        )),
+    }
+    if tier == LocalTier::Accurate && !on_gpu {
+        lines.push(ACCURATE_ON_CPU_WARNING.into());
+    }
+    lines
+}
+
+/// `Local model set to fast: Fast (small.en, CPU) is installed; it runs your next Recording.`
+#[must_use]
+pub fn local_model_in_use_line(setting: LocalModel, tier: LocalTier, on_gpu: bool) -> String {
+    format!(
+        "Local model set to {}: {} is installed; it runs your next Recording.",
+        setting.as_str(),
+        tier.label(on_gpu)
+    )
+}
+
+/// After a tier install: the daemon restart stops the old worker so the
+/// replaced model can be deleted, and the new one serves the next Recording.
+#[must_use]
+pub fn local_model_switched_line(tier: LocalTier, restart: Result<(), String>) -> String {
+    match restart {
+        Ok(()) => format!(
+            "Restarted the Voisu daemon; {} runs your next Recording.",
+            tier.title()
+        ),
+        Err(reason) => format!(
+            "Warning: could not restart the Voisu daemon ({reason}). {} runs after `voisu service restart`.",
+            tier.title()
+        ),
+    }
+}
+
+/// `voisu local-model <setting>`: saves a setting whose tier is installed,
+/// and installs a missing tier only after an explicit yes at the consent.
+/// Non-interactive runs never download. Nothing is saved unless the tier it
+/// names ends up installed, so the setting never points at a missing model.
+#[allow(clippy::too_many_arguments)]
+pub fn run_local_model_switch(
+    io: &mut dyn WizardIo,
+    interactive: bool,
+    setting: LocalModel,
+    on_gpu: bool,
+    installed: &ConsentedStatus,
+    now_unix: u64,
+    save: impl FnOnce(LocalModel) -> Result<(), String>,
+    install: impl FnOnce(ConsentedConsent, SetupDevice) -> Result<(), ConsentedError>,
+    restart_daemon: impl FnOnce() -> Result<(), String>,
+    sweep_replaced: impl FnOnce(),
+) -> LocalRemoveStatus {
+    let (tier, device) = match plan_local_model(setting, on_gpu, installed) {
+        LocalModelChange::InUse(tier) => {
+            return match save(setting) {
+                Ok(()) => {
+                    io.writeln(&local_model_in_use_line(setting, tier, on_gpu));
+                    if tier == LocalTier::Accurate && !on_gpu {
+                        io.writeln(ACCURATE_ON_CPU_WARNING);
+                    }
+                    LocalRemoveStatus::Success
+                }
+                Err(message) => LocalRemoveStatus::Failed(message),
+            };
+        }
+        LocalModelChange::Unknown(reason) => {
+            return LocalRemoveStatus::Failed(format!(
+                "Could not read the installed Local model ({}); nothing changed.",
+                reason.trim_end_matches('.')
+            ));
+        }
+        LocalModelChange::Download { tier, device } => (tier, device),
+    };
+    if !interactive {
+        return LocalRemoveStatus::Failed(format!(
+            "{} is not installed and needs a {} download; run `voisu local-model {}` in a terminal to agree to it. Nothing changed.",
+            tier.title(),
+            format_size(tier.entry().total_download_bytes),
+            setting.as_str()
+        ));
+    }
+    for line in local_model_consent(tier, device) {
+        io.writeln(&line);
+    }
+    if ask_yes_no(io, INSTALL_PROMPT, false) != Some(true) {
+        io.writeln("Nothing downloaded; the Local model is unchanged.");
+        return LocalRemoveStatus::Success;
+    }
+    io.writeln(INSTALL_DURATION_HINT);
+    if let Err(error) = install(
+        ConsentedConsent::accepted_entry(tier.entry(), now_unix),
+        device,
+    ) {
+        return LocalRemoveStatus::Failed(format!(
+            "Install failed: {} The Local model is unchanged.",
+            consented_error_line(&error)
+        ));
+    }
+    io.writeln(&installed_line(tier.entry()));
+    if let Err(message) = save(setting) {
+        // The install already swapped the model; only the setting is stale.
+        io.writeln(&format!("Warning: could not save local_model ({message})."));
+    }
+    io.writeln(&local_model_switched_line(tier, restart_daemon()));
+    sweep_replaced();
+    LocalRemoveStatus::Success
+}
+
+/// Deletes the model a tier switch replaced, best effort: a tree still in
+/// use is left for the next install or `voisu local remove`.
+pub fn production_sweep_replaced() {
+    let Ok(dir) =
+        models_dir_from_state(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+    else {
+        return;
+    };
+    if let Ok(store) = ModelStore::open(dir) {
+        let _ = crate::local_model::remove_replaced_consented_installs(&store);
+    }
+}
+
 #[must_use]
 pub fn consented_error_line(error: &ConsentedError) -> String {
     match error {
@@ -945,6 +1153,171 @@ mod tests {
             || Ok(()),
         );
         (step, io, installs)
+    }
+
+    /// Runs `voisu local-model <setting>` with fakes; returns the status, the
+    /// transcript, the saved settings, the install calls and the sweeps.
+    fn switch(
+        setting: LocalModel,
+        on_gpu: bool,
+        installed: &ConsentedStatus,
+        interactive: bool,
+        answers: Vec<Option<&str>>,
+    ) -> (
+        LocalRemoveStatus,
+        String,
+        Vec<LocalModel>,
+        Vec<(ConsentedConsent, SetupDevice)>,
+        usize,
+    ) {
+        let mut io = FakeIo::new(answers);
+        let (mut saved, mut installs, mut sweeps) = (Vec::new(), Vec::new(), 0);
+        let status = run_local_model_switch(
+            &mut io,
+            interactive,
+            setting,
+            on_gpu,
+            installed,
+            NOW,
+            |model| {
+                saved.push(model);
+                Ok(())
+            },
+            |consent, device| {
+                installs.push((consent, device));
+                Ok(())
+            },
+            || Ok(()),
+            || sweeps += 1,
+        );
+        (status, io.transcript(), saved, installs, sweeps)
+    }
+
+    fn installed_entry(entry: &ConsentedCatalogEntry) -> ConsentedStatus {
+        ConsentedStatus::Installed {
+            entry_id: entry.id.into(),
+            device: "cpu".into(),
+        }
+    }
+
+    #[test]
+    fn the_status_names_the_resolved_tier_and_what_runs_instead() {
+        let accurate = installed_entry(&WHISPER_CPP_ENTRY);
+        assert_eq!(
+            local_model_status_lines(LocalModel::Auto, true, &accurate),
+            ["Local model: auto (Accurate (distil-large-v3.5, GPU))"]
+        );
+        assert_eq!(
+            local_model_status_lines(LocalModel::Fast, true, &accurate),
+            [
+                "Local model: fast (Fast (small.en, GPU))",
+                "Fast (small.en) is not installed, so Accurate (distil-large-v3.5, GPU) runs. Run `voisu local-model fast` to install it."
+            ]
+        );
+        assert_eq!(
+            local_model_status_lines(LocalModel::Accurate, false, &ConsentedStatus::NotInstalled),
+            [
+                "Local model: accurate (Accurate (distil-large-v3.5, CPU))",
+                "Accurate (distil-large-v3.5) is not installed. Run `voisu local-model accurate` to install it.",
+                ACCURATE_ON_CPU_WARNING
+            ]
+        );
+    }
+
+    #[test]
+    fn switching_to_the_installed_tier_saves_without_a_download_or_prompt() {
+        let fast = installed_entry(&WHISPER_CPP_SMALL_EN_ENTRY);
+        let (status, text, saved, installs, sweeps) =
+            switch(LocalModel::Auto, false, &fast, false, vec![]);
+        assert_eq!(status, LocalRemoveStatus::Success);
+        assert_eq!(
+            text,
+            "Local model set to auto: Fast (small.en, CPU) is installed; it runs your next Recording."
+        );
+        assert_eq!(saved, [LocalModel::Auto]);
+        assert!(installs.is_empty() && sweeps == 0);
+
+        // Accurate kept on the CPU is allowed, with the warning.
+        let accurate = installed_entry(&WHISPER_CPP_ENTRY);
+        let (_, text, saved, installs, _) =
+            switch(LocalModel::Accurate, false, &accurate, true, vec![]);
+        assert!(text.ends_with(ACCURATE_ON_CPU_WARNING), "{text}");
+        assert_eq!(saved, [LocalModel::Accurate]);
+        assert!(installs.is_empty());
+    }
+
+    #[test]
+    fn a_missing_tier_downloads_only_after_a_yes_and_never_non_interactively() {
+        let accurate = installed_entry(&WHISPER_CPP_ENTRY);
+        // Non-interactive: refused, nothing saved or fetched.
+        let (status, text, saved, installs, _) =
+            switch(LocalModel::Fast, true, &accurate, false, vec![Some("y")]);
+        assert_eq!(
+            status,
+            LocalRemoveStatus::Failed("Fast (small.en) is not installed and needs a 252.6 MiB download; run `voisu local-model fast` in a terminal to agree to it. Nothing changed.".into())
+        );
+        assert!(text.is_empty() && saved.is_empty() && installs.is_empty());
+
+        // Enter (default no): the consent is shown, nothing else happens.
+        let (status, text, saved, installs, _) =
+            switch(LocalModel::Fast, true, &accurate, true, vec![Some("")]);
+        assert_eq!(status, LocalRemoveStatus::Success);
+        assert!(
+            text.starts_with("Fast (small.en) is not installed. Installing it replaces the installed Local model.\nDownload size: 252.6 MiB\n"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("Nothing downloaded; the Local model is unchanged."),
+            "{text}"
+        );
+        assert!(saved.is_empty() && installs.is_empty());
+
+        // Yes: installs the Fast entry on the GPU, saves, restarts and sweeps.
+        let (status, text, saved, installs, sweeps) =
+            switch(LocalModel::Fast, true, &accurate, true, vec![Some("y")]);
+        assert_eq!(status, LocalRemoveStatus::Success);
+        assert_eq!(
+            installs,
+            [(
+                ConsentedConsent::accepted_entry(&WHISPER_CPP_SMALL_EN_ENTRY, NOW),
+                SetupDevice::Gpu
+            )]
+        );
+        assert_eq!(saved, [LocalModel::Fast]);
+        assert_eq!(sweeps, 1);
+        assert!(
+            text.ends_with("Installed Fast (small.en).\nRestarted the Voisu daemon; Fast (small.en) runs your next Recording."),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn accurate_on_the_cpu_is_warned_at_the_consent_and_an_unknown_store_changes_nothing() {
+        let (_, text, _, installs, _) = switch(
+            LocalModel::Accurate,
+            false,
+            &ConsentedStatus::NotInstalled,
+            true,
+            vec![Some("n")],
+        );
+        assert!(text.contains("Download size: 780.7 MiB"), "{text}");
+        assert!(text.contains(ACCURATE_ON_CPU_WARNING), "{text}");
+        assert!(installs.is_empty());
+
+        let (status, _, saved, _, _) = switch(
+            LocalModel::Fast,
+            false,
+            &ConsentedStatus::Unknown("The model store is busy or unavailable.".into()),
+            true,
+            vec![],
+        );
+        assert_eq!(
+            status,
+            LocalRemoveStatus::Failed(
+                "Could not read the installed Local model (The model store is busy or unavailable); nothing changed.".into()
+            )
+        );
+        assert!(saved.is_empty());
     }
 
     fn offer_with_restart(
