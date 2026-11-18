@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.90.0
+Version:        0.90.1
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -206,6 +206,9 @@ install -D -m 0644 packaging/icons/voisu.svg %{buildroot}%{_datadir}/icons/hicol
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Wed Nov 18 2026 Voisu maintainers <voisu@example.invalid> - 0.90.1-1
+- fix(local): trim the Local install consent to the download size (#342)
+
 * Wed Nov 18 2026 Voisu maintainers <voisu@example.invalid> - 0.90.0-1
 - feat(local): make setup install the whisper.cpp Local model (#341)
 
