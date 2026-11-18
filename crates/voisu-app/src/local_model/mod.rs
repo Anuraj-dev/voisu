@@ -39,14 +39,14 @@ pub(crate) use consented::consented_receipt_exists;
 pub use consented::{
     ConsentedConsent, ConsentedError, ConsentedFilePin, ConsentedHealth, ConsentedInstallRequest,
     ConsentedLayout, ConsentedReceipt, ConsentedRuntimeEntry, VerifiedConsentedInstall,
-    install_consented_install, remove_consented_install, verify_consented_install,
-    verify_consented_install_full,
+    install_consented_install, remove_consented_install, remove_replaced_consented_installs,
+    verify_consented_install, verify_consented_install_full,
 };
 pub use consented_catalog::{
     CONSENT_TEXT, CONSENTED_ENTRY, ConsentedCatalogEntry, DownloadPin,
     ESTIMATED_EXTRACTED_RUNTIME_BYTES, EXPECTED_HEALTH_TEXT, NEMO_LIBRARY, PARAKEET_ENTRY,
-    REQUIRED_FREE_BYTES, WHISPER_CPP_ENTRY, consented_entry, consented_health_clip,
-    installable_entry_for_consent,
+    REQUIRED_FREE_BYTES, WHISPER_CPP_ENTRY, WHISPER_CPP_SMALL_EN_ENTRY, consented_entry,
+    consented_health_clip, installable_entry_for_consent,
 };
 pub use consented_pins::TOTAL_DOWNLOAD_BYTES;
 pub use consented_runtime::{

@@ -25,7 +25,7 @@ pub const DEVELOPMENT_RUNTIME_REVISION_MAX_BYTES: usize = 256;
 
 /// IDs are fixed here so a malformed or unreviewed manifest cannot introduce
 /// an arbitrary executable model into the selector.
-pub const DEV_MODEL_IDS: [&str; 14] = [
+pub const DEV_MODEL_IDS: [&str; 15] = [
     "nemotron-3.5-0.6b",
     "parakeet-tdt-0.6b-v3",
     "qwen3-asr-0.6b",
@@ -40,11 +40,14 @@ pub const DEV_MODEL_IDS: [&str; 14] = [
     "distil-large-v3.5-int8",
     "granite-speech-5.0-470m-turboctc",
     WHISPER_CPP_DISTIL_ID,
+    WHISPER_CPP_SMALL_EN_ID,
 ];
 
 /// The in-repo whisper.cpp worker's model: distil-large-v3.5 at q8_0 (the
 /// Phase 0 verdict over q5_0).
 pub const WHISPER_CPP_DISTIL_ID: &str = "whisper-cpp-distil-large-v3.5-q8-0";
+/// The same worker's Fast-tier model: small.en at q8_0.
+pub const WHISPER_CPP_SMALL_EN_ID: &str = "whisper-cpp-small-en-q8-0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DevRuntimeKind {
@@ -226,6 +229,17 @@ static DEVELOPMENT_CATALOG: &[DevCatalogEntry] = &[
         devices: CPU_GPU,
         memory_bytes: 2048 * 1024 * 1024,
         vram_bytes: 1536 * 1024 * 1024,
+    },
+    // Same worker with small.en q8_0 (264 MB of weights); vram_bytes is an
+    // estimate, not a measured peak.
+    DevCatalogEntry {
+        model_id: WHISPER_CPP_SMALL_EN_ID,
+        runtime: DevRuntimeKind::Native,
+        worker: DevWorker::Executable,
+        languages: EN,
+        devices: CPU_GPU,
+        memory_bytes: 1024 * 1024 * 1024,
+        vram_bytes: 768 * 1024 * 1024,
     },
 ];
 

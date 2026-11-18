@@ -217,8 +217,13 @@ pub(super) const WORKER_FILES: &[(&str, &[u8])] = &[
 ];
 
 /// Catalog lookup is exact; receipts cannot authorize arbitrary entries.
-pub fn consented_catalog_entries() -> [&'static ConsentedCatalogEntry; 3] {
-    [&CONSENTED_ENTRY, &PARAKEET_ENTRY, &WHISPER_CPP_ENTRY]
+pub fn consented_catalog_entries() -> [&'static ConsentedCatalogEntry; 4] {
+    [
+        &CONSENTED_ENTRY,
+        &PARAKEET_ENTRY,
+        &WHISPER_CPP_ENTRY,
+        &WHISPER_CPP_SMALL_EN_ENTRY,
+    ]
 }
 
 pub fn consented_entry(id: &str) -> Option<&'static ConsentedCatalogEntry> {
@@ -305,6 +310,29 @@ pub const WHISPER_CPP_ENTRY: ConsentedCatalogEntry = ConsentedCatalogEntry {
     consent_text: "Download 818,658,033 bytes for distil-large-v3.5 (whisper.cpp q8_0). Licence: MIT. English only. Runs on this computer with your GPU through Vulkan, or on the CPU if you choose `voisu local-device cpu`; audio never leaves it. No automatic CPU or Cloud fallback. This is a Consented Install, not a Bakeoff Winner, and is never selected by default.",
 };
 
+/// ggerganov's whisper.cpp repo, pinned to one commit; the sha256 is checked
+/// after download anyway.
+pub const WHISPER_CPP_SMALL_EN_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-small.en-q8_0.bin";
+/// small.en at q8_0, the Fast tier for computers without a GPU.
+pub const WHISPER_CPP_SMALL_EN_Q8: DownloadPin = DownloadPin {
+    name: "ggml-small.en-q8_0.bin",
+    url: WHISPER_CPP_SMALL_EN_URL,
+    sha256: "67a179f608ea6114bd3fdb9060e762b588a3fb3bd00c4387971be4d177958067",
+    bytes: 264_477_561,
+    hosts: WEIGHT_HOSTS,
+    requirement: None,
+};
+/// The Fast tier: small.en through the same whisper.cpp worker and decode
+/// settings as [`WHISPER_CPP_ENTRY`], about a third of its size.
+pub const WHISPER_CPP_SMALL_EN_ENTRY: ConsentedCatalogEntry = ConsentedCatalogEntry {
+    id: super::development::WHISPER_CPP_SMALL_EN_ID,
+    // openai/whisper small.en is MIT; the q8_0 quant is a derivative.
+    weights: &[WHISPER_CPP_SMALL_EN_Q8],
+    total_download_bytes: WHISPER_CPP_SMALL_EN_Q8.bytes + JFK_BYTES,
+    consent_text: "Download 264,829,639 bytes for small.en (whisper.cpp q8_0). Licence: MIT. English only. Runs on this computer with your GPU through Vulkan, or on the CPU if you choose `voisu local-device cpu`; audio never leaves it. No automatic CPU or Cloud fallback. This is a Consented Install, not a Bakeoff Winner, and is never selected by default.",
+    ..WHISPER_CPP_ENTRY
+};
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -370,6 +398,42 @@ pub(crate) mod tests {
         );
         // Python entries keep their two-copies-of-everything reserve.
         assert_eq!(CONSENTED_ENTRY.required_free_bytes(), REQUIRED_FREE_BYTES);
+        assert_eq!(
+            consented_entry(entry.id).map(|found| found.id),
+            Some(entry.id)
+        );
+    }
+
+    #[test]
+    fn the_fast_entry_pins_small_en_with_the_accurate_decode_settings() {
+        let entry = &WHISPER_CPP_SMALL_EN_ENTRY;
+        assert_eq!(entry.id, "whisper-cpp-small-en-q8-0");
+        assert!(entry.runs_whisper_cpp() && entry.is_hosted() && entry.consent_installable);
+        let pin = entry.weights[0];
+        assert_eq!(
+            (pin.name, pin.sha256, pin.bytes),
+            (
+                "ggml-small.en-q8_0.bin",
+                "67a179f608ea6114bd3fdb9060e762b588a3fb3bd00c4387971be4d177958067",
+                264_477_561
+            )
+        );
+        assert!(validate_catalog_url(pin.url, pin.hosts).is_ok());
+        assert_eq!(entry.total_download_bytes, 264_829_639);
+        assert!(
+            entry
+                .consent_text
+                .contains(&format_with_commas(entry.total_download_bytes))
+        );
+        assert_eq!(
+            entry.whisper_cpp_decode,
+            WHISPER_CPP_ENTRY.whisper_cpp_decode
+        );
+        assert_eq!(entry.license_spdx, "MIT");
+        assert_eq!(
+            installable_entry_for_consent(entry.consent_text, "MIT").map(|found| found.id),
+            Some(entry.id)
+        );
         assert_eq!(
             consented_entry(entry.id).map(|found| found.id),
             Some(entry.id)
