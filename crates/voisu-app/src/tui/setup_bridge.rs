@@ -31,7 +31,7 @@ use crate::setup::{
     install_live_trigger, run_hyprland_setup,
 };
 use crate::setup_consented::{
-    ConsentedInstallStep, SetupDevice, ask_cloud_after_local, consent_terms, consented_error_line,
+    ConsentedInstallStep, SetupDevice, ask_cloud_after_local, consented_error_line, no_gpu_note,
     production_install_with, production_local_complete_message, production_restart_daemon,
     production_setup_device,
 };
@@ -469,19 +469,17 @@ fn consent_question(
     Choose {
         step: STEP_CLOUD_OR_LOCAL,
         title: "Install Local?".to_owned(),
-        body: vec![
-            format!(
-                "Voisu downloads about {} GB once. Then your speech never leaves this computer.",
-                about_gb(entry.total_download_bytes)
-            ),
-            format!("{}.", consent_terms(entry).join(". ")),
-            match device {
-                SetupDevice::Gpu => "It runs on your GPU.",
-                SetupDevice::Cpu => "It runs on the CPU, as Settings asks. That's several times slower than a GPU.",
-                SetupDevice::CpuNoGpu => "No GPU found, so it runs on the CPU, several times slower. Installing sets Local device to CPU.",
-            }
-            .to_owned(),
-        ],
+        body: {
+            let mut body = vec![
+                format!(
+                    "Voisu downloads about {} GB once. Then your speech never leaves this computer.",
+                    about_gb(entry.total_download_bytes)
+                ),
+                "English only.".to_owned(),
+            ];
+            body.extend(no_gpu_note(device).map(|note| format!("{note}.")));
+            body
+        },
         rows: vec![
             ChoiceRow::new("Not now", not_now),
             ChoiceRow::new("Install", "Download and install now."),
@@ -1613,47 +1611,30 @@ mod tests {
     }
 
     #[test]
-    fn the_consent_states_the_real_size_and_device_and_defaults_to_not_now() {
+    fn the_consent_states_the_real_size_and_mentions_only_a_missing_gpu() {
+        const BASE: [&str; 2] = [
+            "Voisu downloads about 0.8 GB once. Then your speech never leaves this computer.",
+            "English only.",
+        ];
         let gpu = consent_question(&WHISPER_CPP_ENTRY, SetupDevice::Gpu, true);
-        assert_eq!(
-            gpu.body,
-            [
-                "Voisu downloads about 0.8 GB once. Then your speech never leaves this computer.",
-                "English only. Licence: MIT.",
-                "It runs on your GPU.",
-            ]
-        );
+        assert_eq!(gpu.body, BASE);
         assert_eq!(gpu.rows[gpu.picked].label, "Not now");
         assert_eq!(gpu.rows[0].line, "Keep using Cloud.");
 
         let cpu = consent_question(&WHISPER_CPP_ENTRY, SetupDevice::Cpu, false);
-        assert_eq!(
-            cpu.body[2],
-            "It runs on the CPU, as Settings asks. That's several times slower than a GPU."
-        );
+        assert_eq!(cpu.body, BASE);
         assert_eq!(cpu.rows[cpu.picked].label, "Not now");
         assert_ne!(cpu.rows[0].line, "Keep using Cloud.");
 
         let no_gpu = consent_question(&WHISPER_CPP_ENTRY, SetupDevice::CpuNoGpu, true);
         assert_eq!(
-            no_gpu.body[2],
-            "No GPU found, so it runs on the CPU, several times slower. Installing sets Local device to CPU."
+            no_gpu.body,
+            [
+                BASE[0],
+                BASE[1],
+                "No GPU found, so it runs on the CPU, more slowly."
+            ]
         );
-    }
-
-    /// A yes records the language and licence in the receipt, so the prompt
-    /// must have shown them, on every device.
-    #[test]
-    fn the_tui_consent_shows_every_term_the_receipt_records() {
-        for device in [SetupDevice::Gpu, SetupDevice::Cpu, SetupDevice::CpuNoGpu] {
-            let body = consent_question(&WHISPER_CPP_ENTRY, device, true)
-                .body
-                .join("\n");
-            for term in ["English only", "Licence: MIT"] {
-                assert!(body.contains(term), "{term} missing: {body}");
-            }
-            assert_eq!(WHISPER_CPP_ENTRY.license_spdx, "MIT");
-        }
     }
 
     #[test]
