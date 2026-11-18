@@ -55,7 +55,11 @@ impl Workers {
     pub fn submit(&self, job: Job) {
         // Once per session, and it may wait out its whole network deadline:
         // a thread of its own, so no queued job waits behind it.
-        if matches!(job, Job::CheckUpdate) {
+        // A Local model download takes minutes; nothing waits behind it either.
+        if matches!(
+            job,
+            Job::CheckUpdate | Job::SetLocalModel { agreed: true, .. }
+        ) {
             let replies = self.replies.clone();
             thread::spawn(move || execute(job, &replies));
             return;
@@ -188,6 +192,7 @@ pub fn execute(job: Job, replies: &Sender<Reply>) {
             "It applies the next time the Local model loads.",
             &[Refresh::Settings],
         )),
+        Job::SetLocalModel { model, agreed } => send(set_local_model(model, agreed)),
         Job::SetUpdateCheck(on) => send(applied_setting(
             config::set_switch(config::Switch::UpdateCheck, on),
             format!("Update check turned {}.", if on { "on" } else { "off" }),
@@ -263,12 +268,103 @@ fn load_settings() -> SettingsSnapshot {
         deepgram: config::deepgram_enabled(),
         local_idle_unload: config::local_idle_unload(),
         local_device: config::local_device(),
+        local_model: config::local_model(),
+        installed_tier: match crate::setup_consented::production_consented_status() {
+            ConsentedStatus::Installed { entry_id, .. } => {
+                crate::local_model::LocalTier::of_entry_id(&entry_id)
+            }
+            _ => None,
+        },
         update_check: config::switch(config::Switch::UpdateCheck),
         star_prompt,
         // Judged against today on every read, so a line closed 30 days ago
         // comes back without waiting for a dictation.
         star_line: crate::star_prompt::state_path()
             .is_some_and(|path| crate::star_prompt::line_shows(&path, star_prompt, &today())),
+    }
+}
+
+/// The switch `voisu local-model` runs. Without `agreed`, a tier that is not
+/// installed only asks; the TUI's `y` is the yes the CLI's prompt takes.
+fn set_local_model(model: config::LocalModel, agreed: bool) -> Reply {
+    use crate::local_model::{SilentProgress, runs_on_gpu};
+    use crate::setup_consented::{
+        LocalModelChange, LocalRemoveStatus, local_model_question, plan_local_model,
+        production_consented_status, production_install_with, production_restart_daemon,
+        production_sweep_replaced, run_local_model_switch,
+    };
+
+    let on_gpu = runs_on_gpu(config::local_device());
+    let installed = production_consented_status();
+    let downloads = match plan_local_model(model, on_gpu, &installed) {
+        LocalModelChange::Download { tier, device } if !agreed => {
+            return Reply::LocalModelConsent {
+                model,
+                tier,
+                text: local_model_question(tier, device),
+            };
+        }
+        LocalModelChange::Download { .. } => true,
+        _ => false,
+    };
+    let mut io = AgreedIo::default();
+    let status = run_local_model_switch(
+        &mut io,
+        true,
+        model,
+        on_gpu,
+        &installed,
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs()),
+        |model| config::set_local_model(model).map(|_| ()),
+        // Never the terminal progress bar: it would draw over the TUI.
+        |consent, device| production_install_with(consent, device, |_| Box::new(SilentProgress)),
+        production_restart_daemon,
+        production_sweep_replaced,
+    );
+    let (kind, text) = match status {
+        LocalRemoveStatus::Success => {
+            match io.lines.iter().find(|line| line.starts_with("Warning:")) {
+                Some(warning) => (Tone::Caution, warning.clone()),
+                // A download ends on the restart line; a switch to the installed
+                // tier says so first.
+                None => (
+                    Tone::Success,
+                    if downloads {
+                        io.lines.last()
+                    } else {
+                        io.lines.first()
+                    }
+                    .cloned()
+                    .unwrap_or_default(),
+                ),
+            }
+        }
+        LocalRemoveStatus::Usage(message) => (Tone::Failure, message.to_owned()),
+        LocalRemoveStatus::Failed(message) => (Tone::Failure, message),
+    };
+    Reply::LocalModelDone { kind, text }
+}
+
+/// The TUI's side of the CLI flow: it keeps what the flow says, and answers
+/// yes, which the user already gave at the TUI's own prompt.
+#[derive(Default)]
+struct AgreedIo {
+    lines: Vec<String>,
+}
+
+impl crate::setup::WizardIo for AgreedIo {
+    fn writeln(&mut self, line: &str) {
+        self.lines.push(line.to_owned());
+    }
+
+    fn prompt_line(&mut self, _prompt: &str) -> Option<String> {
+        Some("y".to_owned())
+    }
+
+    fn prompt_secret(&mut self, _prompt: &str) -> Option<String> {
+        None
     }
 }
 

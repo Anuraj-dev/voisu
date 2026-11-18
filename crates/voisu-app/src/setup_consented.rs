@@ -698,6 +698,22 @@ pub fn local_model_consent(tier: LocalTier, device: SetupDevice) -> Vec<String> 
     lines
 }
 
+/// The same consent as one line, for the TUI's yes/no prompt: the name and
+/// the size, and the warning for Accurate on the CPU.
+#[must_use]
+pub fn local_model_question(tier: LocalTier, device: SetupDevice) -> String {
+    let slower = if accurate_on_cpu_warning(tier.entry(), device).is_some() {
+        " Much slower on the CPU."
+    } else {
+        ""
+    };
+    format!(
+        "Download {}, {}?{slower} y/n",
+        tier.title(),
+        format_size(tier.entry().total_download_bytes)
+    )
+}
+
 /// `voisu local-model` with no argument: the setting, the tier it resolves
 /// to, and what runs instead when that tier is not installed.
 #[must_use]
@@ -1244,6 +1260,22 @@ mod tests {
         assert!(text.ends_with(ACCURATE_ON_CPU_WARNING), "{text}");
         assert_eq!(saved, [LocalModel::Accurate]);
         assert!(installs.is_empty());
+    }
+
+    #[test]
+    fn the_one_line_question_names_the_tier_and_its_size() {
+        assert_eq!(
+            local_model_question(LocalTier::Fast, SetupDevice::Cpu),
+            "Download Fast (small.en), 252.6 MiB? y/n"
+        );
+        assert_eq!(
+            local_model_question(LocalTier::Accurate, SetupDevice::Cpu),
+            "Download Accurate (distil-large-v3.5), 780.7 MiB? Much slower on the CPU. y/n"
+        );
+        assert_eq!(
+            local_model_question(LocalTier::Accurate, SetupDevice::Gpu),
+            "Download Accurate (distil-large-v3.5), 780.7 MiB? y/n"
+        );
     }
 
     #[test]
