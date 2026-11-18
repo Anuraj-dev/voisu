@@ -59,7 +59,7 @@ fn main() -> ExitCode {
         Ok(CliAction::Switch(switch, state)) => switch_command(switch, state),
         Ok(CliAction::LocalUnload(after)) => local_unload(after),
         Ok(CliAction::LocalDevice(device)) => local_device(device),
-        Ok(CliAction::LocalModel(setting)) => local_model(setting),
+        Ok(CliAction::LocalModel(setting)) => local_tier(setting),
         Ok(CliAction::Star) => star(),
         Ok(CliAction::SetAsrMode(mode)) => set_asr_mode(mode),
         Ok(CliAction::Delivery(mode)) => delivery(mode),
@@ -475,45 +475,13 @@ fn local_device(device: Option<voisu_app::config::LocalDevice>) -> ExitCode {
 
 /// Shows or switches the Local model tier. A tier that is not installed is
 /// downloaded only after a yes at its consent, never from a script.
-fn local_model(setting: Option<voisu_app::config::LocalModel>) -> ExitCode {
+fn local_tier(setting: Option<voisu_app::config::LocalModel>) -> ExitCode {
     use std::io::IsTerminal;
-    use voisu_app::local_model::runs_on_gpu;
-    use voisu_app::setup::StdioWizard;
-    use voisu_app::setup_consented::{
-        LocalRemoveStatus, local_model_status_lines, production_consented_status,
-        production_install, production_restart_daemon, production_sweep_replaced,
-        run_local_model_switch,
-    };
-
-    let on_gpu = runs_on_gpu(voisu_app::config::local_device());
-    let installed = production_consented_status();
-    let Some(setting) = setting else {
-        let setting = voisu_app::config::local_model();
-        for line in local_model_status_lines(setting, on_gpu, &installed) {
-            println!("{line}");
-        }
-        if let Some(unknown) = voisu_app::config::unknown_local_model() {
-            eprintln!(
-                "warning: config sets local_model = \"{unknown}\", which is not auto, accurate or fast; it runs as auto. Run `voisu local-model auto`, `accurate` or `fast` to fix it."
-            );
-        }
-        return ExitCode::SUCCESS;
-    };
-    let now_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(0);
-    match run_local_model_switch(
-        &mut StdioWizard,
+    use voisu_app::setup_consented::{LocalRemoveStatus, run_local_model_command};
+    match run_local_model_command(
+        &mut voisu_app::setup::StdioWizard,
         std::io::stdin().is_terminal(),
         setting,
-        on_gpu,
-        &installed,
-        now_unix,
-        |setting| voisu_app::config::set_local_model(setting).map(|_| ()),
-        production_install,
-        production_restart_daemon,
-        production_sweep_replaced,
     ) {
         LocalRemoveStatus::Success => ExitCode::SUCCESS,
         LocalRemoveStatus::Usage(message) => fail(2, message),

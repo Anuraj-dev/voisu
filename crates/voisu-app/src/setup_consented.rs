@@ -855,6 +855,45 @@ pub fn run_local_model_switch(
     LocalRemoveStatus::Success
 }
 
+/// `voisu local-model [auto|accurate|fast]`: with no setting it prints the
+/// setting and the tier it runs; with one it switches through
+/// [`run_local_model_switch`] against the real config, store and daemon.
+pub fn run_local_model_command(
+    io: &mut dyn WizardIo,
+    interactive: bool,
+    setting: Option<LocalModel>,
+) -> LocalRemoveStatus {
+    let on_gpu = crate::local_model::runs_on_gpu(crate::config::local_device());
+    let installed = production_consented_status();
+    let Some(setting) = setting else {
+        for line in local_model_status_lines(crate::config::local_model(), on_gpu, &installed) {
+            io.writeln(&line);
+        }
+        if let Some(unknown) = crate::config::unknown_local_model() {
+            eprintln!(
+                "warning: config sets local_model = \"{unknown}\", which is not auto, accurate or fast; it runs as auto. Run `voisu local-model auto`, `accurate` or `fast` to fix it."
+            );
+        }
+        return LocalRemoveStatus::Success;
+    };
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    run_local_model_switch(
+        io,
+        interactive,
+        setting,
+        on_gpu,
+        &installed,
+        now_unix,
+        |setting| crate::config::set_local_model(setting).map(|_| ()),
+        production_install,
+        production_restart_daemon,
+        production_sweep_replaced,
+    )
+}
+
 /// Deletes the model a tier switch replaced, best effort: a tree still in
 /// use is left for the next install or `voisu local remove`.
 pub fn production_sweep_replaced() {
