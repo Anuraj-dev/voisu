@@ -142,16 +142,27 @@ If the Trigger Key does not respond, run `voisu doctor`. It reports a portal wit
 
 `voisu setup` and the interface's setup show Cloud and Local on one screen. Cloud stays selected until you pick Local. Local is English only. Hinglish stays on Cloud.
 
-Local installs one model on every computer: `whisper-cpp-distil-large-v3.5-q8-0` (about 780 MB, MIT licence), run by whisper.cpp. Where it runs follows `voisu local-device` (*Settings → Local device*):
+Local installs one of two whisper.cpp models (MIT licence). See [Local model](#local-model) for how to choose. Where it runs follows `voisu local-device` (*Settings → Local device*):
 
 - **`auto` (default) or `gpu`:** on the GPU through Vulkan, NVIDIA, AMD or Intel. Setup checks the GPU before it downloads anything.
-- **`auto` with no usable GPU:** setup notes that it runs on the CPU, more slowly. Installing sets `voisu local-device cpu`.
+- **`auto` with no usable GPU:** setup notes that it runs on the CPU, more slowly, and offers the Fast model. Installing sets `voisu local-device cpu`.
 - **`gpu` with no usable GPU:** setup stops before the download and says how to choose the CPU. It never switches silently.
 - **`cpu`:** on the processor.
 
 Nothing downloads until you agree. The prompt shows the size and says when no GPU was found. This is development evidence, not a Bakeoff Winner. Installs of the earlier `distil-large-v3.5-int8` and `parakeet-tdt-0.6b-v3` models keep working; setup no longer offers them. Once installed, the model runs offline in a sandboxed worker. Local has no automatic GPU, CPU or Cloud fallback, and it fails closed until the model is Ready.
 
 Remove it with `voisu local remove`, or `voisu local remove --yes` without a terminal.
+
+### Local model
+
+Local has two models. Voisu shows them by name; `voisu doctor` adds the model id and its pinned checksum.
+
+- **Accurate:** distil-large-v3.5, about 780 MB. The most accurate, and recommended on a GPU. On the CPU it is much slower.
+- **Fast:** small.en, about 265 MB. Made for computers without a GPU, a little less accurate.
+
+`voisu local-model` shows the setting and the model it picks. In the interface it is **Local model** under Settings. `auto` (default) picks Accurate on a GPU and Fast on the CPU. `voisu local-model accurate` or `fast` picks one. `voisu status` and the interface's Home show the model in use, for example `Fast (small.en, CPU)`.
+
+One Local model is installed at a time. Choosing the installed one changes nothing else. Choosing the other shows its size and downloads it only after you agree. Without a terminal, `voisu local-model` never downloads. After the download Voisu restarts the daemon, removes the old model, and the new one runs your next Recording. Switching back downloads the first model again.
 
 ### Local unload
 
