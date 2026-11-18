@@ -1861,16 +1861,30 @@ fn download_resumable(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(&part_path)?;
-    if !file.metadata()?.is_file() {
+    let open_part = |create_new: bool| {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .create_new(create_new)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(&part_path)
+    };
+    let mut file = open_part(false)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
         return Err(not_a_file());
+    }
+    // Only a `.part` this user alone owns is resumed. A hard link to another
+    // file would be extended, or truncated on a restart, through this name.
+    // Unlinking drops only the name; a fresh `.part` takes its place.
+    // SAFETY: geteuid has no pointer arguments or preconditions.
+    if meta.nlink() != 1 || meta.uid() != unsafe { libc::geteuid() } {
+        drop(file);
+        fs::remove_file(&part_path)?;
+        file = open_part(true)?;
     }
     let discard = |file: &mut File| -> Result<(), ConsentedError> {
         file.set_len(0)?;
@@ -2818,6 +2832,25 @@ pub(crate) mod install_tests {
         let fetcher = ScriptedFetcher::new(vec![ScriptedHop::Body(DATA.to_vec()), clip()]);
         install_whisper_cpp(&store, &fetcher, InstallIo::default()).unwrap();
         assert!(!partial_dir(&store).exists());
+    }
+
+    #[test]
+    fn whisper_cpp_a_hard_linked_part_is_replaced_and_the_linked_file_kept() {
+        let (temp, store) = store();
+        // Resuming through the link would range-fetch, see the Range ignored,
+        // and truncate the linked file before writing the model into it.
+        let outside = temp.path().join("precious");
+        fs::write(&outside, b"precious bytes").unwrap();
+        super::super::ensure_private_dir(&partial_dir(&store)).unwrap();
+        fs::hard_link(&outside, part(&store)).unwrap();
+        let fetcher = ScriptedFetcher::new(vec![ScriptedHop::Body(DATA.to_vec()), clip()]);
+        install_whisper_cpp(&store, &fetcher, InstallIo::default()).unwrap();
+        assert_eq!(fs::read(&outside).unwrap(), b"precious bytes");
+        let verified = verify_with_entry(&store, &whisper_cpp_entry()).unwrap();
+        assert_eq!(
+            fs::read(verified.layout.weights.join("model.bin")).unwrap(),
+            DATA
+        );
     }
 
     #[test]
