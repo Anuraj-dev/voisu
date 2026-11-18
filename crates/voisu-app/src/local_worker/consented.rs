@@ -81,6 +81,8 @@ impl ConsentedHealth for ConsentedWorkerHealth {
 /// Loading the Vulkan driver takes well under a second; a hung driver must
 /// not hang the install.
 const GPU_PROBE_DEADLINE: Duration = Duration::from_secs(20);
+/// How long a killed probe, and the pipes of an exited one, may take to close.
+const GPU_PROBE_REAP_GRACE: Duration = Duration::from_secs(1);
 /// What a probe may print; the rest is drained unread.
 const GPU_PROBE_OUTPUT_BYTES: u64 = 16 * 1024;
 
@@ -136,15 +138,31 @@ fn probe_gpu(worker: &Path, deadline: Duration) -> Result<(), ConsentedError> {
         }
         if started.elapsed() >= deadline {
             let _ = child.kill();
-            let _ = child.wait();
+            // A child stuck in the kernel can outlive SIGKILL; it is reaped
+            // off this thread rather than block the install.
+            let killed = Instant::now() + GPU_PROBE_REAP_GRACE;
+            loop {
+                match child.try_wait() {
+                    Ok(None) if Instant::now() < killed => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Ok(None) => {
+                        std::thread::spawn(move || {
+                            let _ = child.wait();
+                        });
+                        break;
+                    }
+                    Ok(Some(_)) | Err(_) => break,
+                }
+            }
             break None;
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    let (stdout, stderr) = (
-        stdout.join().unwrap_or_default(),
-        stderr.join().unwrap_or_default(),
-    );
+    // Anything the probe started may still hold its pipes open; a drain that
+    // has not seen EOF by then is left running and its output dropped.
+    let drained = Instant::now() + GPU_PROBE_REAP_GRACE;
+    let (stdout, stderr) = (join_by(stdout, drained), join_by(stderr, drained));
     match status {
         Some(status) if status.success() && !stdout.is_empty() => Ok(()),
         Some(_) => {
@@ -157,6 +175,18 @@ fn probe_gpu(worker: &Path, deadline: Duration) -> Result<(), ConsentedError> {
             "gpu_unavailable: the GPU probe did not finish within {}s",
             deadline.as_secs()
         ))),
+    }
+}
+
+/// The drain's text if it finished by `by`; otherwise the thread is detached.
+fn join_by(drain: std::thread::JoinHandle<String>, by: Instant) -> String {
+    while !drain.is_finished() && Instant::now() < by {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if drain.is_finished() {
+        drain.join().unwrap_or_default()
+    } else {
+        String::new()
     }
 }
 
@@ -940,6 +970,18 @@ mod tests {
         let started = Instant::now();
         let ConsentedError::Health(reason) =
             probe_gpu(&hung, Duration::from_millis(200)).unwrap_err()
+        else {
+            panic!("a hung probe is a health failure");
+        };
+        assert!(reason.contains("did not finish"), "{reason}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        // A process the probe left behind keeps its pipes open after the
+        // probe is killed; the drains must not wait for it.
+        let orphan = script("orphan", "sleep 30 &\nexec sleep 30");
+        let started = Instant::now();
+        let ConsentedError::Health(reason) =
+            probe_gpu(&orphan, Duration::from_millis(200)).unwrap_err()
         else {
             panic!("a hung probe is a health failure");
         };
