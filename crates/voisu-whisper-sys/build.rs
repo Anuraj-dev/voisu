@@ -98,6 +98,11 @@ fn main() {
         .find(|dir| dir.file_name().is_some_and(|name| name == "build"))
         .and_then(Path::parent)
         .expect("cargo profile dir");
+    // Unit tests read this: their binaries no longer sit in the profile dir.
+    println!(
+        "cargo:rustc-env=VOISU_WHISPER_RUNTIME_DIR={}",
+        profile.display()
+    );
     for dest in [profile.to_path_buf(), profile.join("deps")] {
         fs::create_dir_all(&dest).expect("create runtime dir");
         for source in &runtime {

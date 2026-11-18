@@ -159,12 +159,10 @@ mod tests {
     }
 
     fn backend_dir() -> std::path::PathBuf {
-        // build.rs copies the backend modules next to every test binary.
-        std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_path_buf()
+        // build.rs copies the backend modules into the cargo profile dir. Test
+        // binaries sit elsewhere under cargo 1.100's build-dir layout, so it
+        // also tells them where that dir is.
+        std::path::PathBuf::from(env!("VOISU_WHISPER_RUNTIME_DIR"))
     }
 
     fn load_backends() -> usize {
