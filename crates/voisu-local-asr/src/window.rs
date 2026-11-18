@@ -159,6 +159,24 @@ mod tests {
         assert_eq!(plan_windows(&samples), Err(TooManyWindows));
     }
 
+    /// A tail under [`MIN_FINAL_WINDOW_SAMPLES`] folds into the window before
+    /// it, so that window can run past 30 s; whisper.cpp then decodes the
+    /// overflow as its own internal segment. Kept bit-faithful to the Python
+    /// worker on purpose: do not "fix" this without changing both.
+    #[test]
+    fn a_short_tail_folds_into_an_over_length_final_window() {
+        let total = WINDOW_SAMPLES + RATE / 2;
+        let samples = vec![100i16; total];
+        assert_eq!(
+            plan_windows(&samples).unwrap(),
+            vec![Window {
+                start: 0,
+                end: total,
+                cut: Cut::End
+            }]
+        );
+    }
+
     #[test]
     fn empty_recording_is_one_empty_window() {
         assert_eq!(

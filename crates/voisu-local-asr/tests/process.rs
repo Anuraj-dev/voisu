@@ -1,11 +1,13 @@
 //! The real `voisu-local-asr` binary over stdin/stdout.
 //!
 //! `whisper_cpp_transcribes_the_health_clip` needs a GGML model and a 16 kHz
-//! mono WAV of the JFK clip; it is skipped unless both env vars name files:
+//! mono WAV of the JFK clip, so it is `#[ignore]`d; run it with both env vars
+//! naming files (it fails, not skips, when they do not):
 //!
 //! ```text
 //! VOISU_WHISPER_TEST_MODEL=/path/ggml-tiny.en.bin \
-//! VOISU_WHISPER_TEST_WAV=/path/jfk.wav cargo test -p voisu-local-asr --test process
+//! VOISU_WHISPER_TEST_WAV=/path/jfk.wav \
+//!   cargo test -p voisu-local-asr --test process -- --ignored
 //! ```
 
 use std::io::{Read, Write};
@@ -203,13 +205,13 @@ fn fixture(name: &str) -> Option<PathBuf> {
 }
 
 #[test]
+#[ignore = "needs VOISU_WHISPER_TEST_MODEL and VOISU_WHISPER_TEST_WAV; run with --ignored"]
 fn whisper_cpp_transcribes_the_health_clip() {
     let (Some(model), Some(clip)) = (
         fixture("VOISU_WHISPER_TEST_MODEL"),
         fixture("VOISU_WHISPER_TEST_WAV"),
     ) else {
-        eprintln!("skipped: set VOISU_WHISPER_TEST_MODEL and VOISU_WHISPER_TEST_WAV");
-        return;
+        panic!("set VOISU_WHISPER_TEST_MODEL and VOISU_WHISPER_TEST_WAV to existing files");
     };
     let dir = TempDir::new("whisper");
     let manifest = manifest(&dir.0, &model, &clip);
