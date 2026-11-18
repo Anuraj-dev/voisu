@@ -25,7 +25,7 @@ pub const DEVELOPMENT_RUNTIME_REVISION_MAX_BYTES: usize = 256;
 
 /// IDs are fixed here so a malformed or unreviewed manifest cannot introduce
 /// an arbitrary executable model into the selector.
-pub const DEV_MODEL_IDS: [&str; 13] = [
+pub const DEV_MODEL_IDS: [&str; 14] = [
     "nemotron-3.5-0.6b",
     "parakeet-tdt-0.6b-v3",
     "qwen3-asr-0.6b",
@@ -39,6 +39,7 @@ pub const DEV_MODEL_IDS: [&str; 13] = [
     "whisper-hindi2hinglish-apex-int8",
     "distil-large-v3.5-int8",
     "granite-speech-5.0-470m-turboctc",
+    "whisper-cpp-distil-large-v3.5-q5-0",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,10 +57,23 @@ impl DevRuntimeKind {
     }
 }
 
+/// How the worker process starts, which decides whether a manifest names an
+/// interpreter. Distinct from [`DevRuntimeKind`]: most native runtimes are
+/// still driven by the Python `worker.py`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DevWorker {
+    /// `runtime.python -I runtime.worker`; `runtime.python` is required.
+    Python,
+    /// `runtime.worker` is an executable such as `voisu-local-asr`, launched
+    /// directly; `runtime.python` must be absent.
+    Executable,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DevCatalogEntry {
     pub model_id: &'static str,
     pub runtime: DevRuntimeKind,
+    pub worker: DevWorker,
     pub languages: &'static [&'static str],
     pub devices: &'static [&'static str],
     pub memory_bytes: u64,
@@ -80,6 +94,7 @@ static DEVELOPMENT_CATALOG: &[DevCatalogEntry] = &[
     DevCatalogEntry {
         model_id: "nemotron-3.5-0.6b",
         runtime: DevRuntimeKind::Native,
+        worker: DevWorker::Python,
         languages: EN_HI_AUTO,
         devices: CPU_CUDA,
         memory_bytes: 4 * 1024 * 1024 * 1024,
@@ -88,6 +103,7 @@ static DEVELOPMENT_CATALOG: &[DevCatalogEntry] = &[
     DevCatalogEntry {
         model_id: "parakeet-tdt-0.6b-v3",
         runtime: DevRuntimeKind::Native,
+        worker: DevWorker::Python,
         languages: EN,
         devices: CPU_CUDA,
         memory_bytes: 4 * 1024 * 1024 * 1024,
@@ -96,6 +112,7 @@ static DEVELOPMENT_CATALOG: &[DevCatalogEntry] = &[
     DevCatalogEntry {
         model_id: "qwen3-asr-0.6b",
         runtime: DevRuntimeKind::Python,
+        worker: DevWorker::Python,
         languages: EN_HI_AUTO,
         devices: CPU_CUDA,
         memory_bytes: 4 * 1024 * 1024 * 1024,
@@ -104,6 +121,7 @@ static DEVELOPMENT_CATALOG: &[DevCatalogEntry] = &[
     DevCatalogEntry {
         model_id: "qwen3-asr-1.7b",
         runtime: DevRuntimeKind::Python,
+        worker: DevWorker::Python,
         languages: EN_HI_AUTO,
         devices: CPU_CUDA,
         memory_bytes: 8 * 1024 * 1024 * 1024,
@@ -112,6 +130,7 @@ static DEVELOPMENT_CATALOG: &[DevCatalogEntry] = &[
     DevCatalogEntry {
         model_id: "fun-asr-nano-2512",
         runtime: DevRuntimeKind::Native,
+        worker: DevWorker::Python,
         languages: EN,
         devices: CPU_CUDA,
         memory_bytes: 6 * 1024 * 1024 * 1024,
@@ -120,6 +139,7 @@ static DEVELOPMENT_CATALOG: &[DevCatalogEntry] = &[
     DevCatalogEntry {
         model_id: "moonshine-streaming-medium",
         runtime: DevRuntimeKind::Python,
+        worker: DevWorker::Python,
         languages: EN,
         devices: CPU_ONLY,
         memory_bytes: 2 * 1024 * 1024 * 1024,
@@ -128,6 +148,7 @@ static DEVELOPMENT_CATALOG: &[DevCatalogEntry] = &[
     DevCatalogEntry {
         model_id: "cohere-transcribe-03-2026",
         runtime: DevRuntimeKind::Python,
+        worker: DevWorker::Python,
         languages: EN,
         devices: CPU_CUDA,
         memory_bytes: 8 * 1024 * 1024 * 1024,
@@ -136,6 +157,7 @@ static DEVELOPMENT_CATALOG: &[DevCatalogEntry] = &[
     DevCatalogEntry {
         model_id: "whisper-cpp-large-v3-turbo-q5-0",
         runtime: DevRuntimeKind::Native,
+        worker: DevWorker::Python,
         languages: EN_AUTO,
         devices: CPU_CUDA,
         memory_bytes: 2048 * 1024 * 1024,
@@ -144,6 +166,7 @@ static DEVELOPMENT_CATALOG: &[DevCatalogEntry] = &[
     DevCatalogEntry {
         model_id: "whisper-cpp-small-q8-0",
         runtime: DevRuntimeKind::Native,
+        worker: DevWorker::Python,
         languages: EN_AUTO,
         devices: CPU_CUDA,
         memory_bytes: 2048 * 1024 * 1024,
@@ -152,6 +175,7 @@ static DEVELOPMENT_CATALOG: &[DevCatalogEntry] = &[
     DevCatalogEntry {
         model_id: "faster-whisper-large-v3-turbo-int8",
         runtime: DevRuntimeKind::Native,
+        worker: DevWorker::Python,
         languages: EN_AUTO,
         devices: CPU_CUDA,
         memory_bytes: 3072 * 1024 * 1024,
@@ -160,6 +184,7 @@ static DEVELOPMENT_CATALOG: &[DevCatalogEntry] = &[
     DevCatalogEntry {
         model_id: "whisper-hindi2hinglish-apex-int8",
         runtime: DevRuntimeKind::Native,
+        worker: DevWorker::Python,
         languages: EN_HINGLISH,
         devices: CPU_CUDA,
         memory_bytes: 3072 * 1024 * 1024,
@@ -168,6 +193,7 @@ static DEVELOPMENT_CATALOG: &[DevCatalogEntry] = &[
     DevCatalogEntry {
         model_id: "distil-large-v3.5-int8",
         runtime: DevRuntimeKind::Native,
+        worker: DevWorker::Python,
         languages: EN,
         devices: CPU_CUDA,
         memory_bytes: 3072 * 1024 * 1024,
@@ -176,10 +202,22 @@ static DEVELOPMENT_CATALOG: &[DevCatalogEntry] = &[
     DevCatalogEntry {
         model_id: "granite-speech-5.0-470m-turboctc",
         runtime: DevRuntimeKind::Python,
+        worker: DevWorker::Python,
         languages: EN,
         devices: CPU_CUDA,
         memory_bytes: 4096 * 1024 * 1024,
         vram_bytes: 1792 * 1024 * 1024,
+    },
+    // The in-repo `voisu-local-asr` worker (whisper.cpp) on the q5_0 quant;
+    // CPU only until its GPU backends land.
+    DevCatalogEntry {
+        model_id: "whisper-cpp-distil-large-v3.5-q5-0",
+        runtime: DevRuntimeKind::Native,
+        worker: DevWorker::Executable,
+        languages: EN,
+        devices: CPU_ONLY,
+        memory_bytes: 2048 * 1024 * 1024,
+        vram_bytes: 0,
     },
 ];
 
@@ -509,7 +547,10 @@ pub fn development_receipt(manifest: &DevManifest, manifest_hash: &str) -> Activ
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DevRuntimeManifest {
-    pub python: String,
+    /// The interpreter that runs `worker`. Absent for a native worker
+    /// executable such as `voisu-local-asr`, which is launched directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub python: Option<String>,
     pub worker: String,
     pub revision: String,
 }
@@ -634,6 +675,21 @@ impl DevManifest {
                 self.model_id
             )));
         };
+        match (catalog.worker, &self.runtime.python) {
+            (DevWorker::Python, None) => {
+                return Err(DevelopmentError::Invalid(format!(
+                    "{} runs a Python worker; runtime.python is required",
+                    self.model_id
+                )));
+            }
+            (DevWorker::Executable, Some(_)) => {
+                return Err(DevelopmentError::Invalid(format!(
+                    "{} runs a native worker executable; runtime.python must be absent",
+                    self.model_id
+                )));
+            }
+            _ => {}
+        }
         if !catalog.devices.contains(&self.device.as_str()) {
             return Err(DevelopmentError::Invalid(format!(
                 "{} does not support {}",
@@ -671,7 +727,7 @@ impl DevManifest {
                 "cuda manifests must set a vram_bytes limit".into(),
             ));
         }
-        if self.runtime.python.is_empty()
+        if self.runtime.python.as_ref().is_some_and(String::is_empty)
             || self.runtime.worker.is_empty()
             || self.runtime.revision.is_empty()
             || self.runtime.revision.len() > DEVELOPMENT_RUNTIME_REVISION_MAX_BYTES
@@ -680,11 +736,15 @@ impl DevManifest {
                 "runtime identity is incomplete".into(),
             ));
         }
-        for (label, path) in [
-            ("runtime.python", self.runtime.python.as_str()),
+        let python = self
+            .runtime
+            .python
+            .as_deref()
+            .map(|path| ("runtime.python", path));
+        for (label, path) in python.into_iter().chain([
             ("runtime.worker", self.runtime.worker.as_str()),
             ("model_path", self.model_path.as_str()),
-        ] {
+        ]) {
             let path = Path::new(path);
             if !path.is_absolute() || path.to_string_lossy().contains('\0') {
                 return Err(DevelopmentError::Invalid(format!(
@@ -722,7 +782,7 @@ impl DevManifest {
                 )));
             }
         }
-        for path in [&self.runtime.python, &self.runtime.worker] {
+        for path in self.runtime.python.iter().chain([&self.runtime.worker]) {
             if !paths.contains_key(path) {
                 return Err(DevelopmentError::Invalid(format!(
                     "runtime path is not pinned: {path}"
@@ -1488,18 +1548,24 @@ mod tests {
             sha256: sha256_hex(&fs::read(path).unwrap()),
             bytes: fs::metadata(path).unwrap().len(),
         };
+        let executable = development_catalog_entry(model_id)
+            .is_some_and(|entry| entry.worker == DevWorker::Executable);
+        let mut files = vec![pin(&python), pin(&worker), pin(&model)];
+        if executable {
+            files.remove(0);
+        }
         DevManifest {
             version: 1,
             model_id: model_id.into(),
             device: "cpu".into(),
             language: "en".into(),
             runtime: DevRuntimeManifest {
-                python: python.to_string_lossy().into_owned(),
+                python: (!executable).then(|| python.to_string_lossy().into_owned()),
                 worker: worker.to_string_lossy().into_owned(),
                 revision: "test-runtime".into(),
             },
             model_path: model.to_string_lossy().into_owned(),
-            files: vec![pin(&python), pin(&worker), pin(&model)],
+            files,
             options: serde_json::Map::new(),
             limits: DevLimits {
                 memory_bytes: 1024,
@@ -1508,6 +1574,62 @@ mod tests {
                 cache_bytes: 1024,
                 vram_bytes: 0,
             },
+        }
+    }
+
+    #[test]
+    fn a_native_worker_manifest_has_no_python_and_still_pins_the_worker() {
+        let dir = TempDir::new().unwrap();
+        let value = manifest(dir.path(), "whisper-cpp-distil-large-v3.5-q5-0");
+        assert_eq!(value.runtime.python, None);
+        assert!(value.validate().is_ok(), "{:?}", value.validate());
+        let json = value.to_json().unwrap();
+        assert!(!json.contains("python"), "{json}");
+        assert_eq!(DevManifest::from_json(&json).unwrap(), value);
+
+        let mut unpinned = value.clone();
+        unpinned
+            .files
+            .retain(|pin| pin.path != unpinned.runtime.worker);
+        assert!(unpinned.validate().is_err());
+        // Even a pinned absolute interpreter is refused: this entry is an executable.
+        let python = dir.path().join("python");
+        let mut interpreted = value.clone();
+        interpreted.runtime.python = Some(python.to_string_lossy().into_owned());
+        interpreted.files.push(DevFilePin {
+            path: python.to_string_lossy().into_owned(),
+            sha256: sha256_hex(b"python"),
+            bytes: 6,
+        });
+        let error = interpreted.validate().unwrap_err();
+        assert!(
+            error.to_string().contains("runtime.python must be absent"),
+            "{error}"
+        );
+        let mut gpu = value;
+        gpu.device = "cuda:0".into();
+        gpu.limits.vram_bytes = 1;
+        assert!(
+            gpu.validate().is_err(),
+            "the whisper.cpp worker is CPU only for now"
+        );
+    }
+
+    #[test]
+    fn a_python_worker_manifest_must_name_its_interpreter() {
+        let dir = TempDir::new().unwrap();
+        for entry in development_catalog()
+            .iter()
+            .filter(|entry| entry.worker == DevWorker::Python)
+        {
+            let mut value = manifest(dir.path(), entry.model_id);
+            value.runtime.python = None;
+            let error = value.validate().unwrap_err();
+            assert!(
+                error.to_string().contains("runtime.python is required"),
+                "{}: {error}",
+                entry.model_id
+            );
         }
     }
 

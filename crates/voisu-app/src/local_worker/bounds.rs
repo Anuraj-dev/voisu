@@ -5,27 +5,19 @@
 
 use std::time::Duration;
 
-/// Signed 16-bit little-endian, mono, 16 kHz.
-pub const PCM_SAMPLE_RATE_HZ: u32 = 16_000;
+// Wire numbers the native worker shares live in `voisu_core::local_wire`.
+pub use voisu_core::local_wire::{
+    MAX_JSON_FRAME_BYTES, MAX_PCM_BYTES, MAX_TRANSCRIPT_BYTES, PCM_SAMPLE_RATE_HZ,
+};
+
 pub const PCM_CHANNELS: u16 = 1;
 pub const PCM_BITS: u16 = 16;
-/// 600 seconds × 16_000 Hz × 2 bytes.
-pub const MAX_PCM_BYTES: usize = 19_200_000;
+/// [`MAX_PCM_BYTES`] of PCM.
 pub const MAX_RECORDING: Duration = Duration::from_secs(600);
 
-/// 4-byte length prefix; at most 64 KiB JSON per control frame.
-pub const MAX_JSON_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_JSON_DEPTH: usize = 8;
 pub const MAX_JSON_FIELDS: usize = 64;
 pub const MAX_METADATA_BYTES: usize = 16 * 1024;
-
-/// Cap on the optional `initial_prompt` a Transcribe request carries. The
-/// Dictionary builder stays far below it (about 224 bytes); this only bounds
-/// what a frame may claim.
-pub const MAX_PROMPT_BYTES: usize = 1024;
-
-/// UTF-8 Transcript cap. Empty/silence is an explicit no-text outcome.
-pub const MAX_TRANSCRIPT_BYTES: usize = 24 * 1024;
 
 /// Native stderr drain cap; at most 4 KiB allowlisted structured error metadata.
 pub const MAX_RETAINED_STDERR_BYTES: usize = 4 * 1024;

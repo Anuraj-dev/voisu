@@ -1,0 +1,194 @@
+{
+ "cases": [
+  {
+   "prompt": "Voisu, Tokio, wayfinder",
+   "text": "Voisu, Tokio, wayfinder",
+   "echo": true
+  },
+  {
+   "prompt": "Voisu, Tokio, wayfinder",
+   "text": "Voisu, Tokio, wayfinder.",
+   "echo": true
+  },
+  {
+   "prompt": "Voisu, Tokio, wayfinder",
+   "text": "voisu tokio wayfinder",
+   "echo": true
+  },
+  {
+   "prompt": "Voisu, Tokio, wayfinder",
+   "text": "VOISU,  tokio ,wayfinder .",
+   "echo": true
+  },
+  {
+   "prompt": "Voisu, Tokio, wayfinder",
+   "text": "Voisu",
+   "echo": false
+  },
+  {
+   "prompt": "Voisu, Tokio, wayfinder",
+   "text": "Voisu is great",
+   "echo": false
+  },
+  {
+   "prompt": "Voisu, Tokio, wayfinder",
+   "text": "Voisu, Tokio and more",
+   "echo": false
+  },
+  {
+   "prompt": "Voisu, Tokio, wayfinder",
+   "text": "Voisu, Tokio, and Rust",
+   "echo": false
+  },
+  {
+   "prompt": "Voisu, Tokio, wayfinder",
+   "text": "Voisu, Tokio",
+   "echo": false
+  },
+  {
+   "prompt": "Voisu, Tokio, wayfinder",
+   "text": "voisu tokio",
+   "echo": false
+  },
+  {
+   "prompt": "Voisu, Tokio, wayfinder",
+   "text": "wayfinder, Tokio, Voisu.",
+   "echo": false
+  },
+  {
+   "prompt": "Voisu, Tokio, wayfinder",
+   "text": "Voisu Voisu",
+   "echo": false
+  },
+  {
+   "prompt": "Voisu, Tokio, wayfinder",
+   "text": "Voisu Voisu Voisu",
+   "echo": false
+  },
+  {
+   "prompt": "Voisu, Tokio, wayfinder",
+   "text": "Voisu, wayfinder, Tokio.",
+   "echo": false
+  },
+  {
+   "prompt": "Voisu, Tokio, wayfinder",
+   "text": "I use Voisu, Tokio, wayfinder every day.",
+   "echo": false
+  },
+  {
+   "prompt": "Voisu, Tokio, wayfinder",
+   "text": "real words",
+   "echo": false
+  },
+  {
+   "prompt": "Voisu, Tokio, wayfinder",
+   "text": "",
+   "echo": false
+  },
+  {
+   "prompt": "Glossary: Voisu, Tokio, wayfinder, Rust.",
+   "text": "Voisu, Tokio, wayfinder",
+   "echo": true
+  },
+  {
+   "prompt": "Glossary: Voisu, Tokio, wayfinder, Rust.",
+   "text": "Tokio, wayfinder, Rust.",
+   "echo": true
+  },
+  {
+   "prompt": "Glossary: Voisu, Tokio, wayfinder, Rust.",
+   "text": "Glossary: Voisu, Tokio, wayfinder, Rust.",
+   "echo": true
+  },
+  {
+   "prompt": "Glossary: Voisu, Tokio, wayfinder, Rust.",
+   "text": "glossary voisu tokio wayfinder",
+   "echo": true
+  },
+  {
+   "prompt": "Glossary: Voisu, Tokio, wayfinder, Rust.",
+   "text": "Glossary Voisu Tokio",
+   "echo": false
+  },
+  {
+   "prompt": "Glossary: Voisu, Tokio, wayfinder.",
+   "text": "Voisu",
+   "echo": false
+  },
+  {
+   "prompt": "Glossary: Voisu, Tokio, wayfinder.",
+   "text": "Glossary: Voisu",
+   "echo": false
+  },
+  {
+   "prompt": "Glossary: Voisu, Tokio, wayfinder.",
+   "text": "the glossary has Voisu, Tokio",
+   "echo": false
+  },
+  {
+   "prompt": "Glossary: Voisu, Tokio, wayfinder.",
+   "text": "Voisu, Tokio and more",
+   "echo": false
+  },
+  {
+   "prompt": "Glossary: Voisu, Tokio, wayfinder.",
+   "text": "Voisu, Tokio, wayfinder.",
+   "echo": true
+  },
+  {
+   "prompt": "Glossary: Claude, Claude Code, Codex, OpenAI, Anthropic, GPT, LLM, Groq, Deepgram, Whisper, systemctl.",
+   "text": "OpenAI, Anthropic.",
+   "echo": false
+  },
+  {
+   "prompt": "Glossary: Claude, Claude Code, Codex, OpenAI, Anthropic, GPT, LLM, Groq, Deepgram, Whisper, systemctl.",
+   "text": "GPT LLM",
+   "echo": false
+  },
+  {
+   "prompt": "Glossary: Claude, Claude Code, Codex, OpenAI, Anthropic, GPT, LLM, Groq, Deepgram, Whisper, systemctl.",
+   "text": "Whisper Deepgram",
+   "echo": false
+  },
+  {
+   "prompt": "Glossary: Claude, Claude Code, Codex, OpenAI, Anthropic, GPT, LLM, Groq, Deepgram, Whisper, systemctl.",
+   "text": "Claude Code, Codex.",
+   "echo": false
+  },
+  {
+   "prompt": "Glossary: Claude, Claude Code, Codex, OpenAI, Anthropic, GPT, LLM, Groq, Deepgram, Whisper, systemctl.",
+   "text": "Claude, Claude Code, Codex, OpenAI.",
+   "echo": true
+  },
+  {
+   "prompt": "Glossary: Claude, Claude Code, Codex, OpenAI, Anthropic, GPT, LLM, Groq, Deepgram, Whisper, systemctl.",
+   "text": "Glossary: Claude, Claude Code, Codex.",
+   "echo": true
+  },
+  {
+   "prompt": "Glossary: Claude, Claude Code, Codex, OpenAI, Anthropic, GPT, LLM, Groq, Deepgram, Whisper, systemctl.",
+   "text": "Claude Code, Codex, OpenAI",
+   "echo": true
+  },
+  {
+   "prompt": "Glossary: Claude, Claude Code, Codex, OpenAI, Anthropic, GPT, LLM, Groq, Deepgram, Whisper, systemctl.",
+   "text": "We asked Claude, Claude Code, Codex, OpenAI about it.",
+   "echo": false
+  },
+  {
+   "prompt": "Voisu, Tokio",
+   "text": "Voisu, Tokio",
+   "echo": false
+  },
+  {
+   "prompt": "a.b, c+d, e(f)",
+   "text": "a.b c+d e(f)",
+   "echo": true
+  },
+  {
+   "prompt": "a.b, c+d, e(f)",
+   "text": "axb c+d e(f)",
+   "echo": false
+  }
+ ]
+}

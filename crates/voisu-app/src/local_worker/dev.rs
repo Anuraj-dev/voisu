@@ -890,11 +890,11 @@ fn isolated_systemd_run_args(
     gpu_lock: Option<&Path>,
     lease_path: Option<&Path>,
 ) -> Result<Vec<String>, SupervisorError> {
-    for path in [
-        Path::new(&manifest.runtime.python),
-        Path::new(&manifest.runtime.worker),
-        manifest_path,
-    ] {
+    let python = manifest.runtime.python.as_deref().map(Path::new);
+    for path in python
+        .into_iter()
+        .chain([Path::new(&manifest.runtime.worker), manifest_path])
+    {
         literal_path(path)?;
     }
     // --quiet drops systemd-run's own "Running as unit", "Finished with
@@ -965,9 +965,12 @@ fn isolated_systemd_run_args(
         gpu_lock.ok_or(SupervisorError::LoadAborted)?,
         lease_path,
     )?);
+    // A Python worker runs isolated under its pinned interpreter; a native
+    // worker executable is launched directly under the same sandbox.
+    if let Some(python) = &manifest.runtime.python {
+        args.extend([python.clone(), "-I".into()]);
+    }
     args.extend([
-        manifest.runtime.python.clone(),
-        "-I".into(),
         manifest.runtime.worker.clone(),
         "--manifest".into(),
         manifest_path.to_string_lossy().into_owned(),
@@ -1133,7 +1136,7 @@ mod tests {
         for bad in ["", "   ", "a\nb", "a\u{0}b"] {
             assert_eq!(transcribe_request("q", 4, Some(bad)), bare, "{bad:?}");
         }
-        let long = "x".repeat(super::super::bounds::MAX_PROMPT_BYTES + 1);
+        let long = "x".repeat(voisu_core::local_wire::MAX_PROMPT_BYTES + 1);
         assert_eq!(transcribe_request("q", 4, Some(&long)), bare);
     }
 
@@ -1384,7 +1387,7 @@ mod tests {
     #[test]
     fn consented_transient_unit_preserves_the_offline_sandbox() {
         let mut manifest = test_manifest("cuda:0");
-        manifest.runtime.python = "/state/install/runtime/venv/bin/python".into();
+        manifest.runtime.python = Some("/state/install/runtime/venv/bin/python".into());
         manifest.runtime.worker = "/state/install/worker/worker.py".into();
         assert_eq!(
             isolated_systemd_run_args(
@@ -1450,6 +1453,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_native_worker_is_launched_directly_inside_the_same_sandbox() {
+        let python = test_manifest("cpu");
+        let mut native = python.clone();
+        native.runtime.python = None;
+        native.runtime.worker = "/opt/voisu/voisu-local-asr".into();
+        let run = |manifest: &DevManifest| {
+            systemd_run_args(
+                "voisu-dev-worker-1-1",
+                Path::new("/state/cache"),
+                manifest,
+                Path::new("/state/manifest.json"),
+            )
+        };
+        let (python, native) = (run(&python), run(&native));
+        let command = |args: &[String]| args.iter().position(|arg| arg == "--").unwrap();
+        assert_eq!(native[..command(&native)], python[..command(&python)]);
+        assert_eq!(
+            native[native.len() - 3..],
+            [
+                "/opt/voisu/voisu-local-asr",
+                "--manifest",
+                "/state/manifest.json"
+            ]
+        );
+        assert!(python.iter().any(|arg| arg == "-I"));
+        assert!(!native.iter().any(|arg| arg == "-I" || arg == "/bin/true"));
+    }
+
     fn test_manifest(device: &str) -> DevManifest {
         let vram_bytes = if device == "cpu" { 0 } else { 1 };
         DevManifest {
@@ -1458,7 +1490,7 @@ mod tests {
             device: device.into(),
             language: "en".into(),
             runtime: DevRuntimeManifest {
-                python: "/bin/true".into(),
+                python: Some("/bin/true".into()),
                 worker: "/tmp/worker.py".into(),
                 revision: "test".into(),
             },
