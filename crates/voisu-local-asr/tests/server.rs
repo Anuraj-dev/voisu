@@ -1,7 +1,7 @@
 //! Protocol behavior of the server loop, driven with a scripted engine.
 
 use std::io::{self, Read};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -21,6 +21,8 @@ const HEALTH: &str = "And so my fellow Americans";
 struct Input {
     chunks: Receiver<Vec<u8>>,
     pending: Vec<u8>,
+    /// Bytes the server has read so far.
+    consumed: Arc<AtomicUsize>,
 }
 
 impl Read for Input {
@@ -34,6 +36,7 @@ impl Read for Input {
         let n = buf.len().min(self.pending.len());
         buf[..n].copy_from_slice(&self.pending[..n]);
         self.pending.drain(..n);
+        self.consumed.fetch_add(n, Ordering::SeqCst);
         Ok(n)
     }
 }
@@ -50,6 +53,8 @@ enum Step {
     Fail,
     /// Block until the request is cancelled, then report the abort.
     WaitForAbort,
+    /// Block until the test releases the window, then return "held".
+    Hold(Receiver<()>),
 }
 
 struct Scripted {
@@ -88,6 +93,10 @@ impl Engine for Scripted {
                 }
                 Err(EngineError::new("inference_failed", "aborted"))
             }
+            Step::Hold(release) => {
+                release.recv_timeout(Duration::from_secs(10)).unwrap();
+                Ok("held".into())
+            }
         }
     }
 }
@@ -98,6 +107,7 @@ struct Harness {
     worker: Option<JoinHandle<Exit>>,
     calls: Arc<Mutex<Vec<Call>>>,
     started: Receiver<()>,
+    consumed: Arc<AtomicUsize>,
 }
 
 /// Collects reply frames as the server writes them.
@@ -147,6 +157,8 @@ impl Harness {
             health_expected: HEALTH.into(),
         };
         let engine_calls = Arc::clone(&calls);
+        let consumed = Arc::new(AtomicUsize::new(0));
+        let input_consumed = Arc::clone(&consumed);
         let worker = std::thread::spawn(move || {
             let load = move || {
                 Ok(Scripted {
@@ -158,6 +170,7 @@ impl Harness {
             let input = Input {
                 chunks: input_rx,
                 pending: Vec::new(),
+                consumed: input_consumed,
             };
             let mut output = Output {
                 buffer: Vec::new(),
@@ -171,7 +184,12 @@ impl Harness {
             worker: Some(worker),
             calls,
             started,
+            consumed,
         }
+    }
+
+    fn consumed(&self) -> usize {
+        self.consumed.load(Ordering::SeqCst)
     }
 
     fn send(&self, frame: &Value) {
@@ -439,4 +457,70 @@ fn end_of_input_cancels_a_window_mid_decode() {
     assert_eq!(exit, Exit::EndOfInput);
     assert_eq!(replies.len(), 1, "{replies:?}");
     assert_eq!(replies[0]["code"], "cancelled");
+}
+
+#[test]
+fn a_refused_shutdown_does_not_cancel_later_requests() {
+    let harness = Harness::start(vec![Step::Text(HEALTH), Step::Text("still here")]);
+    harness.prepare();
+    harness.send(&json!({ "v": 2, "op": "shutdown", "id": "s1" }));
+    assert_eq!(harness.reply()["code"], "unsupported_version");
+    harness.send(&json!({ "v": 1, "op": "shutdown", "id": "s2", "now": true }));
+    assert_eq!(harness.reply()["code"], "invalid_request");
+    harness.send(&json!({ "v": 1, "op": "shutdown", "id": "p" }));
+    assert_eq!(harness.reply()["code"], "duplicate_id");
+    harness.send(&json!({ "v": 1, "op": "shutdown", "id": "" }));
+    assert_eq!(harness.reply()["code"], "invalid_id");
+    harness.transcribe("t", &speech(2), None);
+    let reply = harness.reply();
+    assert_eq!(reply["status"], "transcript", "{reply}");
+    assert_eq!(reply["text"], "still here");
+    harness.send(&json!({ "v": 1, "op": "shutdown", "id": "s3" }));
+    assert_eq!(harness.reply()["status"], "shutdown");
+}
+
+#[test]
+fn the_reader_holds_at_most_one_request_ahead_of_the_session() {
+    let (release, hold) = mpsc::channel();
+    let harness = Harness::start(vec![
+        Step::Text(HEALTH),
+        Step::Hold(hold),
+        Step::Text("second"),
+        Step::Text("third"),
+    ]);
+    harness.prepare();
+    harness.started.recv().unwrap();
+    harness.transcribe("a", &speech(1), None);
+    harness
+        .started
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    let before = harness.consumed();
+    let mut second = Vec::new();
+    wire::write_frame(
+        &mut second,
+        &json!({ "v": 1, "op": "transcribe", "id": "b", "pcm_bytes": 32_000 }),
+    )
+    .unwrap();
+    let held_ahead = before + second.len() + 32_000;
+    harness.transcribe("b", &speech(1), None);
+    harness.transcribe("c", &speech(1), None);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while harness.consumed() < held_ahead {
+        assert!(Instant::now() < deadline, "request b was never read");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // Give an unbounded reader time to run ahead; this one must not.
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        harness.consumed(),
+        held_ahead,
+        "request c was read while a was still decoding"
+    );
+    release.send(()).unwrap();
+    for (id, text) in [("a", "held"), ("b", "second"), ("c", "third")] {
+        let reply = harness.reply();
+        assert_eq!(reply["id"], id, "{reply}");
+        assert_eq!(reply["text"], text, "{reply}");
+    }
 }

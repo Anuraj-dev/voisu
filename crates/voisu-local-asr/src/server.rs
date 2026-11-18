@@ -16,9 +16,8 @@
 
 use std::collections::HashSet;
 use std::io::{Read, Write};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::sync::{Arc, LazyLock, mpsc};
 use std::time::Instant;
 
 use regex::Regex;
@@ -65,19 +64,28 @@ enum Inbound {
     EndOfInput,
 }
 
-fn is_well_formed_shutdown(frame: &Value) -> bool {
-    frame.get("op").and_then(Value::as_str) == Some("shutdown")
-        && frame.as_object().is_some_and(|object| {
-            object.len() == 3
-                && ["v", "op", "id"]
-                    .iter()
-                    .all(|key| object.contains_key(*key))
-        })
+/// Whether the session will answer this frame with Shutdown: the same checks
+/// as [`Session::handle`] and the duplicate-id check in [`serve`], so a
+/// refused Shutdown never cancels anything. `seen` mirrors `serve`'s ids.
+fn is_honored_shutdown(frame: &Value, seen: &mut HashSet<String>) -> bool {
+    let Some(id) = wire::request_id(frame) else {
+        return false;
+    };
+    let fresh = seen.insert(id.to_owned());
+    fresh
+        && frame.get("v").and_then(Value::as_u64) == Some(u64::from(PROTOCOL_VERSION))
+        && frame.get("op").and_then(Value::as_str) == Some("shutdown")
+        && frame.as_object().map(Map::len) == Some(3)
 }
 
 /// Reads frames (and each Transcribe's PCM, before anything else is judged,
 /// so a refused request never leaves audio in the stream) until input ends.
-fn read_requests(mut input: impl Read, sender: mpsc::Sender<Inbound>, abort: Arc<AtomicBool>) {
+///
+/// `sender` is a rendezvous channel: while the session works on one request
+/// this thread holds at most the next one, so pipelined Transcribes cannot
+/// pile up PCM in memory. Abort is set before the hand-off blocks.
+fn read_requests(mut input: impl Read, sender: mpsc::SyncSender<Inbound>, abort: Arc<AtomicBool>) {
+    let mut seen = HashSet::new();
     loop {
         let inbound = match wire::read_frame(&mut input) {
             Ok(None) => Inbound::EndOfInput,
@@ -88,15 +96,20 @@ fn read_requests(mut input: impl Read, sender: mpsc::Sender<Inbound>, abort: Arc
             Ok(Some(frame)) if frame.get("op").and_then(Value::as_str) == Some("transcribe") => {
                 let id = wire::request_id(&frame).unwrap_or_default().to_owned();
                 match wire::pcm_len(&frame).and_then(|size| wire::read_pcm(&mut input, size)) {
-                    Ok(pcm) => Inbound::Request {
-                        frame,
-                        pcm: Some(pcm),
-                    },
+                    Ok(pcm) => {
+                        if !id.is_empty() {
+                            seen.insert(id);
+                        }
+                        Inbound::Request {
+                            frame,
+                            pcm: Some(pcm),
+                        }
+                    }
                     Err(error) => Inbound::Broken { id, error },
                 }
             }
             Ok(Some(frame)) => {
-                if is_well_formed_shutdown(&frame) {
+                if is_honored_shutdown(&frame, &mut seen) {
                     abort.store(true, Ordering::Relaxed);
                 }
                 Inbound::Request { frame, pcm: None }
@@ -357,7 +370,7 @@ where
     W: Write,
 {
     let abort = Arc::new(AtomicBool::new(false));
-    let (sender, receiver) = mpsc::channel();
+    let (sender, receiver) = mpsc::sync_channel(0);
     let reader_abort = Arc::clone(&abort);
     std::thread::Builder::new()
         .name("voisu-local-asr-stdin".into())
@@ -409,9 +422,10 @@ where
 /// punctuation (`normalize_tokens` in `voisu_asr/audio.py`).
 #[must_use]
 pub fn health_phrase_matches(actual: &str, expected: &str) -> bool {
-    let token = Regex::new(r"[^\W_]+(?:['’][^\W_]+)?").expect("static pattern");
+    static TOKEN: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"[^\W_]+(?:['’][^\W_]+)?").expect("static pattern"));
     let tokens = |text: &str| -> Vec<String> {
-        token
+        TOKEN
             .find_iter(text)
             .map(|found| found.as_str().to_lowercase())
             .collect()
