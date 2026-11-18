@@ -104,7 +104,7 @@ fn write_engine_screen(
     io.writeln(&availability_line(&suggestion, consented));
     // The binary passes `manifest_exists` only under the developer Local pilot
     // flag, so production output never shows this line.
-    let model_id = suggested_model_id(&suggestion);
+    let model_id = suggestion.model_id;
     if manifest_exists(model_id) {
         io.writeln(&format!(
             "Developer pilot: `voisu local-dev select {model_id}` then `voisu-dev on` (stops voisu.service and enables voisu-dev.service)."
@@ -136,7 +136,7 @@ pub(crate) fn suggested_consented_entry(
     suggestion: &LocalSuggestion,
 ) -> Option<&'static ConsentedCatalogEntry> {
     // Setup and the TUI offer only entries whose every download has a real host.
-    consented_entry(suggested_model_id(suggestion))
+    consented_entry(suggestion.model_id)
         .filter(|entry| entry.consent_installable && entry.is_hosted())
 }
 
@@ -230,16 +230,6 @@ fn key_status(diagnosis: &KeyDiagnosis) -> &'static str {
     }
 }
 
-fn suggested_model_id(suggestion: &LocalSuggestion) -> &'static str {
-    match suggestion {
-        LocalSuggestion::Gpu { model_id, .. } | LocalSuggestion::Cpu { model_id, .. } => model_id,
-        LocalSuggestion::GpuUnknown {
-            cpu_fallback_model_id,
-            ..
-        } => cpu_fallback_model_id,
-    }
-}
-
 fn mode_label(mode: AsrMode) -> &'static str {
     match mode {
         AsrMode::Cloud => "Cloud",
@@ -270,19 +260,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn setup_offers_the_hosted_whisper_cpp_entry() {
-        use crate::local_model::CpuReason;
-        use crate::local_model::WHISPER_CPP_ENTRY;
-        let suggestion = LocalSuggestion::Cpu {
-            model_id: WHISPER_CPP_ENTRY.id,
-            reason: CpuReason::NoNvidiaGpu,
-        };
-        assert_eq!(
-            suggested_consented_entry(&suggestion).map(|entry| entry.id),
-            Some(WHISPER_CPP_ENTRY.id)
-        );
+    fn setup_offers_the_hosted_whisper_cpp_entry_on_every_host() {
+        for probe in [
+            GpuProbe::Nvidia(vec![gpu(0, 8151)]),
+            GpuProbe::Nvidia(vec![gpu(0, 2048)]),
+            GpuProbe::NoneFound,
+            GpuProbe::Failed("driver failed".into()),
+        ] {
+            let suggestion = crate::local_model::suggest_local(&host(probe));
+            assert_eq!(
+                suggested_consented_entry(&suggestion).map(|entry| entry.id),
+                Some(WHISPER_CPP_ENTRY.id)
+            );
+        }
     }
-    use crate::local_model::{CONSENTED_ENTRY, DISTIL_MODEL_ID};
+
+    #[test]
+    fn retired_entries_are_never_offered() {
+        for retired in [&CONSENTED_ENTRY, &crate::local_model::PARAKEET_ENTRY] {
+            let suggestion = LocalSuggestion {
+                model_id: retired.id,
+                nvidia_gpu: None,
+            };
+            assert_eq!(
+                suggested_consented_entry(&suggestion).map(|entry| entry.id),
+                None,
+                "{}",
+                retired.id
+            );
+        }
+    }
+    use crate::local_model::{CONSENTED_ENTRY, WHISPER_CPP_ENTRY};
     use crate::local_model::{GpuProbe, NvidiaGpu};
     use voisu_core::Credential;
 
@@ -404,7 +412,7 @@ mod tests {
     }
 
     #[test]
-    fn rtx_5050_laptop_suggests_distil_and_shows_cloud() {
+    fn rtx_5050_laptop_suggests_whisper_cpp_and_shows_cloud() {
         let hw = host(GpuProbe::Nvidia(vec![gpu(0, 8151)]));
         let (choice, io) = run(
             &hw,
@@ -424,7 +432,7 @@ mod tests {
         );
         assert!(
             text.contains(
-                "\n[2] Local — runs on this computer\nRecommended for this computer: distil-large-v3.5-int8 (RTX 5050 Laptop)\nAvailability: not installed — setup can download it (2.8 GiB) after you agree.\nPROMPT "
+                "\n[2] Local — runs on this computer\nRecommended for this computer: whisper-cpp-distil-large-v3.5-q8-0 on your GPU (RTX 5050 Laptop)\nAvailability: not installed — setup can download it (780.7 MiB) after you agree.\nPROMPT "
             ),
             "{text}"
         );
@@ -441,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn small_gpu_zero_suggests_parakeet_on_cpu() {
+    fn a_small_gpu_still_gets_whisper_cpp_on_the_gpu() {
         let hw = host(GpuProbe::Nvidia(vec![gpu(0, 2048)]));
         let (_, io) = run(
             &hw,
@@ -454,47 +462,35 @@ mod tests {
         );
         let text = io.transcript();
         assert!(
-            text.contains("Recommended for this computer: parakeet-tdt-0.6b-v3 on CPU (RTX 5050 Laptop has 2048 MiB; 3584 MiB needed for the GPU model)"),
+            text.contains("Recommended for this computer: whisper-cpp-distil-large-v3.5-q8-0 on your GPU (RTX 5050 Laptop)\n"),
             "{text}"
         );
     }
 
     #[test]
-    fn absent_nvidia_suggests_parakeet() {
-        let hw = host(GpuProbe::NoneFound);
-        let (_, io) = run(
-            &hw,
-            AsrMode::Cloud,
-            &absent(),
-            &absent(),
-            false,
-            vec![],
-            |_| false,
-        );
-        let text = io.transcript();
-        assert!(
-            text.contains(
-                "Recommended for this computer: parakeet-tdt-0.6b-v3 on CPU (no NVIDIA GPU detected)\n"
-            ),
-            "{text}"
-        );
-    }
-
-    #[test]
-    fn probe_failure_shows_gpu_status_unknown() {
-        let hw = host(GpuProbe::Failed("driver failed".into()));
-        let (_, io) = run(
-            &hw,
-            AsrMode::Cloud,
-            &absent(),
-            &absent(),
-            false,
-            vec![],
-            |_| false,
-        );
-        let text = io.transcript();
-        assert!(text.contains("GPU status unknown"), "{text}");
-        assert!(text.contains("parakeet-tdt-0.6b-v3"), "{text}");
+    fn no_nvidia_gpu_or_a_failed_probe_names_the_gpu_or_cpu() {
+        for probe in [
+            GpuProbe::NoneFound,
+            GpuProbe::Failed("driver failed".into()),
+        ] {
+            let (_, io) = run(
+                &host(probe),
+                AsrMode::Cloud,
+                &absent(),
+                &absent(),
+                false,
+                vec![],
+                |_| false,
+            );
+            let text = io.transcript();
+            assert!(
+                text.contains(
+                    "Recommended for this computer: whisper-cpp-distil-large-v3.5-q8-0 on your GPU, or the CPU without one\n"
+                ),
+                "{text}"
+            );
+            assert!(!text.contains("parakeet"), "{text}");
+        }
     }
 
     #[test]
@@ -685,55 +681,42 @@ mod tests {
 
     #[test]
     fn developer_pilot_line_follows_the_suggested_id() {
-        let rtx = host(GpuProbe::Nvidia(vec![gpu(0, 8151)]));
-        let (choice, io) = run(
-            &rtx,
-            AsrMode::Cloud,
-            &absent(),
-            &absent(),
-            false,
-            vec![],
-            |id| id == "distil-large-v3.5-int8",
-        );
-        assert_eq!(choice, EngineChoice::Keep(AsrMode::Cloud));
-        assert!(
-            io.transcript().contains(
-                "Developer pilot: `voisu local-dev select distil-large-v3.5-int8` then `voisu-dev on` (stops voisu.service and enables voisu-dev.service)."
-            ),
-            "{}",
-            io.transcript()
-        );
-        let (_, io) = run(
-            &rtx,
-            AsrMode::Cloud,
-            &absent(),
-            &absent(),
-            false,
-            vec![],
-            |id| id == "parakeet-tdt-0.6b-v3",
-        );
-        assert!(
-            !io.transcript().contains("Developer pilot:"),
-            "{}",
-            io.transcript()
-        );
-        let unknown = host(GpuProbe::Failed("driver failed".into()));
-        let (_, io) = run(
-            &unknown,
-            AsrMode::Cloud,
-            &absent(),
-            &absent(),
-            false,
-            vec![],
-            |id| id == "parakeet-tdt-0.6b-v3",
-        );
-        assert!(
-            io.transcript().contains(
-                "Developer pilot: `voisu local-dev select parakeet-tdt-0.6b-v3` then `voisu-dev on`"
-            ),
-            "{}",
-            io.transcript()
-        );
+        for hw in [
+            host(GpuProbe::Nvidia(vec![gpu(0, 8151)])),
+            host(GpuProbe::Failed("driver failed".into())),
+        ] {
+            let (choice, io) = run(
+                &hw,
+                AsrMode::Cloud,
+                &absent(),
+                &absent(),
+                false,
+                vec![],
+                |id| id == WHISPER_CPP_ENTRY.id,
+            );
+            assert_eq!(choice, EngineChoice::Keep(AsrMode::Cloud));
+            assert!(
+                io.transcript().contains(
+                    "Developer pilot: `voisu local-dev select whisper-cpp-distil-large-v3.5-q8-0` then `voisu-dev on` (stops voisu.service and enables voisu-dev.service)."
+                ),
+                "{}",
+                io.transcript()
+            );
+            let (_, io) = run(
+                &hw,
+                AsrMode::Cloud,
+                &absent(),
+                &absent(),
+                false,
+                vec![],
+                |id| id == "distil-large-v3.5-int8",
+            );
+            assert!(
+                !io.transcript().contains("Developer pilot:"),
+                "{}",
+                io.transcript()
+            );
+        }
     }
 
     #[test]
@@ -867,7 +850,7 @@ mod tests {
     }
 
     #[test]
-    fn distil_availability_names_the_consented_install_and_size() {
+    fn availability_names_the_consented_install_and_size() {
         let hw = host(GpuProbe::Nvidia(vec![gpu(0, 8151)]));
         let (_, io) = run(
             &hw,
@@ -881,16 +864,15 @@ mod tests {
         let text = io.transcript();
         assert!(
             text.contains(
-                "Availability: not installed — setup can download it (2.8 GiB) after you agree."
+                "Availability: not installed — setup can download it (780.7 MiB) after you agree."
             ),
             "{text}"
         );
         assert_eq!(
-            format_size(CONSENTED_ENTRY.total_download_bytes),
-            "2.8 GiB",
-            "2,980,914,661 bytes"
+            format_size(WHISPER_CPP_ENTRY.total_download_bytes),
+            "780.7 MiB"
         );
-        assert!(text.contains(DISTIL_MODEL_ID), "{text}");
+        assert!(text.contains(WHISPER_CPP_ENTRY.id), "{text}");
         assert!(!text.contains(LOCAL_AVAILABILITY), "{text}");
     }
 
@@ -901,29 +883,6 @@ mod tests {
         assert_eq!(format_size(1536), "1.5 KiB");
         assert_eq!(format_size(25 * 1024 * 1024 + 300 * 1024), "25.3 MiB");
         assert_eq!(format_size(3 * 1024 * 1024 * 1024), "3.0 GiB");
-    }
-
-    #[test]
-    fn parakeet_offers_consented_download_with_real_size() {
-        for hw in [
-            host(GpuProbe::Nvidia(vec![gpu(0, 2048)])),
-            host(GpuProbe::NoneFound),
-        ] {
-            let (_, io) = run(
-                &hw,
-                AsrMode::Cloud,
-                &absent(),
-                &absent(),
-                false,
-                vec![],
-                |_| false,
-            );
-            let text = io.transcript();
-            assert!(
-                text.contains("setup can download it (734.1 MiB) after you agree"),
-                "{text}"
-            );
-        }
     }
 
     #[test]

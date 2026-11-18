@@ -18,8 +18,8 @@ use crate::local_model::{ActiveReceipt, FilePin};
 use crate::local_model::{
     CONSENTED_ENTRY, ConsentedCatalogEntry, ConsentedError, ConsentedFilePin, ConsentedHealth,
     ConsentedLayout, ConsentedReceipt, ConsentedRuntimeEntry, DevFilePin, DevLimits, DevManifest,
-    DevRuntimeManifest, EXPECTED_HEALTH_TEXT, ModelStore, VerifiedConsentedInstall,
-    consented_worker_files, development_catalog_entry, ensure_private_dir, sha256_hex,
+    DevRuntimeManifest, EXPECTED_HEALTH_TEXT, VerifiedConsentedInstall, consented_worker_files,
+    development_catalog_entry, ensure_private_dir, sha256_hex,
 };
 
 /// Installation's real, isolated health probe. `state_dir` is the Voisu
@@ -76,6 +76,16 @@ impl ConsentedHealth for ConsentedWorkerHealth {
         }
         Ok(())
     }
+}
+
+/// Whether the packaged whisper.cpp worker sees a GPU, so setup can say where
+/// the install will run before asking. A missing worker counts as found: the
+/// install's preflight then reports the real problem.
+#[must_use]
+pub fn whisper_cpp_finds_gpu() -> bool {
+    whisper_cpp_worker().map_or(true, |worker| {
+        probe_gpu(&worker, GPU_PROBE_DEADLINE).is_ok()
+    })
 }
 
 /// Loading the Vulkan driver takes well under a second; a hung driver must
@@ -265,7 +275,7 @@ pub(crate) fn verify_default_consented_install() -> Result<VerifiedConsentedInst
         std::env::var_os("HOME"),
     )
     .map_err(ConsentedError::Store)?;
-    let store = ModelStore::open(dir).map_err(ConsentedError::Store)?;
+    let store = crate::local_model::ModelStore::open(dir).map_err(ConsentedError::Store)?;
     verify_consented_install_refreshing(&store, || {})
 }
 
@@ -275,7 +285,7 @@ pub(crate) fn verify_default_consented_install() -> Result<VerifiedConsentedInst
 /// parent, as `launch_consented_worker` derives it.
 #[cfg(not(test))]
 pub(crate) fn verify_consented_install_refreshing(
-    store: &ModelStore,
+    store: &crate::local_model::ModelStore,
     on_verifying: impl FnOnce(),
 ) -> Result<VerifiedConsentedInstall, ConsentedError> {
     let entry = crate::local_model::consented::installed_entry(store)?;
@@ -628,138 +638,6 @@ mod tests {
     use super::super::bounds::resolve_worker_limits;
     use super::*;
     use serde_json::json;
-
-    #[test]
-    #[ignore = "downloads 734 MiB and runs the real CPU sandbox; use temporary XDG roots"]
-    fn real_cpu_consented_install_offline_smoke() {
-        use crate::local_model::{
-            ConsentedConsent, ConsentedInstallRequest, InstallClock, InstallIo, MaintenanceError,
-            MaintenanceKind, MaintenanceReservation, OfflineRuntimeBuilder, PARAKEET_ENTRY,
-            ProductionHttps, SilentProgress,
-        };
-        struct Idle;
-        impl MaintenanceReservation for Idle {
-            fn acquire(&self) -> Result<MaintenanceKind, MaintenanceError> {
-                Ok(MaintenanceKind::Idle)
-            }
-        }
-        let base = PathBuf::from(
-            std::env::var_os("XDG_STATE_HOME").expect("smoke needs temporary XDG_STATE_HOME"),
-        );
-        assert!(base.is_absolute());
-        assert_eq!(std::env::var("CUDA_VISIBLE_DEVICES").as_deref(), Ok(""));
-        ensure_private_dir(&base).unwrap();
-        // Retain failed runs: an unreaped worker must never lose its tree.
-        let state = tempfile::Builder::new()
-            .prefix("cpu-smoke-")
-            .tempdir_in(base)
-            .unwrap()
-            .keep();
-        eprintln!("CPU SMOKE state={}", state.display());
-        let store = ModelStore::open(state.as_path().join("models")).unwrap();
-        let receipt = crate::local_model::install_consented_install(ConsentedInstallRequest {
-            store: &store,
-            consent: ConsentedConsent::accepted_entry(&PARAKEET_ENTRY, 1),
-            fetcher: &ProductionHttps,
-            builder: &OfflineRuntimeBuilder,
-            health: &ConsentedWorkerHealth::for_entry(state.as_path().into(), &PARAKEET_ENTRY),
-            maintenance: &Idle,
-            io: InstallIo::default(),
-            clock: InstallClock::default(),
-            progress: &SilentProgress,
-        })
-        .expect("real pinned CPU install and isolated health");
-        assert_eq!(receipt.entry_id, "parakeet-tdt-0.6b-v3");
-        assert_eq!(receipt.device, "cpu");
-        let extracted: u64 = receipt
-            .runtime_manifest
-            .values()
-            .filter_map(|item| match item {
-                crate::local_model::ConsentedRuntimeEntry::File { bytes, .. } => Some(bytes),
-                _ => None,
-            })
-            .sum();
-        eprintln!(
-            "CPU SMOKE extracted_runtime_bytes={extracted} download_bytes={}",
-            PARAKEET_ENTRY.total_download_bytes
-        );
-        assert!(extracted <= PARAKEET_ENTRY.estimated_extracted_runtime_bytes);
-        assert_eq!(
-            receipt.runtime_inputs[PARAKEET_ENTRY.native_runtime.unwrap().name].sha256,
-            PARAKEET_ENTRY.native_runtime.unwrap().sha256
-        );
-
-        let install = crate::local_model::verify_consented_install_full(&store).unwrap();
-        let layout = install.layout().clone();
-        let (manifest, hash, file) = prepare_manifest(
-            &layout,
-            &receipt.files,
-            state.as_path(),
-            &PARAKEET_ENTRY,
-            &receipt.runtime_manifest,
-        )
-        .unwrap();
-        let pcm = std::process::Command::new(layout.venv_python()).env_clear()
-            .args(["-I", "-c", "import sys,wave; w=wave.open(sys.argv[1]); sys.stdout.buffer.write(w.readframes(w.getnframes()))"])
-            .arg(&layout.health_clip).output().unwrap();
-        assert!(pcm.status.success());
-        let lease = crate::local_model::consented::consented_install_lease(&layout).unwrap();
-        let mut worker = DevWorker::launch_consented(
-            manifest,
-            hash.clone(),
-            file,
-            &layout.root,
-            Some(install),
-            lease,
-        )
-        .unwrap();
-        let mut correlation = Correlation {
-            daemon_nonce: "cpu-smoke".into(),
-            generation: 1,
-            request_id: "prepare".into(),
-            recording_id: "jfk".into(),
-            model_receipt_hash: hash,
-        };
-        let ready = worker
-            .exchange(
-                ControlFrame::Prepare(correlation.clone()),
-                None,
-                Instant::now() + LOAD_DEADLINE,
-            )
-            .unwrap();
-        assert!(
-            matches!(&ready, WorkerFrame::Ready { observed_device, .. } if observed_device == "cpu"),
-            "{ready:?}"
-        );
-        correlation.request_id = "jfk-transcribe".into();
-        let started = Instant::now();
-        let reply = worker
-            .exchange(
-                ControlFrame::Transcribe {
-                    correlation,
-                    pcm_bytes: pcm.stdout.len(),
-                    prompt: None,
-                },
-                Some(&pcm.stdout),
-                Instant::now() + super::super::bounds::STOP_PROCESSING,
-            )
-            .unwrap();
-        eprintln!(
-            "CPU SMOKE clip=jfk.wav ready={ready:?} latency={:?} reply={reply:?}",
-            started.elapsed()
-        );
-        assert!(matches!(reply, WorkerFrame::Transcript { .. }));
-        let metrics = worker.last_inference_metrics();
-        eprintln!("CPU SMOKE metrics={metrics:?}");
-        assert_eq!(metrics.peak_gpu_memory_bytes, Some(0));
-        assert_ne!(worker.cancel_and_reap().unwrap(), ReapOutcome::Unreaped);
-        drop(worker);
-        assert_eq!(
-            crate::local_model::remove_consented_install(&store).unwrap(),
-            crate::local_model::consented::ConsentedRemoveOutcome::Removed
-        );
-        std::fs::remove_dir_all(state).unwrap();
-    }
 
     #[test]
     fn cpu_manifest_pins_native_library_has_no_vram_and_uses_weight_file() {

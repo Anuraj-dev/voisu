@@ -12,10 +12,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 #[cfg(test)]
-use super::consented_catalog::PARAKEET_ENTRY;
+use super::consented_catalog::{CONSENTED_ENTRY, PARAKEET_ENTRY};
 use super::consented_catalog::{
-    CONSENTED_ENTRY, ConsentedCatalogEntry, DownloadPin, WORKER_FILES, consented_catalog_entries,
-    consented_entry,
+    ConsentedCatalogEntry, DownloadPin, WORKER_FILES, consented_catalog_entries, consented_entry,
+    installable_entry_for_consent,
 };
 use super::consented_runtime::{
     ConsentedRuntimeBuilder, RuntimeBuild, audit_runtime_tree, executable, sync_tree,
@@ -66,11 +66,8 @@ pub struct ConsentedConsent {
     pub unix_time: u64,
 }
 impl ConsentedConsent {
-    /// The caller records this only after the user explicitly accepts CONSENT_TEXT.
-    pub fn accepted(unix_time: u64) -> Self {
-        Self::accepted_entry(&CONSENTED_ENTRY, unix_time)
-    }
-
+    /// The caller records this only after the user explicitly accepts the
+    /// entry's consent text.
     pub fn accepted_entry(entry: &ConsentedCatalogEntry, unix_time: u64) -> Self {
         Self {
             text: entry.consent_text.into(),
@@ -353,12 +350,7 @@ pub struct ConsentedInstallRequest<'a> {
 pub fn install_consented_install(
     request: ConsentedInstallRequest<'_>,
 ) -> Result<ConsentedReceipt, ConsentedError> {
-    let entry = consented_catalog_entries()
-        .into_iter()
-        .find(|entry| {
-            request.consent.text == entry.consent_text
-                && request.consent.license_spdx == entry.license_spdx
-        })
+    let entry = installable_entry_for_consent(&request.consent.text, &request.consent.license_spdx)
         .ok_or(ConsentedError::Consent)?;
     install_with_entry(request, entry)
 }
@@ -1242,8 +1234,8 @@ fn check_receipt(
     entry: &ConsentedCatalogEntry,
     receipt: &ConsentedReceipt,
 ) -> Result<(ConsentedLayout, bool), ConsentedError> {
-    if !entry.consent_installable
-        || receipt.consent.text != entry.consent_text
+    // A retired entry's receipt still matches: only new installs are gated.
+    if receipt.consent.text != entry.consent_text
         || receipt.consent.license_spdx != entry.license_spdx
     {
         return Err(ConsentedError::Receipt);
@@ -3720,6 +3712,20 @@ pub(crate) mod install_tests {
     }
 
     #[test]
+    fn a_retired_entrys_install_still_verifies_and_removes() {
+        let (_temp, store) = store();
+        install_fixture_entry(&store, &entry());
+        // Retiring an entry from setup must not strand the people who have it.
+        let mut retired = entry();
+        retired.consent_installable = false;
+        assert!(verify_with_entry(&store, &retired).is_ok());
+        assert_eq!(
+            remove_with_entry(&store, &retired).unwrap(),
+            ConsentedRemoveOutcome::Removed
+        );
+    }
+
+    #[test]
     fn different_entry_refuses_install_before_fetch_or_build() {
         let (_temp, store) = store();
         let mut prior_entry = entry();
@@ -3727,9 +3733,12 @@ pub(crate) mod install_tests {
         let prior = install_fixture_entry(&store, &prior_entry);
         let builder = FakeBuilder::default();
         let fetcher = ScriptedFetcher::default();
-        let health = health(&store, &PARAKEET_ENTRY, false);
+        // A new install can only be whisper.cpp; the retired entry is the
+        // one already on disk.
+        let health = health(&store, &crate::local_model::WHISPER_CPP_ENTRY, false);
         let mut request = request(&store, &fetcher, &builder, &health);
-        request.consent = ConsentedConsent::accepted_entry(&PARAKEET_ENTRY, 42);
+        request.consent =
+            ConsentedConsent::accepted_entry(&crate::local_model::WHISPER_CPP_ENTRY, 42);
         let error = install_consented_install(request).unwrap_err();
         assert!(
             matches!(&error, ConsentedError::DifferentEntry(id) if id == "distil-large-v3.5-int8")
@@ -3757,9 +3766,12 @@ pub(crate) mod install_tests {
         fs::remove_file(receipt_path(&store)).unwrap();
         let builder = FakeBuilder::default();
         let fetcher = ScriptedFetcher::default();
-        let health = health(&store, &PARAKEET_ENTRY, false);
+        // A new install can only be whisper.cpp; the retired entry is the
+        // one already on disk.
+        let health = health(&store, &crate::local_model::WHISPER_CPP_ENTRY, false);
         let mut request = request(&store, &fetcher, &builder, &health);
-        request.consent = ConsentedConsent::accepted_entry(&PARAKEET_ENTRY, 42);
+        request.consent =
+            ConsentedConsent::accepted_entry(&crate::local_model::WHISPER_CPP_ENTRY, 42);
         let error = install_consented_install(request).unwrap_err();
         assert!(
             matches!(&error, ConsentedError::PendingRemoval(id) if id == "distil-large-v3.5-int8")
