@@ -41,7 +41,12 @@ Trigger Key and Delivery use desktop portals."""
 #                                                 wl-clipboard only.)
 #   /usr/bin/secret-tool -> libsecret-tools      (secret-tool binary)
 #   curl                 -> curl                 (provider HTTPS/WSS)
-depends = "$auto, xdg-desktop-portal, pipewire-bin, wireplumber, wl-clipboard | xclip, libsecret-tools, curl, gnome-shell (>= 50), gnome-shell (<< 51)"
+#   vulkan-loader        -> libvulkan1           (libggml-vulkan.so, the
+#                                                 whisper.cpp worker's GPU
+#                                                 backend; an asset, not a
+#                                                 cargo product, so shlibdeps
+#                                                 never scans it)
+depends = "$auto, libvulkan1, xdg-desktop-portal, pipewire-bin, wireplumber, wl-clipboard | xclip, libsecret-tools, curl, gnome-shell (>= 50), gnome-shell (<< 51)"
 # libei is dlopen()'d by SONAME at runtime (an optional auto-type capability),
 # never linked -- so it is Recommends, mirroring the RPM `Recommends: libei`.
 recommends = "libei1"
@@ -64,6 +69,10 @@ assets = [
     ["target/release/voisu", "usr/bin/", "755"],
     ["target/release/voisu-daemon", "usr/bin/", "755"],
     ["target/release/voisu-overlay", "usr/bin/", "755"],
+    # The whisper.cpp worker and its private ggml libraries and backend
+    # modules, built by build-deb.sh into target/worker (see voisu.spec).
+    ["../../target/worker/release/voisu-local-asr", "usr/libexec/voisu/", "755"],
+    ["../../target/worker/release/lib*.so*", "usr/libexec/voisu/", "644"],
     ["../../packaging/voisu.service", "usr/lib/systemd/user/", "644"],
     ["../../packaging/voisu-overlay.service", "usr/lib/systemd/user/", "644"],
     ["../../packaging/voisu.desktop", "usr/share/applications/", "644"],

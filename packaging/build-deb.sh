@@ -142,7 +142,8 @@ voisu (${deb_version}) unstable; urgency=medium
 
   * Automated Voisu package build of commit ${short}.
   * Ships voisu, voisu-daemon and voisu-overlay plus both systemd user units,
-    mirroring the Fedora RPM layout and enable-instruction UX.
+    mirroring the Fedora RPM layout and enable-instruction UX, and the
+    whisper.cpp worker voisu-local-asr in /usr/libexec/voisu.
 
  -- Anuraj Jit Saikia <rajasaikia1644@gmail.com>  ${changelog_date}
 EOF
@@ -150,6 +151,9 @@ EOF
 # --- build (same feature set as the RPM) -----------------------------------
 cargo build --locked --release --workspace
 cargo build --locked --release -p voisu-app --features overlay --bin voisu-overlay
+# The whisper.cpp worker, built with Vulkan in its own target dir (see
+# voisu.spec). Needs cmake g++ libvulkan-dev glslc spirv-headers.
+cargo build --locked --release -p voisu-local-asr --features vulkan --target-dir target/worker
 
 # --- recreate the (already-validated) output dir ---------------------------
 rm -rf "$output_dir"

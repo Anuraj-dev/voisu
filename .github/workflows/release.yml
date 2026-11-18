@@ -83,6 +83,7 @@ jobs:
           apt-get install -y --no-install-recommends \
             ca-certificates curl git build-essential pkg-config \
             libgtk-4-dev libgtk4-layer-shell-dev libxkbcommon-dev \
+            cmake libvulkan-dev glslc spirv-headers \
             dpkg-dev apt-utils gnupg xz-utils
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --default-toolchain stable --profile minimal
@@ -118,6 +119,14 @@ jobs:
           install -m755 target/release/voisu-daemon  "$troot/voisu-daemon"
           install -m755 target/release/voisu-overlay "$troot/voisu-overlay"
           strip "$troot/voisu" "$troot/voisu-daemon" "$troot/voisu-overlay"
+          # The whisper.cpp worker and its private libraries, from the Vulkan
+          # build build-deb.sh made in target/worker.
+          mkdir -p "$troot/worker"
+          install -m755 target/worker/release/voisu-local-asr "$troot/worker/voisu-local-asr"
+          strip "$troot/worker/voisu-local-asr"
+          while read -r lib; do
+              install -m755 "target/worker/release/$lib" "$troot/worker/$lib"
+          done < target/worker/release/voisu-whisper-runtime.txt
           install -m644 packaging/voisu.service         "$troot/voisu.service"
           install -m644 packaging/voisu-overlay.service "$troot/voisu-overlay.service"
           install -m644 packaging/voisu.desktop         "$troot/voisu.desktop"

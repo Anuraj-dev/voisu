@@ -82,6 +82,11 @@ echo "== binaries + units (from the prebuilt package) =="
 test -x /usr/bin/voisu
 test -x /usr/bin/voisu-daemon
 test -x /usr/bin/voisu-overlay
+# The whisper.cpp worker must resolve its private libraries from its own dir.
+test -x /usr/lib/voisu/voisu-local-asr
+if ldd /usr/lib/voisu/voisu-local-asr | grep -q 'not found'; then
+    echo "FAIL: voisu-local-asr has unresolved libraries"; ldd /usr/lib/voisu/voisu-local-asr; exit 1
+fi
 voisu --version
 voisu-daemon --help >/dev/null
 systemd-analyze verify /usr/lib/systemd/user/voisu.service
