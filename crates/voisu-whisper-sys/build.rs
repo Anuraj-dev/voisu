@@ -89,9 +89,15 @@ fn main() {
     }
     println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
 
-    // OUT_DIR is target/<profile>/build/<crate>-<hash>/out.
+    // OUT_DIR is <profile>/build/<crate>-<hash>/out, or
+    // <profile>/build/<crate>/<hash>/out under cargo's newer build-dir
+    // layout (the default from Rust 1.100). Both sit under `build/`.
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
-    let profile = out_dir.ancestors().nth(3).expect("cargo profile dir");
+    let profile = out_dir
+        .ancestors()
+        .find(|dir| dir.file_name().is_some_and(|name| name == "build"))
+        .and_then(Path::parent)
+        .expect("cargo profile dir");
     for dest in [profile.to_path_buf(), profile.join("deps")] {
         fs::create_dir_all(&dest).expect("create runtime dir");
         for source in &runtime {
