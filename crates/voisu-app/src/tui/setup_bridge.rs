@@ -31,9 +31,9 @@ use crate::setup::{
     install_live_trigger, run_hyprland_setup,
 };
 use crate::setup_consented::{
-    ConsentedInstallStep, SetupDevice, ask_cloud_after_local, consented_error_line, no_gpu_note,
-    production_install_with, production_local_complete_message, production_restart_daemon,
-    production_setup_device,
+    ConsentedInstallStep, SetupDevice, accurate_on_cpu_warning, ask_cloud_after_local,
+    consented_error_line, no_gpu_note, production_install_with, production_local_complete_message,
+    production_restart_daemon, production_setup_device, setup_entry,
 };
 use crate::setup_engine::{
     ConsentedStatus, EngineChoice, consent_confirms_local_switch, suggested_consented_entry,
@@ -263,10 +263,13 @@ impl SetupQuestions for TuiQuestions {
         if installed || !interactive {
             return ConsentedInstallStep::Skipped;
         }
-        let Some(entry) = suggested_consented_entry(&suggest_local(hardware)) else {
+        if suggested_consented_entry(&suggest_local(hardware)).is_none() {
+            return ConsentedInstallStep::Skipped;
+        }
+        let device = production_setup_device();
+        let Some(entry) = setup_entry(crate::config::local_model(), device) else {
             return ConsentedInstallStep::Skipped;
         };
-        let device = production_setup_device();
         let question = consent_question(entry, device, self.consent_confirms_switch);
         // Consent exists only from here on, and only for this answer.
         if self.link.ask(&mut self.left, question) != Some(ROW_INSTALL) {
@@ -475,6 +478,7 @@ fn consent_question(
                 about_gb(entry.total_download_bytes)
             )];
             body.extend(no_gpu_note(device).map(|note| format!("{note}.")));
+            body.extend(accurate_on_cpu_warning(entry, device).map(str::to_owned));
             body
         },
         rows: vec![
@@ -1616,15 +1620,26 @@ mod tests {
         assert_eq!(gpu.rows[gpu.picked].label, "Not now");
         assert_eq!(gpu.rows[0].line, "Keep using Cloud.");
 
-        let cpu = consent_question(&WHISPER_CPP_ENTRY, SetupDevice::Cpu, false);
+        let cpu = consent_question(&WHISPER_CPP_ENTRY, SetupDevice::Gpu, false);
         assert_eq!(cpu.body, BASE);
         assert_eq!(cpu.rows[cpu.picked].label, "Not now");
         assert_ne!(cpu.rows[0].line, "Keep using Cloud.");
 
-        let no_gpu = consent_question(&WHISPER_CPP_ENTRY, SetupDevice::CpuNoGpu, true);
+        // Auto setup without a GPU offers Fast at its own size.
+        let fast = setup_entry(crate::config::LocalModel::Auto, SetupDevice::CpuNoGpu).unwrap();
+        let no_gpu = consent_question(fast, SetupDevice::CpuNoGpu, true);
         assert_eq!(
             no_gpu.body,
-            [BASE[0], "No GPU found, so it runs on the CPU, more slowly."]
+            [
+                "Voisu downloads about 0.3 GB once. Then your speech never leaves this computer.",
+                "No GPU found, so it runs on the CPU, more slowly."
+            ]
+        );
+        // Accurate the user chose for the CPU is warned about, not refused.
+        let slow = consent_question(&WHISPER_CPP_ENTRY, SetupDevice::Cpu, false);
+        assert_eq!(
+            slow.body,
+            [BASE[0], crate::local_model::ACCURATE_ON_CPU_WARNING]
         );
     }
 

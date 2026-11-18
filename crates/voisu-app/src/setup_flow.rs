@@ -125,6 +125,7 @@ impl SetupQuestions for TextSetup {
             interactive,
             installed,
             now_unix,
+            crate::config::local_model(),
             production_setup_device,
             production_install,
             production_restart_daemon,

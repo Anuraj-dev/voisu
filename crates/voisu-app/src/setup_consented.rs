@@ -15,13 +15,13 @@ use std::time::{Duration, Instant};
 use voisu_core::{AsrMode, KeyDiagnosis};
 
 use crate::asr_mode::LOCAL_UNAVAILABLE;
-use crate::config::LocalDevice;
+use crate::config::{LocalDevice, LocalModel};
 use crate::local_model::consented::ConsentedRemoveOutcome;
 use crate::local_model::{
-    ConsentedCatalogEntry, ConsentedConsent, ConsentedError, ConsentedInstallRequest, HostHardware,
-    InstallClock, InstallIo, InstallPhase, InstallProgress, ModelStore, OfflineRuntimeBuilder,
-    ProductionHttps, installable_entry_for_consent, models_dir_from_state,
-    remove_consented_install, suggest_local,
+    ACCURATE_ON_CPU_WARNING, ConsentedCatalogEntry, ConsentedConsent, ConsentedError,
+    ConsentedInstallRequest, HostHardware, InstallClock, InstallIo, InstallPhase, InstallProgress,
+    LocalTier, ModelStore, OfflineRuntimeBuilder, ProductionHttps, installable_entry_for_consent,
+    models_dir_from_state, remove_consented_install, suggest_local,
 };
 use crate::local_setup::SetupMaintenance;
 use crate::local_worker::{ConsentedWorkerHealth, whisper_cpp_finds_gpu};
@@ -33,7 +33,7 @@ pub use crate::local_model::{DEVELOPMENT_ROOT_NAME, SystemCommandRunner, probe_h
 const INSTALL_PROMPT: &str = "Download and install now?";
 const INSTALL_DURATION_HINT: &str = "This can take several minutes.";
 #[cfg(test)]
-const INSTALL_SUCCESS: &str = "Installed whisper-cpp-distil-large-v3.5-q8-0 (Consented Install).";
+const INSTALL_SUCCESS: &str = "Installed Accurate (distil-large-v3.5).";
 const DAEMON_RESTARTED: &str = "Restarted the Voisu daemon; Local dictation is ready.";
 const CLOUD_PROMPT: &str = "Also set up Cloud?";
 const CLOUD_SKIPPED: &str = "Cloud skipped; setup will not ask again. To add Cloud later, run `voisu setup` and choose Cloud, or `voisu key set groq`.";
@@ -141,8 +141,41 @@ pub fn consent_summary(entry: &ConsentedCatalogEntry, device: SetupDevice) -> Ve
         format_size(entry.total_download_bytes)
     )];
     lines.extend(no_gpu_note(device).map(Into::into));
+    lines.extend(accurate_on_cpu_warning(entry, device).map(Into::into));
     lines.push("Runs offline after install".into());
     lines
+}
+
+/// The catalog entry setup installs for the `local_model` setting where the
+/// install runs: `auto` is Accurate on a GPU and Fast on the CPU, including
+/// the CPU setup falls to when it finds no GPU.
+#[must_use]
+pub fn setup_entry(
+    model: LocalModel,
+    device: SetupDevice,
+) -> Option<&'static ConsentedCatalogEntry> {
+    let entry = LocalTier::resolve(model, device == SetupDevice::Gpu).entry();
+    (entry.consent_installable && entry.is_hosted()).then_some(entry)
+}
+
+/// `Installed Fast (small.en).`, or the catalog id for an entry that is not
+/// a tier.
+#[must_use]
+pub fn installed_line(entry: &ConsentedCatalogEntry) -> String {
+    match LocalTier::of_entry_id(entry.id) {
+        Some(tier) => format!("Installed {}.", tier.title()),
+        None => format!("Installed {} (Consented Install).", entry.id),
+    }
+}
+
+/// The warning for Accurate where it runs on the CPU.
+#[must_use]
+pub fn accurate_on_cpu_warning(
+    entry: &ConsentedCatalogEntry,
+    device: SetupDevice,
+) -> Option<&'static str> {
+    (device != SetupDevice::Gpu && LocalTier::of_entry_id(entry.id) == Some(LocalTier::Accurate))
+        .then_some(ACCURATE_ON_CPU_WARNING)
 }
 
 /// The one device fact worth a line: `auto` found no GPU, so this install
@@ -165,17 +198,18 @@ pub fn run_consented_install_step(
     interactive: bool,
     installed: bool,
     now_unix: u64,
+    model: LocalModel,
     device: impl FnOnce() -> SetupDevice,
     install: impl FnOnce(ConsentedConsent, SetupDevice) -> Result<(), ConsentedError>,
     restart_daemon: impl FnOnce() -> Result<(), String>,
 ) -> ConsentedInstallStep {
-    if installed || !interactive {
+    if installed || !interactive || suggested_consented_entry(&suggest_local(hw)).is_none() {
         return ConsentedInstallStep::Skipped;
     }
-    let Some(entry) = suggested_consented_entry(&suggest_local(hw)) else {
+    let device = device();
+    let Some(entry) = setup_entry(model, device) else {
         return ConsentedInstallStep::Skipped;
     };
-    let device = device();
     io.writeln("");
     for fact in consent_summary(entry, device) {
         io.writeln(&fact);
@@ -186,7 +220,7 @@ pub fn run_consented_install_step(
             io.writeln(INSTALL_DURATION_HINT);
             match install(ConsentedConsent::accepted_entry(entry, now_unix), device) {
                 Ok(()) => {
-                    io.writeln(&format!("Installed {} (Consented Install).", entry.id));
+                    io.writeln(&installed_line(entry));
                     match restart_daemon() {
                         Ok(()) => io.writeln(DAEMON_RESTARTED),
                         Err(reason) => io.writeln(&format!(
@@ -784,6 +818,7 @@ mod tests {
     use super::*;
     use crate::local_model::{
         CONSENTED_ENTRY, FetchError, GpuProbe, NvidiaGpu, ProgressSink, WHISPER_CPP_ENTRY,
+        WHISPER_CPP_SMALL_EN_ENTRY,
     };
     use crate::setup_engine::{
         ConsentedStatus, EngineChoice, INSTALLED_AVAILABILITY, run_engine_screen,
@@ -875,22 +910,41 @@ mod tests {
         hw: &HostHardware,
         device: SetupDevice,
     ) -> (ConsentedInstallStep, FakeIo, Vec<SetupDevice>) {
+        let (step, io, installs) = accept_model_on(hw, LocalModel::Auto, device);
+        (
+            step,
+            io,
+            installs.into_iter().map(|(_, device)| device).collect(),
+        )
+    }
+
+    /// A yes for the `model` setting on `device`; returns every install call.
+    fn accept_model_on(
+        hw: &HostHardware,
+        model: LocalModel,
+        device: SetupDevice,
+    ) -> (
+        ConsentedInstallStep,
+        FakeIo,
+        Vec<(ConsentedConsent, SetupDevice)>,
+    ) {
         let mut io = FakeIo::new(vec![Some("y")]);
-        let mut devices = Vec::new();
+        let mut installs = Vec::new();
         let step = run_consented_install_step(
             &mut io,
             hw,
             true,
             false,
             NOW,
+            model,
             || device,
-            |_, device| {
-                devices.push(device);
+            |consent, device| {
+                installs.push((consent, device));
                 Ok(())
             },
             || Ok(()),
         );
-        (step, io, devices)
+        (step, io, installs)
     }
 
     fn offer_with_restart(
@@ -910,6 +964,7 @@ mod tests {
             interactive,
             installed,
             NOW,
+            LocalModel::Auto,
             || SetupDevice::Gpu,
             |consent, _| {
                 recorded.push(consent);
@@ -984,27 +1039,55 @@ mod tests {
     #[test]
     fn every_host_is_offered_whisper_cpp_and_only_a_missing_gpu_is_mentioned() {
         const NOTE: &str = "No GPU found, so it runs on the CPU, more slowly";
+        const FAST_SUCCESS: &str = "Installed Fast (small.en).";
         let cases = [
-            (SetupDevice::Gpu, false),
-            (SetupDevice::Cpu, false),
-            (SetupDevice::CpuNoGpu, true),
+            (SetupDevice::Gpu, false, "780.7 MiB", INSTALL_SUCCESS),
+            (SetupDevice::Cpu, false, "252.6 MiB", FAST_SUCCESS),
+            (SetupDevice::CpuNoGpu, true, "252.6 MiB", FAST_SUCCESS),
         ];
         for hw in [
             host(GpuProbe::Nvidia(vec![gpu(0, 2048)])),
             host(GpuProbe::NoneFound),
             host(GpuProbe::Failed("driver failed".into())),
         ] {
-            for (device, noted) in cases {
+            for (device, noted, size, success) in cases {
                 let (step, io, devices) = accept_on(&hw, device);
                 assert_eq!(step, ConsentedInstallStep::Installed);
                 assert_eq!(devices, [device], "the install gets the device it showed");
                 let text = io.transcript();
                 assert_eq!(text.contains(NOTE), noted, "{text}");
                 assert!(!text.contains("Licence"), "{text}");
-                assert!(text.contains("Download size: 780.7 MiB"), "{text}");
-                assert!(text.contains(INSTALL_SUCCESS), "{text}");
+                assert!(text.contains(&format!("Download size: {size}\n")), "{text}");
+                assert!(text.contains(success), "{text}");
+                assert!(!text.contains("whisper-cpp-"), "ids stay out: {text}");
             }
         }
+    }
+
+    #[test]
+    fn auto_setup_without_a_gpu_installs_fast_and_a_chosen_tier_is_kept() {
+        let hw = host(GpuProbe::NoneFound);
+        let (_, _, installs) = accept_model_on(&hw, LocalModel::Auto, SetupDevice::CpuNoGpu);
+        assert_eq!(
+            installs,
+            [(
+                ConsentedConsent::accepted_entry(&WHISPER_CPP_SMALL_EN_ENTRY, NOW),
+                SetupDevice::CpuNoGpu
+            )]
+        );
+        let (_, _, installs) = accept_model_on(&hw, LocalModel::Auto, SetupDevice::Gpu);
+        assert_eq!(installs[0].0, accepted(), "a GPU host is unchanged");
+        let (_, _, installs) = accept_model_on(&hw, LocalModel::Fast, SetupDevice::Gpu);
+        assert_eq!(installs[0].0.text, WHISPER_CPP_SMALL_EN_ENTRY.consent_text);
+
+        // Accurate where it runs on the CPU is kept, with a warning.
+        let (step, io, installs) = accept_model_on(&hw, LocalModel::Accurate, SetupDevice::Cpu);
+        assert_eq!(step, ConsentedInstallStep::Installed);
+        assert_eq!(installs[0].0, accepted());
+        let text = io.transcript();
+        assert!(text.contains(ACCURATE_ON_CPU_WARNING), "{text}");
+        let (_, io, _) = accept_model_on(&hw, LocalModel::Accurate, SetupDevice::Gpu);
+        assert!(!io.transcript().contains(ACCURATE_ON_CPU_WARNING));
     }
 
     #[test]
@@ -1030,6 +1113,7 @@ mod tests {
                 interactive,
                 installed,
                 NOW,
+                LocalModel::Auto,
                 || panic!("a skipped offer must not probe the GPU"),
                 |_, _| panic!("a skipped offer must not install"),
                 || Ok(()),
@@ -1631,6 +1715,7 @@ mod tests {
             true,
             false,
             NOW,
+            LocalModel::Auto,
             || SetupDevice::Gpu,
             |_, _| panic!("decline must not install"),
             || panic!("decline must not restart the daemon"),
@@ -1672,6 +1757,7 @@ mod tests {
             true,
             false,
             NOW,
+            LocalModel::Auto,
             || SetupDevice::Gpu,
             |consent, _| {
                 consents.push(consent);
@@ -1827,6 +1913,7 @@ mod tests {
             true,
             false,
             NOW,
+            LocalModel::Auto,
             || SetupDevice::Gpu,
             |_, _| Ok(()),
             || Ok(()),
