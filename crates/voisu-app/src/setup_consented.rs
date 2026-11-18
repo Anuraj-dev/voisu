@@ -100,6 +100,17 @@ pub enum SetupDevice {
     CpuNoGpu,
 }
 
+impl SetupDevice {
+    /// The device the install runs and health-checks on.
+    #[must_use]
+    pub fn install_device(self) -> LocalDevice {
+        match self {
+            Self::Gpu => LocalDevice::Gpu,
+            Self::Cpu | Self::CpuNoGpu => LocalDevice::Cpu,
+        }
+    }
+}
+
 /// The device for `setting`. Only auto asks `gpu_found`.
 #[must_use]
 pub fn setup_device(setting: LocalDevice, gpu_found: impl FnOnce() -> bool) -> SetupDevice {
@@ -700,36 +711,57 @@ pub fn production_install_with(
     device: SetupDevice,
     progress: impl FnOnce(u64) -> Box<dyn InstallProgress>,
 ) -> Result<(), ConsentedError> {
+    install_then_record_device(
+        consent,
+        device,
+        &crate::config::config_path(),
+        |consent, entry, install_device| {
+            let models =
+                models_dir_from_state(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+                    .map_err(ConsentedError::Store)?;
+            let store = ModelStore::open(models).map_err(ConsentedError::Store)?;
+            let state = voisu_core::state_dir()
+                .map_err(|message| ConsentedError::Io(std::io::Error::other(message)))?;
+            let health = ConsentedWorkerHealth::for_install(state, entry, install_device);
+            let progress = progress(entry.total_download_bytes);
+            crate::local_model::install_consented_install(ConsentedInstallRequest {
+                store: &store,
+                consent,
+                fetcher: &ProductionHttps,
+                builder: &OfflineRuntimeBuilder,
+                health: &health,
+                maintenance: &SetupMaintenance::default(),
+                io: InstallIo::default(),
+                clock: InstallClock::default(),
+                progress: &*progress,
+            })
+            .map(|_| ())
+        },
+    )
+}
+
+/// Resolves `consent` to its installable entry, runs `install` on the device
+/// the user agreed to, and only after it succeeds records a CPU choice in
+/// `config`. A failed install leaves the config as it was.
+fn install_then_record_device(
+    consent: ConsentedConsent,
+    device: SetupDevice,
+    config: &Path,
+    install: impl FnOnce(
+        ConsentedConsent,
+        &'static ConsentedCatalogEntry,
+        LocalDevice,
+    ) -> Result<(), ConsentedError>,
+) -> Result<(), ConsentedError> {
     let entry = installable_entry_for_consent(&consent.text, &consent.license_spdx)
         .ok_or(ConsentedError::Consent)?;
+    install(consent, entry, device.install_device())?;
     if device == SetupDevice::CpuNoGpu {
-        // The consent named the CPU; the install and the daemon read it here.
-        crate::config::set_local_device(LocalDevice::Cpu)
+        // The consent named the CPU; from now on the daemon reads it here.
+        crate::config::set_local_device_at(config, LocalDevice::Cpu)
             .map_err(|message| ConsentedError::Io(std::io::Error::other(message)))?;
     }
-    let models =
-        models_dir_from_state(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
-            .map_err(ConsentedError::Store)?;
-    let store = ModelStore::open(models).map_err(ConsentedError::Store)?;
-    let state = voisu_core::state_dir()
-        .map_err(|message| ConsentedError::Io(std::io::Error::other(message)))?;
-    let fetcher = ProductionHttps;
-    let builder = OfflineRuntimeBuilder;
-    let health = ConsentedWorkerHealth::for_entry(state, entry);
-    let maintenance = SetupMaintenance::default();
-    let progress = progress(entry.total_download_bytes);
-    crate::local_model::install_consented_install(ConsentedInstallRequest {
-        store: &store,
-        consent,
-        fetcher: &fetcher,
-        builder: &builder,
-        health: &health,
-        maintenance: &maintenance,
-        io: InstallIo::default(),
-        clock: InstallClock::default(),
-        progress: &*progress,
-    })
-    .map(|_| ())
+    Ok(())
 }
 
 pub fn production_remove() -> Result<RemoveOutcome, ConsentedError> {
@@ -1825,6 +1857,93 @@ mod tests {
         let root = models_dir_from_state(Some(temp.path().as_os_str().to_owned()), None).unwrap();
         let store = ModelStore::open(root).unwrap();
         (temp, store)
+    }
+
+    /// Runs the real installer for `consent` on a disk with no free space, so
+    /// it fails after the consent and before any fetch.
+    fn install_with_no_space(
+        store: &ModelStore,
+        consent: ConsentedConsent,
+    ) -> Result<(), ConsentedError> {
+        struct Passing;
+        impl crate::local_model::ConsentedHealth for Passing {
+            fn check(
+                &self,
+                _: &crate::local_model::ConsentedLayout,
+                _: &crate::local_model::ConsentedReceipt,
+            ) -> Result<(), ConsentedError> {
+                Ok(())
+            }
+        }
+        struct Idle;
+        impl crate::local_model::MaintenanceReservation for Idle {
+            fn acquire(
+                &self,
+            ) -> Result<crate::local_model::MaintenanceKind, crate::local_model::MaintenanceError>
+            {
+                Ok(crate::local_model::MaintenanceKind::Idle)
+            }
+        }
+        crate::local_model::install_consented_install(ConsentedInstallRequest {
+            store,
+            consent,
+            fetcher: &crate::local_model::ScriptedFetcher::default(),
+            builder: &OfflineRuntimeBuilder,
+            health: &Passing,
+            maintenance: &Idle,
+            io: InstallIo {
+                available_bytes: 0,
+                ..InstallIo::default()
+            },
+            clock: InstallClock::default(),
+            progress: &crate::local_model::SilentProgress,
+        })
+        .map(|_| ())
+    }
+
+    #[test]
+    fn a_failed_install_after_a_cpu_consent_leaves_local_device_unchanged() {
+        let (temp, store) = test_store();
+        let config = temp.path().join("config.toml");
+        let before = "# mine\nlocal_device = \"auto\"\n";
+        std::fs::write(&config, before).unwrap();
+        let mut devices = Vec::new();
+        let error = install_then_record_device(
+            accepted(),
+            SetupDevice::CpuNoGpu,
+            &config,
+            |consent, entry, device| {
+                devices.push(device);
+                // The worker health the production install builds probes the
+                // accepted device, whatever the config says meanwhile.
+                assert_eq!(
+                    ConsentedWorkerHealth::for_install(temp.path().into(), entry, device).device(),
+                    "cpu"
+                );
+                install_with_no_space(&store, consent)
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, ConsentedError::NoSpace), "{error:?}");
+        assert_eq!(devices, [LocalDevice::Cpu]);
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
+        assert_eq!(crate::config::local_device_at(&config), LocalDevice::Auto);
+    }
+
+    #[test]
+    fn only_a_successful_install_after_a_cpu_consent_records_cpu() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config.toml");
+        std::fs::write(&config, "local_device = \"auto\"\n").unwrap();
+        install_then_record_device(accepted(), SetupDevice::Gpu, &config, |_, _, device| {
+            assert_eq!(device, LocalDevice::Gpu);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(crate::config::local_device_at(&config), LocalDevice::Auto);
+        install_then_record_device(accepted(), SetupDevice::CpuNoGpu, &config, |_, _, _| Ok(()))
+            .unwrap();
+        assert_eq!(crate::config::local_device_at(&config), LocalDevice::Cpu);
     }
 
     fn removal_receipt() -> crate::local_model::ConsentedReceipt {

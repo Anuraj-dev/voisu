@@ -14,6 +14,7 @@ use super::dev::DevWorker;
 use super::dev::GPU_BUSY;
 use super::protocol::{ControlFrame, Correlation, WorkerFrame};
 use super::supervisor::{ReapOutcome, SupervisorError, WorkerChild};
+use crate::config::LocalDevice;
 use crate::local_model::{ActiveReceipt, FilePin};
 use crate::local_model::{
     CONSENTED_ENTRY, ConsentedCatalogEntry, ConsentedError, ConsentedFilePin, ConsentedHealth,
@@ -27,6 +28,9 @@ use crate::local_model::{
 pub struct ConsentedWorkerHealth {
     state_dir: PathBuf,
     entry: &'static ConsentedCatalogEntry,
+    /// The manifest device, fixed when this is built: a `local_device` change
+    /// in another terminal mid-install cannot move the probes elsewhere.
+    device: &'static str,
 }
 
 impl ConsentedWorkerHealth {
@@ -34,8 +38,32 @@ impl ConsentedWorkerHealth {
         Self::for_entry(state_dir, &CONSENTED_ENTRY)
     }
 
+    /// Health for `entry` on the device `local_device` names now.
     pub fn for_entry(state_dir: PathBuf, entry: &'static ConsentedCatalogEntry) -> Self {
-        Self { state_dir, entry }
+        Self {
+            state_dir,
+            entry,
+            device: launch_device(entry),
+        }
+    }
+
+    /// Health for an install the user agreed to run on `device`; a
+    /// whisper.cpp entry's preflight and health check use it, not the config.
+    pub fn for_install(
+        state_dir: PathBuf,
+        entry: &'static ConsentedCatalogEntry,
+        device: LocalDevice,
+    ) -> Self {
+        Self {
+            state_dir,
+            entry,
+            device: entry_device(entry, device),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn device(&self) -> &'static str {
+        self.device
     }
 }
 
@@ -54,6 +82,7 @@ impl ConsentedHealth for ConsentedWorkerHealth {
             &pins,
             &self.state_dir,
             self.entry,
+            self.device,
             &receipt.runtime_manifest,
         )?;
         let device = manifest.device.clone();
@@ -64,14 +93,14 @@ impl ConsentedHealth for ConsentedWorkerHealth {
     }
 
     /// Before any download: the packaged whisper.cpp worker must exist, and
-    /// when `local_device` asks for the GPU it must see one. A GPU-less
-    /// machine on the default `auto` learns that now, not after 818 MB.
+    /// when the install's device is the GPU it must see one. A GPU-less
+    /// machine learns that now, not after 818 MB.
     fn preflight(&self, entry: &ConsentedCatalogEntry) -> Result<(), ConsentedError> {
         if !entry.runs_whisper_cpp() {
             return Ok(());
         }
         let worker = whisper_cpp_worker()?;
-        if launch_device(entry) == "gpu" {
+        if self.device == "gpu" {
             probe_gpu(&worker, GPU_PROBE_DEADLINE)?;
         }
         Ok(())
@@ -348,12 +377,14 @@ pub(crate) fn launch_consented_worker(
         .and_then(Path::parent)
         .ok_or(ConsentedError::Receipt)?;
     let state = models.parent().ok_or(ConsentedError::Receipt)?;
+    let entry = crate::local_model::consented_entry(&install.receipt().entry_id)
+        .ok_or(ConsentedError::Receipt)?;
     let (manifest, hash, file) = prepare_manifest(
         layout,
         &install.receipt().files,
         state,
-        crate::local_model::consented_entry(&install.receipt().entry_id)
-            .ok_or(ConsentedError::Receipt)?,
+        entry,
+        launch_device(entry),
         &install.receipt().runtime_manifest,
     )?;
     let root = layout.root.clone();
@@ -401,6 +432,7 @@ fn prepare_manifest(
     pins: &BTreeMap<String, ConsentedFilePin>,
     state: &Path,
     entry: &ConsentedCatalogEntry,
+    device: &'static str,
     runtime_manifest: &BTreeMap<String, ConsentedRuntimeEntry>,
 ) -> Result<(DevManifest, String, tempfile::NamedTempFile), ConsentedError> {
     if !state.is_absolute() || layout.root.to_str().is_none() || state.to_str().is_none() {
@@ -411,7 +443,6 @@ fn prepare_manifest(
     let limits = resolve_live_worker_limits()
         .ok_or_else(|| ConsentedError::Health("cannot resolve worker RAM limit".into()))?
         .limits;
-    let device = launch_device(entry);
     let cache = state.join("consented-worker/cache");
     if cache.starts_with(&layout.root) {
         return Err(ConsentedError::Tree(
@@ -479,8 +510,13 @@ fn prepare_manifest(
 /// Where the worker runs. whisper.cpp follows the `local_device` setting;
 /// the Python entries are pinned to their catalog device.
 fn launch_device(entry: &ConsentedCatalogEntry) -> &'static str {
+    entry_device(entry, crate::config::local_device())
+}
+
+/// whisper.cpp runs where `device` says; the other entries are pinned to theirs.
+fn entry_device(entry: &ConsentedCatalogEntry, device: LocalDevice) -> &'static str {
     if entry.runs_whisper_cpp() {
-        crate::config::local_device().manifest_device()
+        device.manifest_device()
     } else {
         entry.device
     }
@@ -663,6 +699,7 @@ mod tests {
             &pins,
             state.path(),
             &PARAKEET_ENTRY,
+            PARAKEET_ENTRY.device,
             &runtime_manifest,
         )
         .unwrap();
@@ -710,6 +747,7 @@ mod tests {
                 &pins,
                 state.path(),
                 &PARAKEET_ENTRY,
+                PARAKEET_ENTRY.device,
                 &BTreeMap::new(),
             )
             .is_err()
@@ -720,6 +758,7 @@ mod tests {
             &pins,
             state.path(),
             &PARAKEET_ENTRY,
+            PARAKEET_ENTRY.device,
             &runtime_manifest,
         )
         .unwrap();
@@ -785,6 +824,7 @@ mod tests {
             &pins,
             state.path(),
             &CONSENTED_ENTRY,
+            CONSENTED_ENTRY.device,
             &BTreeMap::new(),
         )
         .unwrap();
