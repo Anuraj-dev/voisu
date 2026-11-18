@@ -25,7 +25,7 @@ pub const DEVELOPMENT_RUNTIME_REVISION_MAX_BYTES: usize = 256;
 
 /// IDs are fixed here so a malformed or unreviewed manifest cannot introduce
 /// an arbitrary executable model into the selector.
-pub const DEV_MODEL_IDS: [&str; 13] = [
+pub const DEV_MODEL_IDS: [&str; 14] = [
     "nemotron-3.5-0.6b",
     "parakeet-tdt-0.6b-v3",
     "qwen3-asr-0.6b",
@@ -39,6 +39,7 @@ pub const DEV_MODEL_IDS: [&str; 13] = [
     "whisper-hindi2hinglish-apex-int8",
     "distil-large-v3.5-int8",
     "granite-speech-5.0-470m-turboctc",
+    "whisper-cpp-distil-large-v3.5-q5-0",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -180,6 +181,16 @@ static DEVELOPMENT_CATALOG: &[DevCatalogEntry] = &[
         devices: CPU_CUDA,
         memory_bytes: 4096 * 1024 * 1024,
         vram_bytes: 1792 * 1024 * 1024,
+    },
+    // The in-repo `voisu-local-asr` worker (whisper.cpp) on the q5_0 quant;
+    // CPU only until its GPU backends land.
+    DevCatalogEntry {
+        model_id: "whisper-cpp-distil-large-v3.5-q5-0",
+        runtime: DevRuntimeKind::Native,
+        languages: EN,
+        devices: CPU_ONLY,
+        memory_bytes: 2048 * 1024 * 1024,
+        vram_bytes: 0,
     },
 ];
 
@@ -509,7 +520,10 @@ pub fn development_receipt(manifest: &DevManifest, manifest_hash: &str) -> Activ
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DevRuntimeManifest {
-    pub python: String,
+    /// The interpreter that runs `worker`. Absent for a native worker
+    /// executable such as `voisu-local-asr`, which is launched directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub python: Option<String>,
     pub worker: String,
     pub revision: String,
 }
@@ -671,7 +685,7 @@ impl DevManifest {
                 "cuda manifests must set a vram_bytes limit".into(),
             ));
         }
-        if self.runtime.python.is_empty()
+        if self.runtime.python.as_ref().is_some_and(String::is_empty)
             || self.runtime.worker.is_empty()
             || self.runtime.revision.is_empty()
             || self.runtime.revision.len() > DEVELOPMENT_RUNTIME_REVISION_MAX_BYTES
@@ -680,11 +694,15 @@ impl DevManifest {
                 "runtime identity is incomplete".into(),
             ));
         }
-        for (label, path) in [
-            ("runtime.python", self.runtime.python.as_str()),
+        let python = self
+            .runtime
+            .python
+            .as_deref()
+            .map(|path| ("runtime.python", path));
+        for (label, path) in python.into_iter().chain([
             ("runtime.worker", self.runtime.worker.as_str()),
             ("model_path", self.model_path.as_str()),
-        ] {
+        ]) {
             let path = Path::new(path);
             if !path.is_absolute() || path.to_string_lossy().contains('\0') {
                 return Err(DevelopmentError::Invalid(format!(
@@ -722,7 +740,7 @@ impl DevManifest {
                 )));
             }
         }
-        for path in [&self.runtime.python, &self.runtime.worker] {
+        for path in self.runtime.python.iter().chain([&self.runtime.worker]) {
             if !paths.contains_key(path) {
                 return Err(DevelopmentError::Invalid(format!(
                     "runtime path is not pinned: {path}"
@@ -1494,7 +1512,7 @@ mod tests {
             device: "cpu".into(),
             language: "en".into(),
             runtime: DevRuntimeManifest {
-                python: python.to_string_lossy().into_owned(),
+                python: Some(python.to_string_lossy().into_owned()),
                 worker: worker.to_string_lossy().into_owned(),
                 revision: "test-runtime".into(),
             },
@@ -1509,6 +1527,34 @@ mod tests {
                 vram_bytes: 0,
             },
         }
+    }
+
+    #[test]
+    fn a_native_worker_manifest_has_no_python_and_still_pins_the_worker() {
+        let dir = TempDir::new().unwrap();
+        let mut value = manifest(dir.path(), "whisper-cpp-distil-large-v3.5-q5-0");
+        value.runtime.python = None;
+        value.files.remove(0);
+        assert!(value.validate().is_ok(), "{:?}", value.validate());
+        let json = value.to_json().unwrap();
+        assert!(!json.contains("python"), "{json}");
+        assert_eq!(DevManifest::from_json(&json).unwrap(), value);
+
+        let mut unpinned = value.clone();
+        unpinned
+            .files
+            .retain(|pin| pin.path != unpinned.runtime.worker);
+        assert!(unpinned.validate().is_err());
+        let mut relative = value.clone();
+        relative.runtime.python = Some("python3".into());
+        assert!(relative.validate().is_err());
+        let mut gpu = value;
+        gpu.device = "cuda:0".into();
+        gpu.limits.vram_bytes = 1;
+        assert!(
+            gpu.validate().is_err(),
+            "the whisper.cpp worker is CPU only for now"
+        );
     }
 
     #[test]

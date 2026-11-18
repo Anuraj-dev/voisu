@@ -742,7 +742,7 @@ mod tests {
             device: "cpu".into(),
             language: "en".into(),
             runtime: DevRuntimeManifest {
-                python: python.to_string_lossy().into_owned(),
+                python: Some(python.to_string_lossy().into_owned()),
                 worker: worker.to_string_lossy().into_owned(),
                 revision: "test-runtime".into(),
             },

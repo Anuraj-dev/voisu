@@ -345,7 +345,7 @@ fn manifest_from_pins(
         device: entry.device.into(),
         language: "en".into(),
         runtime: DevRuntimeManifest {
-            python: layout.venv_python().to_string_lossy().into_owned(),
+            python: Some(layout.venv_python().to_string_lossy().into_owned()),
             worker: layout
                 .worker
                 .join("worker.py")

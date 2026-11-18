@@ -5,10 +5,10 @@
 
 use super::bounds::{
     MAX_ERROR_METADATA_BYTES, MAX_JSON_DEPTH, MAX_JSON_FIELDS, MAX_JSON_FRAME_BYTES,
-    MAX_METADATA_BYTES, MAX_PCM_BYTES, MAX_PROMPT_BYTES, MAX_TRANSCRIPT_BYTES,
+    MAX_METADATA_BYTES, MAX_PCM_BYTES, MAX_TRANSCRIPT_BYTES,
 };
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub use voisu_core::local_wire::{PROTOCOL_VERSION, is_valid_prompt};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProtocolVersion(pub u32);
@@ -251,15 +251,6 @@ fn required_string(value: &serde_json::Value, key: &str) -> Result<String, Frame
         .ok_or(FrameError::InvalidJson)
 }
 
-/// The one prompt rule, shared with the Python worker: non-empty after
-/// trimming, at most [`MAX_PROMPT_BYTES`], and no control characters.
-#[must_use]
-pub fn is_valid_prompt(prompt: &str) -> bool {
-    !prompt.trim().is_empty()
-        && prompt.len() <= MAX_PROMPT_BYTES
-        && !prompt.chars().any(char::is_control)
-}
-
 /// The optional `prompt` of a Transcribe frame: valid per [`is_valid_prompt`],
 /// or absent.
 fn optional_prompt(value: &serde_json::Value) -> Result<Option<String>, FrameError> {
@@ -330,6 +321,7 @@ fn check_json_bounds(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use voisu_core::local_wire::MAX_PROMPT_BYTES;
 
     fn corr() -> Correlation {
         Correlation {
