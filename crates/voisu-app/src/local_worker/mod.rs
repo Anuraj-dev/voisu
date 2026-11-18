@@ -113,9 +113,10 @@ mod product_unavailable_tests {
             !cli.contains("local_worker"),
             "L3 keeps worker lifecycle out of voisu.rs"
         );
-        // `local_model` is also a config key; the catalog/installer is the module.
+        // `local_model` is also a config key, so match the module's paths
+        // (`voisu_app::local_model`, `local_model::…`), not the bare word.
         assert!(
-            !cli.contains("local_model::"),
+            !cli.contains("voisu_app::local_model") && !cli.contains("local_model::"),
             "L3 keeps catalog/installer out of voisu.rs"
         );
         assert!(
