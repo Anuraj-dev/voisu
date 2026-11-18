@@ -1,6 +1,9 @@
 //! `voisu-local-asr --manifest <path>`: serve worker protocol v1 on
 //! stdin/stdout. Exit 0 after Shutdown or end of input, 1 when the stream
 //! broke, 2 when the manifest is refused.
+//!
+//! `voisu-local-asr --probe-gpu`: print the GPU the worker would use as
+//! `<device> <description>` and exit 0, or exit 3 when there is none.
 
 use std::fs::File;
 use std::io::Write;
@@ -8,7 +11,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use voisu_core::local_wire::PROTOCOL_VERSION;
-use voisu_local_asr::engine::WhisperCpp;
+use voisu_local_asr::engine::{WhisperCpp, device_label, probe_gpu};
 use voisu_local_asr::manifest::{ManifestError, load_manifest, read_health_wav};
 use voisu_local_asr::server::{self, Config, Exit};
 use voisu_local_asr::wire;
@@ -63,7 +66,28 @@ fn config() -> Result<(Config, voisu_local_asr::manifest::WorkerManifest), Manif
     Ok((config, manifest))
 }
 
+fn probe() -> ExitCode {
+    match probe_gpu() {
+        Ok(gpu) => {
+            println!("{} {}", device_label(&gpu.name), gpu.description);
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("voisu-asr: {}: {}", error.code, error.message);
+            ExitCode::from(3)
+        }
+    }
+}
+
 fn main() -> ExitCode {
+    // ggml loads every module GGML_BACKEND_PATH names, whatever directory the
+    // backends are loaded from; only the modules beside this worker may load.
+    // SAFETY: no other thread exists yet, so nothing reads the environment
+    // concurrently.
+    unsafe { std::env::remove_var("GGML_BACKEND_PATH") };
+    if std::env::args_os().skip(1).eq(["--probe-gpu"]) {
+        return probe();
+    }
     let mut frames: Frames = match claim_stdout() {
         Ok(frames) => frames,
         Err(error) => {

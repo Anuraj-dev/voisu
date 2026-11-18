@@ -29,12 +29,41 @@ pub struct ConsentedCatalogEntry {
     pub total_download_bytes: u64,
     pub estimated_extracted_runtime_bytes: u64,
     pub consent_text: &'static str,
+    /// How the whisper.cpp worker decodes this entry's model; `None` for the
+    /// Python entries and the worker's greedy default.
+    pub whisper_cpp_decode: Option<WhisperCppDecode>,
+}
+
+/// whisper.cpp decoding pinned per catalog entry, written into the manifest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WhisperCppDecode {
+    pub beam_size: u8,
+    pub flash_attn: bool,
 }
 
 impl ConsentedCatalogEntry {
     /// The packaged whisper.cpp worker, not a Python runtime built at install.
     pub fn runs_whisper_cpp(&self) -> bool {
         self.python.is_none()
+    }
+
+    /// Every pin names a real host. An entry still on the reserved `.invalid`
+    /// placeholder fails closed at install and is never offered by setup or
+    /// the TUI.
+    pub fn is_hosted(&self) -> bool {
+        let clip = (self.health_clip)();
+        self.weights
+            .iter()
+            .chain(std::iter::once(&clip))
+            .chain(self.python.iter())
+            .chain(self.native_runtime.iter())
+            .chain(self.wheels)
+            .all(|pin| {
+                !matches!(
+                    super::url_policy::validate_catalog_url(pin.url, pin.hosts),
+                    Err(super::url_policy::UrlPolicyError::PlaceholderHost { .. })
+                )
+            })
     }
 
     /// Free bytes the store filesystem needs before an install starts. A
@@ -113,6 +142,7 @@ pub const CONSENTED_ENTRY: ConsentedCatalogEntry = ConsentedCatalogEntry {
     weights: WEIGHTS,
     python: Some(PYTHON),
     wheels: WHEELS,
+    whisper_cpp_decode: None,
     health_clip: clip_pin,
     total_download_bytes: TOTAL_DOWNLOAD_BYTES,
     estimated_extracted_runtime_bytes: ESTIMATED_EXTRACTED_RUNTIME_BYTES,
@@ -213,6 +243,7 @@ pub const PARAKEET_ENTRY: ConsentedCatalogEntry = ConsentedCatalogEntry {
     // plus pip, NumPy (~70 MiB), bytecode and the 12,238,405-byte native
     // archive. Reserve 384 MiB including metadata and publication headroom.
     estimated_extracted_runtime_bytes: 384 * 1024 * 1024,
+    whisper_cpp_decode: None,
     consent_text: "Download 769,772,225 bytes for parakeet-tdt-0.6b-v3 and its pinned Python/NumPy/NeMo-Speech.cpp v0.1.0 CPU runtime. Licence: CC-BY-4.0. English only. Runs offline on CPU. Development evidence: EN WER 12.8%, warm p50 0.61 s on 4 cores, peak RAM 0.9 GB; one host, one speaker — not the release gate. No automatic GPU or Cloud fallback. This is a Consented Install, not a Bakeoff Winner, and is never selected by default.",
 };
 
@@ -253,6 +284,12 @@ pub const WHISPER_CPP_ENTRY: ConsentedCatalogEntry = ConsentedCatalogEntry {
     health_clip: clip_pin,
     total_download_bytes: WHISPER_CPP_Q8.bytes + JFK_BYTES,
     estimated_extracted_runtime_bytes: 0,
+    // Phase 0 (2026-11-18): beam 5 with flash attention on is accurate and
+    // deterministic on CPU, Vulkan and CUDA for this quant.
+    whisper_cpp_decode: Some(WhisperCppDecode {
+        beam_size: 5,
+        flash_attn: true,
+    }),
     consent_text: "Download 818,658,033 bytes for distil-large-v3.5 (whisper.cpp q8_0). Licence: MIT. English only. Runs on this computer with your GPU through Vulkan, or on the CPU if you choose `voisu local-device cpu`; audio never leaves it. No automatic CPU or Cloud fallback. This is a Consented Install, not a Bakeoff Winner, and is never selected by default.",
 };
 
@@ -260,6 +297,13 @@ pub const WHISPER_CPP_ENTRY: ConsentedCatalogEntry = ConsentedCatalogEntry {
 mod tests {
     use super::*;
     use crate::local_model::url_policy::{UrlPolicyError, validate_catalog_url};
+
+    #[test]
+    fn only_the_placeholder_hosted_entry_is_unhosted() {
+        assert!(!WHISPER_CPP_ENTRY.is_hosted());
+        assert!(CONSENTED_ENTRY.is_hosted());
+        assert!(PARAKEET_ENTRY.is_hosted());
+    }
 
     #[test]
     fn the_whisper_cpp_entry_fails_closed_on_the_placeholder_host() {

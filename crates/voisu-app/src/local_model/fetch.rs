@@ -32,8 +32,9 @@ pub enum FetchError {
         actual: u64,
     },
     Status(u16),
-    /// The server answered a Range request with the whole file (200). Nothing
-    /// was written; the caller starts the download again from byte 0.
+    /// The server answered a Range request with the whole file (200) or with
+    /// a range that is not the held tail. Nothing was written; the caller
+    /// starts the download again from byte 0.
     RangeIgnored,
     Io(String),
     NoSpace,
@@ -227,6 +228,8 @@ pub enum ScriptedHop {
     Truncated(Vec<u8>),
     /// A 206 answer to a Range request: the bytes after the held prefix.
     Partial(Vec<u8>),
+    /// A raw HTTP response, parsed like the production client parses one.
+    Raw(Vec<u8>),
     NoSpace,
     Io(ErrorKind),
 }
@@ -258,6 +261,7 @@ impl ArtifactFetcher for ScriptedFetcher {
                 Some(ScriptedHop::Body(body)) => Ok(Hop::Body(body)),
                 Some(ScriptedHop::Truncated(body)) => Ok(Hop::Body(body)),
                 Some(ScriptedHop::Partial(_)) => Err(FetchError::Status(206)),
+                Some(ScriptedHop::Raw(_)) => Err(FetchError::Io("raw hop needs fetch_to".into())),
                 Some(ScriptedHop::NoSpace) => Err(FetchError::NoSpace),
                 Some(ScriptedHop::Io(kind)) => Err(FetchError::Io(kind.to_string())),
                 None => Err(FetchError::Io("script exhausted".into())),
@@ -288,6 +292,13 @@ impl ArtifactFetcher for ScriptedFetcher {
                     )?))
                 }
                 Some(ScriptedHop::Partial(_)) => Err(FetchError::Status(206)),
+                Some(ScriptedHop::Raw(raw)) => read_http_hop_from(
+                    &mut raw.as_slice(),
+                    sink,
+                    request.expected_bytes,
+                    Instant::now(),
+                    None,
+                ),
                 Some(ScriptedHop::NoSpace) => Err(FetchError::NoSpace),
                 Some(ScriptedHop::Io(kind)) => Err(FetchError::Io(kind.to_string())),
                 None => Err(FetchError::Io("script exhausted".into())),
@@ -327,6 +338,16 @@ impl ArtifactFetcher for ScriptedFetcher {
                 Some(hop @ (ScriptedHop::Body(_) | ScriptedHop::Truncated(_))) => {
                     hops.push_front(hop);
                     Err(FetchError::RangeIgnored)
+                }
+                Some(ScriptedHop::Raw(raw)) => {
+                    drop(hops);
+                    read_http_hop_from(
+                        &mut raw.as_slice(),
+                        sink,
+                        request.expected_bytes,
+                        Instant::now(),
+                        Some((held, prefix.clone())),
+                    )
                 }
                 Some(ScriptedHop::NoSpace) => Err(FetchError::NoSpace),
                 Some(ScriptedHop::Io(kind)) => Err(FetchError::Io(kind.to_string())),
@@ -448,7 +469,14 @@ fn read_http_hop_from<R: Read>(
                 prefix,
             )?))
         }
-        (HttpHop::Body(BodyRange::Partial { .. }), _) => {
+        // Any other range answers a Range request with bytes that are not
+        // the held tail. Keeping the part would wedge every retry on the same
+        // answer, so the caller discards it and fetches the whole file.
+        (HttpHop::Body(BodyRange::Partial { .. } | BodyRange::Unknown), Some(_)) => {
+            Err(FetchError::RangeIgnored)
+        }
+        // An unrequested 206 is never taken for the whole file.
+        (HttpHop::Body(BodyRange::Partial { .. } | BodyRange::Unknown), None) => {
             Err(FetchError::Io("unexpected HTTP Content-Range".into()))
         }
     }
@@ -458,7 +486,13 @@ fn read_http_hop_from<R: Read>(
 #[derive(Debug, Eq, PartialEq)]
 enum BodyRange {
     Whole,
-    Partial { first: u64, last: u64, total: u64 },
+    Partial {
+        first: u64,
+        last: u64,
+        total: u64,
+    },
+    /// A 206 whose Content-Range is missing or unparseable.
+    Unknown,
 }
 
 /// `bytes FIRST-LAST/TOTAL`; an unknown total (`*`) cannot be checked.
@@ -599,11 +633,12 @@ fn parse_http_headers(headers: &[u8]) -> Result<HttpHop<BodyRange>, FetchError> 
             if status == 200 {
                 return Ok(HttpHop::Body(BodyRange::Whole));
             }
-            content_range
-                .as_deref()
-                .and_then(parse_content_range)
-                .map(HttpHop::Body)
-                .ok_or_else(|| FetchError::Io("unexpected HTTP Content-Range".into()))
+            Ok(HttpHop::Body(
+                content_range
+                    .as_deref()
+                    .and_then(parse_content_range)
+                    .unwrap_or(BodyRange::Unknown),
+            ))
         }
         301 | 302 | 303 | 307 | 308 => {
             let location =
@@ -897,7 +932,7 @@ mod tests {
     }
 
     #[test]
-    fn a_range_answer_that_is_not_the_held_tail_writes_nothing() {
+    fn a_range_answer_that_is_not_the_held_tail_restarts_without_writing() {
         for raw in [
             // The server sent the whole file: the caller restarts from byte 0.
             &b"HTTP/1.1 200 OK\r\n\r\nabcd"[..],
@@ -917,12 +952,14 @@ mod tests {
                 Some((2, prefix_hash(b"ab"))),
             )
             .unwrap_err();
-            let expected = if raw.starts_with(b"HTTP/1.1 200") {
-                FetchError::RangeIgnored
-            } else {
-                FetchError::Io("unexpected HTTP Content-Range".into())
-            };
-            assert_eq!(error, expected, "{}", String::from_utf8_lossy(raw));
+            // Every one is discarded and fetched again from byte 0, so a
+            // misranged server cannot wedge the held part.
+            assert_eq!(
+                error,
+                FetchError::RangeIgnored,
+                "{}",
+                String::from_utf8_lossy(raw)
+            );
             assert!(sink.is_empty());
         }
         // An unrequested 206 is never taken for the whole file.

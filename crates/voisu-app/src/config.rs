@@ -712,10 +712,25 @@ pub fn parse_local_device(input: &str) -> Result<LocalDevice, String> {
     LocalDevice::from_value(input).ok_or_else(|| "expected auto, gpu or cpu".to_owned())
 }
 
+/// A `local_device` value the config sets but Voisu does not know, which
+/// therefore runs as `auto` (a GPU, never the CPU). Doctor and
+/// `voisu local-device` warn about it.
+pub fn unknown_local_device() -> Option<String> {
+    unknown_local_device_at(&config_path())
+}
+
 pub(crate) fn local_device_at(path: &Path) -> LocalDevice {
-    let Ok(contents) = std::fs::read_to_string(path) else {
-        return LocalDevice::default();
-    };
+    raw_local_device_at(path)
+        .and_then(|value| LocalDevice::from_value(&value))
+        .unwrap_or_default()
+}
+
+pub(crate) fn unknown_local_device_at(path: &Path) -> Option<String> {
+    raw_local_device_at(path).filter(|value| LocalDevice::from_value(value).is_none())
+}
+
+fn raw_local_device_at(path: &Path) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
     contents
         .lines()
         .map(|line| strip_comment(line).trim())
@@ -724,10 +739,12 @@ pub(crate) fn local_device_at(path: &Path) -> LocalDevice {
             let (name, value) = line.split_once('=')?;
             names_key(name, LOCAL_DEVICE_KEY).then_some(value)
         })
-        .and_then(|value| {
-            LocalDevice::from_value(value.trim().trim_matches(|c| c == '"' || c == '\''))
+        .map(|value| {
+            value
+                .trim()
+                .trim_matches(|c| c == '"' || c == '\'')
+                .to_owned()
         })
-        .unwrap_or_default()
 }
 
 pub(crate) fn set_local_device_at(path: &Path, device: LocalDevice) -> Result<PathBuf, String> {
@@ -2679,8 +2696,12 @@ other_key = 5
         assert_eq!(contents.matches("local_device =").count(), 1, "{contents}");
         assert!(contents.contains("local_device = \"gpu\"\n"), "{contents}");
         assert_eq!(read_tone(&path), Some(Tone::Informal));
+        assert_eq!(unknown_local_device_at(&path), None);
         std::fs::write(&path, "local_device = \"vulkan\"\n").unwrap();
         assert_eq!(local_device_at(&path), LocalDevice::Auto);
+        assert_eq!(unknown_local_device_at(&path).as_deref(), Some("vulkan"));
+        std::fs::write(&path, "local_device = \" CPU \"\n").unwrap();
+        assert_eq!(unknown_local_device_at(&path), None);
 
         assert_eq!(parse_local_device("CPU"), Ok(LocalDevice::Cpu));
         assert_eq!(parse_local_device(" auto "), Ok(LocalDevice::Auto));

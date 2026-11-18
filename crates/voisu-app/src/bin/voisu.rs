@@ -451,6 +451,11 @@ fn local_device(device: Option<voisu_app::config::LocalDevice>) -> ExitCode {
     let Some(device) = device else {
         let device = voisu_app::config::local_device();
         println!("Local device: {} ({})", device.as_str(), meaning(device));
+        if let Some(unknown) = voisu_app::config::unknown_local_device() {
+            eprintln!(
+                "warning: config sets local_device = \"{unknown}\", which is not auto, gpu or cpu; it runs as auto. Run `voisu local-device auto`, `gpu` or `cpu` to fix it."
+            );
+        }
         return ExitCode::SUCCESS;
     };
     match voisu_app::config::set_local_device(device) {

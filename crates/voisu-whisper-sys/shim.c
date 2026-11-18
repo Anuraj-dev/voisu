@@ -7,6 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -30,12 +31,43 @@ size_t voisu_whisper_options_size(void) {
     return sizeof(struct voisu_whisper_options);
 }
 
+// whisper_backend_init_gpu falls back to the CPU without telling its caller
+// when the GPU device is missing or will not initialize; its log lines are
+// the only signal. Classifies one line: 1 for "using <dev> backend" (logged
+// just before the device init), -1 for "failed to initialize" or "no GPU
+// found", 0 for anything else. Tied to the vendored whisper.cpp tag; a Rust
+// test pins the strings.
+int32_t voisu_whisper_gpu_init_log_kind(const char * text) {
+    static const char using_prefix[] = "whisper_backend_init_gpu: using ";
+    static const char failed_prefix[] = "whisper_backend_init_gpu: failed to initialize ";
+    static const char none_prefix[] = "whisper_backend_init_gpu: no GPU found";
+    if (text == NULL) {
+        return 0;
+    }
+    if (strncmp(text, using_prefix, sizeof(using_prefix) - 1) == 0) {
+        return 1;
+    }
+    if (strncmp(text, failed_prefix, sizeof(failed_prefix) - 1) == 0
+            || strncmp(text, none_prefix, sizeof(none_prefix) - 1) == 0) {
+        return -1;
+    }
+    return 0;
+}
+
+// What the GPU init logged during the current voisu_whisper_load: 0 nothing,
+// 1 a device was chosen, -1 the init failed (sticky). One loader at a time.
+static int32_t voisu_gpu_init_seen = 0;
+
 // Debug chatter is dropped; everything else goes to stderr, never stdout,
 // because stdout carries protocol frames only.
 static void voisu_log_to_stderr(enum ggml_log_level level, const char * text, void * user_data) {
     (void) user_data;
     if (level == GGML_LOG_LEVEL_DEBUG || text == NULL) {
         return;
+    }
+    const int32_t kind = voisu_whisper_gpu_init_log_kind(text);
+    if (kind < 0 || (kind > 0 && voisu_gpu_init_seen == 0)) {
+        voisu_gpu_init_seen = kind;
     }
     fputs(text, stderr);
 }
@@ -100,18 +132,24 @@ bool voisu_whisper_pick_gpu(struct voisu_gpu * out) {
     return found;
 }
 
+// `gpu_ready` reports whether the GPU backend initialized; with use_gpu it
+// is false when whisper.cpp quietly fell back to the CPU.
 struct whisper_context * voisu_whisper_load(
         const char * model_path,
         bool use_gpu,
         int32_t gpu_device,
-        bool flash_attn) {
+        bool flash_attn,
+        bool * gpu_ready) {
     struct whisper_context_params params = whisper_context_default_params();
     params.use_gpu = use_gpu;
     params.gpu_device = gpu_device;
-    // Phase 0 (2026-11-18): beam 5 with flash attention on is deterministic
-    // on CPU, Vulkan and CUDA; the old greedy loop does not reproduce.
     params.flash_attn = flash_attn;
-    return whisper_init_from_file_with_params(model_path, params);
+    // The GPU check reads whisper.cpp's log lines, so they must reach us.
+    voisu_whisper_route_logs_to_stderr();
+    voisu_gpu_init_seen = 0;
+    struct whisper_context * ctx = whisper_init_from_file_with_params(model_path, params);
+    *gpu_ready = use_gpu && voisu_gpu_init_seen == 1;
+    return ctx;
 }
 
 // Decodes one window with no carried context. Returns whisper_full's status:

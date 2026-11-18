@@ -52,4 +52,23 @@ fn local_device_round_trips_through_the_cli_and_defaults_to_auto() {
     }
     let kept = run(&["local-device"]);
     assert!(shown(&kept).starts_with("Local device: cpu"), "{kept:?}");
+    assert!(kept.stderr.is_empty(), "{kept:?}");
+
+    // A hand-edited unknown value runs as auto (a GPU, never the CPU) and warns.
+    std::fs::write(
+        temp.path().join("voisu").join("config.toml"),
+        "local_device = \"vulkan\"\n",
+    )
+    .expect("hand-edit config");
+    let unknown = run(&["local-device"]);
+    assert!(unknown.status.success(), "{unknown:?}");
+    assert!(
+        shown(&unknown).starts_with("Local device: auto"),
+        "{unknown:?}"
+    );
+    let warning = String::from_utf8_lossy(&unknown.stderr);
+    assert!(
+        warning.contains("local_device = \"vulkan\"") && warning.contains("runs as auto"),
+        "{unknown:?}"
+    );
 }

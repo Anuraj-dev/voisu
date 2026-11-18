@@ -774,19 +774,23 @@ mod tests {
             app.settings_selected = index;
             let row = app.selected_setting();
 
-            // At 80x24 the description and the whole guide show. Beside a
-            // guide of up to two values at most one row scrolls out of view; a
-            // taller guide (Layout, Local unload) scrolls more, always keeping
-            // the selected row in view.
+            // One line taller than 80x24 (which fifteen rows overfill by one),
+            // every row shows beside a guide of up to two values; a taller
+            // guide (Layout, Local unload) scrolls the rows to keep the
+            // selected one in view.
+            let tall = joined(&screen(&mut app, &UNICODE, (80, 25)));
+            if row.choices().len() <= 2 {
+                for other in SettingsRow::ALL {
+                    assert!(
+                        tall.contains(other.label()),
+                        "{index}: lost {}\n{tall}",
+                        other.label()
+                    );
+                }
+            }
+            // At 80x24 the description and the whole guide show.
             let body = joined(&screen(&mut app, &UNICODE, (80, 24)));
             assert!(body.contains(row.label()), "{index}\n{body}");
-            if row.choices().len() <= 2 {
-                let lost = SettingsRow::ALL
-                    .iter()
-                    .filter(|other| !body.contains(other.label()))
-                    .count();
-                assert!(lost <= 1, "{index}: lost {lost} rows\n{body}");
-            }
             let description = row.description();
             let last_word = description.split_whitespace().last().expect("word");
             assert!(body.contains(last_word), "{index}: description cut\n{body}");

@@ -135,7 +135,9 @@ fn availability_line(suggestion: &LocalSuggestion, consented: &ConsentedStatus) 
 pub(crate) fn suggested_consented_entry(
     suggestion: &LocalSuggestion,
 ) -> Option<&'static ConsentedCatalogEntry> {
-    consented_entry(suggested_model_id(suggestion)).filter(|entry| entry.consent_installable)
+    // Setup and the TUI offer only entries whose every download has a real host.
+    consented_entry(suggested_model_id(suggestion))
+        .filter(|entry| entry.consent_installable && entry.is_hosted())
 }
 
 /// Human byte size in binary units, one decimal: `2.8 GiB`, `25.3 MiB`.
@@ -266,6 +268,17 @@ pub(crate) fn ask_yes_no(io: &mut dyn WizardIo, question: &str, default_yes: boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup_never_offers_an_entry_still_on_the_placeholder_host() {
+        use crate::local_model::CpuReason;
+        use crate::local_model::WHISPER_CPP_ENTRY;
+        let suggestion = LocalSuggestion::Cpu {
+            model_id: WHISPER_CPP_ENTRY.id,
+            reason: CpuReason::NoNvidiaGpu,
+        };
+        assert!(suggested_consented_entry(&suggestion).is_none());
+    }
     use crate::local_model::{CONSENTED_ENTRY, DISTIL_MODEL_ID};
     use crate::local_model::{GpuProbe, NvidiaGpu};
     use voisu_core::Credential;

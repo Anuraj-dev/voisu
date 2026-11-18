@@ -57,6 +57,10 @@ pub struct DecodeOptions {
     pub n_threads: i32,
     /// 1 decodes greedily; above 1 is beam search of that width.
     pub beam_size: i32,
+    /// Flash attention. Off unless the manifest asks: it looped under greedy
+    /// decoding in the 2026-09 bench, and is deterministic with beam 5
+    /// (Phase 0, 2026-11-18).
+    pub flash_attn: bool,
 }
 
 /// Where the model runs, from the manifest's `device`.
@@ -146,6 +150,17 @@ fn c_text(raw: &[c_char]) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// The GPU this worker would load on, for the daemon's check before it
+/// downloads a model: `--probe-gpu`.
+///
+/// # Errors
+///
+/// `gpu_unavailable` when no GPU backend device registered.
+pub fn probe_gpu() -> Result<Gpu, EngineError> {
+    ROUTE_LOGS.call_once(|| unsafe { sys::voisu_whisper_route_logs_to_stderr() });
+    gpu_support(backends().gpu.as_ref(), 0).cloned()
+}
+
 impl WhisperCpp {
     /// Load a GGML model file on `device`. ggml and whisper.cpp logs go to
     /// stderr.
@@ -182,8 +197,18 @@ impl WhisperCpp {
         let path = path_cstring(model_path)
             .ok_or_else(|| EngineError::new("model_load_failed", "model path is not a C string"))?;
         let (use_gpu, index) = gpu.map_or((false, 0), |gpu| (true, gpu.index));
-        // SAFETY: `path` is a valid NUL-terminated string for the call.
-        let ctx = unsafe { sys::voisu_whisper_load(path.as_ptr(), use_gpu, index, true) };
+        let mut gpu_ready = false;
+        // SAFETY: `path` is a valid NUL-terminated string and `gpu_ready` a
+        // writable bool for the call.
+        let ctx = unsafe {
+            sys::voisu_whisper_load(
+                path.as_ptr(),
+                use_gpu,
+                index,
+                options.flash_attn,
+                &raw mut gpu_ready,
+            )
+        };
         let ctx = NonNull::new(ctx).ok_or_else(|| match gpu {
             // whisper.cpp logs the cause; a device allocation is the usual one.
             Some(gpu) => EngineError::new(
@@ -195,6 +220,15 @@ impl WhisperCpp {
             ),
             None => EngineError::new("model_load_failed", "whisper.cpp could not load the model"),
         })?;
+        if let Some(gpu) = gpu.filter(|_| !gpu_ready) {
+            // whisper.cpp fell back to the CPU; never report a GPU it is not on.
+            // SAFETY: `ctx` came from `voisu_whisper_load` and is freed once.
+            unsafe { sys::whisper_free(ctx.as_ptr()) };
+            return Err(EngineError::new(
+                "gpu_unavailable",
+                format!("the {} backend did not initialize", gpu.description),
+            ));
+        }
         Ok(Self {
             ctx,
             options,

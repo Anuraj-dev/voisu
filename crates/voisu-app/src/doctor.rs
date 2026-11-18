@@ -157,6 +157,10 @@ pub fn collect_rows() -> Vec<DoctorRow> {
         rows.extend(daemon_readiness_rows(readiness));
     }
 
+    rows.extend(unknown_local_device_row(
+        crate::config::unknown_local_device().as_deref(),
+    ));
+
     if let Some(asr) = inspector
         .daemon_status()
         .and_then(|response| response.asr_mode.as_ref())
@@ -190,6 +194,23 @@ pub fn collect_rows() -> Vec<DoctorRow> {
     }
 
     rows
+}
+
+/// A WARN row for a `local_device` value Voisu does not know. It runs as
+/// `auto`, which asks for a GPU and never falls back to the CPU.
+fn unknown_local_device_row(value: Option<&str>) -> Option<DoctorRow> {
+    let value = value?;
+    Some(
+        DoctorRow::new(
+            "Local Device",
+            ReadinessStatus::Warn,
+            format!(
+                "config sets local_device = \"{value}\", which is not auto, gpu or cpu; the Local model asks for a GPU as with auto"
+            ),
+        )
+        .value("unknown, using auto")
+        .action("run `voisu local-device auto`, `gpu` or `cpu`"),
+    )
 }
 
 fn local_doctor_row(check: crate::local_doctor::DoctorCheck) -> DoctorRow {
@@ -871,5 +892,20 @@ mod delivery_row_tests {
             let row = delivery_row(&portal, PASTE, || access);
             assert_eq!(shown(&row), expected, "{access:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unknown_local_device_warns_and_a_known_one_adds_no_row() {
+        assert!(unknown_local_device_row(None).is_none());
+        let row = unknown_local_device_row(Some("vulkan")).unwrap();
+        assert_eq!(row.status, ReadinessStatus::Warn);
+        assert!(row.detail.contains("\"vulkan\""), "{}", row.detail);
+        assert!(row.detail.contains("GPU"), "{}", row.detail);
+        assert!(row.action.unwrap().contains("voisu local-device"));
     }
 }

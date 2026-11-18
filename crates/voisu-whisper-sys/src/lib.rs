@@ -68,12 +68,18 @@ unsafe extern "C" {
     pub fn voisu_whisper_cpu_backend_loaded() -> bool;
     /// The first discrete GPU, else the first integrated one.
     pub fn voisu_whisper_pick_gpu(out: *mut VoisuGpu) -> bool;
+    /// `gpu_ready` is set true only when `use_gpu` and the GPU backend
+    /// initialized; whisper.cpp otherwise falls back to the CPU silently.
     pub fn voisu_whisper_load(
         model_path: *const c_char,
         use_gpu: bool,
         gpu_device: i32,
         flash_attn: bool,
+        gpu_ready: *mut bool,
     ) -> *mut WhisperContext;
+    /// 1, -1 or 0: whether one log line says the GPU init chose a device,
+    /// failed, or neither. Exposed for the test that pins the strings.
+    pub fn voisu_whisper_gpu_init_log_kind(text: *const c_char) -> i32;
     pub fn voisu_whisper_transcribe(
         ctx: *mut WhisperContext,
         options: *const VoisuWhisperOptions,
@@ -205,7 +211,50 @@ mod tests {
     fn a_missing_model_fails_to_load_without_crashing() {
         unsafe { voisu_whisper_route_logs_to_stderr() };
         load_backends();
-        let ctx = unsafe { voisu_whisper_load(c"/nonexistent/model.bin".as_ptr(), false, 0, true) };
+        let mut gpu_ready = true;
+        let ctx = unsafe {
+            voisu_whisper_load(
+                c"/nonexistent/model.bin".as_ptr(),
+                false,
+                0,
+                true,
+                &raw mut gpu_ready,
+            )
+        };
         assert!(ctx.is_null());
+        assert!(!gpu_ready, "a CPU load never reports a GPU");
+    }
+
+    #[test]
+    fn the_gpu_init_check_reads_the_vendored_log_lines() {
+        let kind = |text: &CStr| unsafe { voisu_whisper_gpu_init_log_kind(text.as_ptr()) };
+        assert_eq!(
+            kind(c"whisper_backend_init_gpu: using Vulkan0 backend\n"),
+            1
+        );
+        assert_eq!(
+            kind(c"whisper_backend_init_gpu: failed to initialize Vulkan0 backend\n"),
+            -1
+        );
+        assert_eq!(kind(c"whisper_backend_init_gpu: no GPU found\n"), -1);
+        // The ACCEL loop logs the same words from another function.
+        assert_eq!(kind(c"whisper_backend_init: using BLAS backend\n"), 0);
+        assert_eq!(
+            kind(c"whisper_backend_init_gpu: device 0: CPU (type: 0)\n"),
+            0
+        );
+        // The lines come from whisper_backend_init_gpu at the vendored tag.
+        let source = include_str!("../whisper.cpp/src/whisper.cpp");
+        let start = source
+            .find("static ggml_backend_t whisper_backend_init_gpu(")
+            .expect("whisper_backend_init_gpu");
+        let body = &source[start..start + source[start..].find("\n}\n").unwrap()];
+        for line in [
+            r#"WHISPER_LOG_INFO("%s: no GPU found\n", __func__);"#,
+            r#"WHISPER_LOG_INFO("%s: using %s backend\n", __func__, ggml_backend_dev_name(dev));"#,
+            r#"WHISPER_LOG_ERROR("%s: failed to initialize %s backend\n", __func__, ggml_backend_dev_name(dev));"#,
+        ] {
+            assert!(body.contains(line), "whisper.cpp no longer logs {line}");
+        }
     }
 }

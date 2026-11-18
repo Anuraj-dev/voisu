@@ -18,9 +18,9 @@ use crate::engine::{DecodeOptions, Device};
 /// Widest beam the worker accepts.
 const MAX_BEAM_SIZE: i32 = 8;
 
-/// The beam without `options.beam_size`: the Phase 0 verdict for
-/// distil-large-v3.5 (beam 5 beat greedy on accuracy at an affordable cost).
-const DEFAULT_BEAM_SIZE: i64 = 5;
+/// The beam without `options.beam_size`: greedy. A catalog entry that wants
+/// beam search (the distil q8_0 entry asks for 5) says so in its manifest.
+const DEFAULT_BEAM_SIZE: i64 = 1;
 
 /// What the worker needs from a validated manifest.
 #[derive(Clone, Debug, PartialEq)]
@@ -214,6 +214,11 @@ pub fn load_manifest(
             None => return refuse(format!("options.beam_size must be 1..={MAX_BEAM_SIZE}")),
         },
     };
+    let flash_attn = match options.get("flash_attn") {
+        None => false,
+        Some(Value::Bool(on)) => *on,
+        Some(_) => return refuse("options.flash_attn must be a boolean"),
+    };
     Ok(WorkerManifest {
         model_id: model_id.to_owned(),
         device: device.to_owned(),
@@ -224,6 +229,7 @@ pub fn load_manifest(
         decode: DecodeOptions {
             n_threads: i32::try_from(n_threads).unwrap_or(i32::MAX),
             beam_size: i32::try_from(beam_size).unwrap_or(1),
+            flash_attn,
         },
     })
 }
@@ -319,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn threads_are_capped_by_cpu_cores_and_beam_defaults_to_five() {
+    fn threads_are_capped_by_cpu_cores_and_decoding_defaults_to_greedy_without_flash() {
         let fixture = Fixture::new("threads");
         let path = fixture.manifest(&document(&fixture, json!({ "n_threads": 16 })));
         let manifest = load_manifest(&path, None).unwrap();
@@ -327,7 +333,8 @@ mod tests {
             manifest.decode,
             DecodeOptions {
                 n_threads: 4,
-                beam_size: 5
+                beam_size: 1,
+                flash_attn: false,
             }
         );
         assert_eq!(manifest.model_id, "whisper-cpp-test");
@@ -337,8 +344,12 @@ mod tests {
     #[test]
     fn a_changed_pin_is_refused() {
         let fixture = Fixture::new("changed");
-        let path = fixture.manifest(&document(&fixture, json!({ "beam_size": 5 })));
-        assert_eq!(load_manifest(&path, None).unwrap().decode.beam_size, 5);
+        let path = fixture.manifest(&document(
+            &fixture,
+            json!({ "beam_size": 5, "flash_attn": true }),
+        ));
+        let decode = load_manifest(&path, None).unwrap().decode;
+        assert_eq!((decode.beam_size, decode.flash_attn), (5, true));
         std::fs::write(fixture.dir.join("model.bin"), b"swapped").unwrap();
         let error = load_manifest(&path, None).unwrap_err();
         assert!(error.0.starts_with("pinned artifact changed"), "{error:?}");
