@@ -3789,9 +3789,50 @@ fn real_speech_around_silence_phrases_is_not_silence() {
 }
 
 #[test]
-fn empty_or_punctuation_only_text_is_not_a_silence_phrase() {
-    for text in ["", "   ", "...", "-- !!"] {
+fn empty_text_is_not_a_silence_phrase() {
+    for text in ["", "   "] {
         assert!(!is_whisper_silence_phrase(text), "{text:?}");
+    }
+}
+
+#[test]
+fn text_with_no_letters_or_digits_is_silence() {
+    // Whisper writes music notes or stray punctuation over silence.
+    for text in ["♪", "♪♪", " ♪ ♪ ", "...", "-- !!"] {
+        assert!(is_whisper_silence_phrase(text), "{text:?}");
+    }
+    assert!(!is_whisper_silence_phrase("42"), "a digit is speech");
+}
+
+#[test]
+fn watching_outros_and_short_fillers_are_silence() {
+    for text in [
+        "Thanks for watching!",
+        "Thank you for watching.",
+        "Thanks for watching. Thanks for watching.",
+        "Shh.",
+        "Mmm.",
+        "Hmm.",
+        "Hmm. Hmm. Hmm.",
+        "Ahem.",
+        "♪ Hmm ♪",
+    ] {
+        assert!(is_whisper_silence_phrase(text), "{text:?}");
+    }
+}
+
+#[test]
+fn apologies_and_speech_around_fillers_are_not_silence() {
+    for text in [
+        "I'm sorry.",
+        "Hmm, let me check the build.",
+        "Shh, the baby is asleep.",
+        "Hmm. Mmm.",
+        // Beyond the repeat cap of eight.
+        "Hmm hmm hmm hmm hmm hmm hmm hmm hmm.",
+        "Thanks for watching the build for me.",
+    ] {
+        assert!(!is_whisper_silence_phrase(text), "{text:?} is speech");
     }
 }
 

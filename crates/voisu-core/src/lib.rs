@@ -1270,15 +1270,24 @@ pub fn sanitize_source_transcripts(
 /// Whole-transcript phrases Whisper invents over silence. Matched only
 /// against the entire text, so "Send it now. Thank you." is never touched.
 /// Shared by the Cloud path here and the Local engine (`local_tail.rs`).
-const WHISPER_SILENCE_PHRASES: [&str; 8] = [
+///
+/// The short fillers ("hmm", "shh") are what Whisper writes over breath or
+/// room noise. "I'm sorry" is deliberately absent: people dictate it.
+const WHISPER_SILENCE_PHRASES: [&str; 14] = [
     "thank you",
     "thanks",
     "thank you very much",
     "thank you so much",
     "thanks for listening",
+    "thank you for watching",
+    "thanks for watching",
     "you",
     "bye",
     "bye bye",
+    "shh",
+    "mmm",
+    "hmm",
+    "ahem",
 ];
 
 /// Most times one silence phrase may repeat and still count as silence.
@@ -1289,7 +1298,8 @@ const MAX_SILENCE_PHRASE_REPEATS: usize = 8;
 /// True when the WHOLE text is one Whisper silence phrase, or that same
 /// phrase repeated up to `MAX_SILENCE_PHRASE_REPEATS` times ("Thank you.
 /// Thank you."). Every non-alphanumeric character is a word break, so case,
-/// punctuation, quotes and "Bye-bye." do not matter.
+/// punctuation, quotes and "Bye-bye." do not matter. Non-empty text with no
+/// letter or digit at all ("♪♪", "...") is silence too; empty text is not.
 ///
 /// Mixed phrases ("Thank you. Bye.") are deliberately not silence: only a
 /// repeat of one phrase is the Whisper loop signature, and a mix may be a
@@ -1302,7 +1312,7 @@ pub fn is_whisper_silence_phrase(text: &str) -> bool {
         .map(str::to_lowercase)
         .collect::<Vec<_>>();
     if words.is_empty() {
-        return false;
+        return !text.trim().is_empty();
     }
     WHISPER_SILENCE_PHRASES.iter().any(|phrase| {
         let phrase_words = phrase.split(' ').collect::<Vec<_>>();

@@ -581,6 +581,20 @@ mod tests {
     }
 
     #[test]
+    fn music_notes_and_short_fillers_are_no_text() {
+        for text in ["♪", "♪♪", "Shh.", "Mmm.", "Hmm. Hmm.", "Ahem."] {
+            assert_eq!(decide(text, &[]), no_text("no words heard"), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn an_apology_or_a_filler_before_speech_is_delivered() {
+        for text in ["I'm sorry.", "Hmm, let me check the build."] {
+            assert_eq!(decide(text, &[]), transcript(text), "{text:?}");
+        }
+    }
+
+    #[test]
     fn trailing_sign_off_after_real_speech_is_kept() {
         assert_eq!(
             decide("Please send the report. Thank you.", &[]),
