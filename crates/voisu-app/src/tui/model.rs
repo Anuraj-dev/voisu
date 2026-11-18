@@ -18,6 +18,7 @@ use crate::config::{DeliveryMode, RenderingPolicy, WritingMode};
 pub use crate::doctor::DoctorFix as Fix;
 use crate::doctor::DoctorRow;
 use crate::local_model::LocalTier;
+use crate::setup_consented::SetupDevice;
 use crate::setup_flow::SETUP_INCOMPLETE;
 
 use super::keys::{self, Action, Context};
@@ -189,7 +190,7 @@ pub enum Reply {
     /// download it.
     LocalModelConsent {
         model: crate::config::LocalModel,
-        tier: LocalTier,
+        download: AgreedDownload,
         text: String,
     },
     /// A Local model change has finished, whether or not it downloaded.
@@ -203,6 +204,14 @@ pub enum Reply {
 pub enum ServiceVerb {
     Start,
     Restart,
+}
+
+/// The Local model download a consent named: the tier (its size is the
+/// tier's pinned download) and the device it installs for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AgreedDownload {
+    pub tier: LocalTier,
+    pub device: SetupDevice,
 }
 
 /// Slow or blocking work for the worker threads.
@@ -223,10 +232,11 @@ pub enum Job {
     SetLocalIdleUnload(Option<Duration>),
     SetLocalDevice(crate::config::LocalDevice),
     /// Switches the Local model. Without `agreed`, a tier that is not
-    /// installed only asks; with it, the tier downloads.
+    /// installed only asks; with it, that download runs, and only if it is
+    /// still the one the switch needs.
     SetLocalModel {
         model: crate::config::LocalModel,
-        agreed: bool,
+        agreed: Option<AgreedDownload>,
     },
     SetUpdateCheck(bool),
     SetStarPrompt(bool),
@@ -258,7 +268,7 @@ impl Job {
                 | Job::SaveKey { .. }
                 | Job::Service(_)
                 | Job::Star
-                | Job::SetLocalModel { agreed: true, .. }
+                | Job::SetLocalModel { .. }
         )
     }
 }
@@ -281,7 +291,7 @@ impl fmt::Debug for Job {
             Job::SetLocalIdleUnload(after) => write!(f, "SetLocalIdleUnload({after:?})"),
             Job::SetLocalDevice(device) => write!(f, "SetLocalDevice({device:?})"),
             Job::SetLocalModel { model, agreed } => {
-                write!(f, "SetLocalModel({model:?}, agreed: {agreed})")
+                write!(f, "SetLocalModel({model:?}, agreed: {agreed:?})")
             }
             Job::SetUpdateCheck(on) => write!(f, "SetUpdateCheck({on})"),
             Job::SetStarPrompt(on) => write!(f, "SetStarPrompt({on})"),
@@ -370,10 +380,10 @@ pub enum Prompt {
     AddTerm(PromptText),
     Key(Provider, PromptText),
     ConfirmRemove(String),
-    /// Agree to download the Local model `tier` that `model` needs.
+    /// Agree to download the Local model that `model` needs.
     ConfirmDownload {
         model: crate::config::LocalModel,
-        tier: LocalTier,
+        download: AgreedDownload,
         text: String,
     },
     /// A setting's values, open under its row; `picked` is the highlighted one.
@@ -734,6 +744,8 @@ pub struct App {
     pub restart_pending: Vec<SettingsRow>,
     /// The Local model tier downloading now. One download at a time.
     pub local_model_download: Option<LocalTier>,
+    /// `q` was pressed once during a Local model download; the next quits.
+    quit_armed: bool,
     pub should_quit: bool,
     /// The setup screens, over the tabs, while setup runs.
     pub setup: Option<SetupState>,
@@ -779,6 +791,7 @@ impl App {
             fresh_daemon_on_success: false,
             restart_pending: Vec::new(),
             local_model_download: None,
+            quit_armed: false,
             should_quit: false,
             setup: None,
             setup_exit: None,
@@ -1126,15 +1139,27 @@ impl App {
         }
         let (tier, on_gpu, installed) = self.local_model_runs()?;
         if installed != Some(tier) {
+            // With `local_device = auto` the GPU is only probed when a download
+            // is agreed, so name neither GPU nor CPU before then.
+            let settings = self.settings?;
+            let unprobed = settings.local_device == crate::config::LocalDevice::Auto;
             let runs = installed
-                .map(|other| format!("; {} runs", other.label(on_gpu)))
+                .map(|other| {
+                    let label = if unprobed {
+                        other.title()
+                    } else {
+                        other.label(on_gpu)
+                    };
+                    format!("; {label} runs")
+                })
                 .unwrap_or_default();
+            let wanted = if unprobed && settings.local_model == crate::config::LocalModel::Auto {
+                "The model auto picks (Accurate with a GPU, Fast without)".to_owned()
+            } else {
+                tier.title()
+            };
             return Some((
-                format!(
-                    "{} is not installed{}. Pick it to download it.",
-                    tier.title(),
-                    runs
-                ),
+                format!("{wanted} is not installed{runs}. Pick it to download it."),
                 Tone::Caution,
             ));
         }
@@ -1406,9 +1431,30 @@ impl App {
                 self.show(kind, text);
                 self.request_doctor(effects);
             }
-            Reply::LocalModelConsent { model, tier, text } => {
-                if self.local_model_download.is_none() && self.prompt.is_none() {
-                    self.prompt = Some(Prompt::ConfirmDownload { model, tier, text });
+            Reply::LocalModelConsent {
+                model,
+                download,
+                text,
+            } => {
+                if let Some(tier) = self.local_model_download {
+                    self.show(
+                        Tone::Caution,
+                        format!("{} is still downloading.", tier.title()),
+                    );
+                } else if self.prompt.is_some() {
+                    self.show(
+                        Tone::Caution,
+                        format!(
+                            "{} needs a download; pick it again to agree.",
+                            download.tier.title()
+                        ),
+                    );
+                } else {
+                    self.prompt = Some(Prompt::ConfirmDownload {
+                        model,
+                        download,
+                        text,
+                    });
                     self.dirty = true;
                 }
             }
@@ -1471,8 +1517,22 @@ impl App {
     }
 
     fn apply(&mut self, action: Action, effects: &mut Vec<Effect>) {
+        let quit_armed = std::mem::take(&mut self.quit_armed);
         match action {
-            Action::Quit => self.should_quit = true,
+            Action::Quit => match self.local_model_download {
+                // Quitting stops the download; ask once so it is never by accident.
+                Some(tier) if !quit_armed => {
+                    self.quit_armed = true;
+                    self.show(
+                        Tone::Caution,
+                        format!(
+                            "{} is still downloading. Press q again to stop it; it resumes when you pick it again.",
+                            tier.title()
+                        ),
+                    );
+                }
+                _ => self.should_quit = true,
+            },
             Action::PrevTab => self.set_tab(self.tab.shifted(-1), effects),
             Action::NextTab => self.set_tab(self.tab.shifted(1), effects),
             Action::GoTab(tab) => self.set_tab(tab, effects),
@@ -1537,7 +1597,10 @@ impl App {
                     self.dirty = true;
                     effects.push(Effect::Job(Job::RemoveTerm(term)));
                 }
-                Some(Prompt::ConfirmDownload { model, tier, .. }) => {
+                Some(Prompt::ConfirmDownload {
+                    model, download, ..
+                }) => {
+                    let tier = download.tier;
                     self.local_model_download = Some(tier);
                     self.show(
                         Tone::Plain,
@@ -1548,7 +1611,7 @@ impl App {
                     );
                     effects.push(Effect::Job(Job::SetLocalModel {
                         model,
-                        agreed: true,
+                        agreed: Some(download),
                     }));
                 }
                 other => self.prompt = other,
@@ -1744,7 +1807,7 @@ impl App {
             }
             effects.push(Effect::Job(Job::SetLocalModel {
                 model: LOCAL_MODELS[picked],
-                agreed: false,
+                agreed: None,
             }));
             return;
         }
@@ -3189,16 +3252,20 @@ mod tests {
                 effects.as_slice(),
                 [Effect::Job(Job::SetLocalModel {
                     model: LocalModel::Fast,
-                    agreed: false
+                    agreed: None
                 })]
             ),
             "{effects:?}"
         );
         assert_eq!(app.setting_value(SettingsRow::LocalModel).0, "Auto");
 
+        let fast = AgreedDownload {
+            tier: LocalTier::Fast,
+            device: SetupDevice::Gpu,
+        };
         let consent = || Reply::LocalModelConsent {
             model: LocalModel::Fast,
-            tier: LocalTier::Fast,
+            download: fast,
             text: "Download Fast (small.en), 252.6 MiB? y/n".to_owned(),
         };
         let _ = reply(&mut app, consent());
@@ -3213,15 +3280,15 @@ mod tests {
                 effects.as_slice(),
                 [Effect::Job(Job::SetLocalModel {
                     model: LocalModel::Fast,
-                    agreed: true
-                })]
+                    agreed: Some(agreed)
+                })] if *agreed == fast
             ),
             "{effects:?}"
         );
         assert!(
             Job::SetLocalModel {
                 model: LocalModel::Fast,
-                agreed: true
+                agreed: None
             }
             .is_slow()
         );
@@ -3242,12 +3309,33 @@ mod tests {
         let _ = press(&mut app, KeyCode::Up, 0);
         assert!(press(&mut app, KeyCode::Enter, 0).is_empty());
 
+        // Quitting mid-download takes a second q; anything between disarms it.
+        let _ = press(&mut app, KeyCode::Char('q'), 0);
+        assert!(!app.should_quit, "one q never stops a download");
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|toast| toast.kind == Tone::Caution
+                    && toast
+                        .text
+                        .starts_with("Fast (small.en) is still downloading. Press q again")),
+            "{:?}",
+            app.toast
+        );
+        let _ = press(&mut app, KeyCode::Down, 0);
+        let _ = press(&mut app, KeyCode::Char('q'), 0);
+        assert!(!app.should_quit, "another key disarms the second q");
+        let _ = press(&mut app, KeyCode::Char('q'), 0);
+        assert!(app.should_quit, "q twice in a row quits");
+        app.should_quit = false;
+
         let effects = reply(
             &mut app,
             Reply::LocalModelDone {
                 kind: Tone::Success,
-                text: "Restarted the Voisu daemon; Fast (small.en) runs your next Recording."
-                    .to_owned(),
+                text:
+                    "Voisu switches to Fast (small.en) once it is idle, from your next Recording."
+                        .to_owned(),
             },
         );
         assert!(
@@ -3261,6 +3349,44 @@ mod tests {
             app.toast
                 .as_ref()
                 .is_some_and(|toast| toast.kind == Tone::Success)
+        );
+
+        // Once nothing downloads, q quits at once.
+        let _ = press(&mut app, KeyCode::Char('q'), 0);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn a_consent_that_arrives_over_another_prompt_says_so() {
+        use crate::config::LocalModel;
+        let mut app = on_local_model_row();
+        let consent = |model, tier| Reply::LocalModelConsent {
+            model,
+            download: AgreedDownload {
+                tier,
+                device: SetupDevice::Cpu,
+            },
+            text: "Download? y/n".to_owned(),
+        };
+        let _ = reply(&mut app, consent(LocalModel::Fast, LocalTier::Fast));
+        assert!(matches!(app.prompt, Some(Prompt::ConfirmDownload { .. })));
+
+        let _ = reply(&mut app, consent(LocalModel::Accurate, LocalTier::Accurate));
+        assert!(
+            matches!(
+                app.prompt,
+                Some(Prompt::ConfirmDownload {
+                    model: LocalModel::Fast,
+                    ..
+                })
+            ),
+            "the open prompt stays"
+        );
+        assert!(
+            app.toast.as_ref().is_some_and(|toast| toast.text
+                == "Accurate (distil-large-v3.5) needs a download; pick it again to agree."),
+            "{:?}",
+            app.toast
         );
     }
 
@@ -3300,7 +3426,7 @@ mod tests {
                 effects.as_slice(),
                 [Effect::Job(Job::SetLocalModel {
                     model: LocalModel::Auto,
-                    agreed: false
+                    agreed: None
                 })]
             ),
             "{effects:?}"
@@ -3313,6 +3439,28 @@ mod tests {
             Some("Fast (small.en) is not installed. Pick it to download it.".to_owned())
         );
         assert_eq!(app.setting_note(SettingsRow::LocalDevice), None);
+
+        // With the device on auto the GPU is unprobed until a download, so the
+        // note claims neither GPU nor CPU.
+        settings.local_device = LocalDevice::Auto;
+        let _ = reply(&mut app, Reply::Settings(settings));
+        assert_eq!(
+            app.setting_note(SettingsRow::LocalModel).map(|note| note.0),
+            Some(
+                "The model auto picks (Accurate with a GPU, Fast without) is not installed. Pick it to download it."
+                    .to_owned()
+            )
+        );
+        settings.local_model = LocalModel::Fast;
+        settings.installed_tier = Some(LocalTier::Accurate);
+        let _ = reply(&mut app, Reply::Settings(settings));
+        assert_eq!(
+            app.setting_note(SettingsRow::LocalModel).map(|note| note.0),
+            Some(
+                "Fast (small.en) is not installed; Accurate (distil-large-v3.5) runs. Pick it to download it."
+                    .to_owned()
+            )
+        );
     }
 
     #[test]

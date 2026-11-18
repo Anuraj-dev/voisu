@@ -23,7 +23,8 @@ fn local_model_shows_the_resolved_tier_and_refuses_a_download_without_a_terminal
     assert!(fresh.status.success(), "{fresh:?}");
     assert_eq!(
         shown(&fresh),
-        "Local model: auto (Accurate (distil-large-v3.5, GPU))\nAccurate (distil-large-v3.5) is not installed. Run `voisu local-model auto` to install it.\n"
+        "Local model: auto (Accurate with a GPU, Fast without; the GPU is checked when it installs)\nThe Local model it picks is not installed. Run `voisu local-model auto` to install it.\n",
+        "with local_device auto and nothing installed, no GPU is claimed unprobed"
     );
 
     // `local-device cpu` makes auto resolve to Fast.

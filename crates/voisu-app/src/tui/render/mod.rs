@@ -605,7 +605,10 @@ mod tests {
             &mut app,
             Msg::Reply(Reply::LocalModelConsent {
                 model: crate::config::LocalModel::Fast,
-                tier: crate::local_model::LocalTier::Fast,
+                download: crate::tui::model::AgreedDownload {
+                    tier: crate::local_model::LocalTier::Fast,
+                    device: crate::setup_consented::SetupDevice::Cpu,
+                },
                 text: "Download Fast (small.en), 252.6 MiB? y/n".to_owned(),
             }),
             at(0),

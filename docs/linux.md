@@ -162,7 +162,7 @@ Local has two models. Voisu shows them by name; `voisu doctor` adds the model id
 
 `voisu local-model` shows the setting and the model it picks. In the interface it is **Local model** under Settings. `auto` (default) picks Accurate on a GPU and Fast on the CPU. `voisu local-model accurate` or `fast` picks one. `voisu status` and the interface's Home show the model in use, for example `Fast (small.en, CPU)`.
 
-One Local model is installed at a time. Choosing the installed one changes nothing else. Choosing the other shows its size and downloads it only after you agree. Without a terminal, `voisu local-model` never downloads. After the download Voisu restarts the daemon, removes the old model, and the new one runs your next Recording. Switching back downloads the first model again.
+One Local model is installed at a time. Choosing the installed one changes nothing else. Choosing the other shows its size and downloads it only after you agree. Without a terminal, `voisu local-model` never downloads. The switch takes effect once Voisu is idle, at your next Recording; a Recording in progress finishes on the old model. Voisu then removes the old model. With `local_device = auto`, Voisu checks for a GPU before the download, and saves `local_device = cpu` if it finds none. Switching back downloads the first model again.
 
 ### Local unload
 
