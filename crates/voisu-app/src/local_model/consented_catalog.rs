@@ -18,6 +18,8 @@ pub struct ConsentedCatalogEntry {
     pub native_runtime: Option<DownloadPin>,
     pub revision: &'static str,
     pub license_spdx: &'static str,
+    /// Setup may newly install this entry. A retired entry's existing install
+    /// still verifies and runs; it is only never offered or installed again.
     pub consent_installable: bool,
     pub weights: &'static [DownloadPin],
     /// The pinned CPython runtime of a Python worker. `None` for the
@@ -138,7 +140,8 @@ pub const CONSENTED_ENTRY: ConsentedCatalogEntry = ConsentedCatalogEntry {
     revision: "9793ccc07920e0f830e1dba0343efcdf0ef8c903",
     // HF model card for distil-whisper/distil-large-v3.5-ct2 declares `license: mit`.
     license_spdx: "MIT",
-    consent_installable: true,
+    // Retired from setup: whisper.cpp is the one installable Local model.
+    consent_installable: false,
     weights: WEIGHTS,
     python: Some(PYTHON),
     wheels: WHEELS,
@@ -224,6 +227,19 @@ pub fn consented_entry(id: &str) -> Option<&'static ConsentedCatalogEntry> {
         .find(|entry| entry.id == id)
 }
 
+/// The entry a new install may fetch for this exact consent text and licence.
+/// Retired entries never match, so their consent cannot start a download.
+pub fn installable_entry_for_consent(
+    text: &str,
+    license_spdx: &str,
+) -> Option<&'static ConsentedCatalogEntry> {
+    consented_catalog_entries().into_iter().find(|entry| {
+        entry.consent_installable
+            && entry.consent_text == text
+            && entry.license_spdx == license_spdx
+    })
+}
+
 pub const NEMO_LIBRARY: &str =
     "runtime/nemo-speech-0.1.0-linux-x86_64-cpu/lib/libnemo_speech_asr_c.so.1";
 pub const PARAKEET_ENTRY: ConsentedCatalogEntry = ConsentedCatalogEntry {
@@ -232,7 +248,8 @@ pub const PARAKEET_ENTRY: ConsentedCatalogEntry = ConsentedCatalogEntry {
     compute_type: "q8_0",
     revision: "541d1f99c6b0c3cd0b11a95167540bb8edefd82b",
     license_spdx: "CC-BY-4.0",
-    consent_installable: true,
+    // Retired from setup: whisper.cpp is the one installable Local model.
+    consent_installable: false,
     weights: &[super::consented_pins::PARAKEET_WEIGHTS],
     native_runtime: Some(super::consented_pins::NEMO_CPU),
     python: Some(PYTHON),

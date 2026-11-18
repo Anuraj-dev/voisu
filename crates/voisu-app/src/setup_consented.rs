@@ -15,14 +15,16 @@ use std::time::{Duration, Instant};
 use voisu_core::{AsrMode, KeyDiagnosis};
 
 use crate::asr_mode::LOCAL_UNAVAILABLE;
+use crate::config::LocalDevice;
 use crate::local_model::consented::ConsentedRemoveOutcome;
 use crate::local_model::{
-    CONSENTED_ENTRY, ConsentedConsent, ConsentedError, ConsentedInstallRequest, HostHardware,
+    ConsentedCatalogEntry, ConsentedConsent, ConsentedError, ConsentedInstallRequest, HostHardware,
     InstallClock, InstallIo, InstallPhase, InstallProgress, ModelStore, OfflineRuntimeBuilder,
-    ProductionHttps, models_dir_from_state, remove_consented_install, suggest_local,
+    ProductionHttps, installable_entry_for_consent, models_dir_from_state,
+    remove_consented_install, suggest_local,
 };
 use crate::local_setup::SetupMaintenance;
-use crate::local_worker::ConsentedWorkerHealth;
+use crate::local_worker::{ConsentedWorkerHealth, whisper_cpp_finds_gpu};
 use crate::setup::{SETUP_COMPLETE_MESSAGE, WizardIo};
 use crate::setup_engine::{ConsentedStatus, ask_yes_no, format_size, suggested_consented_entry};
 
@@ -31,7 +33,7 @@ pub use crate::local_model::{DEVELOPMENT_ROOT_NAME, SystemCommandRunner, probe_h
 const INSTALL_PROMPT: &str = "Download and install now?";
 const INSTALL_DURATION_HINT: &str = "This can take several minutes.";
 #[cfg(test)]
-const INSTALL_SUCCESS: &str = "Installed distil-large-v3.5-int8 (Consented Install).";
+const INSTALL_SUCCESS: &str = "Installed whisper-cpp-distil-large-v3.5-q8-0 (Consented Install).";
 const DAEMON_RESTARTED: &str = "Restarted the Voisu daemon; Local dictation is ready.";
 const CLOUD_PROMPT: &str = "Also set up Cloud?";
 const CLOUD_SKIPPED: &str = "Cloud skipped; setup will not ask again. To add Cloud later, run `voisu setup` and choose Cloud, or `voisu key set groq`.";
@@ -50,6 +52,7 @@ const REMOVED: &str = "Removed the Consented Install.";
 const NOTHING_TO_REMOVE: &str = "No Consented Install is installed.";
 const IN_USE: &str =
     "The Consented Install is in use; stop dictation or run `voisu service stop` first.";
+const NO_GPU: &str = "No usable GPU was found. Run `voisu local-device cpu` to use the CPU (several times slower), then `voisu setup` again.";
 const GPU_BUSY: &str = "Another Local worker is using the GPU; stop it (for example `voisu service stop`, or stop voisu-dev.service), then run `voisu setup` again.";
 
 /// Outcome of the setup Consented Install offer.
@@ -82,34 +85,86 @@ pub enum LocalRemoveStatus {
     Failed(String),
 }
 
+/// Where setup's install will run, settled before the consent prompt so the
+/// prompt can say so.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SetupDevice {
+    /// `local_device` is auto or gpu; the install checks the GPU before any
+    /// download.
+    Gpu,
+    /// `local_device` is cpu.
+    Cpu,
+    /// `local_device` is auto and the worker found no GPU. Saying yes to the
+    /// prompt is the consent to the CPU: setup sets `local_device` to cpu
+    /// before installing. Auto itself never falls back.
+    CpuNoGpu,
+}
+
+impl SetupDevice {
+    /// The device the install runs and health-checks on.
+    #[must_use]
+    pub fn install_device(self) -> LocalDevice {
+        match self {
+            Self::Gpu => LocalDevice::Gpu,
+            Self::Cpu | Self::CpuNoGpu => LocalDevice::Cpu,
+        }
+    }
+}
+
+/// The device for `setting`. Only auto asks `gpu_found`.
+#[must_use]
+pub fn setup_device(setting: LocalDevice, gpu_found: impl FnOnce() -> bool) -> SetupDevice {
+    match setting {
+        LocalDevice::Cpu => SetupDevice::Cpu,
+        LocalDevice::Gpu => SetupDevice::Gpu,
+        LocalDevice::Auto if gpu_found() => SetupDevice::Gpu,
+        LocalDevice::Auto => SetupDevice::CpuNoGpu,
+    }
+}
+
+/// [`setup_device`] from the user's config and the packaged worker's probe.
+#[must_use]
+pub fn production_setup_device() -> SetupDevice {
+    setup_device(crate::config::local_device(), whisper_cpp_finds_gpu)
+}
+
 /// The facts shown before the install prompt, one per line.
 ///
-/// Display only: the receipt still records the full, hashed `CONSENT_TEXT`
-/// through [`ConsentedConsent::accepted`], which this summary never replaces.
+/// Display only: the receipt still records the entry's full, hashed consent
+/// text through [`ConsentedConsent::accepted_entry`], which this summary never
+/// replaces.
 #[must_use]
-pub fn consent_summary() -> [String; 4] {
+pub fn consent_summary(entry: &ConsentedCatalogEntry, device: SetupDevice) -> [String; 5] {
+    let [language, licence] = consent_terms(entry);
     [
-        format!(
-            "Download size: {}",
-            format_size(CONSENTED_ENTRY.total_download_bytes)
-        ),
-        "English only".into(),
-        "Needs an NVIDIA GPU".into(),
+        format!("Download size: {}", format_size(entry.total_download_bytes)),
+        language,
+        licence,
+        device_line(device).into(),
         "Runs offline after install".into(),
     ]
 }
 
-fn consent_summary_for(entry: &crate::local_model::ConsentedCatalogEntry) -> Vec<String> {
-    if entry.device == "cpu" {
-        vec![
-            format!("Download size: {}", format_size(entry.total_download_bytes)),
-            "English only".into(),
-            format!("Licence: {}", entry.license_spdx),
-            "Runs offline on CPU".into(),
-            "Development evidence: one host, one speaker — not the release gate.".into(),
-        ]
-    } else {
-        consent_summary().into()
+/// The limits a yes accepts beyond size and device: the language and the
+/// licence. The CLI and the TUI consent both show these, so the receipt never
+/// records terms the prompt left out.
+#[must_use]
+pub fn consent_terms(entry: &ConsentedCatalogEntry) -> [String; 2] {
+    [
+        "English only".into(),
+        format!("Licence: {}", entry.license_spdx),
+    ]
+}
+
+fn device_line(device: SetupDevice) -> &'static str {
+    match device {
+        SetupDevice::Gpu => "Runs on your GPU",
+        SetupDevice::Cpu => {
+            "Runs on the CPU, as `voisu local-device cpu` asks; several times slower than a GPU"
+        }
+        SetupDevice::CpuNoGpu => {
+            "No GPU found, so it runs on the CPU, several times slower; installing sets `voisu local-device cpu`"
+        }
     }
 }
 
@@ -117,14 +172,17 @@ fn consent_summary_for(entry: &crate::local_model::ConsentedCatalogEntry) -> Vec
 /// successful install then restarts the daemon through `restart_daemon`; a
 /// failed restart is a warning, never a failed install.
 ///
-/// Non-interactive and an already-verified install never fetch.
+/// Non-interactive and an already-verified install never fetch, and never
+/// run `device`, which may probe the GPU.
+#[allow(clippy::too_many_arguments)]
 pub fn run_consented_install_step(
     io: &mut dyn WizardIo,
     hw: &HostHardware,
     interactive: bool,
     installed: bool,
     now_unix: u64,
-    install: impl FnOnce(ConsentedConsent) -> Result<(), ConsentedError>,
+    device: impl FnOnce() -> SetupDevice,
+    install: impl FnOnce(ConsentedConsent, SetupDevice) -> Result<(), ConsentedError>,
     restart_daemon: impl FnOnce() -> Result<(), String>,
 ) -> ConsentedInstallStep {
     if installed || !interactive {
@@ -133,15 +191,16 @@ pub fn run_consented_install_step(
     let Some(entry) = suggested_consented_entry(&suggest_local(hw)) else {
         return ConsentedInstallStep::Skipped;
     };
+    let device = device();
     io.writeln("");
-    for fact in consent_summary_for(entry) {
+    for fact in consent_summary(entry, device) {
         io.writeln(&fact);
         io.writeln("");
     }
     match ask_yes_no(io, INSTALL_PROMPT, false) {
         Some(true) => {
             io.writeln(INSTALL_DURATION_HINT);
-            match install(ConsentedConsent::accepted_entry(entry, now_unix)) {
+            match install(ConsentedConsent::accepted_entry(entry, now_unix), device) {
                 Ok(()) => {
                     io.writeln(&format!("Installed {} (Consented Install).", entry.id));
                     match restart_daemon() {
@@ -572,6 +631,8 @@ pub fn consented_error_line(error: &ConsentedError) -> String {
     match error {
         ConsentedError::NoSpace => "Not enough free disk space.".into(),
         ConsentedError::Maintenance => IN_USE.into(),
+        // The pre-download GPU probe; the reason is what the worker said.
+        ConsentedError::Health(reason) if reason.starts_with("gpu_unavailable") => NO_GPU.into(),
         ConsentedError::Health(_) => "The installed model failed its health check.".into(),
         ConsentedError::GpuBusy => GPU_BUSY.into(),
         ConsentedError::HealthUnreaped => {
@@ -646,45 +707,73 @@ pub fn production_local_complete_message() -> String {
 }
 
 /// Fetches and installs only when the setup offer calls this after an explicit yes.
-pub fn production_install(consent: ConsentedConsent) -> Result<(), ConsentedError> {
-    production_install_with(consent, |total| Box::new(TerminalProgress::stdout(total)))
+pub fn production_install(
+    consent: ConsentedConsent,
+    device: SetupDevice,
+) -> Result<(), ConsentedError> {
+    production_install_with(consent, device, |total| {
+        Box::new(TerminalProgress::stdout(total))
+    })
 }
 
 /// [`production_install`], reporting to whatever `progress` builds from the
 /// entry's total download size.
 pub fn production_install_with(
     consent: ConsentedConsent,
+    device: SetupDevice,
     progress: impl FnOnce(u64) -> Box<dyn InstallProgress>,
 ) -> Result<(), ConsentedError> {
-    let models =
-        models_dir_from_state(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
-            .map_err(ConsentedError::Store)?;
-    let store = ModelStore::open(models).map_err(ConsentedError::Store)?;
-    let state = voisu_core::state_dir()
-        .map_err(|message| ConsentedError::Io(std::io::Error::other(message)))?;
-    let fetcher = ProductionHttps;
-    let builder = OfflineRuntimeBuilder;
-    let entry = [&CONSENTED_ENTRY, &crate::local_model::PARAKEET_ENTRY]
-        .into_iter()
-        .find(|entry| {
-            entry.consent_text == consent.text && entry.license_spdx == consent.license_spdx
-        })
-        .ok_or(ConsentedError::Consent)?;
-    let health = ConsentedWorkerHealth::for_entry(state, entry);
-    let maintenance = SetupMaintenance::default();
-    let progress = progress(entry.total_download_bytes);
-    crate::local_model::install_consented_install(ConsentedInstallRequest {
-        store: &store,
+    install_then_record_device(
         consent,
-        fetcher: &fetcher,
-        builder: &builder,
-        health: &health,
-        maintenance: &maintenance,
-        io: InstallIo::default(),
-        clock: InstallClock::default(),
-        progress: &*progress,
-    })
-    .map(|_| ())
+        device,
+        &crate::config::config_path(),
+        |consent, entry, install_device| {
+            let models =
+                models_dir_from_state(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+                    .map_err(ConsentedError::Store)?;
+            let store = ModelStore::open(models).map_err(ConsentedError::Store)?;
+            let state = voisu_core::state_dir()
+                .map_err(|message| ConsentedError::Io(std::io::Error::other(message)))?;
+            let health = ConsentedWorkerHealth::for_install(state, entry, install_device);
+            let progress = progress(entry.total_download_bytes);
+            crate::local_model::install_consented_install(ConsentedInstallRequest {
+                store: &store,
+                consent,
+                fetcher: &ProductionHttps,
+                builder: &OfflineRuntimeBuilder,
+                health: &health,
+                maintenance: &SetupMaintenance::default(),
+                io: InstallIo::default(),
+                clock: InstallClock::default(),
+                progress: &*progress,
+            })
+            .map(|_| ())
+        },
+    )
+}
+
+/// Resolves `consent` to its installable entry, runs `install` on the device
+/// the user agreed to, and only after it succeeds records a CPU choice in
+/// `config`. A failed install leaves the config as it was.
+fn install_then_record_device(
+    consent: ConsentedConsent,
+    device: SetupDevice,
+    config: &Path,
+    install: impl FnOnce(
+        ConsentedConsent,
+        &'static ConsentedCatalogEntry,
+        LocalDevice,
+    ) -> Result<(), ConsentedError>,
+) -> Result<(), ConsentedError> {
+    let entry = installable_entry_for_consent(&consent.text, &consent.license_spdx)
+        .ok_or(ConsentedError::Consent)?;
+    install(consent, entry, device.install_device())?;
+    if device == SetupDevice::CpuNoGpu {
+        // The consent named the CPU; from now on the daemon reads it here.
+        crate::config::set_local_device_at(config, LocalDevice::Cpu)
+            .map_err(|message| ConsentedError::Io(std::io::Error::other(message)))?;
+    }
+    Ok(())
 }
 
 pub fn production_remove() -> Result<RemoveOutcome, ConsentedError> {
@@ -704,13 +793,13 @@ fn remove_consented_from_store(store: &ModelStore) -> Result<RemoveOutcome, Cons
     })
 }
 
-const _: () = assert!(CONSENTED_ENTRY.consent_installable);
+const _: () = assert!(crate::local_model::WHISPER_CPP_ENTRY.consent_installable);
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::local_model::{
-        CONSENT_TEXT, DISTIL_MODEL_ID, FetchError, GpuProbe, NvidiaGpu, ProgressSink,
+        CONSENTED_ENTRY, FetchError, GpuProbe, NvidiaGpu, ProgressSink, WHISPER_CPP_ENTRY,
     };
     use crate::setup_engine::{
         ConsentedStatus, EngineChoice, INSTALLED_AVAILABILITY, run_engine_screen,
@@ -792,6 +881,34 @@ mod tests {
         (step, io)
     }
 
+    /// The consent this setup records for the whisper.cpp entry.
+    fn accepted() -> ConsentedConsent {
+        ConsentedConsent::accepted_entry(&WHISPER_CPP_ENTRY, NOW)
+    }
+
+    /// [`offer`] with a yes, on `device`; returns the device the install got.
+    fn accept_on(
+        hw: &HostHardware,
+        device: SetupDevice,
+    ) -> (ConsentedInstallStep, FakeIo, Vec<SetupDevice>) {
+        let mut io = FakeIo::new(vec![Some("y")]);
+        let mut devices = Vec::new();
+        let step = run_consented_install_step(
+            &mut io,
+            hw,
+            true,
+            false,
+            NOW,
+            || device,
+            |_, device| {
+                devices.push(device);
+                Ok(())
+            },
+            || Ok(()),
+        );
+        (step, io, devices)
+    }
+
     fn offer_with_restart(
         hw: &HostHardware,
         interactive: bool,
@@ -809,7 +926,8 @@ mod tests {
             interactive,
             installed,
             NOW,
-            |consent| {
+            || SetupDevice::Gpu,
+            |consent, _| {
                 recorded.push(consent);
                 match &result {
                     Ok(()) => Ok(()),
@@ -832,7 +950,7 @@ mod tests {
         (step, io, restarts)
     }
 
-    const SUMMARY_BLOCK: &str = "\nDownload size: 2.8 GiB\n\nEnglish only\n\nNeeds an NVIDIA GPU\n\nRuns offline after install\n\nPROMPT Download and install now? [y/N] ";
+    const SUMMARY_BLOCK: &str = "\nDownload size: 780.7 MiB\n\nEnglish only\n\nLicence: MIT\n\nRuns on your GPU\n\nRuns offline after install\n\nPROMPT Download and install now? [y/N] ";
 
     #[test]
     fn rtx_5050_offers_install_and_decline_never_fetches() {
@@ -845,7 +963,7 @@ mod tests {
             io.transcript()
         );
         assert!(
-            !io.transcript().contains(CONSENT_TEXT),
+            !io.transcript().contains(WHISPER_CPP_ENTRY.consent_text),
             "{}",
             io.transcript()
         );
@@ -862,14 +980,11 @@ mod tests {
         let hw = host(GpuProbe::Nvidia(vec![gpu(0, 8151)]));
         let (step, io) = offer(&hw, true, false, vec![Some("y")], Ok(()));
         assert_eq!(step, ConsentedInstallStep::Installed);
-        assert_eq!(io.install_calls, vec![ConsentedConsent::accepted(NOW)]);
+        assert_eq!(io.install_calls, vec![accepted()]);
         // The hashed consent record keeps the full catalog text even though
         // the terminal shows only the short summary.
-        assert_eq!(io.install_calls[0].text, CONSENT_TEXT);
-        assert_eq!(
-            io.install_calls[0].license_spdx,
-            CONSENTED_ENTRY.license_spdx
-        );
+        assert_eq!(io.install_calls[0].text, WHISPER_CPP_ENTRY.consent_text);
+        assert_eq!(io.install_calls[0].license_spdx, "MIT");
         assert!(
             io.transcript().contains(INSTALL_DURATION_HINT),
             "{}",
@@ -883,35 +998,96 @@ mod tests {
     }
 
     #[test]
-    fn cpu_suggestion_offers_exact_parakeet_consent_and_decline_does_not_fetch() {
+    fn every_host_is_offered_whisper_cpp_and_the_summary_says_where_it_runs() {
+        let cases = [
+            (SetupDevice::Gpu, "Runs on your GPU\n"),
+            (
+                SetupDevice::Cpu,
+                "Runs on the CPU, as `voisu local-device cpu` asks; several times slower than a GPU\n",
+            ),
+            (
+                SetupDevice::CpuNoGpu,
+                "No GPU found, so it runs on the CPU, several times slower; installing sets `voisu local-device cpu`\n",
+            ),
+        ];
         for hw in [
             host(GpuProbe::Nvidia(vec![gpu(0, 2048)])),
             host(GpuProbe::NoneFound),
+            host(GpuProbe::Failed("driver failed".into())),
         ] {
-            let (step, io) = offer(&hw, true, false, vec![Some("n")], Ok(()));
-            assert_eq!(step, ConsentedInstallStep::Declined);
-            assert!(io.install_calls.is_empty());
-            let text = io.transcript();
-            for expected in [
-                "734.1 MiB",
-                "English only",
-                "CC-BY-4.0",
-                "Runs offline on CPU",
-                "Development evidence",
-                "not the release gate",
-            ] {
-                assert!(text.contains(expected), "{text}");
+            for (device, line) in cases {
+                let (step, io, devices) = accept_on(&hw, device);
+                assert_eq!(step, ConsentedInstallStep::Installed);
+                assert_eq!(devices, [device], "the install gets the device it showed");
+                let text = io.transcript();
+                assert!(text.contains(line), "{text}");
+                assert!(text.contains("Download size: 780.7 MiB"), "{text}");
+                assert!(text.contains(INSTALL_SUCCESS), "{text}");
             }
-            let (step, io) = offer(&hw, true, false, vec![Some("y")], Ok(()));
-            assert_eq!(step, ConsentedInstallStep::Installed);
-            assert_eq!(
-                io.install_calls,
-                vec![ConsentedConsent::accepted_entry(
-                    &crate::local_model::PARAKEET_ENTRY,
-                    NOW
-                )]
+        }
+    }
+
+    #[test]
+    fn auto_asks_the_gpu_probe_and_only_auto_falls_to_the_cpu() {
+        assert_eq!(setup_device(LocalDevice::Auto, || true), SetupDevice::Gpu);
+        assert_eq!(
+            setup_device(LocalDevice::Auto, || false),
+            SetupDevice::CpuNoGpu
+        );
+        let unasked = || panic!("only auto runs the probe");
+        assert_eq!(setup_device(LocalDevice::Gpu, unasked), SetupDevice::Gpu);
+        assert_eq!(setup_device(LocalDevice::Cpu, unasked), SetupDevice::Cpu);
+    }
+
+    #[test]
+    fn a_skipped_or_declined_offer_never_probes_and_a_decline_never_installs() {
+        let hw = host(GpuProbe::NoneFound);
+        for (interactive, installed) in [(false, false), (true, true)] {
+            let mut io = FakeIo::new(vec![Some("y")]);
+            let step = run_consented_install_step(
+                &mut io,
+                &hw,
+                interactive,
+                installed,
+                NOW,
+                || panic!("a skipped offer must not probe the GPU"),
+                |_, _| panic!("a skipped offer must not install"),
+                || Ok(()),
             );
-            assert!(io.transcript().contains("Installed parakeet-tdt-0.6b-v3"));
+            assert_eq!(step, ConsentedInstallStep::Skipped);
+        }
+    }
+
+    /// The real chain setup and the TUI use: the hardware suggestion, the
+    /// offered entry and the installer's consent lookup all land on
+    /// whisper.cpp, and the retired entries' consent starts nothing.
+    #[test]
+    fn the_suggested_consent_resolves_to_the_whisper_cpp_entry_only() {
+        for probe in [
+            GpuProbe::Nvidia(vec![gpu(0, 8151)]),
+            GpuProbe::NoneFound,
+            GpuProbe::Failed("driver failed".into()),
+        ] {
+            let entry = suggested_consented_entry(&suggest_local(&host(probe))).unwrap();
+            let consent = ConsentedConsent::accepted_entry(entry, NOW);
+            let resolved =
+                installable_entry_for_consent(&consent.text, &consent.license_spdx).unwrap();
+            assert_eq!(resolved.id, "whisper-cpp-distil-large-v3.5-q8-0");
+            assert!(resolved.runs_whisper_cpp());
+        }
+        for retired in [&CONSENTED_ENTRY, &crate::local_model::PARAKEET_ENTRY] {
+            let consent = ConsentedConsent::accepted_entry(retired, NOW);
+            assert!(
+                installable_entry_for_consent(&consent.text, &consent.license_spdx).is_none(),
+                "{}",
+                retired.id
+            );
+            assert!(matches!(
+                production_install_with(consent, SetupDevice::CpuNoGpu, |_| {
+                    panic!("a retired consent must not reach the download")
+                }),
+                Err(ConsentedError::Consent)
+            ));
         }
     }
 
@@ -976,7 +1152,7 @@ mod tests {
             assert!(text.contains(line), "{line}: {text}");
             assert!(text.contains(LOCAL_UNAVAILABLE), "{text}");
             assert!(text.contains(INSTALL_RETRY), "{text}");
-            assert_eq!(io.install_calls, vec![ConsentedConsent::accepted(NOW)]);
+            assert_eq!(io.install_calls, vec![accepted()]);
         }
     }
 
@@ -1475,19 +1651,24 @@ mod tests {
             true,
             false,
             NOW,
-            |_| panic!("decline must not install"),
+            || SetupDevice::Gpu,
+            |_, _| panic!("decline must not install"),
             || panic!("decline must not restart the daemon"),
         );
         assert_eq!(step, ConsentedInstallStep::Declined);
         let declined = decline.transcript();
         assert!(
             declined.contains(&format!(
-                "Recommended for this computer: {DISTIL_MODEL_ID} (RTX 5050 Laptop)"
+                "Recommended for this computer: {} on your GPU (RTX 5050 Laptop)",
+                WHISPER_CPP_ENTRY.id
             )),
             "{declined}"
         );
         assert!(declined.contains(SUMMARY_BLOCK), "{declined}");
-        assert!(!declined.contains(CONSENT_TEXT), "{declined}");
+        assert!(
+            !declined.contains(WHISPER_CPP_ENTRY.consent_text),
+            "{declined}"
+        );
         assert!(!declined.contains(INSTALL_SUCCESS), "{declined}");
         assert!(!declined.contains("Switch to Local anyway?"), "{declined}");
         assert_eq!(decline.prompts, 2, "engine choice, then consent");
@@ -1511,14 +1692,15 @@ mod tests {
             true,
             false,
             NOW,
-            |consent| {
+            || SetupDevice::Gpu,
+            |consent, _| {
                 consents.push(consent);
                 Ok(())
             },
             || Ok(()),
         );
         assert_eq!(step, ConsentedInstallStep::Installed);
-        assert_eq!(consents, vec![ConsentedConsent::accepted(NOW)]);
+        assert_eq!(consents, vec![accepted()]);
         let accepted = accept.transcript();
         assert!(accepted.contains(SUMMARY_BLOCK), "{accepted}");
         assert!(accepted.contains(DAEMON_RESTARTED), "{accepted}");
@@ -1659,8 +1841,16 @@ mod tests {
 
         let hw = host(GpuProbe::Nvidia(vec![gpu(0, 8151)]));
         let mut io = FakeIo::new(vec![Some("y")]);
-        let step =
-            run_consented_install_step(&mut io, &hw, true, false, NOW, |_| Ok(()), || Ok(()));
+        let step = run_consented_install_step(
+            &mut io,
+            &hw,
+            true,
+            false,
+            NOW,
+            || SetupDevice::Gpu,
+            |_, _| Ok(()),
+            || Ok(()),
+        );
         assert_eq!(step, ConsentedInstallStep::Installed);
         let mut catalog_ran = false;
         run_catalog_repair_if_needed(&mut io, step, false, |io| {
@@ -1679,6 +1869,93 @@ mod tests {
         let root = models_dir_from_state(Some(temp.path().as_os_str().to_owned()), None).unwrap();
         let store = ModelStore::open(root).unwrap();
         (temp, store)
+    }
+
+    /// Runs the real installer for `consent` on a disk with no free space, so
+    /// it fails after the consent and before any fetch.
+    fn install_with_no_space(
+        store: &ModelStore,
+        consent: ConsentedConsent,
+    ) -> Result<(), ConsentedError> {
+        struct Passing;
+        impl crate::local_model::ConsentedHealth for Passing {
+            fn check(
+                &self,
+                _: &crate::local_model::ConsentedLayout,
+                _: &crate::local_model::ConsentedReceipt,
+            ) -> Result<(), ConsentedError> {
+                Ok(())
+            }
+        }
+        struct Idle;
+        impl crate::local_model::MaintenanceReservation for Idle {
+            fn acquire(
+                &self,
+            ) -> Result<crate::local_model::MaintenanceKind, crate::local_model::MaintenanceError>
+            {
+                Ok(crate::local_model::MaintenanceKind::Idle)
+            }
+        }
+        crate::local_model::install_consented_install(ConsentedInstallRequest {
+            store,
+            consent,
+            fetcher: &crate::local_model::ScriptedFetcher::default(),
+            builder: &OfflineRuntimeBuilder,
+            health: &Passing,
+            maintenance: &Idle,
+            io: InstallIo {
+                available_bytes: 0,
+                ..InstallIo::default()
+            },
+            clock: InstallClock::default(),
+            progress: &crate::local_model::SilentProgress,
+        })
+        .map(|_| ())
+    }
+
+    #[test]
+    fn a_failed_install_after_a_cpu_consent_leaves_local_device_unchanged() {
+        let (temp, store) = test_store();
+        let config = temp.path().join("config.toml");
+        let before = "# mine\nlocal_device = \"auto\"\n";
+        std::fs::write(&config, before).unwrap();
+        let mut devices = Vec::new();
+        let error = install_then_record_device(
+            accepted(),
+            SetupDevice::CpuNoGpu,
+            &config,
+            |consent, entry, device| {
+                devices.push(device);
+                // The worker health the production install builds probes the
+                // accepted device, whatever the config says meanwhile.
+                assert_eq!(
+                    ConsentedWorkerHealth::for_install(temp.path().into(), entry, device).device(),
+                    "cpu"
+                );
+                install_with_no_space(&store, consent)
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, ConsentedError::NoSpace), "{error:?}");
+        assert_eq!(devices, [LocalDevice::Cpu]);
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
+        assert_eq!(crate::config::local_device_at(&config), LocalDevice::Auto);
+    }
+
+    #[test]
+    fn only_a_successful_install_after_a_cpu_consent_records_cpu() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config.toml");
+        std::fs::write(&config, "local_device = \"auto\"\n").unwrap();
+        install_then_record_device(accepted(), SetupDevice::Gpu, &config, |_, _, device| {
+            assert_eq!(device, LocalDevice::Gpu);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(crate::config::local_device_at(&config), LocalDevice::Auto);
+        install_then_record_device(accepted(), SetupDevice::CpuNoGpu, &config, |_, _, _| Ok(()))
+            .unwrap();
+        assert_eq!(crate::config::local_device_at(&config), LocalDevice::Cpu);
     }
 
     fn removal_receipt() -> crate::local_model::ConsentedReceipt {

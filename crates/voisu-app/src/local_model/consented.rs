@@ -12,10 +12,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 #[cfg(test)]
-use super::consented_catalog::PARAKEET_ENTRY;
+use super::consented_catalog::{CONSENTED_ENTRY, PARAKEET_ENTRY};
 use super::consented_catalog::{
-    CONSENTED_ENTRY, ConsentedCatalogEntry, DownloadPin, WORKER_FILES, consented_catalog_entries,
-    consented_entry,
+    ConsentedCatalogEntry, DownloadPin, WORKER_FILES, consented_catalog_entries, consented_entry,
+    installable_entry_for_consent,
 };
 use super::consented_runtime::{
     ConsentedRuntimeBuilder, RuntimeBuild, audit_runtime_tree, executable, sync_tree,
@@ -66,11 +66,8 @@ pub struct ConsentedConsent {
     pub unix_time: u64,
 }
 impl ConsentedConsent {
-    /// The caller records this only after the user explicitly accepts CONSENT_TEXT.
-    pub fn accepted(unix_time: u64) -> Self {
-        Self::accepted_entry(&CONSENTED_ENTRY, unix_time)
-    }
-
+    /// The caller records this only after the user explicitly accepts the
+    /// entry's consent text.
     pub fn accepted_entry(entry: &ConsentedCatalogEntry, unix_time: u64) -> Self {
         Self {
             text: entry.consent_text.into(),
@@ -353,12 +350,7 @@ pub struct ConsentedInstallRequest<'a> {
 pub fn install_consented_install(
     request: ConsentedInstallRequest<'_>,
 ) -> Result<ConsentedReceipt, ConsentedError> {
-    let entry = consented_catalog_entries()
-        .into_iter()
-        .find(|entry| {
-            request.consent.text == entry.consent_text
-                && request.consent.license_spdx == entry.license_spdx
-        })
+    let entry = installable_entry_for_consent(&request.consent.text, &request.consent.license_spdx)
         .ok_or(ConsentedError::Consent)?;
     install_with_entry(request, entry)
 }
@@ -1242,8 +1234,8 @@ fn check_receipt(
     entry: &ConsentedCatalogEntry,
     receipt: &ConsentedReceipt,
 ) -> Result<(ConsentedLayout, bool), ConsentedError> {
-    if !entry.consent_installable
-        || receipt.consent.text != entry.consent_text
+    // A retired entry's receipt still matches: only new installs are gated.
+    if receipt.consent.text != entry.consent_text
         || receipt.consent.license_spdx != entry.license_spdx
     {
         return Err(ConsentedError::Receipt);
@@ -1861,16 +1853,30 @@ fn download_resumable(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(&part_path)?;
-    if !file.metadata()?.is_file() {
+    let open_part = |create_new: bool| {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .create_new(create_new)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(&part_path)
+    };
+    let mut file = open_part(false)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
         return Err(not_a_file());
+    }
+    // Only a `.part` this user alone owns is resumed. A hard link to another
+    // file would be extended, or truncated on a restart, through this name.
+    // Unlinking drops only the name; a fresh `.part` takes its place.
+    // SAFETY: geteuid has no pointer arguments or preconditions.
+    if meta.nlink() != 1 || meta.uid() != unsafe { libc::geteuid() } {
+        drop(file);
+        fs::remove_file(&part_path)?;
+        file = open_part(true)?;
     }
     let discard = |file: &mut File| -> Result<(), ConsentedError> {
         file.set_len(0)?;
@@ -2821,6 +2827,25 @@ pub(crate) mod install_tests {
     }
 
     #[test]
+    fn whisper_cpp_a_hard_linked_part_is_replaced_and_the_linked_file_kept() {
+        let (temp, store) = store();
+        // Resuming through the link would range-fetch, see the Range ignored,
+        // and truncate the linked file before writing the model into it.
+        let outside = temp.path().join("precious");
+        fs::write(&outside, b"precious bytes").unwrap();
+        super::super::ensure_private_dir(&partial_dir(&store)).unwrap();
+        fs::hard_link(&outside, part(&store)).unwrap();
+        let fetcher = ScriptedFetcher::new(vec![ScriptedHop::Body(DATA.to_vec()), clip()]);
+        install_whisper_cpp(&store, &fetcher, InstallIo::default()).unwrap();
+        assert_eq!(fs::read(&outside).unwrap(), b"precious bytes");
+        let verified = verify_with_entry(&store, &whisper_cpp_entry()).unwrap();
+        assert_eq!(
+            fs::read(verified.layout.weights.join("model.bin")).unwrap(),
+            DATA
+        );
+    }
+
+    #[test]
     fn an_entry_on_the_placeholder_host_fails_closed_before_any_network() {
         use super::super::consented_catalog::tests::PLACEHOLDER_ENTRY;
         let (_temp, store) = store();
@@ -3687,6 +3712,20 @@ pub(crate) mod install_tests {
     }
 
     #[test]
+    fn a_retired_entrys_install_still_verifies_and_removes() {
+        let (_temp, store) = store();
+        install_fixture_entry(&store, &entry());
+        // Retiring an entry from setup must not strand the people who have it.
+        let mut retired = entry();
+        retired.consent_installable = false;
+        assert!(verify_with_entry(&store, &retired).is_ok());
+        assert_eq!(
+            remove_with_entry(&store, &retired).unwrap(),
+            ConsentedRemoveOutcome::Removed
+        );
+    }
+
+    #[test]
     fn different_entry_refuses_install_before_fetch_or_build() {
         let (_temp, store) = store();
         let mut prior_entry = entry();
@@ -3694,9 +3733,12 @@ pub(crate) mod install_tests {
         let prior = install_fixture_entry(&store, &prior_entry);
         let builder = FakeBuilder::default();
         let fetcher = ScriptedFetcher::default();
-        let health = health(&store, &PARAKEET_ENTRY, false);
+        // A new install can only be whisper.cpp; the retired entry is the
+        // one already on disk.
+        let health = health(&store, &crate::local_model::WHISPER_CPP_ENTRY, false);
         let mut request = request(&store, &fetcher, &builder, &health);
-        request.consent = ConsentedConsent::accepted_entry(&PARAKEET_ENTRY, 42);
+        request.consent =
+            ConsentedConsent::accepted_entry(&crate::local_model::WHISPER_CPP_ENTRY, 42);
         let error = install_consented_install(request).unwrap_err();
         assert!(
             matches!(&error, ConsentedError::DifferentEntry(id) if id == "distil-large-v3.5-int8")
@@ -3724,9 +3766,12 @@ pub(crate) mod install_tests {
         fs::remove_file(receipt_path(&store)).unwrap();
         let builder = FakeBuilder::default();
         let fetcher = ScriptedFetcher::default();
-        let health = health(&store, &PARAKEET_ENTRY, false);
+        // A new install can only be whisper.cpp; the retired entry is the
+        // one already on disk.
+        let health = health(&store, &crate::local_model::WHISPER_CPP_ENTRY, false);
         let mut request = request(&store, &fetcher, &builder, &health);
-        request.consent = ConsentedConsent::accepted_entry(&PARAKEET_ENTRY, 42);
+        request.consent =
+            ConsentedConsent::accepted_entry(&crate::local_model::WHISPER_CPP_ENTRY, 42);
         let error = install_consented_install(request).unwrap_err();
         assert!(
             matches!(&error, ConsentedError::PendingRemoval(id) if id == "distil-large-v3.5-int8")

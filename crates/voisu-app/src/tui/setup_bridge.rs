@@ -31,8 +31,9 @@ use crate::setup::{
     install_live_trigger, run_hyprland_setup,
 };
 use crate::setup_consented::{
-    ConsentedInstallStep, ask_cloud_after_local, consented_error_line, production_install_with,
-    production_local_complete_message, production_restart_daemon,
+    ConsentedInstallStep, SetupDevice, ask_cloud_after_local, consent_terms, consented_error_line,
+    production_install_with, production_local_complete_message, production_restart_daemon,
+    production_setup_device,
 };
 use crate::setup_engine::{
     ConsentedStatus, EngineChoice, consent_confirms_local_switch, suggested_consented_entry,
@@ -265,7 +266,8 @@ impl SetupQuestions for TuiQuestions {
         let Some(entry) = suggested_consented_entry(&suggest_local(hardware)) else {
             return ConsentedInstallStep::Skipped;
         };
-        let question = consent_question(entry, self.consent_confirms_switch);
+        let device = production_setup_device();
+        let question = consent_question(entry, device, self.consent_confirms_switch);
         // Consent exists only from here on, and only for this answer.
         if self.link.ask(&mut self.left, question) != Some(ROW_INSTALL) {
             return ConsentedInstallStep::Declined;
@@ -282,7 +284,7 @@ impl SetupQuestions for TuiQuestions {
             });
             let replies = self.link.replies.clone();
             let consent = ConsentedConsent::accepted_entry(entry, now_unix);
-            let error = match production_install_with(consent, move |_| {
+            let error = match production_install_with(consent, device, move |_| {
                 Box::new(ProgressToScreen::new(replies))
             }) {
                 Ok(()) => {
@@ -454,7 +456,11 @@ fn local_warning_question() -> Choose {
     }
 }
 
-fn consent_question(entry: &ConsentedCatalogEntry, keeps_cloud: bool) -> Choose {
+fn consent_question(
+    entry: &ConsentedCatalogEntry,
+    device: SetupDevice,
+    keeps_cloud: bool,
+) -> Choose {
     let not_now = if keeps_cloud {
         "Keep using Cloud."
     } else {
@@ -463,10 +469,19 @@ fn consent_question(entry: &ConsentedCatalogEntry, keeps_cloud: bool) -> Choose 
     Choose {
         step: STEP_CLOUD_OR_LOCAL,
         title: "Install Local?".to_owned(),
-        body: vec![format!(
-            "Voisu downloads about {} GB once. Then your speech never leaves this computer.",
-            about_gb(entry.total_download_bytes)
-        )],
+        body: vec![
+            format!(
+                "Voisu downloads about {} GB once. Then your speech never leaves this computer.",
+                about_gb(entry.total_download_bytes)
+            ),
+            format!("{}.", consent_terms(entry).join(". ")),
+            match device {
+                SetupDevice::Gpu => "It runs on your GPU.",
+                SetupDevice::Cpu => "It runs on the CPU, as Settings asks. That's several times slower than a GPU.",
+                SetupDevice::CpuNoGpu => "No GPU found, so it runs on the CPU, several times slower. Installing sets Local device to CPU.",
+            }
+            .to_owned(),
+        ],
         rows: vec![
             ChoiceRow::new("Not now", not_now),
             ChoiceRow::new("Install", "Download and install now."),
@@ -481,6 +496,11 @@ fn install_failure(error: &ConsentedError, esc_says: &str) -> String {
         ConsentedError::Fetch(_) | ConsentedError::Deadline => {
             format!("{DOWNLOAD_STOPPED} {esc_says}")
         }
+        // The CLI line names `voisu local-device`; here the same switch is a
+        // Settings row.
+        ConsentedError::Health(reason) if reason.starts_with("gpu_unavailable") => format!(
+            "✕ No usable GPU was found. Set Local device to CPU in Settings (several times slower), then run setup again. {esc_says}"
+        ),
         other => format!(
             "✕ {} ↵ to try again. {esc_says}",
             consented_error_line(other)
@@ -1124,7 +1144,7 @@ mod tests {
 
     use super::*;
     use crate::hyprland_bindings::CAPS_LOCK;
-    use crate::local_model::{CONSENTED_ENTRY, PARAKEET_ENTRY};
+    use crate::local_model::WHISPER_CPP_ENTRY;
 
     const KEY: &str = "gsk_secret_value";
 
@@ -1593,23 +1613,58 @@ mod tests {
     }
 
     #[test]
-    fn the_consent_line_states_each_downloads_real_size_and_defaults_to_not_now() {
-        let distil = consent_question(&CONSENTED_ENTRY, true);
+    fn the_consent_states_the_real_size_and_device_and_defaults_to_not_now() {
+        let gpu = consent_question(&WHISPER_CPP_ENTRY, SetupDevice::Gpu, true);
         assert_eq!(
-            distil.body[0],
-            "Voisu downloads about 3 GB once. Then your speech never leaves this computer."
+            gpu.body,
+            [
+                "Voisu downloads about 0.8 GB once. Then your speech never leaves this computer.",
+                "English only. Licence: MIT.",
+                "It runs on your GPU.",
+            ]
         );
-        assert_eq!(distil.rows[distil.picked].label, "Not now");
-        assert_eq!(distil.rows[0].line, "Keep using Cloud.");
+        assert_eq!(gpu.rows[gpu.picked].label, "Not now");
+        assert_eq!(gpu.rows[0].line, "Keep using Cloud.");
 
-        let parakeet = consent_question(&PARAKEET_ENTRY, false);
-        assert!(
-            parakeet.body[0].contains("about 0.8 GB"),
-            "{:?}",
-            parakeet.body
+        let cpu = consent_question(&WHISPER_CPP_ENTRY, SetupDevice::Cpu, false);
+        assert_eq!(
+            cpu.body[2],
+            "It runs on the CPU, as Settings asks. That's several times slower than a GPU."
         );
-        assert_eq!(parakeet.rows[parakeet.picked].label, "Not now");
-        assert_ne!(parakeet.rows[0].line, "Keep using Cloud.");
+        assert_eq!(cpu.rows[cpu.picked].label, "Not now");
+        assert_ne!(cpu.rows[0].line, "Keep using Cloud.");
+
+        let no_gpu = consent_question(&WHISPER_CPP_ENTRY, SetupDevice::CpuNoGpu, true);
+        assert_eq!(
+            no_gpu.body[2],
+            "No GPU found, so it runs on the CPU, several times slower. Installing sets Local device to CPU."
+        );
+    }
+
+    /// A yes records the language and licence in the receipt, so the prompt
+    /// must have shown them, on every device.
+    #[test]
+    fn the_tui_consent_shows_every_term_the_receipt_records() {
+        for device in [SetupDevice::Gpu, SetupDevice::Cpu, SetupDevice::CpuNoGpu] {
+            let body = consent_question(&WHISPER_CPP_ENTRY, device, true)
+                .body
+                .join("\n");
+            for term in ["English only", "Licence: MIT"] {
+                assert!(body.contains(term), "{term} missing: {body}");
+            }
+            assert_eq!(WHISPER_CPP_ENTRY.license_spdx, "MIT");
+        }
+    }
+
+    #[test]
+    fn a_missing_gpu_points_at_the_local_device_setting() {
+        assert_eq!(
+            install_failure(
+                &ConsentedError::Health("gpu_unavailable: no device".into()),
+                ESC_USES_CLOUD
+            ),
+            "✕ No usable GPU was found. Set Local device to CPU in Settings (several times slower), then run setup again. Esc uses Cloud for now."
+        );
     }
 
     #[test]

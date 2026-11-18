@@ -14,12 +14,13 @@ use super::dev::DevWorker;
 use super::dev::GPU_BUSY;
 use super::protocol::{ControlFrame, Correlation, WorkerFrame};
 use super::supervisor::{ReapOutcome, SupervisorError, WorkerChild};
+use crate::config::LocalDevice;
 use crate::local_model::{ActiveReceipt, FilePin};
 use crate::local_model::{
     CONSENTED_ENTRY, ConsentedCatalogEntry, ConsentedError, ConsentedFilePin, ConsentedHealth,
     ConsentedLayout, ConsentedReceipt, ConsentedRuntimeEntry, DevFilePin, DevLimits, DevManifest,
-    DevRuntimeManifest, EXPECTED_HEALTH_TEXT, ModelStore, VerifiedConsentedInstall,
-    consented_worker_files, development_catalog_entry, ensure_private_dir, sha256_hex,
+    DevRuntimeManifest, EXPECTED_HEALTH_TEXT, VerifiedConsentedInstall, consented_worker_files,
+    development_catalog_entry, ensure_private_dir, sha256_hex,
 };
 
 /// Installation's real, isolated health probe. `state_dir` is the Voisu
@@ -27,6 +28,9 @@ use crate::local_model::{
 pub struct ConsentedWorkerHealth {
     state_dir: PathBuf,
     entry: &'static ConsentedCatalogEntry,
+    /// The manifest device, fixed when this is built: a `local_device` change
+    /// in another terminal mid-install cannot move the probes elsewhere.
+    device: &'static str,
 }
 
 impl ConsentedWorkerHealth {
@@ -34,8 +38,32 @@ impl ConsentedWorkerHealth {
         Self::for_entry(state_dir, &CONSENTED_ENTRY)
     }
 
+    /// Health for `entry` on the device `local_device` names now.
     pub fn for_entry(state_dir: PathBuf, entry: &'static ConsentedCatalogEntry) -> Self {
-        Self { state_dir, entry }
+        Self {
+            state_dir,
+            entry,
+            device: launch_device(entry),
+        }
+    }
+
+    /// Health for an install the user agreed to run on `device`; a
+    /// whisper.cpp entry's preflight and health check use it, not the config.
+    pub fn for_install(
+        state_dir: PathBuf,
+        entry: &'static ConsentedCatalogEntry,
+        device: LocalDevice,
+    ) -> Self {
+        Self {
+            state_dir,
+            entry,
+            device: entry_device(entry, device),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn device(&self) -> &'static str {
+        self.device
     }
 }
 
@@ -54,6 +82,7 @@ impl ConsentedHealth for ConsentedWorkerHealth {
             &pins,
             &self.state_dir,
             self.entry,
+            self.device,
             &receipt.runtime_manifest,
         )?;
         let device = manifest.device.clone();
@@ -64,23 +93,35 @@ impl ConsentedHealth for ConsentedWorkerHealth {
     }
 
     /// Before any download: the packaged whisper.cpp worker must exist, and
-    /// when `local_device` asks for the GPU it must see one. A GPU-less
-    /// machine on the default `auto` learns that now, not after 818 MB.
+    /// when the install's device is the GPU it must see one. A GPU-less
+    /// machine learns that now, not after 818 MB.
     fn preflight(&self, entry: &ConsentedCatalogEntry) -> Result<(), ConsentedError> {
         if !entry.runs_whisper_cpp() {
             return Ok(());
         }
         let worker = whisper_cpp_worker()?;
-        if launch_device(entry) == "gpu" {
+        if self.device == "gpu" {
             probe_gpu(&worker, GPU_PROBE_DEADLINE)?;
         }
         Ok(())
     }
 }
 
+/// Whether the packaged whisper.cpp worker sees a GPU, so setup can say where
+/// the install will run before asking. A missing worker counts as found: the
+/// install's preflight then reports the real problem.
+#[must_use]
+pub fn whisper_cpp_finds_gpu() -> bool {
+    whisper_cpp_worker().map_or(true, |worker| {
+        probe_gpu(&worker, GPU_PROBE_DEADLINE).is_ok()
+    })
+}
+
 /// Loading the Vulkan driver takes well under a second; a hung driver must
 /// not hang the install.
 const GPU_PROBE_DEADLINE: Duration = Duration::from_secs(20);
+/// How long a killed probe, and the pipes of an exited one, may take to close.
+const GPU_PROBE_REAP_GRACE: Duration = Duration::from_secs(1);
 /// What a probe may print; the rest is drained unread.
 const GPU_PROBE_OUTPUT_BYTES: u64 = 16 * 1024;
 
@@ -136,15 +177,31 @@ fn probe_gpu(worker: &Path, deadline: Duration) -> Result<(), ConsentedError> {
         }
         if started.elapsed() >= deadline {
             let _ = child.kill();
-            let _ = child.wait();
+            // A child stuck in the kernel can outlive SIGKILL; it is reaped
+            // off this thread rather than block the install.
+            let killed = Instant::now() + GPU_PROBE_REAP_GRACE;
+            loop {
+                match child.try_wait() {
+                    Ok(None) if Instant::now() < killed => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Ok(None) => {
+                        std::thread::spawn(move || {
+                            let _ = child.wait();
+                        });
+                        break;
+                    }
+                    Ok(Some(_)) | Err(_) => break,
+                }
+            }
             break None;
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    let (stdout, stderr) = (
-        stdout.join().unwrap_or_default(),
-        stderr.join().unwrap_or_default(),
-    );
+    // Anything the probe started may still hold its pipes open; a drain that
+    // has not seen EOF by then is left running and its output dropped.
+    let drained = Instant::now() + GPU_PROBE_REAP_GRACE;
+    let (stdout, stderr) = (join_by(stdout, drained), join_by(stderr, drained));
     match status {
         Some(status) if status.success() && !stdout.is_empty() => Ok(()),
         Some(_) => {
@@ -157,6 +214,18 @@ fn probe_gpu(worker: &Path, deadline: Duration) -> Result<(), ConsentedError> {
             "gpu_unavailable: the GPU probe did not finish within {}s",
             deadline.as_secs()
         ))),
+    }
+}
+
+/// The drain's text if it finished by `by`; otherwise the thread is detached.
+fn join_by(drain: std::thread::JoinHandle<String>, by: Instant) -> String {
+    while !drain.is_finished() && Instant::now() < by {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if drain.is_finished() {
+        drain.join().unwrap_or_default()
+    } else {
+        String::new()
     }
 }
 
@@ -235,7 +304,7 @@ pub(crate) fn verify_default_consented_install() -> Result<VerifiedConsentedInst
         std::env::var_os("HOME"),
     )
     .map_err(ConsentedError::Store)?;
-    let store = ModelStore::open(dir).map_err(ConsentedError::Store)?;
+    let store = crate::local_model::ModelStore::open(dir).map_err(ConsentedError::Store)?;
     verify_consented_install_refreshing(&store, || {})
 }
 
@@ -245,7 +314,7 @@ pub(crate) fn verify_default_consented_install() -> Result<VerifiedConsentedInst
 /// parent, as `launch_consented_worker` derives it.
 #[cfg(not(test))]
 pub(crate) fn verify_consented_install_refreshing(
-    store: &ModelStore,
+    store: &crate::local_model::ModelStore,
     on_verifying: impl FnOnce(),
 ) -> Result<VerifiedConsentedInstall, ConsentedError> {
     let entry = crate::local_model::consented::installed_entry(store)?;
@@ -308,12 +377,14 @@ pub(crate) fn launch_consented_worker(
         .and_then(Path::parent)
         .ok_or(ConsentedError::Receipt)?;
     let state = models.parent().ok_or(ConsentedError::Receipt)?;
+    let entry = crate::local_model::consented_entry(&install.receipt().entry_id)
+        .ok_or(ConsentedError::Receipt)?;
     let (manifest, hash, file) = prepare_manifest(
         layout,
         &install.receipt().files,
         state,
-        crate::local_model::consented_entry(&install.receipt().entry_id)
-            .ok_or(ConsentedError::Receipt)?,
+        entry,
+        launch_device(entry),
         &install.receipt().runtime_manifest,
     )?;
     let root = layout.root.clone();
@@ -361,6 +432,7 @@ fn prepare_manifest(
     pins: &BTreeMap<String, ConsentedFilePin>,
     state: &Path,
     entry: &ConsentedCatalogEntry,
+    device: &'static str,
     runtime_manifest: &BTreeMap<String, ConsentedRuntimeEntry>,
 ) -> Result<(DevManifest, String, tempfile::NamedTempFile), ConsentedError> {
     if !state.is_absolute() || layout.root.to_str().is_none() || state.to_str().is_none() {
@@ -371,7 +443,6 @@ fn prepare_manifest(
     let limits = resolve_live_worker_limits()
         .ok_or_else(|| ConsentedError::Health("cannot resolve worker RAM limit".into()))?
         .limits;
-    let device = launch_device(entry);
     let cache = state.join("consented-worker/cache");
     if cache.starts_with(&layout.root) {
         return Err(ConsentedError::Tree(
@@ -439,8 +510,13 @@ fn prepare_manifest(
 /// Where the worker runs. whisper.cpp follows the `local_device` setting;
 /// the Python entries are pinned to their catalog device.
 fn launch_device(entry: &ConsentedCatalogEntry) -> &'static str {
+    entry_device(entry, crate::config::local_device())
+}
+
+/// whisper.cpp runs where `device` says; the other entries are pinned to theirs.
+fn entry_device(entry: &ConsentedCatalogEntry, device: LocalDevice) -> &'static str {
     if entry.runs_whisper_cpp() {
-        crate::config::local_device().manifest_device()
+        device.manifest_device()
     } else {
         entry.device
     }
@@ -600,138 +676,6 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    #[ignore = "downloads 734 MiB and runs the real CPU sandbox; use temporary XDG roots"]
-    fn real_cpu_consented_install_offline_smoke() {
-        use crate::local_model::{
-            ConsentedConsent, ConsentedInstallRequest, InstallClock, InstallIo, MaintenanceError,
-            MaintenanceKind, MaintenanceReservation, OfflineRuntimeBuilder, PARAKEET_ENTRY,
-            ProductionHttps, SilentProgress,
-        };
-        struct Idle;
-        impl MaintenanceReservation for Idle {
-            fn acquire(&self) -> Result<MaintenanceKind, MaintenanceError> {
-                Ok(MaintenanceKind::Idle)
-            }
-        }
-        let base = PathBuf::from(
-            std::env::var_os("XDG_STATE_HOME").expect("smoke needs temporary XDG_STATE_HOME"),
-        );
-        assert!(base.is_absolute());
-        assert_eq!(std::env::var("CUDA_VISIBLE_DEVICES").as_deref(), Ok(""));
-        ensure_private_dir(&base).unwrap();
-        // Retain failed runs: an unreaped worker must never lose its tree.
-        let state = tempfile::Builder::new()
-            .prefix("cpu-smoke-")
-            .tempdir_in(base)
-            .unwrap()
-            .keep();
-        eprintln!("CPU SMOKE state={}", state.display());
-        let store = ModelStore::open(state.as_path().join("models")).unwrap();
-        let receipt = crate::local_model::install_consented_install(ConsentedInstallRequest {
-            store: &store,
-            consent: ConsentedConsent::accepted_entry(&PARAKEET_ENTRY, 1),
-            fetcher: &ProductionHttps,
-            builder: &OfflineRuntimeBuilder,
-            health: &ConsentedWorkerHealth::for_entry(state.as_path().into(), &PARAKEET_ENTRY),
-            maintenance: &Idle,
-            io: InstallIo::default(),
-            clock: InstallClock::default(),
-            progress: &SilentProgress,
-        })
-        .expect("real pinned CPU install and isolated health");
-        assert_eq!(receipt.entry_id, "parakeet-tdt-0.6b-v3");
-        assert_eq!(receipt.device, "cpu");
-        let extracted: u64 = receipt
-            .runtime_manifest
-            .values()
-            .filter_map(|item| match item {
-                crate::local_model::ConsentedRuntimeEntry::File { bytes, .. } => Some(bytes),
-                _ => None,
-            })
-            .sum();
-        eprintln!(
-            "CPU SMOKE extracted_runtime_bytes={extracted} download_bytes={}",
-            PARAKEET_ENTRY.total_download_bytes
-        );
-        assert!(extracted <= PARAKEET_ENTRY.estimated_extracted_runtime_bytes);
-        assert_eq!(
-            receipt.runtime_inputs[PARAKEET_ENTRY.native_runtime.unwrap().name].sha256,
-            PARAKEET_ENTRY.native_runtime.unwrap().sha256
-        );
-
-        let install = crate::local_model::verify_consented_install_full(&store).unwrap();
-        let layout = install.layout().clone();
-        let (manifest, hash, file) = prepare_manifest(
-            &layout,
-            &receipt.files,
-            state.as_path(),
-            &PARAKEET_ENTRY,
-            &receipt.runtime_manifest,
-        )
-        .unwrap();
-        let pcm = std::process::Command::new(layout.venv_python()).env_clear()
-            .args(["-I", "-c", "import sys,wave; w=wave.open(sys.argv[1]); sys.stdout.buffer.write(w.readframes(w.getnframes()))"])
-            .arg(&layout.health_clip).output().unwrap();
-        assert!(pcm.status.success());
-        let lease = crate::local_model::consented::consented_install_lease(&layout).unwrap();
-        let mut worker = DevWorker::launch_consented(
-            manifest,
-            hash.clone(),
-            file,
-            &layout.root,
-            Some(install),
-            lease,
-        )
-        .unwrap();
-        let mut correlation = Correlation {
-            daemon_nonce: "cpu-smoke".into(),
-            generation: 1,
-            request_id: "prepare".into(),
-            recording_id: "jfk".into(),
-            model_receipt_hash: hash,
-        };
-        let ready = worker
-            .exchange(
-                ControlFrame::Prepare(correlation.clone()),
-                None,
-                Instant::now() + LOAD_DEADLINE,
-            )
-            .unwrap();
-        assert!(
-            matches!(&ready, WorkerFrame::Ready { observed_device, .. } if observed_device == "cpu"),
-            "{ready:?}"
-        );
-        correlation.request_id = "jfk-transcribe".into();
-        let started = Instant::now();
-        let reply = worker
-            .exchange(
-                ControlFrame::Transcribe {
-                    correlation,
-                    pcm_bytes: pcm.stdout.len(),
-                    prompt: None,
-                },
-                Some(&pcm.stdout),
-                Instant::now() + super::super::bounds::STOP_PROCESSING,
-            )
-            .unwrap();
-        eprintln!(
-            "CPU SMOKE clip=jfk.wav ready={ready:?} latency={:?} reply={reply:?}",
-            started.elapsed()
-        );
-        assert!(matches!(reply, WorkerFrame::Transcript { .. }));
-        let metrics = worker.last_inference_metrics();
-        eprintln!("CPU SMOKE metrics={metrics:?}");
-        assert_eq!(metrics.peak_gpu_memory_bytes, Some(0));
-        assert_ne!(worker.cancel_and_reap().unwrap(), ReapOutcome::Unreaped);
-        drop(worker);
-        assert_eq!(
-            crate::local_model::remove_consented_install(&store).unwrap(),
-            crate::local_model::consented::ConsentedRemoveOutcome::Removed
-        );
-        std::fs::remove_dir_all(state).unwrap();
-    }
-
-    #[test]
     fn cpu_manifest_pins_native_library_has_no_vram_and_uses_weight_file() {
         use crate::local_model::PARAKEET_ENTRY;
         let state = tempfile::tempdir().unwrap();
@@ -755,6 +699,7 @@ mod tests {
             &pins,
             state.path(),
             &PARAKEET_ENTRY,
+            PARAKEET_ENTRY.device,
             &runtime_manifest,
         )
         .unwrap();
@@ -802,6 +747,7 @@ mod tests {
                 &pins,
                 state.path(),
                 &PARAKEET_ENTRY,
+                PARAKEET_ENTRY.device,
                 &BTreeMap::new(),
             )
             .is_err()
@@ -812,6 +758,7 @@ mod tests {
             &pins,
             state.path(),
             &PARAKEET_ENTRY,
+            PARAKEET_ENTRY.device,
             &runtime_manifest,
         )
         .unwrap();
@@ -877,6 +824,7 @@ mod tests {
             &pins,
             state.path(),
             &CONSENTED_ENTRY,
+            CONSENTED_ENTRY.device,
             &BTreeMap::new(),
         )
         .unwrap();
@@ -940,6 +888,18 @@ mod tests {
         let started = Instant::now();
         let ConsentedError::Health(reason) =
             probe_gpu(&hung, Duration::from_millis(200)).unwrap_err()
+        else {
+            panic!("a hung probe is a health failure");
+        };
+        assert!(reason.contains("did not finish"), "{reason}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        // A process the probe left behind keeps its pipes open after the
+        // probe is killed; the drains must not wait for it.
+        let orphan = script("orphan", "sleep 30 &\nexec sleep 30");
+        let started = Instant::now();
+        let ConsentedError::Health(reason) =
+            probe_gpu(&orphan, Duration::from_millis(200)).unwrap_err()
         else {
             panic!("a hung probe is a health failure");
         };

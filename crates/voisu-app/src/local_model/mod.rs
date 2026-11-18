@@ -46,6 +46,7 @@ pub use consented_catalog::{
     CONSENT_TEXT, CONSENTED_ENTRY, ConsentedCatalogEntry, DownloadPin,
     ESTIMATED_EXTRACTED_RUNTIME_BYTES, EXPECTED_HEALTH_TEXT, NEMO_LIBRARY, PARAKEET_ENTRY,
     REQUIRED_FREE_BYTES, WHISPER_CPP_ENTRY, consented_entry, consented_health_clip,
+    installable_entry_for_consent,
 };
 pub use consented_pins::TOTAL_DOWNLOAD_BYTES;
 pub use consented_runtime::{
@@ -84,8 +85,7 @@ pub use store::{
     models_dir_from_state, resolve_models_root,
 };
 pub use suggest::{
-    CpuReason, DISTIL_MIN_TOTAL_VRAM_MIB, DISTIL_MODEL_ID, LocalSuggestion, PARAKEET_MODEL_ID,
-    RECOMMENDATION_PREFIX, suggest_local, suggestion_line, warnings,
+    LocalSuggestion, RECOMMENDATION_PREFIX, suggest_local, suggestion_line, warnings,
 };
 pub use url_policy::{CatalogUrl, UrlPolicyError, validate_catalog_url};
 

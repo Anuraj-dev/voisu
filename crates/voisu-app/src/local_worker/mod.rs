@@ -37,7 +37,7 @@ pub use bounds::{
     record_resource_evidence, resolve_live_worker_limits, resolve_worker_limits, vram_budget_bytes,
     worker_cpu_quota_cores, worker_memory_ceiling_bytes,
 };
-pub use consented::ConsentedWorkerHealth;
+pub use consented::{ConsentedWorkerHealth, whisper_cpp_finds_gpu};
 pub(crate) use consented::{consented_active_receipt, select_consented_receipt};
 #[cfg(not(test))]
 pub(crate) use consented::{

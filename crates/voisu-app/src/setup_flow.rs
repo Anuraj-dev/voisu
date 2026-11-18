@@ -18,7 +18,8 @@ use crate::setup_consented::{
     ConsentedInstallStep, SystemCommandRunner, ask_cloud_after_local,
     developer_pilot_manifest_exists, probe_hardware, production_cloud_declined_marker,
     production_consented_status, production_install, production_local_complete_message,
-    production_restart_daemon, run_catalog_repair_if_needed, run_consented_install_step,
+    production_restart_daemon, production_setup_device, run_catalog_repair_if_needed,
+    run_consented_install_step,
 };
 use crate::setup_engine::{
     ConsentedStatus, EngineChoice, consent_confirms_local_switch, run_engine_screen,
@@ -124,6 +125,7 @@ impl SetupQuestions for TextSetup {
             interactive,
             installed,
             now_unix,
+            production_setup_device,
             production_install,
             production_restart_daemon,
         )
