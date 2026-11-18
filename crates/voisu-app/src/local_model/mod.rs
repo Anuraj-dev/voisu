@@ -23,6 +23,7 @@ mod receipt;
 mod safe_fs;
 mod store;
 mod suggest;
+mod tier;
 mod url_policy;
 
 pub(crate) fn consented_worker_files() -> &'static [(&'static str, &'static [u8])] {
@@ -87,6 +88,7 @@ pub use store::{
 pub use suggest::{
     LocalSuggestion, RECOMMENDATION_PREFIX, suggest_local, suggestion_line, warnings,
 };
+pub use tier::{ACCURATE_ON_CPU_WARNING, ACCURATE_ON_GPU_HINT, LocalTier, runs_on_gpu};
 pub use url_policy::{CatalogUrl, UrlPolicyError, validate_catalog_url};
 
 use crate::local_worker::local_runtime_admission;
