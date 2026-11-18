@@ -132,40 +132,24 @@ pub fn production_setup_device() -> SetupDevice {
 ///
 /// Display only: the receipt still records the entry's full, hashed consent
 /// text through [`ConsentedConsent::accepted_entry`], which this summary never
-/// replaces.
+/// replaces. Where it runs is said only when it surprises: a GPU, or a CPU the
+/// user chose, goes unsaid.
 #[must_use]
-pub fn consent_summary(entry: &ConsentedCatalogEntry, device: SetupDevice) -> [String; 5] {
-    let [language, licence] = consent_terms(entry);
-    [
-        format!("Download size: {}", format_size(entry.total_download_bytes)),
-        language,
-        licence,
-        device_line(device).into(),
-        "Runs offline after install".into(),
-    ]
+pub fn consent_summary(entry: &ConsentedCatalogEntry, device: SetupDevice) -> Vec<String> {
+    let mut lines = vec![format!(
+        "Download size: {}",
+        format_size(entry.total_download_bytes)
+    )];
+    lines.extend(no_gpu_note(device).map(Into::into));
+    lines.push("Runs offline after install".into());
+    lines
 }
 
-/// The limits a yes accepts beyond size and device: the language and the
-/// licence. The CLI and the TUI consent both show these, so the receipt never
-/// records terms the prompt left out.
+/// The one device fact worth a line: `auto` found no GPU, so this install
+/// runs on the CPU and sets `local-device cpu`.
 #[must_use]
-pub fn consent_terms(entry: &ConsentedCatalogEntry) -> [String; 2] {
-    [
-        "English only".into(),
-        format!("Licence: {}", entry.license_spdx),
-    ]
-}
-
-fn device_line(device: SetupDevice) -> &'static str {
-    match device {
-        SetupDevice::Gpu => "Runs on your GPU",
-        SetupDevice::Cpu => {
-            "Runs on the CPU, as `voisu local-device cpu` asks; several times slower than a GPU"
-        }
-        SetupDevice::CpuNoGpu => {
-            "No GPU found, so it runs on the CPU, several times slower; installing sets `voisu local-device cpu`"
-        }
-    }
+pub fn no_gpu_note(device: SetupDevice) -> Option<&'static str> {
+    (device == SetupDevice::CpuNoGpu).then_some("No GPU found, so it runs on the CPU, more slowly")
 }
 
 /// Shows the consent summary and installs only after an explicit yes. A
@@ -950,7 +934,7 @@ mod tests {
         (step, io, restarts)
     }
 
-    const SUMMARY_BLOCK: &str = "\nDownload size: 780.7 MiB\n\nEnglish only\n\nLicence: MIT\n\nRuns on your GPU\n\nRuns offline after install\n\nPROMPT Download and install now? [y/N] ";
+    const SUMMARY_BLOCK: &str = "\nDownload size: 780.7 MiB\n\nRuns offline after install\n\nPROMPT Download and install now? [y/N] ";
 
     #[test]
     fn rtx_5050_offers_install_and_decline_never_fetches() {
@@ -998,29 +982,25 @@ mod tests {
     }
 
     #[test]
-    fn every_host_is_offered_whisper_cpp_and_the_summary_says_where_it_runs() {
+    fn every_host_is_offered_whisper_cpp_and_only_a_missing_gpu_is_mentioned() {
+        const NOTE: &str = "No GPU found, so it runs on the CPU, more slowly";
         let cases = [
-            (SetupDevice::Gpu, "Runs on your GPU\n"),
-            (
-                SetupDevice::Cpu,
-                "Runs on the CPU, as `voisu local-device cpu` asks; several times slower than a GPU\n",
-            ),
-            (
-                SetupDevice::CpuNoGpu,
-                "No GPU found, so it runs on the CPU, several times slower; installing sets `voisu local-device cpu`\n",
-            ),
+            (SetupDevice::Gpu, false),
+            (SetupDevice::Cpu, false),
+            (SetupDevice::CpuNoGpu, true),
         ];
         for hw in [
             host(GpuProbe::Nvidia(vec![gpu(0, 2048)])),
             host(GpuProbe::NoneFound),
             host(GpuProbe::Failed("driver failed".into())),
         ] {
-            for (device, line) in cases {
+            for (device, noted) in cases {
                 let (step, io, devices) = accept_on(&hw, device);
                 assert_eq!(step, ConsentedInstallStep::Installed);
                 assert_eq!(devices, [device], "the install gets the device it showed");
                 let text = io.transcript();
-                assert!(text.contains(line), "{text}");
+                assert_eq!(text.contains(NOTE), noted, "{text}");
+                assert!(!text.contains("Licence"), "{text}");
                 assert!(text.contains("Download size: 780.7 MiB"), "{text}");
                 assert!(text.contains(INSTALL_SUCCESS), "{text}");
             }

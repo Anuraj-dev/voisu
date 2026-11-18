@@ -145,11 +145,11 @@ If the Trigger Key does not respond, run `voisu doctor`. It reports a portal wit
 Local installs one model on every computer: `whisper-cpp-distil-large-v3.5-q8-0` (about 780 MB, MIT licence), run by whisper.cpp. Where it runs follows `voisu local-device` (*Settings → Local device*):
 
 - **`auto` (default) or `gpu`:** on the GPU through Vulkan, NVIDIA, AMD or Intel. Setup checks the GPU before it downloads anything.
-- **`auto` with no usable GPU:** setup says so and offers the CPU, several times slower. Agreeing sets `voisu local-device cpu`.
+- **`auto` with no usable GPU:** setup notes that it runs on the CPU, more slowly. Installing sets `voisu local-device cpu`.
 - **`gpu` with no usable GPU:** setup stops before the download and says how to choose the CPU. It never switches silently.
 - **`cpu`:** on the processor.
 
-Nothing downloads until you agree to the size, the licence, the English-only limit and where it runs. This is development evidence, not a Bakeoff Winner. Installs of the earlier `distil-large-v3.5-int8` and `parakeet-tdt-0.6b-v3` models keep working; setup no longer offers them. Once installed, the model runs offline in a sandboxed worker. Local has no automatic GPU, CPU or Cloud fallback, and it fails closed until the model is Ready.
+Nothing downloads until you agree. The prompt shows the size and says when no GPU was found. This is development evidence, not a Bakeoff Winner. Installs of the earlier `distil-large-v3.5-int8` and `parakeet-tdt-0.6b-v3` models keep working; setup no longer offers them. Once installed, the model runs offline in a sandboxed worker. Local has no automatic GPU, CPU or Cloud fallback, and it fails closed until the model is Ready.
 
 Remove it with `voisu local remove`, or `voisu local remove --yes` without a terminal.
 
