@@ -9,6 +9,7 @@
 #include <stdio.h>
 
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "whisper.h"
 
 // Mirrored by `VoisuWhisperOptions` in src/lib.rs; `voisu_whisper_options_size`
@@ -44,12 +45,72 @@ void voisu_whisper_route_logs_to_stderr(void) {
     ggml_log_set(voisu_log_to_stderr, NULL);
 }
 
-struct whisper_context * voisu_whisper_load(const char * model_path, bool use_gpu, int32_t gpu_device) {
+// ggml is built with GGML_BACKEND_DL: nothing is registered until the
+// backend modules (libggml-cpu-<variant>.so, libggml-vulkan.so) are loaded
+// from `dir`. ggml scores every CPU variant against this CPU and keeps the
+// best one it can run. Returns the number of registered devices.
+size_t voisu_whisper_load_backends(const char * dir) {
+    ggml_backend_load_all_from_path(dir);
+    return ggml_backend_dev_count();
+}
+
+// True when a CPU backend variant loaded: the lowest variant (x64) needs no
+// SIMD, so false means the variants are missing, not that the CPU is too old.
+bool voisu_whisper_cpu_backend_loaded(void) {
+    return ggml_backend_reg_by_name("CPU") != NULL;
+}
+
+// Mirrored by `VoisuGpu` in src/lib.rs.
+struct voisu_gpu {
+    // The `gpu_device` index whisper.cpp counts over GPU and iGPU devices.
+    int32_t index;
+    bool discrete;
+    size_t free_bytes;
+    size_t total_bytes;
+    char name[128];
+    char description[256];
+};
+
+size_t voisu_gpu_size(void) {
+    return sizeof(struct voisu_gpu);
+}
+
+// Picks the first discrete GPU, else the first integrated one, counting the
+// way whisper_backend_init_gpu counts. Returns false when there is none.
+bool voisu_whisper_pick_gpu(struct voisu_gpu * out) {
+    int32_t counted = 0;
+    bool found = false;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+        if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            continue;
+        }
+        const bool discrete = type == GGML_BACKEND_DEVICE_TYPE_GPU;
+        if (!found || (discrete && !out->discrete)) {
+            out->index = counted;
+            out->discrete = discrete;
+            ggml_backend_dev_memory(dev, &out->free_bytes, &out->total_bytes);
+            snprintf(out->name, sizeof(out->name), "%s", ggml_backend_dev_name(dev));
+            snprintf(out->description, sizeof(out->description), "%s", ggml_backend_dev_description(dev));
+            found = true;
+        }
+        counted++;
+    }
+    return found;
+}
+
+struct whisper_context * voisu_whisper_load(
+        const char * model_path,
+        bool use_gpu,
+        int32_t gpu_device,
+        bool flash_attn) {
     struct whisper_context_params params = whisper_context_default_params();
     params.use_gpu = use_gpu;
     params.gpu_device = gpu_device;
-    // Flash attention looped under greedy decoding in the 2026-09 bench.
-    params.flash_attn = false;
+    // Phase 0 (2026-11-18): beam 5 with flash attention on is deterministic
+    // on CPU, Vulkan and CUDA; the old greedy loop does not reproduce.
+    params.flash_attn = flash_attn;
     return whisper_init_from_file_with_params(model_path, params);
 }
 

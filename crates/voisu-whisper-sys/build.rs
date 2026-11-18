@@ -1,92 +1,141 @@
 //! Builds the vendored whisper.cpp (see `vendor.sh`) and the C shim.
 //!
-//! Phase 1 is CPU only. A GPU backend later is one more `GGML_<NAME>` define
-//! here plus its static library in `LIBS` and its system library link.
+//! # Backends
 //!
-//! # CPU instruction baseline
+//! ggml is built with `GGML_BACKEND_DL=ON`: `libwhisper.so.1`,
+//! `libggml.so.0` and `libggml-base.so.0` are linked, and every backend is a
+//! module the worker loads at start from its own directory
+//! (`voisu_whisper_load_backends`):
 //!
-//! ggml defaults to `GGML_NATIVE=ON` (`-march=native`: the binary dies of
-//! SIGILL on any older CPU than the build host) unless `SOURCE_DATE_EPOCH` is
-//! set, as under rpmbuild, where it silently drops to no SIMD at all. Neither
-//! is acceptable for a shipped binary, so the ISA is pinned here:
+//! - CPU: `GGML_CPU_ALL_VARIANTS=ON` builds `libggml-cpu-<variant>.so` from
+//!   plain `x64` up to `sapphirerapids`. ggml scores each against the running
+//!   CPU and keeps the best, so no single ISA baseline is pinned and no
+//!   variant runs code the CPU lacks. `GGML_NATIVE` stays off: on a build
+//!   host `-march=native` would leak the build CPU into a shipped module.
+//! - Vulkan: the `vulkan` feature adds `libggml-vulkan.so`. It needs `glslc`
+//!   and the Vulkan headers and loader at build time (Fedora:
+//!   `vulkan-loader-devel glslc`; Arch: `vulkan-headers shaderc`).
 //!
-//! - x86_64: the x86-64-v3 level (Haswell / Zen 1 and later): SSE4.2, AVX,
-//!   AVX2, FMA, F16C and BMI2 on; every AVX-512 flavour, AVX-VNNI and AMX
-//!   off. `REQUIRED_CPU_FEATURES` in `src/lib.rs` lists the same set, and
-//!   the worker refuses Prepare with `cpu_unsupported` on a CPU without it
-//!   instead of crashing. Keep the two lists in step.
-//! - aarch64 and others: ggml's own defaults with `GGML_NATIVE` off.
-//!
-//! Phase 2 packaging replaces the single baseline with `GGML_BACKEND_DL` and
-//! `GGML_CPU_ALL_VARIANTS`, so ggml picks the best CPU kernel at run time.
+//! The runtime files are copied next to the cargo binaries and test binaries
+//! (`target/<profile>/` and its `deps/`), and their names are listed in
+//! `target/<profile>/voisu-whisper-runtime.txt`, which packaging installs
+//! from. Binaries find the libraries through an `$ORIGIN` rpath (emitted here
+//! for this crate's tests and by `voisu-local-asr/build.rs` for the worker);
+//! packages install the same files beside `voisu-local-asr` in
+//! `/usr/libexec/voisu/`.
 
 use std::env;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 
-/// Link order matters for static archives: users before what they use.
-const LIBS: &[&str] = &[
-    "voisu_whisper_shim",
-    "whisper",
-    "ggml",
-    "ggml-cpu",
-    "ggml-base",
-];
-
-/// x86-64-v3, matching `REQUIRED_CPU_FEATURES`.
-const X86_64_ON: &[&str] = &[
-    "GGML_SSE42",
-    "GGML_AVX",
-    "GGML_AVX2",
-    "GGML_FMA",
-    "GGML_F16C",
-    "GGML_BMI2",
-];
-const X86_64_OFF: &[&str] = &[
-    "GGML_AVX_VNNI",
-    "GGML_AVX512",
-    "GGML_AVX512_VBMI",
-    "GGML_AVX512_VNNI",
-    "GGML_AVX512_BF16",
-    "GGML_AMX_TILE",
-    "GGML_AMX_INT8",
-    "GGML_AMX_BF16",
-];
+/// The linked libraries, under the SONAME the binary records.
+const LINKED: &[&str] = &["libwhisper.so.1", "libggml.so.0", "libggml-base.so.0"];
 
 fn main() {
     println!("cargo:rerun-if-changed=CMakeLists.txt");
     println!("cargo:rerun-if-changed=shim.c");
     println!("cargo:rerun-if-changed=whisper.cpp");
 
+    let vulkan = env::var_os("CARGO_FEATURE_VULKAN").is_some();
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
     let mut config = cmake::Config::new(".");
     // A Debug ggml decodes many times slower; the worker is never useful so.
     config
         .profile("Release")
+        .define("GGML_BACKEND_DL", "ON")
         .define("GGML_CPU", "ON")
-        .define("GGML_NATIVE", "OFF");
+        .define("GGML_NATIVE", "OFF")
+        .define("GGML_VULKAN", if vulkan { "ON" } else { "OFF" });
     if env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64") {
-        for option in X86_64_ON {
-            config.define(option, "ON");
-        }
-        for option in X86_64_OFF {
-            config.define(option, "OFF");
-        }
+        config.define("GGML_CPU_ALL_VARIANTS", "ON");
     }
     let out = config.build();
 
+    let mut runtime = Vec::new();
     for dir in ["lib", "lib64"] {
         let path: PathBuf = out.join(dir);
         if path.is_dir() {
             println!("cargo:rustc-link-search=native={}", path.display());
+            runtime.extend(LINKED.iter().map(|name| path.join(name)));
         }
     }
-    for lib in LIBS {
-        println!("cargo:rustc-link-lib=static={lib}");
+    // Backend modules install to bin/ (ggml's CMAKE_INSTALL_BINDIR default).
+    runtime.extend(modules(&out.join("bin")));
+    let runtime: Vec<PathBuf> = runtime.into_iter().filter(|path| path.exists()).collect();
+    assert!(
+        runtime
+            .iter()
+            .any(|path| file_name(path).starts_with("libggml-cpu")),
+        "no CPU backend module was built"
+    );
+    if vulkan {
+        assert!(
+            runtime
+                .iter()
+                .any(|path| file_name(path) == "libggml-vulkan.so"),
+            "the vulkan feature built no libggml-vulkan.so"
+        );
     }
-    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+
+    println!("cargo:rustc-link-lib=static=voisu_whisper_shim");
+    for lib in ["whisper", "ggml", "ggml-base"] {
+        println!("cargo:rustc-link-lib=dylib={lib}");
+    }
     match (target_os.as_str(), target_env.as_str()) {
         ("macos" | "ios", _) => println!("cargo:rustc-link-lib=c++"),
         (_, "msvc") => {}
         _ => println!("cargo:rustc-link-lib=stdc++"),
     }
+    println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+
+    // OUT_DIR is target/<profile>/build/<crate>-<hash>/out.
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
+    let profile = out_dir.ancestors().nth(3).expect("cargo profile dir");
+    for dest in [profile.to_path_buf(), profile.join("deps")] {
+        fs::create_dir_all(&dest).expect("create runtime dir");
+        for source in &runtime {
+            copy_if_changed(source, &dest.join(file_name(source)));
+        }
+    }
+    let names: Vec<&str> = runtime.iter().map(|path| file_name(path)).collect();
+    fs::write(
+        profile.join("voisu-whisper-runtime.txt"),
+        names.join("\n") + "\n",
+    )
+    .expect("write runtime list");
+}
+
+fn modules(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            let name = file_name(path);
+            name.starts_with("libggml-") && name.ends_with(".so")
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+fn file_name(path: &Path) -> &str {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .expect("UTF-8 file name")
+}
+
+/// Follows symlinks (the SONAME links point at the versioned files) and
+/// skips identical copies so a no-op rebuild does not touch the targets.
+fn copy_if_changed(source: &Path, dest: &Path) {
+    let bytes = fs::read(source).expect("read runtime file");
+    if fs::read(dest).ok().as_deref() == Some(bytes.as_slice()) {
+        return;
+    }
+    let partial = dest.with_extension("partial");
+    fs::write(&partial, &bytes).expect("write runtime file");
+    fs::rename(&partial, dest).expect("publish runtime file");
 }

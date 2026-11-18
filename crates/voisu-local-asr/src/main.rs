@@ -86,7 +86,13 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let load = || WhisperCpp::load(&manifest.model_path, manifest.decode);
+    let load = || {
+        WhisperCpp::load(
+            &manifest.model_path,
+            manifest.engine_device,
+            manifest.decode,
+        )
+    };
     let exit = server::serve(config, load, std::io::stdin(), &mut frames);
     let _ = frames.flush();
     match exit {

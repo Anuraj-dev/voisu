@@ -19,3 +19,7 @@ voisu-whisper-sys = { path = "../voisu-whisper-sys" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[features]
+# ggml's Vulkan backend; see voisu-whisper-sys.
+vulkan = ["voisu-whisper-sys/vulkan"]
