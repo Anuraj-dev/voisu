@@ -136,10 +136,10 @@ pub fn production_setup_device() -> SetupDevice {
 /// user chose, goes unsaid.
 #[must_use]
 pub fn consent_summary(entry: &ConsentedCatalogEntry, device: SetupDevice) -> Vec<String> {
-    let mut lines = vec![
-        format!("Download size: {}", format_size(entry.total_download_bytes)),
-        "English only".into(),
-    ];
+    let mut lines = vec![format!(
+        "Download size: {}",
+        format_size(entry.total_download_bytes)
+    )];
     lines.extend(no_gpu_note(device).map(Into::into));
     lines.push("Runs offline after install".into());
     lines
@@ -934,7 +934,7 @@ mod tests {
         (step, io, restarts)
     }
 
-    const SUMMARY_BLOCK: &str = "\nDownload size: 780.7 MiB\n\nEnglish only\n\nRuns offline after install\n\nPROMPT Download and install now? [y/N] ";
+    const SUMMARY_BLOCK: &str = "\nDownload size: 780.7 MiB\n\nRuns offline after install\n\nPROMPT Download and install now? [y/N] ";
 
     #[test]
     fn rtx_5050_offers_install_and_decline_never_fetches() {

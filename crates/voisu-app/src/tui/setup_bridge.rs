@@ -470,13 +470,10 @@ fn consent_question(
         step: STEP_CLOUD_OR_LOCAL,
         title: "Install Local?".to_owned(),
         body: {
-            let mut body = vec![
-                format!(
-                    "Voisu downloads about {} GB once. Then your speech never leaves this computer.",
-                    about_gb(entry.total_download_bytes)
-                ),
-                "English only.".to_owned(),
-            ];
+            let mut body = vec![format!(
+                "Voisu downloads about {} GB once. Then your speech never leaves this computer.",
+                about_gb(entry.total_download_bytes)
+            )];
             body.extend(no_gpu_note(device).map(|note| format!("{note}.")));
             body
         },
@@ -1612,10 +1609,8 @@ mod tests {
 
     #[test]
     fn the_consent_states_the_real_size_and_mentions_only_a_missing_gpu() {
-        const BASE: [&str; 2] = [
-            "Voisu downloads about 0.8 GB once. Then your speech never leaves this computer.",
-            "English only.",
-        ];
+        const BASE: [&str; 1] =
+            ["Voisu downloads about 0.8 GB once. Then your speech never leaves this computer."];
         let gpu = consent_question(&WHISPER_CPP_ENTRY, SetupDevice::Gpu, true);
         assert_eq!(gpu.body, BASE);
         assert_eq!(gpu.rows[gpu.picked].label, "Not now");
@@ -1629,11 +1624,7 @@ mod tests {
         let no_gpu = consent_question(&WHISPER_CPP_ENTRY, SetupDevice::CpuNoGpu, true);
         assert_eq!(
             no_gpu.body,
-            [
-                BASE[0],
-                BASE[1],
-                "No GPU found, so it runs on the CPU, more slowly."
-            ]
+            [BASE[0], "No GPU found, so it runs on the CPU, more slowly."]
         );
     }
 

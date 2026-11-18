@@ -149,7 +149,7 @@ Local installs one model on every computer: `whisper-cpp-distil-large-v3.5-q8-0`
 - **`gpu` with no usable GPU:** setup stops before the download and says how to choose the CPU. It never switches silently.
 - **`cpu`:** on the processor.
 
-Nothing downloads until you agree. The prompt shows the size and the English-only limit, and says when no GPU was found. This is development evidence, not a Bakeoff Winner. Installs of the earlier `distil-large-v3.5-int8` and `parakeet-tdt-0.6b-v3` models keep working; setup no longer offers them. Once installed, the model runs offline in a sandboxed worker. Local has no automatic GPU, CPU or Cloud fallback, and it fails closed until the model is Ready.
+Nothing downloads until you agree. The prompt shows the size and says when no GPU was found. This is development evidence, not a Bakeoff Winner. Installs of the earlier `distil-large-v3.5-int8` and `parakeet-tdt-0.6b-v3` models keep working; setup no longer offers them. Once installed, the model runs offline in a sandboxed worker. Local has no automatic GPU, CPU or Cloud fallback, and it fails closed until the model is Ready.
 
 Remove it with `voisu local remove`, or `voisu local remove --yes` without a terminal.
 
