@@ -1045,6 +1045,15 @@ fn remove_unreceipted_publish_with_sync(
 /// A tree a live worker still leases is left for a later sweep or install.
 /// Returns how many trees were removed.
 pub fn remove_replaced_consented_installs(store: &ModelStore) -> Result<usize, ConsentedError> {
+    remove_replaced_among(store, consented_catalog_entries())
+}
+
+/// [`remove_replaced_consented_installs`] over `entries`, so tests can sweep
+/// fixture entries the way the catalog's are swept.
+fn remove_replaced_among<'a>(
+    store: &ModelStore,
+    entries: impl IntoIterator<Item = &'a ConsentedCatalogEntry>,
+) -> Result<usize, ConsentedError> {
     let _lock = store.lock_exclusive().map_err(ConsentedError::Store)?;
     let receipted = match load_receipt(store) {
         Ok(receipt) => Some(receipt.content_hash),
@@ -1052,7 +1061,7 @@ pub fn remove_replaced_consented_installs(store: &ModelStore) -> Result<usize, C
         Err(error) => return Err(error),
     };
     let mut removed = 0;
-    for entry in consented_catalog_entries() {
+    for entry in entries {
         let hash = content_hash(entry);
         if !entry.runs_whisper_cpp() || receipted.as_deref() == Some(hash.as_str()) {
             continue;
@@ -3816,6 +3825,14 @@ pub(crate) mod install_tests {
         verify_with_entry(&store, &second).unwrap();
         // The old tree outlives the swap so a worker still on it keeps running.
         assert!(old_root.is_dir());
+        // The sweep after the swap removes exactly that tree.
+        assert_eq!(remove_replaced_among(&store, [&first, &second]).unwrap(), 1);
+        assert!(!old_root.exists(), "the replaced model's tree is swept");
+        assert!(
+            install_root(&store, second.id, &content_hash(&second)).is_dir(),
+            "the receipted model stays"
+        );
+        verify_with_entry(&store, &second).unwrap();
 
         // The sweep only knows catalog entries; plant a replaced catalog tree
         // and check it goes, weights and all, while the receipted one stays.

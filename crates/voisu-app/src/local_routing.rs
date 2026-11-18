@@ -416,6 +416,18 @@ impl Gate {
         readiness
     }
 
+    /// Deletes whisper.cpp trees the Consented Install receipt no longer
+    /// names. Leased trees and a busy store are skipped for a later sweep;
+    /// a failure only leaves disk in use, so it is not reported.
+    fn sweep_replaced_models(&self) {
+        #[cfg(test)]
+        if let Some((store, _)) = self.test_consented.as_ref() {
+            let _ = crate::local_model::remove_replaced_consented_installs(store);
+        }
+        #[cfg(not(test))]
+        sweep_replaced_models_in_store();
+    }
+
     fn observe_consented(&self) -> Option<crate::local_model::consented::ConsentedObservation> {
         #[cfg(test)]
         {
@@ -508,6 +520,9 @@ impl Gate {
                 return self.readiness.clone();
             }
             self.receipt = Some(selected);
+            // The previous model's worker is reaped, so its tree is no longer
+            // leased: a Local model switch frees that disk now.
+            self.sweep_replaced_models();
         } else if self.lifecycle.state() == WorkerState::Ready && self.receipt.is_some() {
             self.readiness = LocalReadiness::Ready {
                 model_identity: self.receipt.as_ref().map(local_model_identity),
@@ -1521,9 +1536,20 @@ fn is_consented_receipt(receipt: &ActiveReceipt) -> bool {
     receipt.runtime_abi.starts_with("voisu-consented:")
 }
 
+#[cfg(not(test))]
+fn sweep_replaced_models_in_store() {
+    if let Some(store) = models_dir().ok().and_then(|dir| ModelStore::open(dir).ok()) {
+        let _ = crate::local_model::remove_replaced_consented_installs(&store);
+    }
+}
+
 fn gate() -> &'static Mutex<Gate> {
     static GATE: OnceLock<Mutex<Gate>> = OnceLock::new();
     GATE.get_or_init(|| {
+        // A switch whose idle swap never ran (the daemon stopped first) or
+        // whose old tree was still leased left it behind; free it at start.
+        #[cfg(not(test))]
+        sweep_replaced_models_in_store();
         let mut gate = Gate::new();
         gate.published = published_readiness().clone();
         gate.published_sentinel = published_sentinel().clone();
