@@ -5,8 +5,8 @@
 use voisu_core::{AsrMode, KeyDiagnosis, KeyLocation, Provider};
 
 use crate::local_model::{
-    ConsentedCatalogEntry, HostHardware, LocalSuggestion, consented_entry, suggest_local,
-    suggestion_line, warnings,
+    ConsentedCatalogEntry, HostHardware, LocalSuggestion, LocalTier, consented_entry,
+    suggest_local, suggestion_line, warnings,
 };
 use crate::setup::WizardIo;
 
@@ -114,18 +114,25 @@ fn write_engine_screen(
 
 fn availability_line(suggestion: &LocalSuggestion, consented: &ConsentedStatus) -> String {
     match consented {
-        ConsentedStatus::Installed { entry_id, device } => {
-            format!("Availability: installed — {entry_id} (Consented Install, {device})")
-        }
+        ConsentedStatus::Installed { entry_id, device } => match LocalTier::of_entry_id(entry_id) {
+            Some(tier) => format!("Availability: installed — {}", tier.label(device == "gpu")),
+            None => format!("Availability: installed — {entry_id} (Consented Install, {device})"),
+        },
         ConsentedStatus::Unknown(reason) => format!("Availability: unknown — {reason}"),
         ConsentedStatus::NotInstalled if suggested_consented_entry(suggestion).is_some() => {
+            let size = |tier: LocalTier| format_size(tier.entry().total_download_bytes);
+            // Without an NVIDIA GPU the worker's own probe at install decides
+            // the tier, so both sizes are honest.
+            let sizes = match suggestion.nvidia_gpu {
+                Some(_) => size(LocalTier::Accurate),
+                None => format!(
+                    "{} on a GPU, {} on the CPU",
+                    size(LocalTier::Accurate),
+                    size(LocalTier::Fast)
+                ),
+            };
             format!(
-                "Availability: not installed — setup can download it ({}) after you agree.",
-                format_size(
-                    suggested_consented_entry(suggestion)
-                        .expect("catalog entry")
-                        .total_download_bytes
-                )
+                "Availability: not installed — setup can download it ({sizes}) after you agree."
             )
         }
         ConsentedStatus::NotInstalled => LOCAL_AVAILABILITY.to_owned(),
@@ -432,7 +439,7 @@ mod tests {
         );
         assert!(
             text.contains(
-                "\n[2] Local — runs on this computer\nRecommended for this computer: whisper-cpp-distil-large-v3.5-q8-0 on your GPU (RTX 5050 Laptop)\nAvailability: not installed — setup can download it (780.7 MiB) after you agree.\nPROMPT "
+                "\n[2] Local — runs on this computer\nRecommended for this computer: Accurate (distil-large-v3.5) on your GPU (RTX 5050 Laptop)\nAvailability: not installed — setup can download it (780.7 MiB) after you agree.\nPROMPT "
             ),
             "{text}"
         );
@@ -462,7 +469,7 @@ mod tests {
         );
         let text = io.transcript();
         assert!(
-            text.contains("Recommended for this computer: whisper-cpp-distil-large-v3.5-q8-0 on your GPU (RTX 5050 Laptop)\n"),
+            text.contains("Recommended for this computer: Accurate (distil-large-v3.5) on your GPU (RTX 5050 Laptop)\n"),
             "{text}"
         );
     }
@@ -485,7 +492,7 @@ mod tests {
             let text = io.transcript();
             assert!(
                 text.contains(
-                    "Recommended for this computer: whisper-cpp-distil-large-v3.5-q8-0 on your GPU, or the CPU without one\n"
+                    "Recommended for this computer: Accurate (distil-large-v3.5) on a GPU, or Fast (small.en) on the CPU without one\n"
                 ),
                 "{text}"
             );
@@ -872,8 +879,23 @@ mod tests {
             format_size(WHISPER_CPP_ENTRY.total_download_bytes),
             "780.7 MiB"
         );
-        assert!(text.contains(WHISPER_CPP_ENTRY.id), "{text}");
+        // Users see tier names; ids stay in `voisu doctor`.
+        assert!(!text.contains(WHISPER_CPP_ENTRY.id), "{text}");
         assert!(!text.contains(LOCAL_AVAILABILITY), "{text}");
+
+        let suggestion = suggest_local(&host(GpuProbe::NoneFound));
+        assert_eq!(
+            availability_line(&suggestion, &ConsentedStatus::NotInstalled),
+            "Availability: not installed — setup can download it (780.7 MiB on a GPU, 252.6 MiB on the CPU) after you agree."
+        );
+        let fast = ConsentedStatus::Installed {
+            entry_id: crate::local_model::WHISPER_CPP_SMALL_EN_ENTRY.id.into(),
+            device: "cpu".into(),
+        };
+        assert_eq!(
+            availability_line(&suggestion, &fast),
+            "Availability: installed — Fast (small.en, CPU)"
+        );
     }
 
     #[test]

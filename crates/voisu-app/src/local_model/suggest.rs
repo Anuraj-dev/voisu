@@ -1,11 +1,12 @@
-//! Setup's Local suggestion: the whisper.cpp model, on every host.
+//! Setup's Local suggestion: Accurate on a GPU, Fast on the CPU.
 //!
-//! The model is the same everywhere; only where it runs differs. That is the
+//! Which tier runs follows where the model runs. That is the
 //! `local_device` setting and the worker's own GPU probe at install, not this
 //! hardware probe, which sees NVIDIA GPUs only.
 
 use super::consented_catalog::WHISPER_CPP_ENTRY;
 use super::hardware::{GpuProbe, HostHardware};
+use super::tier::LocalTier;
 
 // The CPU-quota warning refers to the core count the Local CPU row in
 // docs/research/local-asr-benchmark-2026-10-12.md was measured with.
@@ -55,10 +56,13 @@ pub fn warnings(hw: &HostHardware) -> Vec<String> {
 /// model will actually run.
 #[must_use]
 pub fn suggestion_line(suggestion: &LocalSuggestion) -> String {
-    let model_id = suggestion.model_id;
+    let accurate = LocalTier::Accurate.title();
     match &suggestion.nvidia_gpu {
-        Some(name) => format!("{RECOMMENDATION_PREFIX} {model_id} on your GPU ({name})"),
-        None => format!("{RECOMMENDATION_PREFIX} {model_id} on your GPU, or the CPU without one"),
+        Some(name) => format!("{RECOMMENDATION_PREFIX} {accurate} on your GPU ({name})"),
+        None => format!(
+            "{RECOMMENDATION_PREFIX} {accurate} on a GPU, or {} on the CPU without one",
+            LocalTier::Fast.title()
+        ),
     }
 }
 
@@ -107,7 +111,7 @@ mod tests {
                 gpu(1, "RTX 4090"),
                 gpu(0, "RTX 5050 Laptop")
             ])),
-            "Recommended for this computer: whisper-cpp-distil-large-v3.5-q8-0 on your GPU (RTX 5050 Laptop)"
+            "Recommended for this computer: Accurate (distil-large-v3.5) on your GPU (RTX 5050 Laptop)"
         );
         for probe in [
             GpuProbe::NoneFound,
@@ -115,7 +119,7 @@ mod tests {
         ] {
             assert_eq!(
                 line(probe),
-                "Recommended for this computer: whisper-cpp-distil-large-v3.5-q8-0 on your GPU, or the CPU without one"
+                "Recommended for this computer: Accurate (distil-large-v3.5) on a GPU, or Fast (small.en) on the CPU without one"
             );
         }
     }

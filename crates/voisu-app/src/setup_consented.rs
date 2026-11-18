@@ -1723,10 +1723,9 @@ mod tests {
         assert_eq!(step, ConsentedInstallStep::Declined);
         let declined = decline.transcript();
         assert!(
-            declined.contains(&format!(
-                "Recommended for this computer: {} on your GPU (RTX 5050 Laptop)",
-                WHISPER_CPP_ENTRY.id
-            )),
+            declined.contains(
+                "Recommended for this computer: Accurate (distil-large-v3.5) on your GPU (RTX 5050 Laptop)"
+            ),
             "{declined}"
         );
         assert!(declined.contains(SUMMARY_BLOCK), "{declined}");
