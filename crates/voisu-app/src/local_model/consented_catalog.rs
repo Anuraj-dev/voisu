@@ -329,7 +329,7 @@ pub const WHISPER_CPP_SMALL_EN_ENTRY: ConsentedCatalogEntry = ConsentedCatalogEn
     // openai/whisper small.en is MIT; the q8_0 quant is a derivative.
     weights: &[WHISPER_CPP_SMALL_EN_Q8],
     total_download_bytes: WHISPER_CPP_SMALL_EN_Q8.bytes + JFK_BYTES,
-    consent_text: "Download 264,829,639 bytes for small.en (whisper.cpp q8_0). Licence: MIT. English only. Runs on this computer with your GPU through Vulkan, or on the CPU if you choose `voisu local-device cpu`; audio never leaves it. No automatic CPU or Cloud fallback. This is a Consented Install, not a Bakeoff Winner, and is never selected by default.",
+    consent_text: "Download 264,829,639 bytes for small.en (whisper.cpp q8_0). Licence: MIT. English only. Runs on this computer with your GPU through Vulkan, or on the CPU if you choose `voisu local-device cpu`; audio never leaves it. No automatic CPU or Cloud fallback. This is a Consented Install, not a Bakeoff Winner.",
     ..WHISPER_CPP_ENTRY
 };
 
