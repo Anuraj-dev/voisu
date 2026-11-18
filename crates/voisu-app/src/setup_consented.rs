@@ -135,12 +135,24 @@ pub fn production_setup_device() -> SetupDevice {
 /// replaces.
 #[must_use]
 pub fn consent_summary(entry: &ConsentedCatalogEntry, device: SetupDevice) -> [String; 5] {
+    let [language, licence] = consent_terms(entry);
     [
         format!("Download size: {}", format_size(entry.total_download_bytes)),
-        "English only".into(),
-        format!("Licence: {}", entry.license_spdx),
+        language,
+        licence,
         device_line(device).into(),
         "Runs offline after install".into(),
+    ]
+}
+
+/// The limits a yes accepts beyond size and device: the language and the
+/// licence. The CLI and the TUI consent both show these, so the receipt never
+/// records terms the prompt left out.
+#[must_use]
+pub fn consent_terms(entry: &ConsentedCatalogEntry) -> [String; 2] {
+    [
+        "English only".into(),
+        format!("Licence: {}", entry.license_spdx),
     ]
 }
 
