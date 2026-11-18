@@ -55,7 +55,8 @@ int32_t voisu_whisper_gpu_init_log_kind(const char * text) {
 }
 
 // What the GPU init logged during the current voisu_whisper_load: 0 nothing,
-// 1 a device was chosen, -1 the init failed (sticky). One loader at a time.
+// 1 a device was chosen, -1 the init failed (sticky). One loader at a time:
+// voisu-local-asr serializes every voisu_whisper_load behind LOAD_LOCK.
 static int32_t voisu_gpu_init_seen = 0;
 
 // Debug chatter is dropped; everything else goes to stderr, never stdout,

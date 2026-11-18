@@ -70,6 +70,8 @@ unsafe extern "C" {
     pub fn voisu_whisper_pick_gpu(out: *mut VoisuGpu) -> bool;
     /// `gpu_ready` is set true only when `use_gpu` and the GPU backend
     /// initialized; whisper.cpp otherwise falls back to the CPU silently.
+    /// Not reentrant: the GPU check reads a process-wide C global, so callers
+    /// must serialize loads (`voisu-local-asr` holds a process-wide lock).
     pub fn voisu_whisper_load(
         model_path: *const c_char,
         use_gpu: bool,

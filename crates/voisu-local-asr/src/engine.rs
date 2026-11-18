@@ -4,7 +4,7 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Once, OnceLock};
+use std::sync::{Mutex, Once, OnceLock, PoisonError};
 
 use voisu_whisper_sys as sys;
 
@@ -107,6 +107,11 @@ struct Backends {
 
 static ROUTE_LOGS: Once = Once::new();
 static BACKENDS: OnceLock<Backends> = OnceLock::new();
+/// One `voisu_whisper_load` at a time in this process. The shim resets and
+/// then reads a plain C global (`voisu_gpu_init_seen`) that the log callback
+/// sets while whisper.cpp initializes, so two concurrent loads would read each
+/// other's GPU verdict. Every caller of `voisu_whisper_load` holds this lock.
+static LOAD_LOCK: Mutex<()> = Mutex::new(());
 
 /// The backend modules ship beside the worker (`target/<profile>/` or
 /// `/usr/libexec/voisu/`). An explicit directory: given none, ggml would also
@@ -198,6 +203,9 @@ impl WhisperCpp {
             .ok_or_else(|| EngineError::new("model_load_failed", "model path is not a C string"))?;
         let (use_gpu, index) = gpu.map_or((false, 0), |gpu| (true, gpu.index));
         let mut gpu_ready = false;
+        // A panic elsewhere cannot leave the shim's global half-written, so a
+        // poisoned lock is still safe to take.
+        let serialized = LOAD_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         // SAFETY: `path` is a valid NUL-terminated string and `gpu_ready` a
         // writable bool for the call.
         let ctx = unsafe {
@@ -209,6 +217,7 @@ impl WhisperCpp {
                 &raw mut gpu_ready,
             )
         };
+        drop(serialized);
         let ctx = NonNull::new(ctx).ok_or_else(|| match gpu {
             // whisper.cpp logs the cause; a device allocation is the usual one.
             Some(gpu) => EngineError::new(
