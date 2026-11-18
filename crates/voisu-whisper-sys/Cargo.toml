@@ -1,0 +1,12 @@
+[package]
+name = "voisu-whisper-sys"
+version = "0.86.0"
+description = "Vendored whisper.cpp v1.9.5 behind a small C shim, for voisu-local-asr"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+links = "voisu_whisper"
+build = "build.rs"
+
+[build-dependencies]
+cmake = "0.1"
