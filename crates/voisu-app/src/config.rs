@@ -649,6 +649,111 @@ pub(crate) fn set_local_idle_unload_at(
     Ok(path.to_path_buf())
 }
 
+/// `local_device`: where the whisper.cpp Local model runs.
+const LOCAL_DEVICE_KEY: &str = "local_device";
+
+/// Where the whisper.cpp Local model runs. Neither GPU choice falls back to
+/// the CPU silently: CPU decoding is several times slower, so it is only
+/// ever the user's explicit choice.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LocalDevice {
+    /// The best GPU (discrete first), or a clear error naming `cpu`.
+    #[default]
+    Auto,
+    /// A GPU, or an error.
+    Gpu,
+    /// The CPU.
+    Cpu,
+}
+
+impl LocalDevice {
+    pub const ALL: [Self; 3] = [Self::Auto, Self::Gpu, Self::Cpu];
+
+    /// The config value and CLI word.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Gpu => "gpu",
+            Self::Cpu => "cpu",
+        }
+    }
+
+    /// The worker manifest's device: `auto` and `gpu` both ask for a GPU.
+    #[must_use]
+    pub fn manifest_device(self) -> &'static str {
+        match self {
+            Self::Auto | Self::Gpu => "gpu",
+            Self::Cpu => "cpu",
+        }
+    }
+
+    fn from_value(value: &str) -> Option<Self> {
+        let value = value.trim().to_ascii_lowercase();
+        Self::ALL
+            .into_iter()
+            .find(|device| device.as_str() == value)
+    }
+}
+
+/// The Local device setting. Missing, unreadable or unknown values keep
+/// `auto`.
+pub fn local_device() -> LocalDevice {
+    local_device_at(&config_path())
+}
+
+/// Persists the Local device, keeping every other line.
+pub fn set_local_device(device: LocalDevice) -> Result<PathBuf, String> {
+    set_local_device_at(&config_path(), device)
+}
+
+/// User input: `auto`, `gpu` or `cpu`.
+pub fn parse_local_device(input: &str) -> Result<LocalDevice, String> {
+    LocalDevice::from_value(input).ok_or_else(|| "expected auto, gpu or cpu".to_owned())
+}
+
+pub(crate) fn local_device_at(path: &Path) -> LocalDevice {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return LocalDevice::default();
+    };
+    contents
+        .lines()
+        .map(|line| strip_comment(line).trim())
+        .take_while(|line| !line.starts_with('['))
+        .find_map(|line| {
+            let (name, value) = line.split_once('=')?;
+            names_key(name, LOCAL_DEVICE_KEY).then_some(value)
+        })
+        .and_then(|value| {
+            LocalDevice::from_value(value.trim().trim_matches(|c| c == '"' || c == '\''))
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn set_local_device_at(path: &Path, device: LocalDevice) -> Result<PathBuf, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("config path has no parent: {}", path.display()))?;
+    let _lock = ConfigLock::acquire(path)?;
+    let existing = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(format!(
+                "cannot read existing config {} before writing: {error}",
+                path.display()
+            ));
+        }
+    };
+    let value = format!("\"{}\"", device.as_str());
+    write_atomic(
+        path,
+        parent,
+        &merge_root_value(&existing, LOCAL_DEVICE_KEY, &value),
+    )?;
+    Ok(path.to_path_buf())
+}
+
 /// Whether the root table sets `key` at all, whatever its value.
 fn has_root_key(contents: &str, key: &str) -> bool {
     contents
@@ -2558,6 +2663,32 @@ other_key = 5
             std::fs::write(&path, format!("local_idle_unload = {value}\n")).unwrap();
             assert_eq!(local_idle_unload_at(&path), expected, "{value}");
         }
+    }
+
+    #[test]
+    fn local_device_defaults_to_auto_round_trips_and_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("voisu").join("config.toml");
+        assert_eq!(local_device_at(&path), LocalDevice::Auto);
+        write_tone(&path, Tone::Informal).unwrap();
+        set_local_device_at(&path, LocalDevice::Cpu).unwrap();
+        assert_eq!(local_device_at(&path), LocalDevice::Cpu);
+        set_local_device_at(&path, LocalDevice::Gpu).unwrap();
+        assert_eq!(local_device_at(&path), LocalDevice::Gpu);
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents.matches("local_device =").count(), 1, "{contents}");
+        assert!(contents.contains("local_device = \"gpu\"\n"), "{contents}");
+        assert_eq!(read_tone(&path), Some(Tone::Informal));
+        std::fs::write(&path, "local_device = \"vulkan\"\n").unwrap();
+        assert_eq!(local_device_at(&path), LocalDevice::Auto);
+
+        assert_eq!(parse_local_device("CPU"), Ok(LocalDevice::Cpu));
+        assert_eq!(parse_local_device(" auto "), Ok(LocalDevice::Auto));
+        assert!(parse_local_device("cuda:0").is_err());
+        // No silent CPU: both GPU choices ask the worker for a GPU.
+        assert_eq!(LocalDevice::Auto.manifest_device(), "gpu");
+        assert_eq!(LocalDevice::Gpu.manifest_device(), "gpu");
+        assert_eq!(LocalDevice::Cpu.manifest_device(), "cpu");
     }
 
     #[test]

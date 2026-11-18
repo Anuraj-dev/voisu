@@ -39,8 +39,12 @@ pub const DEV_MODEL_IDS: [&str; 14] = [
     "whisper-hindi2hinglish-apex-int8",
     "distil-large-v3.5-int8",
     "granite-speech-5.0-470m-turboctc",
-    "whisper-cpp-distil-large-v3.5-q5-0",
+    WHISPER_CPP_DISTIL_ID,
 ];
+
+/// The in-repo whisper.cpp worker's model: distil-large-v3.5 at q8_0 (the
+/// Phase 0 verdict over q5_0).
+pub const WHISPER_CPP_DISTIL_ID: &str = "whisper-cpp-distil-large-v3.5-q8-0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DevRuntimeKind {
@@ -89,6 +93,9 @@ const EN_HINGLISH: &[&str] = &["en", "hi"];
 // to 62 s) plus margin; see the registered manifests.
 const CPU_CUDA: &[&str] = &["cpu", "cuda:0"];
 const CPU_ONLY: &[&str] = &["cpu"];
+/// `gpu` lets the worker pick the GPU (first discrete, else integrated) and
+/// report which one as its observed device (`vulkan:0`).
+const CPU_GPU: &[&str] = &["cpu", "gpu"];
 
 static DEVELOPMENT_CATALOG: &[DevCatalogEntry] = &[
     DevCatalogEntry {
@@ -208,16 +215,17 @@ static DEVELOPMENT_CATALOG: &[DevCatalogEntry] = &[
         memory_bytes: 4096 * 1024 * 1024,
         vram_bytes: 1792 * 1024 * 1024,
     },
-    // The in-repo `voisu-local-asr` worker (whisper.cpp) on the q5_0 quant;
-    // CPU only until its GPU backends land.
+    // The in-repo `voisu-local-asr` worker (whisper.cpp, Vulkan or CPU).
+    // vram_bytes is an estimate for q8_0 (818 MB of weights, beam 5, flash
+    // attention), not a measured peak.
     DevCatalogEntry {
-        model_id: "whisper-cpp-distil-large-v3.5-q5-0",
+        model_id: WHISPER_CPP_DISTIL_ID,
         runtime: DevRuntimeKind::Native,
         worker: DevWorker::Executable,
         languages: EN,
-        devices: CPU_ONLY,
+        devices: CPU_GPU,
         memory_bytes: 2048 * 1024 * 1024,
-        vram_bytes: 0,
+        vram_bytes: 1536 * 1024 * 1024,
     },
 ];
 
@@ -722,9 +730,9 @@ impl DevManifest {
                 "cpu manifests must set vram_bytes=0".into(),
             ));
         }
-        if self.device == "cuda:0" && self.limits.vram_bytes == 0 {
+        if self.device != "cpu" && self.limits.vram_bytes == 0 {
             return Err(DevelopmentError::Invalid(
-                "cuda manifests must set a vram_bytes limit".into(),
+                "gpu manifests must set a vram_bytes limit".into(),
             ));
         }
         if self.runtime.python.as_ref().is_some_and(String::is_empty)
@@ -1580,7 +1588,7 @@ mod tests {
     #[test]
     fn a_native_worker_manifest_has_no_python_and_still_pins_the_worker() {
         let dir = TempDir::new().unwrap();
-        let value = manifest(dir.path(), "whisper-cpp-distil-large-v3.5-q5-0");
+        let value = manifest(dir.path(), WHISPER_CPP_DISTIL_ID);
         assert_eq!(value.runtime.python, None);
         assert!(value.validate().is_ok(), "{:?}", value.validate());
         let json = value.to_json().unwrap();
@@ -1606,13 +1614,18 @@ mod tests {
             error.to_string().contains("runtime.python must be absent"),
             "{error}"
         );
-        let mut gpu = value;
-        gpu.device = "cuda:0".into();
-        gpu.limits.vram_bytes = 1;
+        let mut cuda = value.clone();
+        cuda.device = "cuda:0".into();
+        cuda.limits.vram_bytes = 1;
         assert!(
-            gpu.validate().is_err(),
-            "the whisper.cpp worker is CPU only for now"
+            cuda.validate().is_err(),
+            "the whisper.cpp worker picks its GPU itself"
         );
+        let mut gpu = value;
+        gpu.device = "gpu".into();
+        assert!(gpu.validate().is_err(), "a gpu manifest needs vram_bytes");
+        gpu.limits.vram_bytes = 1536 * 1024 * 1024;
+        assert!(gpu.validate().is_ok(), "{:?}", gpu.validate());
     }
 
     #[test]

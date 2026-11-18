@@ -163,15 +163,17 @@ impl DevWorker {
         install_root: Option<&Path>,
         lease_path: Option<&Path>,
     ) -> Result<Self, SupervisorError> {
-        // CUDA workers serialize GPU ownership through the GPU lock and refuse
-        // overlapping development units. CPU workers take a separate exclusive
-        // CPU lock so two CPU units cannot overlap; they stay independent of CUDA.
+        // GPU workers (`cuda:0`, or `gpu` for the whisper.cpp worker) serialize
+        // GPU ownership through the GPU lock and refuse overlapping development
+        // units. CPU workers take a separate exclusive CPU lock so two CPU
+        // units cannot overlap; they stay independent of the GPU.
         if !Path::new(FLOCK).is_file() {
             return Err(SupervisorError::Unavailable(
                 "/usr/bin/flock is required for Local worker locks",
             ));
         }
-        let gpu_lock = if manifest.device == "cuda:0" {
+        let on_gpu = manifest.device != "cpu";
+        let gpu_lock = if on_gpu {
             prepare_gpu_lock()?
         } else {
             prepare_cpu_lock()?
@@ -179,7 +181,7 @@ impl DevWorker {
         // This early probe gives a clear refusal. The transient unit's atomic
         // nonblocking flock is authoritative when two launches race this probe.
         let probe = open_gpu_lock(&gpu_lock)?;
-        if manifest.device == "cuda:0" {
+        if on_gpu {
             lock_gpu(&probe)?;
             drop(probe);
             refuse_if_development_worker_loaded()?;
@@ -804,8 +806,17 @@ fn bounded_metadata(message: &str) -> Map<String, Value> {
     metadata
 }
 
+/// `gpu` asks the worker to pick a GPU, so it matches any GPU it reports
+/// (`vulkan:0`, `cuda:0`) but never the CPU: no silent fallback.
 fn requested_device_matches(requested: &str, observed: &str) -> bool {
-    requested == observed && matches!(observed, "cpu" | "cuda:0")
+    match requested {
+        "gpu" => observed.split_once(':').is_some_and(|(backend, index)| {
+            matches!(backend, "vulkan" | "cuda")
+                && !index.is_empty()
+                && index.bytes().all(|b| b.is_ascii_digit())
+        }),
+        _ => requested == observed && matches!(observed, "cpu" | "cuda:0"),
+    }
 }
 
 fn cache_path(manifest: &DevManifest) -> PathBuf {
@@ -934,6 +945,11 @@ fn isolated_systemd_run_args(
     if manifest.device == "cuda:0" {
         args.push("--setenv=CUDA_VISIBLE_DEVICES=0".into());
         args.push("--setenv=CUDA_DEVICE_ORDER=PCI_BUS_ID".into());
+    }
+    if manifest.device == "gpu" {
+        // ggml's CUDA programmatic dependent launch hangs some drivers; a no-op
+        // for the Vulkan backend, kept so a ggml CUDA module cannot enable it.
+        args.push("--setenv=GGML_CUDA_PDL=0".into());
     }
     if let Some(library) = manifest
         .options
@@ -1533,6 +1549,33 @@ mod tests {
         assert!(requested_device_matches("cuda:0", "cuda:0"));
         assert!(!requested_device_matches("cuda:0", "cpu"));
         assert!(requested_device_matches("cpu", "cpu"));
+        assert!(requested_device_matches("gpu", "vulkan:0"));
+        assert!(requested_device_matches("gpu", "cuda:1"));
+        assert!(!requested_device_matches("gpu", "cpu"));
+        assert!(!requested_device_matches("gpu", "gpu"));
+        assert!(!requested_device_matches("gpu", "vulkan:"));
+        assert!(!requested_device_matches("cpu", "vulkan:0"));
+    }
+
+    #[test]
+    fn a_gpu_whisper_worker_keeps_its_devices_and_disables_cuda_pdl() {
+        let gpu = test_manifest("gpu");
+        let args = systemd_run_args(
+            "voisu-dev-worker-test",
+            Path::new("/tmp/voisu-dev-cache"),
+            &gpu,
+            Path::new("/tmp/gpu.json"),
+        );
+        assert!(args.iter().any(|arg| arg == "--setenv=GGML_CUDA_PDL=0"));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "--property=PrivateDevices=yes")
+        );
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--property=PrivateNetwork=yes")
+        );
     }
 
     #[test]

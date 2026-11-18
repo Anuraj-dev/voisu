@@ -21,6 +21,7 @@ enum CliAction {
     SetDeepgram(bool),
     Switch(Switch, Option<bool>),
     LocalUnload(Option<Option<std::time::Duration>>),
+    LocalDevice(Option<voisu_app::config::LocalDevice>),
     Star,
     SetAsrMode(AsrMode),
     Delivery(Option<DeliveryMode>),
@@ -56,6 +57,7 @@ fn main() -> ExitCode {
         Ok(CliAction::SetDeepgram(enabled)) => set_deepgram(enabled),
         Ok(CliAction::Switch(switch, state)) => switch_command(switch, state),
         Ok(CliAction::LocalUnload(after)) => local_unload(after),
+        Ok(CliAction::LocalDevice(device)) => local_device(device),
         Ok(CliAction::Star) => star(),
         Ok(CliAction::SetAsrMode(mode)) => set_asr_mode(mode),
         Ok(CliAction::Delivery(mode)) => delivery(mode),
@@ -437,6 +439,33 @@ fn local_unload(after: Option<Option<std::time::Duration>>) -> ExitCode {
     }
 }
 
+/// Shows or sets where the Local model runs. The next model load uses it.
+fn local_device(device: Option<voisu_app::config::LocalDevice>) -> ExitCode {
+    use voisu_app::config::LocalDevice;
+    let meaning = |device: LocalDevice| match device {
+        LocalDevice::Auto | LocalDevice::Gpu => {
+            "the Local model runs on your GPU; without a usable one it stops with an error and never falls back to the CPU on its own"
+        }
+        LocalDevice::Cpu => "the Local model runs on the CPU, several times slower than a GPU",
+    };
+    let Some(device) = device else {
+        let device = voisu_app::config::local_device();
+        println!("Local device: {} ({})", device.as_str(), meaning(device));
+        return ExitCode::SUCCESS;
+    };
+    match voisu_app::config::set_local_device(device) {
+        Ok(_) => {
+            println!(
+                "Local device set to {} ({}). It applies the next time the Local model loads.",
+                device.as_str(),
+                meaning(device)
+            );
+            ExitCode::SUCCESS
+        }
+        Err(message) => fail(4, &message),
+    }
+}
+
 fn switch_label(switch: Switch) -> &'static str {
     match switch {
         Switch::UpdateCheck => "Update check",
@@ -759,6 +788,11 @@ fn parse_command() -> Result<CliAction, String> {
             voisu_app::config::parse_local_idle_unload(after)
                 .map_err(|error| format!("local-unload: {error}"))?,
         ))),
+        [command] if command == "local-device" => Ok(CliAction::LocalDevice(None)),
+        [command, device] if command == "local-device" => Ok(CliAction::LocalDevice(Some(
+            voisu_app::config::parse_local_device(device)
+                .map_err(|error| format!("local-device: {error}"))?,
+        ))),
         [command] if command == "star-prompt" => Ok(CliAction::Switch(Switch::StarPrompt, None)),
         [command, state] if command == "star-prompt" => Ok(CliAction::Switch(
             Switch::StarPrompt,
@@ -908,6 +942,7 @@ commands:
                                 manage the Voisu service
   local remove [--yes]          delete the Local model
   local-unload [off|SECONDS]    free an idle Local model's memory after this long
+  local-device [auto|gpu|cpu]   run the Local model on your GPU or the CPU
   update [--check|--dry-run] [--switch-to-bin]
                                 update Voisu
   update-check [on|off]         check once a day for a newer version

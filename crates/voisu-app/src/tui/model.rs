@@ -115,6 +115,8 @@ pub struct SettingsSnapshot {
     pub deepgram: bool,
     /// How long an idle Local worker keeps its model loaded; `None` = never.
     pub local_idle_unload: Option<Duration>,
+    /// Where the whisper.cpp Local model runs.
+    pub local_device: crate::config::LocalDevice,
     pub update_check: bool,
     pub star_prompt: bool,
     /// The star prompt line shows on Home: threshold met, setting on, not
@@ -201,6 +203,7 @@ pub enum Job {
     SetTone(WritingTone),
     SetDeepgram(bool),
     SetLocalIdleUnload(Option<Duration>),
+    SetLocalDevice(crate::config::LocalDevice),
     SetUpdateCheck(bool),
     SetStarPrompt(bool),
     /// Opens the repository page and ends the star nudge for good.
@@ -248,6 +251,7 @@ impl fmt::Debug for Job {
             Job::SetTone(tone) => write!(f, "SetTone({tone:?})"),
             Job::SetDeepgram(enabled) => write!(f, "SetDeepgram({enabled})"),
             Job::SetLocalIdleUnload(after) => write!(f, "SetLocalIdleUnload({after:?})"),
+            Job::SetLocalDevice(device) => write!(f, "SetLocalDevice({device:?})"),
             Job::SetUpdateCheck(on) => write!(f, "SetUpdateCheck({on})"),
             Job::SetStarPrompt(on) => write!(f, "SetStarPrompt({on})"),
             Job::Star => f.write_str("Star"),
@@ -372,6 +376,7 @@ const fn minutes(n: u64) -> Option<Duration> {
 }
 const LOCAL_UNLOADS: [Option<Duration>; 5] =
     [None, minutes(1), minutes(5), minutes(15), minutes(30)];
+const LOCAL_DEVICES: [crate::config::LocalDevice; 3] = crate::config::LocalDevice::ALL;
 
 const ENGINE_CHOICES: [Choice; 2] = [
     choice("Cloud", "Fast and accurate. Needs internet."),
@@ -401,6 +406,18 @@ const LOCAL_UNLOAD_CHOICES: [Choice; 5] = [
     choice("After 15 min", "Reloads less often."),
     choice("After 30 min", "Holds memory longest."),
 ];
+const LOCAL_DEVICE_CHOICES: [Choice; 3] = [
+    choice(
+        "Auto",
+        "Your best GPU. Without one, Local stops with an error.",
+    ),
+    choice("GPU", "A GPU only, never the CPU."),
+    choice("CPU", "Works anywhere; several times slower."),
+];
+
+pub fn local_device_label(device: crate::config::LocalDevice) -> &'static str {
+    LOCAL_DEVICE_CHOICES[position(&LOCAL_DEVICES, device)].label
+}
 
 pub fn engine_label(mode: AsrMode) -> &'static str {
     ENGINE_CHOICES[position(&ENGINES, mode)].label
@@ -513,6 +530,7 @@ pub enum SettingsRow {
     DeepgramKey,
     TriggerKey,
     LocalUnload,
+    LocalDevice,
     UpdateCheck,
     StarPrompt,
     RunSetup,
@@ -520,7 +538,7 @@ pub enum SettingsRow {
 }
 
 impl SettingsRow {
-    pub const ALL: [SettingsRow; 14] = [
+    pub const ALL: [SettingsRow; 15] = [
         SettingsRow::Engine,
         SettingsRow::Delivery,
         SettingsRow::Writing,
@@ -531,6 +549,7 @@ impl SettingsRow {
         SettingsRow::DeepgramKey,
         SettingsRow::TriggerKey,
         SettingsRow::LocalUnload,
+        SettingsRow::LocalDevice,
         SettingsRow::UpdateCheck,
         SettingsRow::StarPrompt,
         SettingsRow::RunSetup,
@@ -549,6 +568,7 @@ impl SettingsRow {
             SettingsRow::DeepgramKey => "Deepgram key",
             SettingsRow::TriggerKey => "Trigger Key",
             SettingsRow::LocalUnload => "Local unload",
+            SettingsRow::LocalDevice => "Local device",
             SettingsRow::UpdateCheck => "Update check",
             SettingsRow::StarPrompt => "Star prompt",
             SettingsRow::RunSetup => "Run setup",
@@ -565,6 +585,7 @@ impl SettingsRow {
             SettingsRow::Rendering => &LAYOUT_CHOICES,
             SettingsRow::Tone => &TONE_CHOICES,
             SettingsRow::LocalUnload => &LOCAL_UNLOAD_CHOICES,
+            SettingsRow::LocalDevice => &LOCAL_DEVICE_CHOICES,
             _ => &[],
         }
     }
@@ -603,6 +624,9 @@ impl SettingsRow {
             }
             SettingsRow::LocalUnload => {
                 "Frees the Local model's memory when idle. It reloads when you start recording."
+            }
+            SettingsRow::LocalDevice => {
+                "Where the Local model runs. It applies the next time the model loads."
             }
             SettingsRow::UpdateCheck => {
                 "Once a day, reads the newest version number from GitHub. No identifier or usage is sent."
@@ -994,6 +1018,9 @@ impl App {
             }),
             SettingsRow::LocalUnload => self.settings.map_or_else(loading, |settings| {
                 plain(local_unload_label(settings.local_idle_unload))
+            }),
+            SettingsRow::LocalDevice => self.settings.map_or_else(loading, |settings| {
+                plain(local_device_label(settings.local_device).to_owned())
             }),
             SettingsRow::UpdateCheck => self.settings.map_or_else(loading, |settings| {
                 plain(if settings.update_check { "On" } else { "Off" }.to_owned())
@@ -1447,7 +1474,8 @@ impl App {
             | SettingsRow::Writing
             | SettingsRow::Rendering
             | SettingsRow::Tone
-            | SettingsRow::LocalUnload => {
+            | SettingsRow::LocalUnload
+            | SettingsRow::LocalDevice => {
                 let Some(picked) = self.current_choice(row) else {
                     return;
                 };
@@ -1504,6 +1532,7 @@ impl App {
                 .iter()
                 .position(|after| *after == settings.local_idle_unload)
                 .unwrap_or(2),
+            SettingsRow::LocalDevice => position(&LOCAL_DEVICES, settings.local_device),
             _ => return None,
         })
     }
@@ -1562,6 +1591,10 @@ impl App {
             SettingsRow::LocalUnload => {
                 settings.local_idle_unload = LOCAL_UNLOADS[picked];
                 Job::SetLocalIdleUnload(settings.local_idle_unload)
+            }
+            SettingsRow::LocalDevice => {
+                settings.local_device = LOCAL_DEVICES[picked];
+                Job::SetLocalDevice(settings.local_device)
             }
             _ => return,
         };
@@ -1848,6 +1881,7 @@ pub(super) mod test_support {
             tone: WritingTone::Formal,
             deepgram: true,
             local_idle_unload: crate::config::DEFAULT_LOCAL_IDLE_UNLOAD,
+            local_device: crate::config::LocalDevice::Auto,
             update_check: true,
             star_prompt: true,
             star_line: false,
@@ -2879,6 +2913,44 @@ mod tests {
             .position(|row| *row == SettingsRow::LocalUnload)
             .unwrap();
         app
+    }
+
+    #[test]
+    fn the_local_device_row_shows_and_picks_gpu_or_cpu() {
+        let mut app = ready_app();
+        app.tab = Tab::Settings;
+        app.settings_selected = SettingsRow::ALL
+            .iter()
+            .position(|row| *row == SettingsRow::LocalDevice)
+            .unwrap();
+        assert_eq!(SettingsRow::LocalDevice.label(), "Local device");
+        assert_eq!(
+            app.setting_value(SettingsRow::LocalDevice),
+            ("Auto".to_owned(), Tone::Plain)
+        );
+        assert!(press(&mut app, KeyCode::Enter, 0).is_empty());
+        assert!(matches!(
+            app.prompt,
+            Some(Prompt::Choice {
+                row: SettingsRow::LocalDevice,
+                picked: 0
+            })
+        ));
+        for _ in 0..2 {
+            let _ = press(&mut app, KeyCode::Down, 0);
+        }
+        let effects = press(&mut app, KeyCode::Enter, 0);
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Job(Job::SetLocalDevice(
+                    crate::config::LocalDevice::Cpu
+                ))]
+            ),
+            "{effects:?}"
+        );
+        assert_eq!(app.setting_value(SettingsRow::LocalDevice).0, "CPU");
+        assert!(app.restart_pending.is_empty());
     }
 
     #[test]

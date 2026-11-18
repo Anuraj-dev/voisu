@@ -182,6 +182,12 @@ pub fn execute(job: Job, replies: &Sender<Reply>) {
             "It applies within 30 seconds.",
             &[Refresh::Settings],
         )),
+        Job::SetLocalDevice(device) => send(applied_setting(
+            config::set_local_device(device),
+            format!("Local device set to {}.", device.as_str()),
+            "It applies the next time the Local model loads.",
+            &[Refresh::Settings],
+        )),
         Job::SetUpdateCheck(on) => send(applied_setting(
             config::set_switch(config::Switch::UpdateCheck, on),
             format!("Update check turned {}.", if on { "on" } else { "off" }),
@@ -256,6 +262,7 @@ fn load_settings() -> SettingsSnapshot {
         tone: config::tone(),
         deepgram: config::deepgram_enabled(),
         local_idle_unload: config::local_idle_unload(),
+        local_device: config::local_device(),
         update_check: config::switch(config::Switch::UpdateCheck),
         star_prompt,
         // Judged against today on every read, so a line closed 30 days ago
