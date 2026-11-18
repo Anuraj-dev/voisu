@@ -69,8 +69,11 @@ impl WhisperCpp {
     ///
     /// # Errors
     ///
-    /// `model_load_failed` when the path is unusable or whisper.cpp refuses it.
+    /// `cpu_unsupported` when the CPU lacks the instruction sets ggml was
+    /// built for (checked before any ggml code runs), and `model_load_failed`
+    /// when the path is unusable or whisper.cpp refuses it.
     pub fn load(model_path: &Path, options: DecodeOptions) -> Result<Self, EngineError> {
+        cpu_support(&sys::missing_cpu_features())?;
         ROUTE_LOGS.call_once(|| unsafe { sys::voisu_whisper_route_logs_to_stderr() });
         let path = path_cstring(model_path)
             .ok_or_else(|| EngineError::new("model_load_failed", "model path is not a C string"))?;
@@ -159,4 +162,36 @@ fn path_cstring(path: &Path) -> Option<CString> {
 #[cfg(not(unix))]
 fn path_cstring(path: &Path) -> Option<CString> {
     CString::new(path.to_str()?).ok()
+}
+
+/// Refuse a CPU that lacks part of the ggml build baseline (`missing`, from
+/// [`sys::missing_cpu_features`]) with a protocol error instead of SIGILL.
+///
+/// # Errors
+///
+/// `cpu_unsupported`, naming the missing instruction sets.
+pub fn cpu_support(missing: &[&str]) -> Result<(), EngineError> {
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(EngineError::new(
+        "cpu_unsupported",
+        format!(
+            "this CPU lacks {}, which the whisper.cpp worker is built for (x86-64-v3)",
+            missing.join(", ")
+        ),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cpu_without_the_baseline_is_refused_by_name() {
+        assert_eq!(cpu_support(&[]), Ok(()));
+        let error = cpu_support(&["avx2", "fma"]).unwrap_err();
+        assert_eq!(error.code, "cpu_unsupported");
+        assert!(error.message.contains("avx2, fma"), "{}", error.message);
+    }
 }

@@ -55,6 +55,37 @@ unsafe extern "C" {
     pub fn whisper_print_system_info() -> *const c_char;
 }
 
+/// The x86_64 instruction sets `build.rs` compiles ggml for (x86-64-v3).
+/// Keep in step with `X86_64_ON` there.
+#[cfg(target_arch = "x86_64")]
+pub const REQUIRED_CPU_FEATURES: &[&str] = &["sse4.2", "avx", "avx2", "fma", "f16c", "bmi2"];
+
+/// Other architectures build with ggml's portable defaults.
+#[cfg(not(target_arch = "x86_64"))]
+pub const REQUIRED_CPU_FEATURES: &[&str] = &[];
+
+/// The [`REQUIRED_CPU_FEATURES`] this CPU lacks. Any ggml call on such a CPU
+/// may die of SIGILL, so check this before the first one.
+#[must_use]
+pub fn missing_cpu_features() -> Vec<&'static str> {
+    #[cfg(target_arch = "x86_64")]
+    let detected = [
+        ("sse4.2", std::arch::is_x86_feature_detected!("sse4.2")),
+        ("avx", std::arch::is_x86_feature_detected!("avx")),
+        ("avx2", std::arch::is_x86_feature_detected!("avx2")),
+        ("fma", std::arch::is_x86_feature_detected!("fma")),
+        ("f16c", std::arch::is_x86_feature_detected!("f16c")),
+        ("bmi2", std::arch::is_x86_feature_detected!("bmi2")),
+    ];
+    #[cfg(not(target_arch = "x86_64"))]
+    let detected: [(&'static str, bool); 0] = [];
+    detected
+        .into_iter()
+        .filter(|(_, present)| !present)
+        .map(|(name, _)| name)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,6 +103,32 @@ mod tests {
     fn linked_library_is_the_vendored_tag() {
         let version = unsafe { CStr::from_ptr(whisper_version()) };
         assert_eq!(version.to_str().unwrap(), WHISPER_CPP_VERSION);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn ggml_is_built_for_the_pinned_baseline_not_the_build_host() {
+        let info = unsafe { CStr::from_ptr(whisper_print_system_info()) }
+            .to_str()
+            .unwrap()
+            .to_owned();
+        for feature in ["AVX = 1", "AVX2 = 1", "F16C = 1", "FMA = 1", "BMI2 = 1"] {
+            assert!(info.contains(feature), "{feature} missing from {info}");
+        }
+        // Holds even on an AVX-512 build host: GGML_NATIVE is off.
+        for feature in ["AVX512", "AVX_VNNI", "AMX"] {
+            assert!(!info.contains(feature), "{feature} compiled in: {info}");
+        }
+    }
+
+    #[test]
+    fn missing_features_are_named_from_the_baseline_list() {
+        let missing = missing_cpu_features();
+        assert!(
+            missing
+                .iter()
+                .all(|name| REQUIRED_CPU_FEATURES.contains(name))
+        );
     }
 
     #[test]
