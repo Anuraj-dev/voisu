@@ -577,6 +577,9 @@ pub fn consented_error_line(error: &ConsentedError) -> String {
         ConsentedError::HealthUnreaped => {
             "The health-check worker did not stop; its files were kept.".into()
         }
+        ConsentedError::Fetch(crate::local_model::FetchError::Policy(
+            crate::local_model::UrlPolicyError::PlaceholderHost { .. },
+        )) => "This model has no download location yet; nothing was downloaded.".into(),
         ConsentedError::Fetch(_) | ConsentedError::Deadline => {
             "The download failed (network or deadline).".into()
         }

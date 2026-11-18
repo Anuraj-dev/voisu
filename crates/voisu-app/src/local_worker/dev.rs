@@ -808,7 +808,7 @@ fn bounded_metadata(message: &str) -> Map<String, Value> {
 
 /// `gpu` asks the worker to pick a GPU, so it matches any GPU it reports
 /// (`vulkan:0`, `cuda:0`) but never the CPU: no silent fallback.
-fn requested_device_matches(requested: &str, observed: &str) -> bool {
+pub(super) fn requested_device_matches(requested: &str, observed: &str) -> bool {
     match requested {
         "gpu" => observed.split_once(':').is_some_and(|(backend, index)| {
             matches!(backend, "vulkan" | "cuda")

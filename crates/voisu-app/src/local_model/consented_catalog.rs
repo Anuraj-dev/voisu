@@ -20,13 +20,35 @@ pub struct ConsentedCatalogEntry {
     pub license_spdx: &'static str,
     pub consent_installable: bool,
     pub weights: &'static [DownloadPin],
-    pub python: DownloadPin,
+    /// The pinned CPython runtime of a Python worker. `None` for the
+    /// whisper.cpp entry: its worker is the packaged `voisu-local-asr` binary,
+    /// so the install holds only weights and the health clip.
+    pub python: Option<DownloadPin>,
     pub health_clip: fn() -> DownloadPin,
     pub wheels: &'static [DownloadPin],
     pub total_download_bytes: u64,
     pub estimated_extracted_runtime_bytes: u64,
     pub consent_text: &'static str,
 }
+
+impl ConsentedCatalogEntry {
+    /// The packaged whisper.cpp worker, not a Python runtime built at install.
+    pub fn runs_whisper_cpp(&self) -> bool {
+        self.python.is_none()
+    }
+
+    /// Free bytes the store filesystem needs before an install starts. A
+    /// whisper.cpp install has nothing to extract: the model plus headroom.
+    pub fn required_free_bytes(&self) -> u64 {
+        if self.runs_whisper_cpp() {
+            self.total_download_bytes + WHISPER_CPP_HEADROOM_BYTES
+        } else {
+            2 * (self.total_download_bytes + self.estimated_extracted_runtime_bytes)
+        }
+    }
+}
+
+const WHISPER_CPP_HEADROOM_BYTES: u64 = 256 * 1024 * 1024;
 // 2.3 GiB rounded up for the CUDA venv, plus 105 MiB CPython, rounded up to
 // 128 MiB. docs/local-gpu-development.md measured the venv at 2.3 GB; using
 // GiB and rounding upward leaves headroom for extracted package metadata.
@@ -89,7 +111,7 @@ pub const CONSENTED_ENTRY: ConsentedCatalogEntry = ConsentedCatalogEntry {
     license_spdx: "MIT",
     consent_installable: true,
     weights: WEIGHTS,
-    python: PYTHON,
+    python: Some(PYTHON),
     wheels: WHEELS,
     health_clip: clip_pin,
     total_download_bytes: TOTAL_DOWNLOAD_BYTES,
@@ -162,8 +184,8 @@ pub(super) const WORKER_FILES: &[(&str, &[u8])] = &[
 ];
 
 /// Catalog lookup is exact; receipts cannot authorize arbitrary entries.
-pub fn consented_catalog_entries() -> [&'static ConsentedCatalogEntry; 2] {
-    [&CONSENTED_ENTRY, &PARAKEET_ENTRY]
+pub fn consented_catalog_entries() -> [&'static ConsentedCatalogEntry; 3] {
+    [&CONSENTED_ENTRY, &PARAKEET_ENTRY, &WHISPER_CPP_ENTRY]
 }
 
 pub fn consented_entry(id: &str) -> Option<&'static ConsentedCatalogEntry> {
@@ -183,7 +205,7 @@ pub const PARAKEET_ENTRY: ConsentedCatalogEntry = ConsentedCatalogEntry {
     consent_installable: true,
     weights: &[super::consented_pins::PARAKEET_WEIGHTS],
     native_runtime: Some(super::consented_pins::NEMO_CPU),
-    python: PYTHON,
+    python: Some(PYTHON),
     wheels: super::consented_pins::CPU_WHEELS,
     health_clip: clip_pin,
     total_download_bytes: 769_772_225,
@@ -193,3 +215,107 @@ pub const PARAKEET_ENTRY: ConsentedCatalogEntry = ConsentedCatalogEntry {
     estimated_extracted_runtime_bytes: 384 * 1024 * 1024,
     consent_text: "Download 769,772,225 bytes for parakeet-tdt-0.6b-v3 and its pinned Python/NumPy/NeMo-Speech.cpp v0.1.0 CPU runtime. Licence: CC-BY-4.0. English only. Runs offline on CPU. Development evidence: EN WER 12.8%, warm p50 0.61 s on 4 cores, peak RAM 0.9 GB; one host, one speaker — not the release gate. No automatic GPU or Cloud fallback. This is a Consented Install, not a Bakeoff Winner, and is never selected by default.",
 };
+
+/// TODO(hosting, spec open question 4): the q8_0 quant has no public host
+/// yet. The reserved `.invalid` host is refused by the URL policy before any
+/// network access, so an install fails closed until this constant and
+/// [`WHISPER_CPP_HOSTS`] name the real pinned location and its exact
+/// redirect hosts.
+pub const WHISPER_CPP_Q8_URL: &str =
+    "https://voisu-model-host.invalid/whisper-cpp/ggml-distil-large-v3.5-q8_0.bin";
+pub const WHISPER_CPP_HOSTS: &[&str] = &["voisu-model-host.invalid"];
+/// distil-large-v3.5 quantized to q8_0 with whisper.cpp 1.9.5's
+/// `whisper-quantize` (the Phase 0 verdict).
+pub const WHISPER_CPP_Q8: DownloadPin = DownloadPin {
+    name: "ggml-distil-large-v3.5-q8_0.bin",
+    url: WHISPER_CPP_Q8_URL,
+    sha256: "7e570abdf13b681354a2ecc93802e25bf204dd6f8c0dd9f6ecb9478b71b231d7",
+    bytes: 818_305_955,
+    hosts: WHISPER_CPP_HOSTS,
+    requirement: None,
+};
+/// The JFK health clip's size; the entry's total adds it to the model.
+const JFK_BYTES: u64 = 352_078;
+/// The whisper.cpp entry. Its `device` is `gpu`; the worker runs where the
+/// `local_device` setting says when it loads.
+pub const WHISPER_CPP_ENTRY: ConsentedCatalogEntry = ConsentedCatalogEntry {
+    id: super::development::WHISPER_CPP_DISTIL_ID,
+    device: "gpu",
+    compute_type: "q8_0",
+    native_runtime: None,
+    revision: "whisper.cpp-1.9.5",
+    // distil-whisper/distil-large-v3.5 is MIT; the q8_0 quant is a derivative.
+    license_spdx: "MIT",
+    consent_installable: true,
+    weights: &[WHISPER_CPP_Q8],
+    python: None,
+    wheels: &[],
+    health_clip: clip_pin,
+    total_download_bytes: WHISPER_CPP_Q8.bytes + JFK_BYTES,
+    estimated_extracted_runtime_bytes: 0,
+    consent_text: "Download 818,658,033 bytes for distil-large-v3.5 (whisper.cpp q8_0). Licence: MIT. English only. Runs on this computer with your GPU through Vulkan, or on the CPU if you choose `voisu local-device cpu`; audio never leaves it. No automatic CPU or Cloud fallback. This is a Consented Install, not a Bakeoff Winner, and is never selected by default.",
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::local_model::url_policy::{UrlPolicyError, validate_catalog_url};
+
+    #[test]
+    fn the_whisper_cpp_entry_fails_closed_on_the_placeholder_host() {
+        let pin = WHISPER_CPP_ENTRY.weights[0];
+        assert_eq!(pin.url, WHISPER_CPP_Q8_URL);
+        assert_eq!(
+            validate_catalog_url(pin.url, pin.hosts),
+            Err(UrlPolicyError::PlaceholderHost {
+                host: "voisu-model-host.invalid".into()
+            })
+        );
+    }
+
+    #[test]
+    fn the_whisper_cpp_entry_pins_the_phase_0_quant_and_needs_model_plus_256_mib() {
+        let entry = &WHISPER_CPP_ENTRY;
+        assert!(entry.runs_whisper_cpp());
+        assert_eq!(entry.weights.len(), 1);
+        assert_eq!(
+            (entry.weights[0].sha256, entry.weights[0].bytes),
+            (
+                "7e570abdf13b681354a2ecc93802e25bf204dd6f8c0dd9f6ecb9478b71b231d7",
+                818_305_955
+            )
+        );
+        assert_eq!(clip_pin().bytes, JFK_BYTES);
+        assert_eq!(
+            entry.total_download_bytes,
+            entry.weights[0].bytes + clip_pin().bytes
+        );
+        assert!(
+            entry
+                .consent_text
+                .contains(&format_with_commas(entry.total_download_bytes))
+        );
+        assert_eq!(
+            entry.required_free_bytes(),
+            entry.total_download_bytes + 256 * 1024 * 1024
+        );
+        // Python entries keep their two-copies-of-everything reserve.
+        assert_eq!(CONSENTED_ENTRY.required_free_bytes(), REQUIRED_FREE_BYTES);
+        assert_eq!(
+            consented_entry(entry.id).map(|found| found.id),
+            Some(entry.id)
+        );
+    }
+
+    fn format_with_commas(value: u64) -> String {
+        let digits = value.to_string();
+        let mut out = String::new();
+        for (index, digit) in digits.chars().enumerate() {
+            if index > 0 && (digits.len() - index).is_multiple_of(3) {
+                out.push(',');
+            }
+            out.push(digit);
+        }
+        out
+    }
+}
