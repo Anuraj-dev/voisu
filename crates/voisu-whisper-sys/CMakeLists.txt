@@ -1,8 +1,13 @@
-# Builds the vendored whisper.cpp plus the Voisu shim as static libraries.
+# Builds the vendored whisper.cpp with dynamically loaded ggml backends, plus
+# the Voisu shim as a static library.
 cmake_minimum_required(VERSION 3.14)
 project(voisu_whisper C CXX)
 
-set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+# GGML_BACKEND_DL needs shared libraries: libwhisper, libggml and libggml-base
+# are linked; each backend (libggml-cpu-<variant>.so, libggml-vulkan.so) is a
+# module ggml dlopen()s from the worker's own directory.
+set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(WHISPER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(WHISPER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(WHISPER_BUILD_SERVER OFF CACHE BOOL "" FORCE)
@@ -28,5 +33,5 @@ set(WHISPER_BUILD_NUMBER 0 CACHE STRING "" FORCE)
 add_subdirectory(whisper.cpp)
 
 add_library(voisu_whisper_shim STATIC shim.c)
-target_link_libraries(voisu_whisper_shim PRIVATE whisper)
+target_link_libraries(voisu_whisper_shim PRIVATE whisper ggml)
 install(TARGETS voisu_whisper_shim ARCHIVE DESTINATION lib)

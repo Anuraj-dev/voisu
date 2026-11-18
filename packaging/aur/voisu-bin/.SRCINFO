@@ -19,6 +19,7 @@ pkgbase = voisu-bin
 	depends = libsecret
 	depends = curl
 	depends = xdg-desktop-portal
+	depends = vulkan-icd-loader
 	optdepends = libei: direct Delivery of the Transcript into the focused window
 	optdepends = xdg-desktop-portal-kde: portal backend for KDE Plasma
 	optdepends = xdg-desktop-portal-hyprland: portal backend for Hyprland

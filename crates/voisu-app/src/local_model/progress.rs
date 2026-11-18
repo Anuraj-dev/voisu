@@ -50,6 +50,38 @@ impl<W: Write + ?Sized> Write for ProgressSink<'_, W> {
     }
 }
 
+/// A [`ProgressSink`] for a resumed download: reports the `held` bytes
+/// already on disk just before the first tail byte is written, so a server
+/// that ignores the Range (and so writes nothing here) never counts them.
+pub(crate) struct HeldCredit<'a, W: Write + ?Sized> {
+    sink: ProgressSink<'a, W>,
+    held: u64,
+}
+
+impl<'a, W: Write + ?Sized> HeldCredit<'a, W> {
+    pub(crate) fn new(inner: &'a mut W, progress: &'a dyn InstallProgress, held: u64) -> Self {
+        Self {
+            sink: ProgressSink::new(inner, progress),
+            held,
+        }
+    }
+}
+
+impl<W: Write + ?Sized> Write for HeldCredit<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.held > 0 && !buf.is_empty() {
+            self.sink
+                .progress
+                .downloaded(std::mem::take(&mut self.held));
+        }
+        self.sink.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.sink.flush()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

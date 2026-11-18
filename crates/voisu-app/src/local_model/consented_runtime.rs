@@ -58,7 +58,12 @@ impl OfflineRuntimeBuilder {
         runner: &dyn ConsentedCommandRunner,
     ) -> Result<(), ConsentedError> {
         let root = &build.staging.root;
-        let archive = root.join("inputs").join(build.entry.python.name);
+        let python = build
+            .entry
+            .python
+            .as_ref()
+            .ok_or_else(|| ConsentedError::Build("entry pins no CPython runtime".into()))?;
+        let archive = root.join("inputs").join(python.name);
         let runtime = root.join("runtime");
         let listing = prepared_run(
             runner,

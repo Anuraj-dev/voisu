@@ -12,3 +12,7 @@ voisu: no-manual-page
 # This package is distributed through a self-hosted apt repo, not the Debian
 # archive, so there is no ITP/RFP bug for the initial changelog to close.
 voisu: initial-upload-closes-no-bugs
+
+# The whisper.cpp worker keeps its ggml libraries and backend modules private
+# in /usr/libexec/voisu and finds them through a deliberate $ORIGIN rpath.
+voisu: custom-library-search-path *

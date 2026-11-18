@@ -12,7 +12,14 @@ pub enum UrlPolicyError {
     NotHttps,
     Userinfo,
     MissingHost,
-    HostNotCataloged { host: String },
+    HostNotCataloged {
+        host: String,
+    },
+    /// A reserved `.invalid` host (RFC 6761): a catalog placeholder whose real
+    /// location is not decided yet. Refused before any network access.
+    PlaceholderHost {
+        host: String,
+    },
     PortNotHttps,
     IpHost,
     EmptyPath,
@@ -51,6 +58,15 @@ pub fn check_url(url: &Url, allowed_hosts: &[&str]) -> Result<(), UrlPolicyError
     };
     if host.is_empty() {
         return Err(UrlPolicyError::MissingHost);
+    }
+    if host.eq_ignore_ascii_case("invalid")
+        || host
+            .rsplit_once('.')
+            .is_some_and(|(_, tld)| tld.eq_ignore_ascii_case("invalid"))
+    {
+        return Err(UrlPolicyError::PlaceholderHost {
+            host: host.to_owned(),
+        });
     }
     let allowed = allowed_hosts
         .iter()

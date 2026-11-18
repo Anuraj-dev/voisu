@@ -408,3 +408,142 @@ fn daemon_and_cli_stay_call_sites() {
     );
     assert!(cli.contains("engine <local|cloud>"));
 }
+
+/// The whisper.cpp worker, its ggml libraries and every backend module ship
+/// together in one private directory, built with Vulkan, in every package.
+#[test]
+fn packages_ship_the_whisper_cpp_worker_with_its_runtime_and_notices() {
+    let root = workspace_root();
+    let read = |path: &str| fs::read_to_string(root.join(path)).unwrap();
+    let vendored = read("crates/voisu-whisper-sys/whisper.cpp/VENDORED");
+    let version = vendored
+        .split_whitespace()
+        .nth(1)
+        .and_then(|tag| tag.strip_prefix('v'))
+        .expect("VENDORED names the whisper.cpp tag");
+
+    let spec = read("packaging/voisu.spec");
+    for line in [
+        "BuildRequires:  cmake".to_string(),
+        "BuildRequires:  gcc-c++".to_string(),
+        "BuildRequires:  vulkan-loader-devel".to_string(),
+        "BuildRequires:  glslc".to_string(),
+        "BuildRequires:  spirv-headers-devel".to_string(),
+        format!("Provides:       bundled(whisper-cpp) = {version}"),
+        "Provides:       bundled(ggml) = ".to_string(),
+    ] {
+        assert!(spec.contains(&line), "voisu.spec lacks {line:?}");
+    }
+    // The private libraries must not satisfy or demand system sonames.
+    assert!(spec.contains("%global __provides_exclude_from ^%{_libexecdir}/voisu/"));
+    assert!(spec.contains("%global __requires_exclude ^lib(whisper|ggml"));
+    let build = section(&spec, "%build");
+    assert!(build.contains("-p voisu-local-asr --features vulkan --target-dir target/worker"));
+    let install = section(&spec, "%install");
+    assert!(install.contains("target/worker/release/voisu-local-asr"));
+    assert!(install.contains("target/worker/release/voisu-whisper-runtime.txt"));
+    assert!(install.contains("%{buildroot}%{_libexecdir}/voisu/"));
+    // Every package checks what it ships: RUNPATH $ORIGIN, and each listed
+    // runtime file beside the worker.
+    let check = "packaging/ci/check-worker-runtime.sh";
+    assert!(root.join(check).is_file());
+    assert!(install.contains(&format!("{check} %{{buildroot}}%{{_libexecdir}}/voisu")));
+    let files = section(&spec, "%files");
+    assert!(files.contains("%dir %{_libexecdir}/voisu"));
+    assert!(files.contains("%{_libexecdir}/voisu/voisu-local-asr"));
+    assert!(files.contains("%{_libexecdir}/voisu/voisu-whisper-runtime.txt"));
+    assert!(files.contains("%{_libexecdir}/voisu/lib*.so*"));
+
+    // The deb ships a clean stage of exactly the listed files, never a glob
+    // over a target dir that may hold stale libraries.
+    let deb = read("crates/voisu-app/Cargo.toml");
+    assert!(deb.contains(
+        r#"["../../target/worker/deb-stage/voisu-local-asr", "usr/libexec/voisu/", "755"]"#
+    ));
+    assert!(
+        deb.contains(r#"["../../target/worker/deb-stage/runtime/*", "usr/libexec/voisu/", "644"]"#)
+    );
+    assert!(!deb.contains("target/worker/release/lib"));
+    assert!(deb.contains("libvulkan1"));
+    let build_deb = read("packaging/build-deb.sh");
+    assert!(build_deb.contains("-p voisu-local-asr --features vulkan --target-dir target/worker"));
+    assert!(build_deb.contains(r#"rm -rf "$worker_stage""#));
+    assert!(
+        build_deb.contains(r#"done < "$root/target/worker/release/voisu-whisper-runtime.txt""#)
+    );
+    assert!(build_deb.contains(&format!(r#""$root/{check}" "$check_dir""#)));
+
+    let aur = read("packaging/aur/voisu/PKGBUILD");
+    for dependency in [
+        "'cmake'",
+        "'shaderc'",
+        "'vulkan-headers'",
+        "'spirv-headers'",
+        "'vulkan-icd-loader'",
+    ] {
+        assert!(aur.contains(dependency), "PKGBUILD lacks {dependency}");
+    }
+    assert!(aur.contains("-p voisu-local-asr --features vulkan --target-dir target/worker"));
+    assert!(aur.contains(r#""$pkgdir/usr/lib/voisu/voisu-local-asr""#));
+    assert!(aur.contains("voisu-whisper-runtime.txt"));
+    let aur_bin = read("packaging/aur/voisu-bin/PKGBUILD");
+    assert!(
+        aur_bin.contains(r#"install -Dm755 -t "$pkgdir/usr/lib/voisu" worker/voisu-local-asr"#)
+    );
+    assert!(aur_bin.contains("done < worker/voisu-whisper-runtime.txt"));
+    assert!(aur_bin.contains(r#""$pkgdir/usr/lib/voisu/voisu-whisper-runtime.txt""#));
+    assert!(!aur_bin.contains("worker/*"));
+    assert!(aur_bin.contains("'vulkan-icd-loader'"));
+    let release = read(".github/workflows/release.yml");
+    assert!(release.contains(r#""$troot/worker/voisu-local-asr""#));
+    assert!(release.contains("done < target/worker/release/voisu-whisper-runtime.txt"));
+    assert!(release.contains(&format!(r#"{check} "$troot/worker""#)));
+    assert!(release.contains("cmake libvulkan-dev glslc spirv-headers"));
+
+    // Each install directory is one the daemon looks in, and it starts only a
+    // worker with its runtime list beside it.
+    let lookup = read("crates/voisu-app/src/local_worker/consented.rs");
+    assert!(lookup.contains(r#""voisu-whisper-runtime.txt""#));
+    for path in [
+        "/usr/libexec/voisu/voisu-local-asr",
+        "/usr/lib/voisu/voisu-local-asr",
+    ] {
+        assert!(
+            lookup.contains(&format!("\"{path}\"")),
+            "{path} not searched"
+        );
+    }
+
+    let notices = read("THIRD_PARTY_NOTICES.md");
+    assert!(notices.contains("## whisper.cpp and ggml"));
+    assert!(notices.contains(&format!("`v{version}`")));
+    assert!(notices.contains(read("crates/voisu-whisper-sys/whisper.cpp/LICENSE").trim_end()));
+    let copyright = read("packaging/deb/copyright");
+    assert!(copyright.contains("Files: crates/voisu-whisper-sys/whisper.cpp/*"));
+}
+
+/// The body of one spec section: from its header to the next section.
+fn section<'a>(spec: &'a str, header: &str) -> &'a str {
+    const SECTIONS: [&str; 8] = [
+        "%build",
+        "%check",
+        "%install",
+        "%post",
+        "%preun",
+        "%postun",
+        "%files",
+        "%changelog",
+    ];
+    let start = spec
+        .find(&format!("\n{header}\n"))
+        .unwrap_or_else(|| panic!("spec has no {header}"))
+        + header.len()
+        + 2;
+    let body = &spec[start..];
+    let end = body
+        .match_indices("\n%")
+        .map(|(at, _)| at)
+        .find(|at| SECTIONS.iter().any(|next| body[at + 1..].starts_with(next)))
+        .unwrap_or(body.len());
+    &body[..end]
+}

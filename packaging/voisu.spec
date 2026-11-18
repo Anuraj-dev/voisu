@@ -35,6 +35,26 @@ BuildRequires:  curl
 BuildRequires:  pkgconfig(gtk4)
 BuildRequires:  pkgconfig(gtk4-layer-shell-0)
 BuildRequires:  pkgconfig(xkbcommon)
+# The whisper.cpp worker (crates/voisu-whisper-sys): cmake and a C++ compiler
+# build the vendored tree, and ggml's Vulkan backend compiles its shaders with
+# glslc against the Vulkan and SPIR-V headers.
+BuildRequires:  cmake
+BuildRequires:  gcc-c++
+BuildRequires:  vulkan-loader-devel
+BuildRequires:  glslc
+BuildRequires:  spirv-headers-devel
+
+# voisu-local-asr bundles a pinned whisper.cpp release (vendored by
+# crates/voisu-whisper-sys/vendor.sh) and the ggml inside it (MIT, see
+# THIRD_PARTY_NOTICES.md). libggml-vulkan.so links libvulkan.so.1, which rpm
+# turns into the vulkan-loader requirement; without a Vulkan driver the worker
+# reports the GPU missing and never falls back to the CPU on its own.
+Provides:       bundled(whisper-cpp) = 1.9.5
+Provides:       bundled(ggml) = 0.26.0
+# Those libraries are private to %%{_libexecdir}/voisu: never offer them as
+# system sonames, and never ask the system for them.
+%global __provides_exclude_from ^%{_libexecdir}/voisu/.*$
+%global __requires_exclude ^lib(whisper|ggml)[-a-z0-9_]*\\.so.*$
 
 # These are actual external boundaries in system.rs: wl-copy/wl-paste, pw-record,
 # wpctl, curl, and secret-tool. Fedora ownership was verified against the
@@ -107,6 +127,10 @@ EOF
 %build
 cargo build --offline --release --locked --workspace
 cargo build --offline --release --locked -p voisu-app --features overlay --bin voisu-overlay
+# The worker gets its own target dir: its Vulkan build of voisu-whisper-sys
+# would otherwise trade places with the CPU-only libraries the workspace build
+# and %%check copy into target/release.
+cargo build --offline --release --locked -p voisu-local-asr --features vulkan --target-dir target/worker
 
 %check
 # Constrained builders (mock/COPR) do not inherit the caller's environment, so
@@ -122,6 +146,16 @@ cargo check --offline --release --locked -p voisu-app --features overlay
 install -D -m 0755 target/release/voisu %{buildroot}%{_bindir}/voisu
 install -D -m 0755 target/release/voisu-daemon %{buildroot}%{_bindir}/voisu-daemon
 install -D -m 0755 target/release/voisu-overlay %{buildroot}%{_bindir}/voisu-overlay
+# The worker and the runtime files voisu-whisper-sys lists (libwhisper, libggml,
+# libggml-base and every backend module) share one private directory; the
+# worker finds them through its $ORIGIN rpath and loads the backends from it.
+install -D -m 0755 target/worker/release/voisu-local-asr %{buildroot}%{_libexecdir}/voisu/voisu-local-asr
+while read -r lib; do
+    install -m 0755 "target/worker/release/$lib" %{buildroot}%{_libexecdir}/voisu/
+done < target/worker/release/voisu-whisper-runtime.txt
+# The daemon starts only a worker whose runtime list sits beside it.
+install -m 0644 target/worker/release/voisu-whisper-runtime.txt %{buildroot}%{_libexecdir}/voisu/
+packaging/ci/check-worker-runtime.sh %{buildroot}%{_libexecdir}/voisu
 install -D -m 0644 packaging/voisu.service %{buildroot}%{_userunitdir}/voisu.service
 install -D -m 0644 packaging/voisu-overlay.service %{buildroot}%{_userunitdir}/voisu-overlay.service
 # Desktop entry makes a resolvable app_id (voisu) available to portal
@@ -159,6 +193,10 @@ install -D -m 0644 packaging/icons/voisu.svg %{buildroot}%{_datadir}/icons/hicol
 %doc README.md
 %{_bindir}/voisu
 %{_bindir}/voisu-daemon
+%dir %{_libexecdir}/voisu
+%{_libexecdir}/voisu/voisu-local-asr
+%{_libexecdir}/voisu/voisu-whisper-runtime.txt
+%{_libexecdir}/voisu/lib*.so*
 %{_userunitdir}/voisu.service
 %{_datadir}/applications/voisu.desktop
 %{_datadir}/icons/hicolor/scalable/apps/voisu.svg

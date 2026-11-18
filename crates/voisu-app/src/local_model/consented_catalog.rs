@@ -20,13 +20,64 @@ pub struct ConsentedCatalogEntry {
     pub license_spdx: &'static str,
     pub consent_installable: bool,
     pub weights: &'static [DownloadPin],
-    pub python: DownloadPin,
+    /// The pinned CPython runtime of a Python worker. `None` for the
+    /// whisper.cpp entry: its worker is the packaged `voisu-local-asr` binary,
+    /// so the install holds only weights and the health clip.
+    pub python: Option<DownloadPin>,
     pub health_clip: fn() -> DownloadPin,
     pub wheels: &'static [DownloadPin],
     pub total_download_bytes: u64,
     pub estimated_extracted_runtime_bytes: u64,
     pub consent_text: &'static str,
+    /// How the whisper.cpp worker decodes this entry's model; `None` for the
+    /// Python entries and the worker's greedy default.
+    pub whisper_cpp_decode: Option<WhisperCppDecode>,
 }
+
+/// whisper.cpp decoding pinned per catalog entry, written into the manifest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WhisperCppDecode {
+    pub beam_size: u8,
+    pub flash_attn: bool,
+}
+
+impl ConsentedCatalogEntry {
+    /// The packaged whisper.cpp worker, not a Python runtime built at install.
+    pub fn runs_whisper_cpp(&self) -> bool {
+        self.python.is_none()
+    }
+
+    /// Every pin names a real host. An entry still on the reserved `.invalid`
+    /// placeholder fails closed at install and is never offered by setup or
+    /// the TUI.
+    pub fn is_hosted(&self) -> bool {
+        let clip = (self.health_clip)();
+        self.weights
+            .iter()
+            .chain(std::iter::once(&clip))
+            .chain(self.python.iter())
+            .chain(self.native_runtime.iter())
+            .chain(self.wheels)
+            .all(|pin| {
+                !matches!(
+                    super::url_policy::validate_catalog_url(pin.url, pin.hosts),
+                    Err(super::url_policy::UrlPolicyError::PlaceholderHost { .. })
+                )
+            })
+    }
+
+    /// Free bytes the store filesystem needs before an install starts. A
+    /// whisper.cpp install has nothing to extract: the model plus headroom.
+    pub fn required_free_bytes(&self) -> u64 {
+        if self.runs_whisper_cpp() {
+            self.total_download_bytes + WHISPER_CPP_HEADROOM_BYTES
+        } else {
+            2 * (self.total_download_bytes + self.estimated_extracted_runtime_bytes)
+        }
+    }
+}
+
+const WHISPER_CPP_HEADROOM_BYTES: u64 = 256 * 1024 * 1024;
 // 2.3 GiB rounded up for the CUDA venv, plus 105 MiB CPython, rounded up to
 // 128 MiB. docs/local-gpu-development.md measured the venv at 2.3 GB; using
 // GiB and rounding upward leaves headroom for extracted package metadata.
@@ -89,8 +140,9 @@ pub const CONSENTED_ENTRY: ConsentedCatalogEntry = ConsentedCatalogEntry {
     license_spdx: "MIT",
     consent_installable: true,
     weights: WEIGHTS,
-    python: PYTHON,
+    python: Some(PYTHON),
     wheels: WHEELS,
+    whisper_cpp_decode: None,
     health_clip: clip_pin,
     total_download_bytes: TOTAL_DOWNLOAD_BYTES,
     estimated_extracted_runtime_bytes: ESTIMATED_EXTRACTED_RUNTIME_BYTES,
@@ -162,8 +214,8 @@ pub(super) const WORKER_FILES: &[(&str, &[u8])] = &[
 ];
 
 /// Catalog lookup is exact; receipts cannot authorize arbitrary entries.
-pub fn consented_catalog_entries() -> [&'static ConsentedCatalogEntry; 2] {
-    [&CONSENTED_ENTRY, &PARAKEET_ENTRY]
+pub fn consented_catalog_entries() -> [&'static ConsentedCatalogEntry; 3] {
+    [&CONSENTED_ENTRY, &PARAKEET_ENTRY, &WHISPER_CPP_ENTRY]
 }
 
 pub fn consented_entry(id: &str) -> Option<&'static ConsentedCatalogEntry> {
@@ -183,7 +235,7 @@ pub const PARAKEET_ENTRY: ConsentedCatalogEntry = ConsentedCatalogEntry {
     consent_installable: true,
     weights: &[super::consented_pins::PARAKEET_WEIGHTS],
     native_runtime: Some(super::consented_pins::NEMO_CPU),
-    python: PYTHON,
+    python: Some(PYTHON),
     wheels: super::consented_pins::CPU_WHEELS,
     health_clip: clip_pin,
     total_download_bytes: 769_772_225,
@@ -191,5 +243,131 @@ pub const PARAKEET_ENTRY: ConsentedCatalogEntry = ConsentedCatalogEntry {
     // plus pip, NumPy (~70 MiB), bytecode and the 12,238,405-byte native
     // archive. Reserve 384 MiB including metadata and publication headroom.
     estimated_extracted_runtime_bytes: 384 * 1024 * 1024,
+    whisper_cpp_decode: None,
     consent_text: "Download 769,772,225 bytes for parakeet-tdt-0.6b-v3 and its pinned Python/NumPy/NeMo-Speech.cpp v0.1.0 CPU runtime. Licence: CC-BY-4.0. English only. Runs offline on CPU. Development evidence: EN WER 12.8%, warm p50 0.61 s on 4 cores, peak RAM 0.9 GB; one host, one speaker — not the release gate. No automatic GPU or Cloud fallback. This is a Consented Install, not a Bakeoff Winner, and is never selected by default.",
 };
+
+/// Voisu's Hugging Face repo, pinned to one commit so the bytes behind the URL
+/// cannot change; the sha256 below is checked after download anyway.
+pub const WHISPER_CPP_Q8_URL: &str = "https://huggingface.co/Anurajjit/voisu-distil-large-v3.5-ggml/resolve/33b03a8479479b1ad96d4b7b51ebdeecbd1d9b71/ggml-distil-large-v3.5-q8_0.bin";
+/// distil-large-v3.5 quantized to q8_0 with whisper.cpp 1.9.5's
+/// `whisper-quantize` (the Phase 0 verdict).
+pub const WHISPER_CPP_Q8: DownloadPin = DownloadPin {
+    name: "ggml-distil-large-v3.5-q8_0.bin",
+    url: WHISPER_CPP_Q8_URL,
+    sha256: "7e570abdf13b681354a2ecc93802e25bf204dd6f8c0dd9f6ecb9478b71b231d7",
+    bytes: 818_305_955,
+    hosts: WEIGHT_HOSTS,
+    requirement: None,
+};
+/// The JFK health clip's size; the entry's total adds it to the model.
+const JFK_BYTES: u64 = 352_078;
+/// The whisper.cpp entry. Its `device` is `gpu`; the worker runs where the
+/// `local_device` setting says when it loads.
+pub const WHISPER_CPP_ENTRY: ConsentedCatalogEntry = ConsentedCatalogEntry {
+    id: super::development::WHISPER_CPP_DISTIL_ID,
+    device: "gpu",
+    compute_type: "q8_0",
+    native_runtime: None,
+    revision: "whisper.cpp-1.9.5",
+    // distil-whisper/distil-large-v3.5 is MIT; the q8_0 quant is a derivative.
+    license_spdx: "MIT",
+    consent_installable: true,
+    weights: &[WHISPER_CPP_Q8],
+    python: None,
+    wheels: &[],
+    health_clip: clip_pin,
+    total_download_bytes: WHISPER_CPP_Q8.bytes + JFK_BYTES,
+    estimated_extracted_runtime_bytes: 0,
+    // Phase 0 (2026-11-18): beam 5 with flash attention on is accurate and
+    // deterministic on CPU, Vulkan and CUDA for this quant.
+    whisper_cpp_decode: Some(WhisperCppDecode {
+        beam_size: 5,
+        flash_attn: true,
+    }),
+    consent_text: "Download 818,658,033 bytes for distil-large-v3.5 (whisper.cpp q8_0). Licence: MIT. English only. Runs on this computer with your GPU through Vulkan, or on the CPU if you choose `voisu local-device cpu`; audio never leaves it. No automatic CPU or Cloud fallback. This is a Consented Install, not a Bakeoff Winner, and is never selected by default.",
+};
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::local_model::url_policy::{UrlPolicyError, validate_catalog_url};
+
+    /// A pin still on the reserved placeholder host, as a new entry has
+    /// before its files are published.
+    pub(crate) const PLACEHOLDER_PIN: DownloadPin = DownloadPin {
+        url: "https://voisu-model-host.invalid/whisper-cpp/model.bin",
+        hosts: &["voisu-model-host.invalid"],
+        ..WHISPER_CPP_Q8
+    };
+    pub(crate) const PLACEHOLDER_ENTRY: ConsentedCatalogEntry = ConsentedCatalogEntry {
+        weights: &[PLACEHOLDER_PIN],
+        ..WHISPER_CPP_ENTRY
+    };
+
+    #[test]
+    fn every_catalog_entry_is_hosted_and_a_placeholder_pin_is_not() {
+        assert!(WHISPER_CPP_ENTRY.is_hosted());
+        assert!(CONSENTED_ENTRY.is_hosted());
+        assert!(PARAKEET_ENTRY.is_hosted());
+        assert!(!PLACEHOLDER_ENTRY.is_hosted());
+    }
+
+    #[test]
+    fn the_whisper_cpp_model_url_passes_the_catalog_policy() {
+        let pin = WHISPER_CPP_ENTRY.weights[0];
+        assert!(validate_catalog_url(pin.url, pin.hosts).is_ok());
+        assert_eq!(
+            validate_catalog_url(PLACEHOLDER_PIN.url, PLACEHOLDER_PIN.hosts),
+            Err(UrlPolicyError::PlaceholderHost {
+                host: "voisu-model-host.invalid".into()
+            })
+        );
+    }
+
+    #[test]
+    fn the_whisper_cpp_entry_pins_the_phase_0_quant_and_needs_model_plus_256_mib() {
+        let entry = &WHISPER_CPP_ENTRY;
+        assert!(entry.runs_whisper_cpp());
+        assert_eq!(entry.weights.len(), 1);
+        assert_eq!(
+            (entry.weights[0].sha256, entry.weights[0].bytes),
+            (
+                "7e570abdf13b681354a2ecc93802e25bf204dd6f8c0dd9f6ecb9478b71b231d7",
+                818_305_955
+            )
+        );
+        assert_eq!(clip_pin().bytes, JFK_BYTES);
+        assert_eq!(
+            entry.total_download_bytes,
+            entry.weights[0].bytes + clip_pin().bytes
+        );
+        assert!(
+            entry
+                .consent_text
+                .contains(&format_with_commas(entry.total_download_bytes))
+        );
+        assert_eq!(
+            entry.required_free_bytes(),
+            entry.total_download_bytes + 256 * 1024 * 1024
+        );
+        // Python entries keep their two-copies-of-everything reserve.
+        assert_eq!(CONSENTED_ENTRY.required_free_bytes(), REQUIRED_FREE_BYTES);
+        assert_eq!(
+            consented_entry(entry.id).map(|found| found.id),
+            Some(entry.id)
+        );
+    }
+
+    fn format_with_commas(value: u64) -> String {
+        let digits = value.to_string();
+        let mut out = String::new();
+        for (index, digit) in digits.chars().enumerate() {
+            if index > 0 && (digits.len() - index).is_multiple_of(3) {
+                out.push(',');
+            }
+            out.push(digit);
+        }
+        out
+    }
+}

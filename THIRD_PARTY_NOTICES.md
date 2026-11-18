@@ -138,6 +138,43 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
+## whisper.cpp and ggml
+
+- Used in: `crates/voisu-whisper-sys/whisper.cpp/` (vendored, trimmed by
+  `crates/voisu-whisper-sys/vendor.sh`), built into `libwhisper.so.1`,
+  `libggml.so.0`, `libggml-base.so.0` and the `libggml-cpu-*.so` and
+  `libggml-vulkan.so` backend modules that ship beside the
+  `voisu-local-asr` worker in `/usr/libexec/voisu/`. ggml is part of the same
+  tree and carries the same license.
+- Source: <https://github.com/ggml-org/whisper.cpp>, release tarball
+  `v1.9.5` (sha256
+  `ff1a9053feb509ff9d7729703355541ae9690073a6b1c40eb692c962e0dc1720`)
+- License: MIT
+
+```text
+MIT License
+
+Copyright (c) 2023-2026 The ggml authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
 ## Test audio
 
 - `crates/voisu-app/tests/fixtures/jfk-3s.wav`: the first three seconds of

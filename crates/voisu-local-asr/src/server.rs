@@ -237,6 +237,15 @@ impl<E: Engine, L: FnMut() -> Result<E, EngineError>> Session<E, L> {
         Ok(())
     }
 
+    /// The engine's device once loaded (a GPU reports which one), else the
+    /// manifest's.
+    fn observed_device(&self) -> String {
+        self.engine
+            .as_ref()
+            .and_then(Engine::observed_device)
+            .unwrap_or_else(|| self.config.observed_device.clone())
+    }
+
     fn resident(&self) -> bool {
         // Load plus one inference is still cold; a second without reload proves residency.
         self.inferences >= 2
@@ -248,7 +257,7 @@ impl<E: Engine, L: FnMut() -> Result<E, EngineError>> Session<E, L> {
             "id": id,
             "status": "ready",
             "model_id": self.config.model_id,
-            "observed_device": self.config.observed_device,
+            "observed_device": self.observed_device(),
             "resident": self.resident(),
             "backend": self.config.backend,
             "peak_host_ram_bytes": peak_host_ram_bytes(),
@@ -321,7 +330,7 @@ impl<E: Engine, L: FnMut() -> Result<E, EngineError>> Session<E, L> {
                     "v": PROTOCOL_VERSION,
                     "id": id,
                     "status": if text.is_empty() { "no_text" } else { "transcript" },
-                    "observed_device": self.config.observed_device,
+                    "observed_device": self.observed_device(),
                     "resident": self.resident(),
                     "inference_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                     "cpu_time_ms": cpu_time_ms().saturating_sub(cpu_started),

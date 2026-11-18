@@ -2,7 +2,9 @@
 //!
 //! `whisper_cpp_transcribes_the_health_clip` needs a GGML model and a 16 kHz
 //! mono WAV of the JFK clip, so it is `#[ignore]`d; run it with both env vars
-//! naming files (it fails, not skips, when they do not):
+//! naming files (it fails, not skips, when they do not). It runs on the CPU
+//! unless `VOISU_WHISPER_TEST_DEVICE=gpu`, which needs a build with
+//! `--features vulkan` and a Vulkan GPU:
 //!
 //! ```text
 //! VOISU_WHISPER_TEST_MODEL=/path/ggml-tiny.en.bin \
@@ -71,16 +73,27 @@ fn wav(samples: &[i16]) -> Vec<u8> {
 }
 
 fn manifest(dir: &Path, model: &Path, health: &Path) -> PathBuf {
+    manifest_on(dir, model, health, "cpu", 0)
+}
+
+fn manifest_on(dir: &Path, model: &Path, health: &Path, device: &str, vram_bytes: u64) -> PathBuf {
     let document = json!({
         "version": 1,
         "model_id": "whisper-cpp-test",
-        "device": "cpu",
+        "device": device,
         "language": "en",
         "runtime": { "worker": worker(), "revision": "test" },
         "model_path": model,
         "files": [pin(&worker()), pin(model), pin(health)],
-        "options": { "health_audio": health, "health_expected": JFK, "n_threads": 4 },
-        "limits": { "cpu_cores": 4, "vram_bytes": 0 }
+        // The decoding the distil q8_0 catalog entry pins.
+        "options": {
+            "health_audio": health,
+            "health_expected": JFK,
+            "n_threads": 4,
+            "beam_size": 5,
+            "flash_attn": true
+        },
+        "limits": { "cpu_cores": 4, "vram_bytes": vram_bytes }
     });
     let path = dir.join("manifest.json");
     std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
@@ -199,6 +212,29 @@ fn a_refused_manifest_is_one_startup_error_frame_and_exit_2() {
     );
 }
 
+#[test]
+fn the_gpu_probe_ignores_ggml_backend_path() {
+    let output = Command::new(worker())
+        .arg("--probe-gpu")
+        .env("GGML_BACKEND_PATH", "/nonexistent/libggml-planted.so")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("libggml-planted"),
+        "GGML_BACKEND_PATH reached ggml: {stderr}"
+    );
+    if cfg!(feature = "vulkan") {
+        // A Vulkan build exits 0 with a GPU and 3 without one.
+        assert!(matches!(output.status.code(), Some(0 | 3)), "{stderr}");
+    } else {
+        assert_eq!(output.status.code(), Some(3), "{stderr}");
+        assert!(output.stdout.is_empty());
+        assert!(stderr.contains("gpu_unavailable"), "{stderr}");
+    }
+}
+
 fn fixture(name: &str) -> Option<PathBuf> {
     let path = PathBuf::from(std::env::var_os(name)?);
     path.is_file().then_some(path)
@@ -213,8 +249,13 @@ fn whisper_cpp_transcribes_the_health_clip() {
     ) else {
         panic!("set VOISU_WHISPER_TEST_MODEL and VOISU_WHISPER_TEST_WAV to existing files");
     };
+    let gpu = std::env::var("VOISU_WHISPER_TEST_DEVICE").as_deref() == Ok("gpu");
     let dir = TempDir::new("whisper");
-    let manifest = manifest(&dir.0, &model, &clip);
+    let manifest = if gpu {
+        manifest_on(&dir.0, &model, &clip, "gpu", 1536 << 20)
+    } else {
+        manifest(&dir.0, &model, &clip)
+    };
     let samples = voisu_local_asr::manifest::read_health_wav(&clip).unwrap();
     let pcm: Vec<u8> = samples
         .iter()
@@ -237,8 +278,16 @@ fn whisper_cpp_transcribes_the_health_clip() {
 
     assert_eq!(status.code(), Some(0), "{stderr}");
     assert_eq!(frames[0]["status"], "ready", "{frames:?}");
-    assert_eq!(frames[0]["observed_device"], "cpu");
     assert_eq!(frames[1]["status"], "transcript", "{frames:?}");
+    // The ready frame and the transcript both name where the model runs.
+    for reply in &frames[..2] {
+        let observed = reply["observed_device"].as_str().unwrap();
+        if gpu {
+            assert!(observed.starts_with("vulkan:"), "{observed}");
+        } else {
+            assert_eq!(observed, "cpu");
+        }
+    }
     assert!(
         voisu_local_asr::server::health_phrase_matches(frames[1]["text"].as_str().unwrap(), JFK),
         "{}",

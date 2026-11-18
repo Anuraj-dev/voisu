@@ -73,6 +73,14 @@ Comment:
  https://github.com/IlyaSemenov/wikipedia-word-frequency at commit
  d11c4fab211156e96ab5943850dd6f98604707fb, embedded in the voisu binaries.
 
+Files: crates/voisu-whisper-sys/whisper.cpp/*
+Copyright: 2023-2026 The ggml authors
+License: MIT
+Comment:
+ whisper.cpp v1.9.5 and the ggml inside it, vendored from
+ https://github.com/ggml-org/whisper.cpp and built into the voisu-local-asr
+ worker's libraries and backend modules in /usr/libexec/voisu.
+
 License: MIT
  Permission is hereby granted, free of charge, to any person obtaining a copy
  of this software and associated documentation files (the "Software"), to deal

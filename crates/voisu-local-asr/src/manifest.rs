@@ -13,16 +13,22 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use voisu_core::{WavScan, scan_wav_pcm};
 
-use crate::engine::DecodeOptions;
+use crate::engine::{DecodeOptions, Device};
 
 /// Widest beam the worker accepts.
 const MAX_BEAM_SIZE: i32 = 8;
+
+/// The beam without `options.beam_size`: greedy. A catalog entry that wants
+/// beam search (the distil q8_0 entry asks for 5) says so in its manifest.
+const DEFAULT_BEAM_SIZE: i64 = 1;
 
 /// What the worker needs from a validated manifest.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorkerManifest {
     pub model_id: String,
+    /// The manifest's device: `cpu`, or `gpu` (the worker picks which).
     pub device: String,
+    pub engine_device: Device,
     pub model_path: PathBuf,
     pub health_audio: PathBuf,
     pub health_expected: String,
@@ -150,21 +156,21 @@ pub fn load_manifest(
         .get("device")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if device != "cpu" {
-        return refuse("this worker serves device cpu only");
-    }
     if document.get("language").and_then(Value::as_str) != Some("en") {
         return refuse("this worker serves language en only");
     }
     let limits = document.get("limits").unwrap_or(&Value::Null);
-    if limits
+    let vram_bytes = limits
         .get("vram_bytes")
         .and_then(Value::as_u64)
-        .unwrap_or(0)
-        != 0
-    {
-        return refuse("vram_bytes must be zero for CPU manifests");
-    }
+        .unwrap_or(0);
+    let engine_device = match (device, vram_bytes) {
+        ("cpu", 0) => Device::Cpu,
+        ("cpu", _) => return refuse("vram_bytes must be zero for CPU manifests"),
+        ("gpu", 0) => return refuse("vram_bytes must be positive for GPU manifests"),
+        ("gpu", vram_bytes) => Device::Gpu { vram_bytes },
+        _ => return refuse("this worker serves device cpu or gpu only"),
+    };
 
     let runtime = document.get("runtime").unwrap_or(&Value::Null);
     let worker = absolute(runtime.get("worker"), "runtime.worker")?;
@@ -202,21 +208,28 @@ pub fn load_manifest(
     let cores = positive(limits.get("cpu_cores")).unwrap_or(1);
     let n_threads = positive(options.get("n_threads")).map_or(cores, |n| n.min(cores));
     let beam_size = match options.get("beam_size") {
-        None => 1,
+        None => DEFAULT_BEAM_SIZE,
         Some(value) => match positive(Some(value)).filter(|n| *n <= i64::from(MAX_BEAM_SIZE)) {
             Some(beam) => beam,
             None => return refuse(format!("options.beam_size must be 1..={MAX_BEAM_SIZE}")),
         },
     };
+    let flash_attn = match options.get("flash_attn") {
+        None => false,
+        Some(Value::Bool(on)) => *on,
+        Some(_) => return refuse("options.flash_attn must be a boolean"),
+    };
     Ok(WorkerManifest {
         model_id: model_id.to_owned(),
         device: device.to_owned(),
+        engine_device,
         model_path,
         health_audio,
         health_expected: health_expected.to_owned(),
         decode: DecodeOptions {
             n_threads: i32::try_from(n_threads).unwrap_or(i32::MAX),
             beam_size: i32::try_from(beam_size).unwrap_or(1),
+            flash_attn,
         },
     })
 }
@@ -312,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn threads_are_capped_by_cpu_cores_and_beam_defaults_to_greedy() {
+    fn threads_are_capped_by_cpu_cores_and_decoding_defaults_to_greedy_without_flash() {
         let fixture = Fixture::new("threads");
         let path = fixture.manifest(&document(&fixture, json!({ "n_threads": 16 })));
         let manifest = load_manifest(&path, None).unwrap();
@@ -320,24 +333,30 @@ mod tests {
             manifest.decode,
             DecodeOptions {
                 n_threads: 4,
-                beam_size: 1
+                beam_size: 1,
+                flash_attn: false,
             }
         );
         assert_eq!(manifest.model_id, "whisper-cpp-test");
+        assert_eq!(manifest.engine_device, Device::Cpu);
     }
 
     #[test]
     fn a_changed_pin_is_refused() {
         let fixture = Fixture::new("changed");
-        let path = fixture.manifest(&document(&fixture, json!({ "beam_size": 5 })));
-        assert_eq!(load_manifest(&path, None).unwrap().decode.beam_size, 5);
+        let path = fixture.manifest(&document(
+            &fixture,
+            json!({ "beam_size": 5, "flash_attn": true }),
+        ));
+        let decode = load_manifest(&path, None).unwrap().decode;
+        assert_eq!((decode.beam_size, decode.flash_attn), (5, true));
         std::fs::write(fixture.dir.join("model.bin"), b"swapped").unwrap();
         let error = load_manifest(&path, None).unwrap_err();
         assert!(error.0.starts_with("pinned artifact changed"), "{error:?}");
     }
 
     #[test]
-    fn a_gpu_device_or_a_foreign_worker_is_refused() {
+    fn a_gpu_needs_its_memory_and_other_devices_or_workers_are_refused() {
         let fixture = Fixture::new("device");
         let mut doc = document(&fixture, json!({}));
         let path = fixture.manifest(&doc);
@@ -345,6 +364,22 @@ mod tests {
         assert!(load_manifest(&path, Some(&other)).is_err());
         assert!(load_manifest(&path, Some(&fixture.dir.join("worker"))).is_ok());
         doc["device"] = json!("cuda:0");
+        let path = fixture.manifest(&doc);
+        assert!(load_manifest(&path, None).is_err());
+
+        doc["device"] = json!("gpu");
+        let path = fixture.manifest(&doc);
+        let error = load_manifest(&path, None).unwrap_err();
+        assert!(error.0.contains("positive for GPU"), "{error:?}");
+        doc["limits"]["vram_bytes"] = json!(1u64 << 30);
+        let path = fixture.manifest(&doc);
+        assert_eq!(
+            load_manifest(&path, None).unwrap().engine_device,
+            Device::Gpu {
+                vram_bytes: 1 << 30
+            }
+        );
+        doc["device"] = json!("cpu");
         let path = fixture.manifest(&doc);
         assert!(load_manifest(&path, None).is_err());
     }

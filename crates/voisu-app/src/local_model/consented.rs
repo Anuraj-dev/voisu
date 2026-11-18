@@ -20,7 +20,7 @@ use super::consented_catalog::{
 use super::consented_runtime::{
     ConsentedRuntimeBuilder, RuntimeBuild, audit_runtime_tree, executable, sync_tree,
 };
-use super::progress::{InstallPhase, InstallProgress, ProgressSink};
+use super::progress::{HeldCredit, InstallPhase, InstallProgress, ProgressSink};
 use super::{
     ArtifactFetcher, FetchError, FetchRequest, INSTALL_DEADLINE, InstallAbort, InstallClock,
     InstallIo, MaintenanceKind, MaintenanceReservation, ModelStore, NO_PROGRESS, SafeFsError,
@@ -115,6 +115,13 @@ pub struct ConsentedReceipt {
     pub compute_type: String,
     pub receipt_hash: String,
 }
+impl ConsentedReceipt {
+    /// A whisper.cpp install records no Python paths: its worker is the
+    /// packaged `voisu-local-asr` binary and `runtime/` stays empty.
+    pub fn runs_python(&self) -> bool {
+        !self.venv_path.as_os_str().is_empty()
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConsentedLayout {
@@ -149,6 +156,12 @@ pub trait ConsentedHealth {
         layout: &ConsentedLayout,
         receipt: &ConsentedReceipt,
     ) -> Result<(), ConsentedError>;
+
+    /// Runs before any download, so a machine that cannot run `entry` on the
+    /// chosen device (no usable GPU) fails before the weights are fetched.
+    fn preflight(&self, _entry: &ConsentedCatalogEntry) -> Result<(), ConsentedError> {
+        Ok(())
+    }
 }
 
 /// Holds an OS shared lease until dropped. No constructible verification token:
@@ -368,6 +381,20 @@ fn install_with_receipt_sync(
     {
         return Err(ConsentedError::Consent);
     }
+    // A placeholder or malformed catalog URL fails before any lock, disk check
+    // or network access, so an entry whose host is not decided yet cannot start.
+    let clip = (entry.health_clip)();
+    for pin in entry
+        .weights
+        .iter()
+        .chain(std::iter::once(&clip))
+        .chain(entry.python.iter())
+        .chain(entry.native_runtime.iter())
+        .chain(entry.wheels)
+    {
+        super::url_policy::validate_catalog_url(pin.url, pin.hosts)
+            .map_err(|error| ConsentedError::Fetch(error.into()))?;
+    }
     if request
         .maintenance
         .acquire()
@@ -431,7 +458,11 @@ fn install_with_receipt_sync(
             }
         }
     }
-    let required = 2 * (entry.total_download_bytes + entry.estimated_extracted_runtime_bytes);
+    request.health.preflight(entry)?;
+    // Held resumable bytes already sit on this disk and are renamed, not
+    // copied, so they count against the requirement.
+    let held = prepare_partial(request.store, entry)?;
+    let required = entry.required_free_bytes().saturating_sub(held);
     if request
         .io
         .available_bytes
@@ -449,50 +480,72 @@ fn install_with_receipt_sync(
         .prefix("install-")
         .tempdir_in(staging_parent)?;
     let staging = ConsentedLayout::at(stage.path().to_path_buf());
-    for dir in ["weights", "runtime", "worker/voisu_asr", "inputs/wheels"] {
+    let dirs: &[&str] = if entry.runs_whisper_cpp() {
+        &["weights", "runtime"]
+    } else {
+        &["weights", "runtime", "worker/voisu_asr", "inputs/wheels"]
+    };
+    for dir in dirs {
         super::ensure_private_dir(&staging.root.join(dir)).map_err(ConsentedError::Fs)?;
     }
     abort(&request, InstallAbort::AfterStaging)?;
+    // Until the receipt is stored, a failure hands digest-verified weights
+    // back to the resumable cache instead of deleting them with the tree.
+    let mut verified_weights = VerifiedWeights {
+        store: request.store,
+        entry,
+        dir: Some(staging.weights.clone()),
+    };
     for pin in entry.weights {
-        download(&request, pin, &staging.weights)?;
+        if entry.runs_whisper_cpp() {
+            download_resumable(&request, pin, &staging.weights)?;
+        } else {
+            download(&request, pin, &staging.weights)?;
+        }
     }
     download(&request, &(entry.health_clip)(), &staging.root)?;
-    download(&request, &entry.python, &staging.root.join("inputs"))?;
-    if let Some(pin) = &entry.native_runtime {
-        download(&request, pin, &staging.root.join("inputs"))?;
-    }
-    for pin in entry.wheels {
-        download(&request, pin, &staging.root.join("inputs/wheels"))?;
-    }
-    for (name, bytes) in WORKER_FILES {
-        let path = staging.worker.join(name);
-        write_new(
-            path.parent().expect("worker parent"),
-            path.file_name()
-                .expect("worker name")
-                .to_str()
-                .expect("UTF-8"),
-            bytes,
-        )?;
+    if let Some(python) = &entry.python {
+        download(&request, python, &staging.root.join("inputs"))?;
+        if let Some(pin) = &entry.native_runtime {
+            download(&request, pin, &staging.root.join("inputs"))?;
+        }
+        for pin in entry.wheels {
+            download(&request, pin, &staging.root.join("inputs/wheels"))?;
+        }
+        for (name, bytes) in WORKER_FILES {
+            let path = staging.worker.join(name);
+            write_new(
+                path.parent().expect("worker parent"),
+                path.file_name()
+                    .expect("worker name")
+                    .to_str()
+                    .expect("UTF-8"),
+                bytes,
+            )?;
+        }
     }
     abort(&request, InstallAbort::AfterFetch)?;
-    request.progress.phase(InstallPhase::BuildingRuntime);
-    request.builder.build(&RuntimeBuild {
-        staging: &staging,
-        published: &published,
-        entry,
-        clock: &request.clock,
-    })?;
-    check_deadline(&request.clock)?;
-    fs::remove_dir_all(staging.root.join("inputs"))?;
-    for name in ["build-home", "build-tmp"] {
-        let path = staging.root.join(name);
-        if path.exists() {
-            fs::remove_dir_all(path)?;
+    if !entry.runs_whisper_cpp() {
+        request.progress.phase(InstallPhase::BuildingRuntime);
+        request.builder.build(&RuntimeBuild {
+            staging: &staging,
+            published: &published,
+            entry,
+            clock: &request.clock,
+        })?;
+        check_deadline(&request.clock)?;
+        fs::remove_dir_all(staging.root.join("inputs"))?;
+        for name in ["build-home", "build-tmp"] {
+            let path = staging.root.join(name);
+            if path.exists() {
+                fs::remove_dir_all(path)?;
+            }
         }
     }
     audit_runtime_tree(&staging.root)?;
-    executable(&staging.venv_python())?;
+    if !entry.runs_whisper_cpp() {
+        executable(&staging.venv_python())?;
+    }
     let mut receipt = make_receipt(entry, request.consent.clone(), &published);
     receipt.runtime_manifest = runtime_manifest(&staging.root.join("runtime"))?;
     receipt.receipt_hash = receipt_hash(&receipt)?;
@@ -532,6 +585,9 @@ fn install_with_receipt_sync(
         sync_tree(&staging.root)?;
         super::safe_fs::durable_rename(&staging.root, &published.root)
             .map_err(ConsentedError::Fs)?;
+        // The weights now live in the published tree, which only the
+        // rollback below may hand back.
+        verified_weights.dir = None;
     }
     // Health takes its own shared lease on the same path.
     drop(replaced_lease);
@@ -568,6 +624,7 @@ fn install_with_receipt_sync(
         let lease = lease_file(request.store, &hash)?;
         match flock(&lease, libc::LOCK_EX) {
             Ok(()) => {
+                keep_verified_weights(request.store, entry, &published.weights);
                 fs::remove_dir_all(&published.root)?;
                 File::open(published.root.parent().expect("parent"))?.sync_all()?;
             }
@@ -575,7 +632,78 @@ fn install_with_receipt_sync(
             Err(error) => return Err(error),
         }
     }
+    if result.is_ok() {
+        verified_weights.dir = None;
+    }
     result
+}
+
+/// On drop, hands the weights still in `dir` (the staging tree, before
+/// publication) to [`keep_verified_weights`].
+struct VerifiedWeights<'a> {
+    store: &'a ModelStore,
+    entry: &'a ConsentedCatalogEntry,
+    dir: Option<PathBuf>,
+}
+
+impl Drop for VerifiedWeights<'_> {
+    fn drop(&mut self) {
+        if let Some(dir) = self.dir.take() {
+            keep_verified_weights(self.store, self.entry, &dir);
+        }
+    }
+}
+
+/// Moves whisper.cpp weights back to `partial/<sha256>.part` before their
+/// tree is deleted, so an install that fails after the download (a failed
+/// health check, say) retries without fetching 800 MB again. The retry
+/// rehashes the part against the pin, so nothing here is trusted. Best
+/// effort: the cache only saves bandwidth.
+fn keep_verified_weights(store: &ModelStore, entry: &ConsentedCatalogEntry, weights: &Path) {
+    if !entry.runs_whisper_cpp() {
+        return;
+    }
+    let partial = partial_dir(store);
+    for pin in entry.weights {
+        let from = weights.join(pin.name);
+        let to = partial.join(format!("{}.part", pin.sha256));
+        let regular = fs::symlink_metadata(&from).is_ok_and(|meta| meta.is_file());
+        if !regular || fs::symlink_metadata(&to).is_ok() {
+            continue;
+        }
+        if super::ensure_private_dir(&partial).is_ok() && fs::rename(&from, &to).is_ok() {
+            let _ = sync_dir(&partial);
+        }
+    }
+}
+
+/// Clears `partial/` of everything that is not a regular `.part` file for one
+/// of `entry`'s weights (parts of an older catalog, directories, FIFOs) and
+/// returns how many bytes the remaining parts already hold.
+fn prepare_partial(
+    store: &ModelStore,
+    entry: &ConsentedCatalogEntry,
+) -> Result<u64, ConsentedError> {
+    let partial = partial_dir(store);
+    if !entry.runs_whisper_cpp()
+        || !super::safe_fs::dir_present(&partial).map_err(ConsentedError::Fs)?
+    {
+        return Ok(0);
+    }
+    let mut held = 0_u64;
+    for child in fs::read_dir(&partial)? {
+        let child = child?;
+        let meta = fs::symlink_metadata(child.path())?;
+        let pin = entry.weights.iter().find(|pin| {
+            child.file_name().to_str() == Some(format!("{}.part", pin.sha256).as_str())
+        });
+        match pin {
+            Some(pin) if meta.is_file() => held = held.saturating_add(meta.len().min(pin.bytes)),
+            _ if meta.is_dir() => fs::remove_dir_all(child.path())?,
+            _ => fs::remove_file(child.path())?,
+        }
+    }
+    Ok(held)
 }
 
 /// Per-launch admission hashes model/fixture/worker and checks runtime metadata.
@@ -905,6 +1033,8 @@ fn remove_unreceipted_publish_with_sync(
     if super::safe_fs::dir_present(&root).map_err(ConsentedError::Fs)? {
         let lease = lease_file(store, &hash)?;
         flock(&lease, libc::LOCK_EX)?;
+        // An install that died before its receipt: its weights may resume.
+        keep_verified_weights(store, entry, &ConsentedLayout::at(root.clone()).weights);
         fs::remove_dir_all(&root)?;
         sync_dir(root.parent().expect("version parent"))?;
         return Ok(true);
@@ -992,10 +1122,14 @@ fn make_receipt(
         files.insert(format!("weights/{}", item.name), pin(item));
     }
     files.insert("jfk.wav".into(), pin(&(entry.health_clip)()));
-    files.extend(binary_worker_pins());
+    files.extend(worker_pins(entry));
     let mut runtime_inputs = BTreeMap::new();
-    runtime_inputs.insert(entry.python.name.into(), pin(&entry.python));
-    for item in entry.wheels.iter().chain(entry.native_runtime.iter()) {
+    for item in entry
+        .python
+        .iter()
+        .chain(entry.wheels)
+        .chain(entry.native_runtime.iter())
+    {
         runtime_inputs.insert(item.name.into(), pin(item));
     }
     ConsentedReceipt {
@@ -1008,8 +1142,16 @@ fn make_receipt(
         files,
         runtime_inputs,
         runtime_manifest: BTreeMap::new(),
-        python_path: layout.python.join("bin/python3"),
-        venv_path: layout.venv_python(),
+        python_path: if entry.runs_whisper_cpp() {
+            PathBuf::new()
+        } else {
+            layout.python.join("bin/python3")
+        },
+        venv_path: if entry.runs_whisper_cpp() {
+            PathBuf::new()
+        } else {
+            layout.venv_python()
+        },
         device: entry.device.into(),
         compute_type: entry.compute_type.into(),
         receipt_hash: String::new(),
@@ -1037,6 +1179,14 @@ fn binary_worker_pins() -> impl Iterator<Item = (String, ConsentedFilePin)> {
         )
     })
 }
+/// Voisu's own worker files an entry pins: the Python worker for Python
+/// entries, none for whisper.cpp (its worker is a packaged binary).
+fn worker_pins(
+    entry: &ConsentedCatalogEntry,
+) -> impl Iterator<Item = (String, ConsentedFilePin)> + use<> {
+    let python = !entry.runs_whisper_cpp();
+    binary_worker_pins().filter(move |_| python)
+}
 fn is_worker_pin(name: &str) -> bool {
     name.starts_with("worker/")
 }
@@ -1058,7 +1208,7 @@ fn content_hash(entry: &ConsentedCatalogEntry) -> String {
     for item in entry
         .weights
         .iter()
-        .chain(std::iter::once(&entry.python))
+        .chain(entry.python.iter())
         .chain(entry.wheels)
         .chain(entry.native_runtime.iter())
     {
@@ -1110,14 +1260,14 @@ fn check_receipt(
     let mut expected = make_receipt(entry, receipt.consent.clone(), &layout);
     expected.version = receipt.version;
     expected.content_hash = hash;
-    validate_runtime_manifest(&receipt.runtime_manifest)?;
+    validate_runtime_manifest(&receipt.runtime_manifest, !entry.runs_whisper_cpp())?;
     expected.runtime_manifest = receipt.runtime_manifest.clone();
     expected.receipt_hash = receipt_hash(&expected)?;
     let stale = if *receipt == expected {
         false
     } else {
         let mut current = without_worker_pins(receipt);
-        current.files.extend(binary_worker_pins());
+        current.files.extend(worker_pins(entry));
         current.receipt_hash = receipt_hash(&current)?;
         if current != expected || receipt.receipt_hash != receipt_hash(receipt)? {
             return Err(ConsentedError::Receipt);
@@ -1415,11 +1565,13 @@ fn verify_layout(
 ) -> Result<(), ConsentedError> {
     audit_runtime_tree(&layout.root)?;
     audit_runtime_tree(&layout.root.join("runtime"))?;
-    if !layout.python.is_dir() || !layout.venv.is_dir() {
-        return Err(ConsentedError::Tree("missing runtime directory".into()));
+    if receipt.runs_python() {
+        if !layout.python.is_dir() || !layout.venv.is_dir() {
+            return Err(ConsentedError::Tree("missing runtime directory".into()));
+        }
+        executable(&layout.venv_python())?;
     }
-    executable(&layout.venv_python())?;
-    verify_runtime_manifest(layout, &receipt.runtime_manifest)?;
+    verify_runtime_manifest(layout, &receipt.runtime_manifest, receipt.runs_python())?;
     verify_files(layout, receipt)
 }
 fn verify_layout_full(
@@ -1494,7 +1646,16 @@ fn hash_runtime_file(path: &Path) -> Result<String, ConsentedError> {
 }
 fn validate_runtime_manifest(
     manifest: &BTreeMap<String, ConsentedRuntimeEntry>,
+    python: bool,
 ) -> Result<(), ConsentedError> {
+    // whisper.cpp installs carry no runtime at all.
+    if !python {
+        return if manifest.is_empty() {
+            Ok(())
+        } else {
+            Err(ConsentedError::Receipt)
+        };
+    }
     for required in ["python", "venv", "venv/bin"] {
         if manifest.get(required) != Some(&ConsentedRuntimeEntry::Directory) {
             return Err(ConsentedError::Receipt);
@@ -1543,8 +1704,9 @@ fn validate_runtime_manifest(
 fn verify_runtime_manifest(
     layout: &ConsentedLayout,
     manifest: &BTreeMap<String, ConsentedRuntimeEntry>,
+    python: bool,
 ) -> Result<(), ConsentedError> {
-    validate_runtime_manifest(manifest)?;
+    validate_runtime_manifest(manifest, python)?;
     let runtime = layout.root.join("runtime");
     for (name, expected) in manifest {
         let path = runtime.join(name);
@@ -1662,6 +1824,175 @@ fn download(
     }
     check_deadline(&request.clock)?;
     pending.publish(pin.name).map_err(ConsentedError::Fs)
+}
+/// The whisper.cpp model is one 800 MB file, so an interrupted download
+/// resumes. Its bytes accumulate in `staging/partial/<sha256>.part`, which
+/// outlives the install's staging tree; the next install sends
+/// `Range: bytes=<held>-`. A server that ignores the Range, or answers with
+/// another range, starts the file again, and that counts as the one restart.
+/// A digest mismatch deletes the `.part`; when the bad bytes came from a
+/// resume the download restarts once from byte 0. A full disk, a 416, a
+/// policy or redirect refusal and an oversized body delete it too. Network
+/// failures, server errors and deadlines keep it for the next attempt.
+/// [`prepare_partial`] has already removed everything else in `partial/`.
+fn download_resumable(
+    request: &ConsentedInstallRequest<'_>,
+    pin: &DownloadPin,
+    dir: &Path,
+) -> Result<(), ConsentedError> {
+    use std::io::{Seek, SeekFrom};
+    super::relative_file_name(pin.name).map_err(ConsentedError::Fs)?;
+    check_deadline(&request.clock)?;
+    if let Some(errno) = request.io.fail_write {
+        return Err(if errno == libc::ENOSPC {
+            ConsentedError::NoSpace
+        } else {
+            std::io::Error::from_raw_os_error(errno).into()
+        });
+    }
+    let partial = partial_dir(request.store);
+    super::ensure_private_dir(&partial).map_err(ConsentedError::Fs)?;
+    let part_path = partial.join(format!("{}.part", pin.sha256));
+    let not_a_file = || ConsentedError::Tree("partial download is not a file".into());
+    // Checked before opening: opening a FIFO or device could block or act.
+    match fs::symlink_metadata(&part_path) {
+        Ok(meta) if !meta.is_file() => return Err(not_a_file()),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(&part_path)?;
+    if !file.metadata()?.is_file() {
+        return Err(not_a_file());
+    }
+    let discard = |file: &mut File| -> Result<(), ConsentedError> {
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        Ok(())
+    };
+    let remove_part = || {
+        let _ = fs::remove_file(&part_path);
+        let _ = fs::remove_dir(&partial);
+    };
+    let request_for = FetchRequest {
+        url: pin.url.into(),
+        allowed_hosts: pin.hosts.iter().map(|host| (*host).into()).collect(),
+        expected_bytes: pin.bytes,
+    };
+    let mut restarted = false;
+    loop {
+        if file.metadata()?.len() > pin.bytes {
+            discard(&mut file)?;
+        }
+        // Re-read the held prefix: its digest seeds the whole-file hash.
+        file.seek(SeekFrom::Start(0))?;
+        let mut prefix = Sha256::new();
+        let held = std::io::copy(&mut (&file).take(pin.bytes), &mut prefix)?;
+        file.seek(SeekFrom::Start(held))?;
+        let fetched = if held == pin.bytes {
+            request.progress.downloaded(held);
+            Ok(super::fetch::FetchedSummary {
+                bytes: held,
+                sha256_hex: format!("{:x}", prefix.finalize()),
+                hops: 0,
+            })
+        } else if held == 0 {
+            request.fetcher.fetch_to(
+                &request_for,
+                &mut ProgressSink::new(&mut file, request.progress),
+            )
+        } else {
+            // The held bytes count toward progress only once the server
+            // honours the Range; a restart reports the whole file instead.
+            match request.fetcher.fetch_range_to(
+                &request_for,
+                held,
+                &prefix,
+                &mut HeldCredit::new(&mut file, request.progress, held),
+            ) {
+                Err(FetchError::RangeIgnored) => {
+                    discard(&mut file)?;
+                    restarted = true;
+                    request.fetcher.fetch_to(
+                        &request_for,
+                        &mut ProgressSink::new(&mut file, request.progress),
+                    )
+                }
+                other => other,
+            }
+        };
+        let fetched = match fetched {
+            Ok(fetched) => fetched,
+            Err(FetchError::Deadline | FetchError::NoProgress) => {
+                return Err(ConsentedError::Deadline);
+            }
+            Err(FetchError::NoSpace) => {
+                drop(file);
+                remove_part();
+                return Err(ConsentedError::NoSpace);
+            }
+            // The held bytes survive a network failure or a server error
+            // (503, 429, 408, even 404 from a mirror in flux). A 416 says the
+            // held prefix is not a prefix of the file, so it goes below.
+            Err(
+                error @ (FetchError::Truncated { .. }
+                | FetchError::Io(_)
+                | FetchError::Status(0..=415 | 417..)),
+            ) => {
+                return Err(ConsentedError::Fetch(error));
+            }
+            // A 416, a policy or redirect refusal, an oversized body.
+            Err(error) => {
+                drop(file);
+                remove_part();
+                return Err(ConsentedError::Fetch(error));
+            }
+        };
+        check_deadline(&request.clock)?;
+        if fetched.matches_pin(pin.sha256, pin.bytes) {
+            break;
+        }
+        discard(&mut file)?;
+        if held == 0 || restarted {
+            drop(file);
+            remove_part();
+            return Err(ConsentedError::Digest(pin.name.into()));
+        }
+        restarted = true;
+    }
+    let before = request.clock.elapsed();
+    file.sync_all()
+        .map_err(|error| match super::fetch::io_err(error) {
+            FetchError::NoSpace => ConsentedError::NoSpace,
+            other => ConsentedError::Fetch(other),
+        })?;
+    if request.clock.elapsed().saturating_sub(before) > NO_PROGRESS {
+        return Err(ConsentedError::Deadline);
+    }
+    drop(file);
+    // Staging and the partial directory share the store filesystem.
+    let dest = dir.join(pin.name);
+    if fs::symlink_metadata(&dest).is_ok() {
+        return Err(ConsentedError::Tree(format!(
+            "refusing to replace {}",
+            dest.display()
+        )));
+    }
+    fs::rename(&part_path, &dest)?;
+    sync_dir(dir)?;
+    sync_dir(&partial)?;
+    let _ = fs::remove_dir(&partial);
+    Ok(())
+}
+fn partial_dir(store: &ModelStore) -> PathBuf {
+    store.staging_dir("partial")
 }
 fn write_new(dir: &Path, name: &str, data: &[u8]) -> Result<(), ConsentedError> {
     super::relative_file_name(name).map_err(ConsentedError::Fs)?;
@@ -1886,12 +2217,13 @@ pub(crate) mod install_tests {
             license_spdx: "MIT",
             consent_installable: true,
             weights: WEIGHTS,
-            python: INPUT,
+            python: Some(INPUT),
             wheels: WHEELS,
             health_clip: fixture_clip,
             total_download_bytes: 83,
             estimated_extracted_runtime_bytes: 128,
             consent_text: "83 bytes; MIT; explicit fixture consent",
+            whisper_cpp_decode: None,
         }
     }
     fn consent() -> ConsentedConsent {
@@ -1932,7 +2264,7 @@ pub(crate) mod install_tests {
                         .staging
                         .root
                         .join("inputs")
-                        .join(build.entry.python.name)
+                        .join(build.entry.python.unwrap().name)
                 )
                 .unwrap(),
                 DATA
@@ -2057,6 +2389,462 @@ pub(crate) mod install_tests {
         receipt
     }
 
+    /// A whisper.cpp-shaped entry on the fixture host: weights and the clip,
+    /// no Python runtime, no wheels, no Voisu worker files.
+    fn whisper_cpp_entry() -> ConsentedCatalogEntry {
+        ConsentedCatalogEntry {
+            id: "whisper-cpp-test",
+            device: "gpu",
+            compute_type: "q8_0",
+            python: None,
+            wheels: &[],
+            total_download_bytes: DATA.len() as u64 + 20,
+            estimated_extracted_runtime_bytes: 0,
+            consent_text: "42 bytes; MIT; whisper.cpp fixture consent",
+            ..entry()
+        }
+    }
+    /// Health for a whisper.cpp install: nothing Python-shaped exists.
+    struct WhisperCppHealth;
+    impl ConsentedHealth for WhisperCppHealth {
+        fn check(
+            &self,
+            layout: &ConsentedLayout,
+            receipt: &ConsentedReceipt,
+        ) -> Result<(), ConsentedError> {
+            let _lease = consented_install_lease(layout)?;
+            assert!(!layout.worker.exists() && !layout.venv.exists());
+            assert!(receipt.files.keys().all(|name| !is_worker_pin(name)));
+            Ok(())
+        }
+    }
+    fn install_whisper_cpp(
+        store: &ModelStore,
+        fetcher: &dyn ArtifactFetcher,
+        io: InstallIo,
+    ) -> Result<ConsentedReceipt, ConsentedError> {
+        let entry = whisper_cpp_entry();
+        let builder = FakeBuilder::default();
+        let mut request = request(store, fetcher, &builder, &WhisperCppHealth);
+        request.consent = ConsentedConsent::accepted_entry(&entry, 42);
+        request.io = io;
+        let result = install_with_entry(request, &entry);
+        assert!(!builder.called.get(), "whisper.cpp builds no runtime");
+        result
+    }
+    fn part(store: &ModelStore) -> PathBuf {
+        partial_dir(store).join(format!("{SHA}.part"))
+    }
+    fn hold(store: &ModelStore, bytes: &[u8]) {
+        super::super::ensure_private_dir(&partial_dir(store)).unwrap();
+        fs::write(part(store), bytes).unwrap();
+    }
+    /// Nothing of a failed install remains: no staging tree, no install root.
+    fn assert_no_install_left(store: &ModelStore) {
+        let staging = store.staging_dir("consented");
+        if staging.exists() {
+            assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
+        }
+        let entry = whisper_cpp_entry();
+        assert!(!install_root(store, entry.id, &content_hash(&entry)).exists());
+        assert!(matches!(load_receipt(store), Err(ConsentedError::Missing)));
+    }
+
+    #[test]
+    fn whisper_cpp_install_resumes_a_truncated_part_with_a_range_request() {
+        let (_temp, store) = store();
+        let cut = ScriptedFetcher::new(vec![ScriptedHop::Truncated(DATA[..9].to_vec())]);
+        assert!(matches!(
+            install_whisper_cpp(&store, &cut, InstallIo::default()),
+            Err(ConsentedError::Fetch(FetchError::Truncated { .. }))
+        ));
+        assert_eq!(fs::read(part(&store)).unwrap(), &DATA[..9]);
+        assert_no_install_left(&store);
+
+        // Only the tail is served: a whole-file fetch would get a 206 and fail.
+        let resume = ScriptedFetcher::new(vec![
+            ScriptedHop::Partial(DATA[9..].to_vec()),
+            ScriptedHop::Body(CatalogEntry::fixture_pcm_bytes().to_vec()),
+        ]);
+        let receipt = install_whisper_cpp(&store, &resume, InstallIo::default()).unwrap();
+        assert!(
+            !partial_dir(&store).exists(),
+            "the .part moves into the install"
+        );
+        assert!(!receipt.runs_python());
+        assert!(receipt.runtime_inputs.is_empty() && receipt.runtime_manifest.is_empty());
+        assert_eq!(
+            receipt.files.keys().collect::<Vec<_>>(),
+            ["jfk.wav", "weights/model.bin"]
+        );
+        let verified = verify_with_entry(&store, &whisper_cpp_entry()).unwrap();
+        assert_eq!(
+            fs::read(verified.layout.weights.join("model.bin")).unwrap(),
+            DATA
+        );
+        assert_eq!(
+            fs::read_dir(verified.layout.root.join("runtime"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn whisper_cpp_restarts_when_the_server_ignores_the_range() {
+        let (_temp, store) = store();
+        hold(&store, &DATA[..9]);
+        let whole = ScriptedFetcher::new(vec![
+            ScriptedHop::Body(DATA.to_vec()),
+            ScriptedHop::Body(CatalogEntry::fixture_pcm_bytes().to_vec()),
+        ]);
+        install_whisper_cpp(&store, &whole, InstallIo::default()).unwrap();
+        let verified = verify_with_entry(&store, &whisper_cpp_entry()).unwrap();
+        assert_eq!(
+            fs::read(verified.layout.weights.join("model.bin")).unwrap(),
+            DATA
+        );
+    }
+
+    #[test]
+    fn whisper_cpp_digest_mismatch_deletes_the_part_and_fails() {
+        let (_temp, store) = store();
+        let mut wrong = DATA.to_vec();
+        wrong[0] ^= 1;
+        let fresh = ScriptedFetcher::new(vec![ScriptedHop::Body(wrong.clone())]);
+        assert!(matches!(
+            install_whisper_cpp(&store, &fresh, InstallIo::default()),
+            Err(ConsentedError::Digest(name)) if name == "model.bin"
+        ));
+        assert!(!part(&store).exists() && !partial_dir(&store).exists());
+        assert_no_install_left(&store);
+
+        // Bad held bytes: the resumed file mismatches, so it restarts once
+        // from byte 0; a second mismatch is final.
+        hold(&store, &wrong[..9]);
+        let twice = ScriptedFetcher::new(vec![
+            ScriptedHop::Partial(DATA[9..].to_vec()),
+            ScriptedHop::Body(wrong.clone()),
+        ]);
+        assert!(matches!(
+            install_whisper_cpp(&store, &twice, InstallIo::default()),
+            Err(ConsentedError::Digest(_))
+        ));
+        assert!(!partial_dir(&store).exists());
+        assert_no_install_left(&store);
+
+        hold(&store, &wrong[..9]);
+        let recovers = ScriptedFetcher::new(vec![
+            ScriptedHop::Partial(DATA[9..].to_vec()),
+            ScriptedHop::Body(DATA.to_vec()),
+            ScriptedHop::Body(CatalogEntry::fixture_pcm_bytes().to_vec()),
+        ]);
+        install_whisper_cpp(&store, &recovers, InstallIo::default()).unwrap();
+        verify_with_entry(&store, &whisper_cpp_entry()).unwrap();
+    }
+
+    #[test]
+    fn whisper_cpp_full_disk_fails_clearly_and_leaves_nothing_behind() {
+        let (_temp, store) = store();
+        let entry = whisper_cpp_entry();
+        // Model plus 256 MiB of headroom, not the Python entries' double reserve.
+        assert_eq!(entry.required_free_bytes(), 42 + 256 * 1024 * 1024);
+        let small = InstallIo {
+            available_bytes: entry.required_free_bytes() - 1,
+            ..InstallIo::default()
+        };
+        // An empty script fails any fetch: the refusal comes before the network.
+        let error = install_whisper_cpp(&store, &ScriptedFetcher::new(vec![]), small).unwrap_err();
+        assert!(matches!(error, ConsentedError::NoSpace));
+        assert_eq!(
+            crate::setup_consented::consented_error_line(&error),
+            "Not enough free disk space."
+        );
+        assert_no_install_left(&store);
+        assert!(!partial_dir(&store).exists());
+
+        // The disk fills mid-download (ENOSPC): the held bytes go too.
+        hold(&store, &DATA[..9]);
+        let full = ScriptedFetcher::new(vec![ScriptedHop::NoSpace]);
+        assert!(matches!(
+            install_whisper_cpp(&store, &full, InstallIo::default()),
+            Err(ConsentedError::NoSpace)
+        ));
+        assert!(!partial_dir(&store).exists());
+        assert_no_install_left(&store);
+    }
+
+    fn raw(status: &str, extra: &str, body: &[u8]) -> ScriptedHop {
+        let mut raw = format!("HTTP/1.1 {status}\r\n{extra}\r\n").into_bytes();
+        raw.extend_from_slice(body);
+        ScriptedHop::Raw(raw)
+    }
+    fn clip() -> ScriptedHop {
+        ScriptedHop::Body(CatalogEntry::fixture_pcm_bytes().to_vec())
+    }
+
+    #[test]
+    fn whisper_cpp_server_errors_keep_the_held_bytes_but_a_416_drops_them() {
+        let (_temp, store) = store();
+        hold(&store, &DATA[..9]);
+        for status in [
+            "503 Service Unavailable",
+            "429 Too Many Requests",
+            "408 Request Timeout",
+        ] {
+            let busy = ScriptedFetcher::new(vec![raw(status, "", b"")]);
+            let error = install_whisper_cpp(&store, &busy, InstallIo::default()).unwrap_err();
+            assert!(
+                matches!(error, ConsentedError::Fetch(FetchError::Status(_))),
+                "{error:?}"
+            );
+            assert_eq!(fs::read(part(&store)).unwrap(), &DATA[..9], "{status}");
+            assert_no_install_left(&store);
+        }
+        // 416: the held bytes are not a prefix this server knows.
+        let unsatisfiable = ScriptedFetcher::new(vec![raw("416 Range Not Satisfiable", "", b"")]);
+        assert!(matches!(
+            install_whisper_cpp(&store, &unsatisfiable, InstallIo::default()),
+            Err(ConsentedError::Fetch(FetchError::Status(416)))
+        ));
+        assert!(!partial_dir(&store).exists());
+        assert_no_install_left(&store);
+    }
+
+    #[test]
+    fn whisper_cpp_a_misranged_206_restarts_instead_of_wedging_the_part() {
+        let total = DATA.len();
+        for range in [
+            format!("Content-Range: bytes 5-{}/{total}\r\n", total - 1),
+            format!("Content-Range: bytes 9-{}/{}\r\n", total - 1, total + 1),
+            "Content-Range: bytes 9-12/99\r\n".to_owned(),
+            String::new(),
+        ] {
+            let (_temp, store) = store();
+            hold(&store, &DATA[..9]);
+            let misranged = ScriptedFetcher::new(vec![
+                raw("206 Partial Content", &range, &DATA[5..]),
+                ScriptedHop::Body(DATA.to_vec()),
+                clip(),
+            ]);
+            install_whisper_cpp(&store, &misranged, InstallIo::default())
+                .unwrap_or_else(|error| panic!("{range:?}: {error:?}"));
+            let verified = verify_with_entry(&store, &whisper_cpp_entry()).unwrap();
+            assert_eq!(
+                fs::read(verified.layout.weights.join("model.bin")).unwrap(),
+                DATA
+            );
+        }
+    }
+
+    #[test]
+    fn whisper_cpp_an_ignored_range_is_the_one_restart_and_counts_once() {
+        #[derive(Default)]
+        struct Total(Cell<u64>);
+        impl InstallProgress for Total {
+            fn downloaded(&self, bytes: u64) {
+                self.0.set(self.0.get() + bytes);
+            }
+        }
+        let (_temp, store) = store();
+        hold(&store, &DATA[..9]);
+        let whole = ScriptedFetcher::new(vec![ScriptedHop::Body(DATA.to_vec()), clip()]);
+        let entry = whisper_cpp_entry();
+        let builder = FakeBuilder::default();
+        let total = Total::default();
+        let mut request = request(&store, &whole, &builder, &WhisperCppHealth);
+        request.consent = ConsentedConsent::accepted_entry(&entry, 42);
+        request.progress = &total;
+        install_with_entry(request, &entry).unwrap();
+        let clip_bytes = CatalogEntry::fixture_pcm_bytes().len() as u64;
+        assert_eq!(
+            total.0.get(),
+            DATA.len() as u64 + clip_bytes,
+            "held bytes count once"
+        );
+
+        // A full fetch after an ignored Range that mismatches is final: the
+        // file is not downloaded a third time.
+        let (_temp, store) = super::install_tests::store();
+        let mut wrong = DATA.to_vec();
+        wrong[0] ^= 1;
+        hold(&store, &DATA[..9]);
+        let fetcher = ScriptedFetcher::new(vec![
+            ScriptedHop::Body(wrong),
+            ScriptedHop::Body(DATA.to_vec()),
+            clip(),
+        ]);
+        assert!(matches!(
+            install_whisper_cpp(&store, &fetcher, InstallIo::default()),
+            Err(ConsentedError::Digest(_))
+        ));
+        assert!(!partial_dir(&store).exists());
+        assert_no_install_left(&store);
+    }
+
+    #[test]
+    fn whisper_cpp_failed_health_keeps_the_weights_so_a_retry_does_not_download_them() {
+        struct FailsOnce(Cell<bool>);
+        impl ConsentedHealth for FailsOnce {
+            fn check(
+                &self,
+                layout: &ConsentedLayout,
+                receipt: &ConsentedReceipt,
+            ) -> Result<(), ConsentedError> {
+                if self.0.replace(false) {
+                    return Err(ConsentedError::Health("gpu_unavailable".into()));
+                }
+                WhisperCppHealth.check(layout, receipt)
+            }
+        }
+        let (_temp, store) = store();
+        let entry = whisper_cpp_entry();
+        let builder = FakeBuilder::default();
+        let health = FailsOnce(Cell::new(true));
+        let attempt = |fetcher: &ScriptedFetcher| {
+            let mut request = request(&store, fetcher, &builder, &health);
+            request.consent = ConsentedConsent::accepted_entry(&entry, 42);
+            install_with_entry(request, &entry)
+        };
+        let first = ScriptedFetcher::new(vec![ScriptedHop::Body(DATA.to_vec()), clip()]);
+        assert!(
+            matches!(attempt(&first), Err(ConsentedError::Health(code)) if code == "gpu_unavailable")
+        );
+        assert_no_install_left(&store);
+        assert_eq!(
+            fs::read(part(&store)).unwrap(),
+            DATA,
+            "verified weights are kept"
+        );
+
+        // The retry serves only the clip: fetching the weights would fail.
+        let retry = ScriptedFetcher::new(vec![clip()]);
+        attempt(&retry).unwrap();
+        assert!(
+            !partial_dir(&store).exists(),
+            "the receipt consumes the cache"
+        );
+        verify_with_entry(&store, &entry).unwrap();
+
+        // A failure before publication (here an abort) keeps them too.
+        let (_temp, store) = super::install_tests::store();
+        let fetcher = ScriptedFetcher::new(vec![ScriptedHop::Body(DATA.to_vec()), clip()]);
+        let mut request = request(&store, &fetcher, &builder, &WhisperCppHealth);
+        request.consent = ConsentedConsent::accepted_entry(&entry, 42);
+        request.io.abort = Some(InstallAbort::AfterFetch);
+        assert!(install_with_entry(request, &entry).is_err());
+        assert_no_install_left(&store);
+        assert_eq!(fs::read(part(&store)).unwrap(), DATA);
+    }
+
+    #[test]
+    fn whisper_cpp_a_device_preflight_failure_downloads_nothing() {
+        struct NoGpu;
+        impl ConsentedHealth for NoGpu {
+            fn check(
+                &self,
+                _: &ConsentedLayout,
+                _: &ConsentedReceipt,
+            ) -> Result<(), ConsentedError> {
+                panic!("health runs only after a download");
+            }
+            fn preflight(&self, entry: &ConsentedCatalogEntry) -> Result<(), ConsentedError> {
+                assert!(entry.runs_whisper_cpp());
+                Err(ConsentedError::Health("gpu_unavailable".into()))
+            }
+        }
+        let (_temp, store) = store();
+        let entry = whisper_cpp_entry();
+        let builder = FakeBuilder::default();
+        let fetcher = ScriptedFetcher::new(vec![]);
+        let mut request = request(&store, &fetcher, &builder, &NoGpu);
+        request.consent = ConsentedConsent::accepted_entry(&entry, 42);
+        assert!(matches!(
+            install_with_entry(request, &entry),
+            Err(ConsentedError::Health(code)) if code == "gpu_unavailable"
+        ));
+        assert!(!partial_dir(&store).exists());
+        assert!(!store.staging_dir("consented").exists());
+    }
+
+    #[test]
+    fn whisper_cpp_clears_stale_partials_first_and_credits_held_bytes() {
+        let (_temp, store) = store();
+        let entry = whisper_cpp_entry();
+        hold(&store, &DATA[..9]);
+        let partial = partial_dir(&store);
+        fs::write(
+            partial.join(format!("{}.part", "1".repeat(64))),
+            b"older catalog",
+        )
+        .unwrap();
+        fs::create_dir_all(partial.join("leftover/nested")).unwrap();
+        // Short of the requirement by less than the held bytes: still enough.
+        let tight = InstallIo {
+            available_bytes: entry.required_free_bytes() - 9,
+            ..InstallIo::default()
+        };
+        let fetcher = ScriptedFetcher::new(vec![ScriptedHop::Partial(DATA[9..].to_vec()), clip()]);
+        install_whisper_cpp(&store, &fetcher, tight).unwrap();
+        assert!(!partial.exists());
+
+        // A refused disk check has still cleared the stale parts.
+        let (_temp, store) = super::install_tests::store();
+        let partial = partial_dir(&store);
+        super::super::ensure_private_dir(&partial).unwrap();
+        fs::write(
+            partial.join(format!("{}.part", "1".repeat(64))),
+            b"older catalog",
+        )
+        .unwrap();
+        let small = InstallIo {
+            available_bytes: entry.required_free_bytes() - 1,
+            ..InstallIo::default()
+        };
+        assert!(matches!(
+            install_whisper_cpp(&store, &ScriptedFetcher::new(vec![]), small),
+            Err(ConsentedError::NoSpace)
+        ));
+        assert_eq!(fs::read_dir(&partial).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn whisper_cpp_a_fifo_part_is_cleared_and_never_opened() {
+        let (_temp, store) = store();
+        super::super::ensure_private_dir(&partial_dir(&store)).unwrap();
+        let path = std::ffi::CString::new(part(&store).as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let fetcher = ScriptedFetcher::new(vec![ScriptedHop::Body(DATA.to_vec()), clip()]);
+        install_whisper_cpp(&store, &fetcher, InstallIo::default()).unwrap();
+        assert!(!partial_dir(&store).exists());
+    }
+
+    #[test]
+    fn an_entry_on_the_placeholder_host_fails_closed_before_any_network() {
+        use super::super::consented_catalog::tests::PLACEHOLDER_ENTRY;
+        let (_temp, store) = store();
+        let fetcher = ScriptedFetcher::new(vec![]);
+        let builder = FakeBuilder::default();
+        let mut request = request(&store, &fetcher, &builder, &WhisperCppHealth);
+        request.consent = ConsentedConsent::accepted_entry(&PLACEHOLDER_ENTRY, 42);
+        let error = install_with_entry(request, &PLACEHOLDER_ENTRY).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ConsentedError::Fetch(FetchError::Policy(
+                    super::super::UrlPolicyError::PlaceholderHost { host }
+                )) if host == "voisu-model-host.invalid"
+            ),
+            "{error:?}"
+        );
+        assert!(
+            crate::setup_consented::consented_error_line(&error).contains("no download location")
+        );
+        assert!(!store.staging_dir("consented").exists());
+        assert!(!partial_dir(&store).exists());
+    }
+
     #[test]
     fn consented_install_verifies_and_removes_without_production_receipt() {
         let (_temp, store) = store();
@@ -2113,7 +2901,7 @@ pub(crate) mod install_tests {
         let fixture = entry();
         let pinned: u64 = fixture.weights.iter().map(|pin| pin.bytes).sum::<u64>()
             + (fixture.health_clip)().bytes
-            + fixture.python.bytes
+            + fixture.python.unwrap().bytes
             + fixture.wheels.iter().map(|pin| pin.bytes).sum::<u64>();
         let build_at = events.iter().position(|e| e == "BuildingRuntime").unwrap();
         let mut total = 0_u64;
@@ -3454,7 +4242,7 @@ pub(crate) mod install_tests {
         let sum = entry
             .weights
             .iter()
-            .chain(std::iter::once(&entry.python))
+            .chain(entry.python.iter())
             .chain(entry.wheels)
             .chain(entry.native_runtime.iter())
             .map(|pin| pin.bytes)
@@ -3465,7 +4253,7 @@ pub(crate) mod install_tests {
         for pin in entry
             .weights
             .iter()
-            .chain(std::iter::once(&entry.python))
+            .chain(entry.python.iter())
             .chain(entry.wheels)
             .chain(entry.native_runtime.iter())
         {
@@ -3489,7 +4277,7 @@ pub(crate) mod install_tests {
         let sum = CONSENTED_ENTRY
             .weights
             .iter()
-            .chain(std::iter::once(&CONSENTED_ENTRY.python))
+            .chain(CONSENTED_ENTRY.python.iter())
             .chain(CONSENTED_ENTRY.wheels)
             .map(|pin| pin.bytes)
             .sum::<u64>()
@@ -3498,7 +4286,7 @@ pub(crate) mod install_tests {
         for pin in CONSENTED_ENTRY
             .weights
             .iter()
-            .chain(std::iter::once(&CONSENTED_ENTRY.python))
+            .chain(CONSENTED_ENTRY.python.iter())
             .chain(CONSENTED_ENTRY.wheels)
         {
             super::super::validate_catalog_url(pin.url, pin.hosts).unwrap();
@@ -3509,7 +4297,7 @@ pub(crate) mod install_tests {
             &["huggingface.co", "us.aws.cdn.hf.co"]
         );
         assert_eq!(
-            CONSENTED_ENTRY.python.hosts,
+            CONSENTED_ENTRY.python.unwrap().hosts,
             &["github.com", "release-assets.githubusercontent.com"]
         );
         assert!(

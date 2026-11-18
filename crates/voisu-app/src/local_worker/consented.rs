@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
@@ -56,10 +56,107 @@ impl ConsentedHealth for ConsentedWorkerHealth {
             self.entry,
             &receipt.runtime_manifest,
         )?;
+        let device = manifest.device.clone();
         let mut worker =
             DevWorker::launch_consented(manifest, hash.clone(), file, &layout.root, None, lease)
                 .map_err(health_error)?;
-        check_worker_health_on_device(&mut worker, &hash, self.entry.device)
+        check_worker_health_on_device(&mut worker, &hash, &device)
+    }
+
+    /// Before any download: the packaged whisper.cpp worker must exist, and
+    /// when `local_device` asks for the GPU it must see one. A GPU-less
+    /// machine on the default `auto` learns that now, not after 818 MB.
+    fn preflight(&self, entry: &ConsentedCatalogEntry) -> Result<(), ConsentedError> {
+        if !entry.runs_whisper_cpp() {
+            return Ok(());
+        }
+        let worker = whisper_cpp_worker()?;
+        if launch_device(entry) == "gpu" {
+            probe_gpu(&worker, GPU_PROBE_DEADLINE)?;
+        }
+        Ok(())
+    }
+}
+
+/// Loading the Vulkan driver takes well under a second; a hung driver must
+/// not hang the install.
+const GPU_PROBE_DEADLINE: Duration = Duration::from_secs(20);
+/// What a probe may print; the rest is drained unread.
+const GPU_PROBE_OUTPUT_BYTES: u64 = 16 * 1024;
+
+/// `voisu-local-asr --probe-gpu` with nothing from the environment that could
+/// load other code into it, so it sees what the sandboxed worker will.
+fn probe_command(worker: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new(worker);
+    command
+        .arg("--probe-gpu")
+        .env_remove("GGML_BACKEND_PATH")
+        .env_remove("LD_LIBRARY_PATH")
+        .env_remove("LD_PRELOAD")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    command
+}
+
+fn probe_gpu(worker: &Path, deadline: Duration) -> Result<(), ConsentedError> {
+    let mut child = probe_command(worker).spawn().map_err(|error| {
+        ConsentedError::Health(format!(
+            "gpu_unavailable: cannot run the GPU probe: {error}"
+        ))
+    })?;
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut text = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = (&mut pipe)
+                    .take(GPU_PROBE_OUTPUT_BYTES)
+                    .read_to_end(&mut text);
+                let _ = std::io::copy(&mut pipe, &mut std::io::sink());
+            }
+            String::from_utf8_lossy(&text).trim().to_owned()
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|pipe| Box::new(pipe) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|pipe| Box::new(pipe) as Box<dyn Read + Send>),
+    );
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if started.elapsed() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let (stdout, stderr) = (
+        stdout.join().unwrap_or_default(),
+        stderr.join().unwrap_or_default(),
+    );
+    match status {
+        Some(status) if status.success() && !stdout.is_empty() => Ok(()),
+        Some(_) => {
+            let reason = stderr.lines().last().unwrap_or("no GPU backend device");
+            Err(ConsentedError::Health(format!(
+                "gpu_unavailable: {reason}; choose `voisu local-device cpu` to run on the CPU"
+            )))
+        }
+        None => Err(ConsentedError::Health(format!(
+            "gpu_unavailable: the GPU probe did not finish within {}s",
+            deadline.as_secs()
+        ))),
     }
 }
 
@@ -100,7 +197,11 @@ fn check_worker_health_on_device(
                 correlation: observed,
                 observed_device,
                 ..
-            } if observed == correlation && observed_device == device => Ok(()),
+            } if observed == correlation
+                && super::dev::requested_device_matches(device, &observed_device) =>
+            {
+                Ok(())
+            }
             WorkerFrame::Error { code, .. } => Err(ConsentedError::Health(code)),
             _ => Err(ConsentedError::Health(format!(
                 "health did not prove ready on {device}"
@@ -240,7 +341,10 @@ fn catalog_pins(entry: &ConsentedCatalogEntry) -> BTreeMap<String, ConsentedFile
             bytes: health.bytes,
         },
     );
-    for (name, bytes) in consented_worker_files() {
+    for (name, bytes) in consented_worker_files()
+        .iter()
+        .filter(|_| !entry.runs_whisper_cpp())
+    {
         pins.insert(
             format!("worker/{name}"),
             ConsentedFilePin {
@@ -267,6 +371,7 @@ fn prepare_manifest(
     let limits = resolve_live_worker_limits()
         .ok_or_else(|| ConsentedError::Health("cannot resolve worker RAM limit".into()))?
         .limits;
+    let device = launch_device(entry);
     let cache = state.join("consented-worker/cache");
     if cache.starts_with(&layout.root) {
         return Err(ConsentedError::Tree(
@@ -274,21 +379,30 @@ fn prepare_manifest(
         ));
     }
     ensure_private_dir(&cache).map_err(ConsentedError::Fs)?;
-    let python_path = layout.venv_python();
-    let mut python = std::fs::File::open(&python_path)?;
+    // The program systemd-run starts: the install's venv interpreter, or the
+    // packaged whisper.cpp worker. Either is pinned by its current digest.
+    let runner_path = if entry.runs_whisper_cpp() {
+        whisper_cpp_worker()?
+    } else {
+        layout.venv_python()
+    };
+    let mut runner = std::fs::File::open(&runner_path)?;
     let mut digest = Sha256::new();
     let mut buf = [0_u8; 64 * 1024];
     loop {
-        let size = python.read(&mut buf)?;
+        let size = runner.read(&mut buf)?;
         if size == 0 {
             break;
         }
         digest.update(&buf[..size]);
     }
     let pin = DevFilePin {
-        path: python_path.to_string_lossy().into_owned(),
+        path: runner_path
+            .to_str()
+            .ok_or_else(|| ConsentedError::Tree("worker path must be UTF-8".into()))?
+            .to_owned(),
         sha256: format!("{:x}", digest.finalize()),
-        bytes: python.metadata()?.len(),
+        bytes: runner.metadata()?.len(),
     };
     let mut pins = pins.clone();
     if entry.native_runtime.is_some() {
@@ -305,7 +419,7 @@ fn prepare_manifest(
         };
         pins.insert(relative.into(), pin);
     }
-    let manifest = manifest_from_pins(layout, &pins, pin, limits, &cache, entry);
+    let manifest = manifest_from_pins(layout, &pins, pin, limits, &cache, entry, device);
     manifest
         .validate()
         .map_err(|error| ConsentedError::Health(error.to_string()))?;
@@ -322,13 +436,73 @@ fn prepare_manifest(
     Ok((manifest, hash, file))
 }
 
+/// Where the worker runs. whisper.cpp follows the `local_device` setting;
+/// the Python entries are pinned to their catalog device.
+fn launch_device(entry: &ConsentedCatalogEntry) -> &'static str {
+    if entry.runs_whisper_cpp() {
+        crate::config::local_device().manifest_device()
+    } else {
+        entry.device
+    }
+}
+
+/// The packaged whisper.cpp worker. No environment override: the daemon only
+/// starts a worker it can name from its own install.
+const PACKAGED_WHISPER_CPP_WORKER: &str = "/usr/libexec/voisu/voisu-local-asr";
+/// Arch keeps private helpers in `/usr/lib/<pkg>/`, not `/usr/libexec/`.
+const ARCH_WHISPER_CPP_WORKER: &str = "/usr/lib/voisu/voisu-local-asr";
+/// Every build of the worker writes this list of its private ggml libraries
+/// beside itself. A `voisu-local-asr` without it is not one Voisu built (a
+/// stray `cargo install` copy, say) and would load the system libggml.
+const WHISPER_CPP_RUNTIME_LIST: &str = "voisu-whisper-runtime.txt";
+
+/// The packaged worker sits in a private directory with its ggml libraries
+/// and backend modules. Packaged paths win; the worker beside this binary is
+/// used only for a cargo build (an ancestor named `target`), so a stray copy
+/// in `~/.cargo/bin` or `/usr/bin` is never pinned.
+fn whisper_cpp_worker() -> Result<PathBuf, ConsentedError> {
+    let exe = std::env::current_exe().ok();
+    pick_whisper_cpp_worker(
+        &[
+            Path::new(PACKAGED_WHISPER_CPP_WORKER),
+            Path::new(ARCH_WHISPER_CPP_WORKER),
+        ],
+        exe.as_deref(),
+    )
+    .ok_or_else(|| {
+        ConsentedError::Health(format!(
+            "whisper.cpp worker missing: install the Voisu package that ships {PACKAGED_WHISPER_CPP_WORKER}"
+        ))
+    })
+}
+
+fn pick_whisper_cpp_worker(packaged: &[&Path], exe: Option<&Path>) -> Option<PathBuf> {
+    let dev = exe.and_then(|exe| {
+        let dir = exe.parent()?;
+        dir.ancestors()
+            .any(|ancestor| ancestor.file_name().is_some_and(|name| name == "target"))
+            .then(|| dir.join("voisu-local-asr"))
+    });
+    packaged
+        .iter()
+        .map(|path| path.to_path_buf())
+        .chain(dev)
+        .find(|path| {
+            path.is_file()
+                && path
+                    .parent()
+                    .is_some_and(|dir| dir.join(WHISPER_CPP_RUNTIME_LIST).is_file())
+        })
+}
+
 fn manifest_from_pins(
     layout: &ConsentedLayout,
     pins: &BTreeMap<String, ConsentedFilePin>,
-    python: DevFilePin,
+    runner: DevFilePin,
     limits: WorkerResourceLimits,
     cache: &Path,
     entry: &ConsentedCatalogEntry,
+    device: &str,
 ) -> DevManifest {
     let mut files = pins
         .iter()
@@ -338,22 +512,32 @@ fn manifest_from_pins(
             bytes: pin.bytes,
         })
         .collect::<Vec<_>>();
-    files.push(python);
-    DevManifest {
-        version: 1,
-        model_id: entry.id.into(),
-        device: entry.device.into(),
-        language: "en".into(),
-        runtime: DevRuntimeManifest {
-            python: Some(layout.venv_python().to_string_lossy().into_owned()),
+    let whisper_cpp = entry.runs_whisper_cpp();
+    let runtime = if whisper_cpp {
+        DevRuntimeManifest {
+            python: None,
+            worker: runner.path.clone(),
+            revision: entry.revision.into(),
+        }
+    } else {
+        DevRuntimeManifest {
+            python: Some(runner.path.clone()),
             worker: layout
                 .worker
                 .join("worker.py")
                 .to_string_lossy()
                 .into_owned(),
             revision: entry.revision.into(),
-        },
-        model_path: if entry.native_runtime.is_some() {
+        }
+    };
+    files.push(runner);
+    DevManifest {
+        version: 1,
+        model_id: entry.id.into(),
+        device: device.into(),
+        language: "en".into(),
+        runtime,
+        model_path: if entry.native_runtime.is_some() || whisper_cpp {
             layout
                 .weights
                 .join(entry.weights[0].name)
@@ -374,6 +558,14 @@ fn manifest_from_pins(
             .as_object()
             .expect("object")
             .clone();
+            if whisper_cpp {
+                options.remove("revision");
+                options.remove("compute_type");
+                if let Some(decode) = entry.whisper_cpp_decode {
+                    options.insert("beam_size".into(), serde_json::json!(decode.beam_size));
+                    options.insert("flash_attn".into(), serde_json::json!(decode.flash_attn));
+                }
+            }
             if entry.native_runtime.is_some() {
                 options.remove("revision");
                 options.remove("compute_type");
@@ -390,11 +582,11 @@ fn manifest_from_pins(
             tasks: u64::from(limits.tasks_max),
             cpu_cores: limits.cpu_quota_cores,
             cache_bytes: limits.cache_max_bytes,
-            vram_bytes: if entry.device == "cpu" {
+            vram_bytes: if device == "cpu" {
                 0
             } else {
                 development_catalog_entry(entry.id)
-                    .expect("CUDA catalog entry")
+                    .expect("GPU catalog entry")
                     .vram_bytes
             },
         },
@@ -709,6 +901,196 @@ mod tests {
     }
 
     #[test]
+    fn the_gpu_probe_passes_only_a_worker_that_names_a_gpu_in_time() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let deadline = Duration::from_secs(5);
+        let gpu = script(
+            "gpu",
+            r#"[ "$1" = --probe-gpu ] && echo 'vulkan:0 Test GPU'"#,
+        );
+        probe_gpu(&gpu, deadline).unwrap();
+
+        let none = script(
+            "none",
+            "echo 'voisu-asr: gpu_unavailable: no GPU backend device loaded' >&2; exit 3",
+        );
+        let ConsentedError::Health(reason) = probe_gpu(&none, deadline).unwrap_err() else {
+            panic!("a GPU-less probe is a health failure");
+        };
+        assert!(
+            reason.starts_with("gpu_unavailable: voisu-asr: gpu_unavailable"),
+            "{reason}"
+        );
+        assert!(reason.contains("voisu local-device cpu"), "{reason}");
+
+        let silent = script("silent", "exit 0");
+        assert!(
+            probe_gpu(&silent, deadline).is_err(),
+            "success must name a GPU"
+        );
+
+        let hung = script("hung", "exec sleep 30");
+        let started = Instant::now();
+        let ConsentedError::Health(reason) =
+            probe_gpu(&hung, Duration::from_millis(200)).unwrap_err()
+        else {
+            panic!("a hung probe is a health failure");
+        };
+        assert!(reason.contains("did not finish"), "{reason}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        // Nothing from the daemon's environment may load code into the probe.
+        let removed = probe_command(&gpu)
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            removed,
+            ["GGML_BACKEND_PATH", "LD_LIBRARY_PATH", "LD_PRELOAD"]
+        );
+    }
+
+    #[test]
+    fn the_whisper_cpp_worker_is_packaged_first_and_needs_its_runtime_list() {
+        let root = tempfile::tempdir().unwrap();
+        let place = |dir: &str, list: bool| {
+            let dir = root.path().join(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("voisu-local-asr"), b"elf").unwrap();
+            if list {
+                std::fs::write(dir.join(WHISPER_CPP_RUNTIME_LIST), b"libwhisper.so.1\n").unwrap();
+            }
+            dir.join("voisu-local-asr")
+        };
+        let packaged = place("usr/libexec/voisu", true);
+        let arch = place("usr/lib/voisu", true);
+        let dev_exe = place("src/voisu/target/debug", true).with_file_name("voisu");
+        let stray_exe = place("home/.cargo/bin", true).with_file_name("voisu");
+        let unlisted = place("opt/voisu", false);
+        let pick = |packaged: &[&Path], exe: &Path| pick_whisper_cpp_worker(packaged, Some(exe));
+
+        assert_eq!(
+            pick(&[&packaged, &arch], &dev_exe),
+            Some(packaged.clone()),
+            "package beats dev"
+        );
+        assert_eq!(
+            pick(&[&unlisted, &arch], &dev_exe),
+            Some(arch.clone()),
+            "no list, no pin"
+        );
+        assert_eq!(
+            pick(&[], &dev_exe),
+            Some(dev_exe.with_file_name("voisu-local-asr")),
+            "a cargo target dir may use its own worker"
+        );
+        assert_eq!(
+            pick(&[], &stray_exe),
+            None,
+            "a stray ~/.cargo/bin worker is never pinned"
+        );
+        let unlisted_dev = place("src/other/target/release", false).with_file_name("voisu");
+        assert_eq!(
+            pick(&[], &unlisted_dev),
+            None,
+            "a dev worker still needs its list"
+        );
+    }
+
+    #[test]
+    fn whisper_cpp_manifest_runs_the_packaged_worker_on_the_chosen_device() {
+        use crate::local_model::WHISPER_CPP_ENTRY;
+        let layout = ConsentedLayout::at(PathBuf::from("/state/models/consented/w/hash"));
+        let pins = catalog_pins(&WHISPER_CPP_ENTRY);
+        assert_eq!(
+            pins.keys().collect::<Vec<_>>(),
+            ["jfk.wav", "weights/ggml-distil-large-v3.5-q8_0.bin"],
+            "no Python worker files"
+        );
+        let worker = DevFilePin {
+            path: PACKAGED_WHISPER_CPP_WORKER.into(),
+            sha256: "e".repeat(64),
+            bytes: 66,
+        };
+        for (device, vram) in [("gpu", 1536 * 1024 * 1024), ("cpu", 0)] {
+            let manifest = manifest_from_pins(
+                &layout,
+                &pins,
+                worker.clone(),
+                resolve_worker_limits(16 * 1024 * 1024 * 1024, 12),
+                Path::new("/state/worker-cache"),
+                &WHISPER_CPP_ENTRY,
+                device,
+            );
+            manifest.validate().unwrap();
+            assert_eq!(manifest.device, device);
+            assert_eq!(manifest.limits.vram_bytes, vram);
+            assert_eq!(manifest.runtime.python, None);
+            assert_eq!(manifest.runtime.worker, PACKAGED_WHISPER_CPP_WORKER);
+            assert_eq!(
+                manifest.model_path,
+                "/state/models/consented/w/hash/weights/ggml-distil-large-v3.5-q8_0.bin"
+            );
+            assert!(
+                manifest
+                    .files
+                    .iter()
+                    .any(|pin| pin.path == PACKAGED_WHISPER_CPP_WORKER)
+            );
+            let mut options = manifest.options.keys().collect::<Vec<_>>();
+            options.sort();
+            assert_eq!(
+                options,
+                [
+                    "beam_size",
+                    "cache_dir",
+                    "flash_attn",
+                    "health_audio",
+                    "health_expected"
+                ]
+            );
+            // The distil q8_0 entry pins beam 5 with flash attention.
+            assert_eq!(manifest.options["beam_size"], json!(5));
+            assert_eq!(manifest.options["flash_attn"], json!(true));
+        }
+    }
+
+    #[test]
+    fn whisper_cpp_health_accepts_any_gpu_for_gpu_but_never_the_cpu() {
+        for (requested, observed, accepted) in [
+            ("gpu", "vulkan:0", true),
+            ("gpu", "cuda:0", true),
+            ("gpu", "cpu", false),
+            ("cpu", "cpu", true),
+            ("cpu", "vulkan:0", false),
+        ] {
+            let mut worker = HealthWorker {
+                inner: super::super::FakeWorker {
+                    model_receipt_hash: "h".into(),
+                    observed_device: observed.into(),
+                    reap: ReapOutcome::Exited,
+                    ..Default::default()
+                },
+                shutdown: false,
+                reaped: false,
+            };
+            assert_eq!(
+                check_worker_health_on_device(&mut worker, "h", requested).is_ok(),
+                accepted,
+                "{requested} vs {observed}"
+            );
+        }
+    }
+
+    #[test]
     fn health_error_maps_gpu_busy_without_a_health_failure() {
         assert!(matches!(
             health_error(SupervisorError::Busy),
@@ -816,6 +1198,7 @@ mod tests {
             resolve_worker_limits(16 * 1024 * 1024 * 1024, 12),
             Path::new("/state/worker-cache"),
             &CONSENTED_ENTRY,
+            CONSENTED_ENTRY.device,
         );
         assert_eq!(
             serde_json::to_value(manifest).unwrap(),

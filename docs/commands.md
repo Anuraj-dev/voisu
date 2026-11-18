@@ -11,6 +11,7 @@
 | `voisu engine [cloud\|local]` | Transcribe online with Cloud, or on this computer with an installed Local model |
 | `voisu local remove [--yes]` | Remove a Consented Install. `--yes` is required when stdin is not a terminal |
 | `voisu local-unload [off\|SECONDS]` | Free an idle Local model's memory after this long (default 300, from 30 to 86400; `off` or `never` keeps it loaded; one already unloaded reloads at the next Recording). Linux, see [Local unload](linux.md#local-unload) |
+| `voisu local-device [auto\|gpu\|cpu]` | Where the whisper.cpp Local model runs: `auto` (default) and `gpu` use the GPU through Vulkan, `cpu` runs it on the processor. Voisu never switches to the CPU on its own. Linux |
 | `voisu key set` / `key check <groq\|deepgram>` | Save or check a Groq or Deepgram key (key on stdin) |
 | `voisu deepgram on` / `off` | Enable or disable Deepgram streaming |
 | `voisu delivery [paste\|copy]` | Paste the Transcript into your window, or only copy it |
