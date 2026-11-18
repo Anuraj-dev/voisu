@@ -127,6 +127,8 @@ jobs:
           while read -r lib; do
               install -m755 "target/worker/release/$lib" "$troot/worker/$lib"
           done < target/worker/release/voisu-whisper-runtime.txt
+          install -m644 target/worker/release/voisu-whisper-runtime.txt "$troot/worker/"
+          packaging/ci/check-worker-runtime.sh "$troot/worker"
           install -m644 packaging/voisu.service         "$troot/voisu.service"
           install -m644 packaging/voisu-overlay.service "$troot/voisu-overlay.service"
           install -m644 packaging/voisu.desktop         "$troot/voisu.desktop"

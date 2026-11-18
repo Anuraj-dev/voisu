@@ -69,10 +69,10 @@ assets = [
     ["target/release/voisu", "usr/bin/", "755"],
     ["target/release/voisu-daemon", "usr/bin/", "755"],
     ["target/release/voisu-overlay", "usr/bin/", "755"],
-    # The whisper.cpp worker and its private ggml libraries and backend
-    # modules, built by build-deb.sh into target/worker (see voisu.spec).
-    ["../../target/worker/release/voisu-local-asr", "usr/libexec/voisu/", "755"],
-    ["../../target/worker/release/lib*.so*", "usr/libexec/voisu/", "644"],
+    # The whisper.cpp worker, its private ggml libraries and backend modules
+    # and the list naming them, staged by build-deb.sh (see voisu.spec).
+    ["../../target/worker/deb-stage/voisu-local-asr", "usr/libexec/voisu/", "755"],
+    ["../../target/worker/deb-stage/runtime/*", "usr/libexec/voisu/", "644"],
     ["../../packaging/voisu.service", "usr/lib/systemd/user/", "644"],
     ["../../packaging/voisu-overlay.service", "usr/lib/systemd/user/", "644"],
     ["../../packaging/voisu.desktop", "usr/share/applications/", "644"],

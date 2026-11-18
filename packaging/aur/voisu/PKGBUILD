@@ -111,6 +111,9 @@ package() {
     while read -r lib; do
         install -Dm755 "target/worker/release/$lib" "$pkgdir/usr/lib/voisu/$lib"
     done < target/worker/release/voisu-whisper-runtime.txt
+    # The daemon starts only a worker whose runtime list sits beside it.
+    install -Dm644 target/worker/release/voisu-whisper-runtime.txt \
+        "$pkgdir/usr/lib/voisu/voisu-whisper-runtime.txt"
 
     # systemd *user* units (Voisu never runs privileged system services).
     install -Dm644 packaging/voisu.service \

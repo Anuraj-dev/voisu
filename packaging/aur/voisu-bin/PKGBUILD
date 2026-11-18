@@ -66,7 +66,14 @@ package() {
 
     # The whisper.cpp worker keeps its libraries beside it and finds them
     # through its $ORIGIN rpath. Arch keeps private helpers in /usr/lib/<pkg>.
-    install -Dm755 -t "$pkgdir/usr/lib/voisu" worker/*
+    # The daemon starts only a worker whose runtime list sits beside it.
+    install -Dm755 -t "$pkgdir/usr/lib/voisu" worker/voisu-local-asr
+    local lib
+    while read -r lib; do
+        install -Dm755 "worker/$lib" "$pkgdir/usr/lib/voisu/$lib"
+    done < worker/voisu-whisper-runtime.txt
+    install -Dm644 worker/voisu-whisper-runtime.txt \
+        "$pkgdir/usr/lib/voisu/voisu-whisper-runtime.txt"
 
     install -Dm644 voisu.service "$pkgdir/usr/lib/systemd/user/voisu.service"
     install -Dm644 voisu-overlay.service \

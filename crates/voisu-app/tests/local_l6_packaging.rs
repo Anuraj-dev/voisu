@@ -443,21 +443,35 @@ fn packages_ship_the_whisper_cpp_worker_with_its_runtime_and_notices() {
     assert!(install.contains("target/worker/release/voisu-local-asr"));
     assert!(install.contains("target/worker/release/voisu-whisper-runtime.txt"));
     assert!(install.contains("%{buildroot}%{_libexecdir}/voisu/"));
+    // Every package checks what it ships: RUNPATH $ORIGIN, and each listed
+    // runtime file beside the worker.
+    let check = "packaging/ci/check-worker-runtime.sh";
+    assert!(root.join(check).is_file());
+    assert!(install.contains(&format!("{check} %{{buildroot}}%{{_libexecdir}}/voisu")));
     let files = section(&spec, "%files");
     assert!(files.contains("%dir %{_libexecdir}/voisu"));
     assert!(files.contains("%{_libexecdir}/voisu/voisu-local-asr"));
+    assert!(files.contains("%{_libexecdir}/voisu/voisu-whisper-runtime.txt"));
     assert!(files.contains("%{_libexecdir}/voisu/lib*.so*"));
 
+    // The deb ships a clean stage of exactly the listed files, never a glob
+    // over a target dir that may hold stale libraries.
     let deb = read("crates/voisu-app/Cargo.toml");
     assert!(deb.contains(
-        r#"["../../target/worker/release/voisu-local-asr", "usr/libexec/voisu/", "755"]"#
+        r#"["../../target/worker/deb-stage/voisu-local-asr", "usr/libexec/voisu/", "755"]"#
     ));
     assert!(
-        deb.contains(r#"["../../target/worker/release/lib*.so*", "usr/libexec/voisu/", "644"]"#)
+        deb.contains(r#"["../../target/worker/deb-stage/runtime/*", "usr/libexec/voisu/", "644"]"#)
     );
+    assert!(!deb.contains("target/worker/release/lib"));
     assert!(deb.contains("libvulkan1"));
     let build_deb = read("packaging/build-deb.sh");
     assert!(build_deb.contains("-p voisu-local-asr --features vulkan --target-dir target/worker"));
+    assert!(build_deb.contains(r#"rm -rf "$worker_stage""#));
+    assert!(
+        build_deb.contains(r#"done < "$root/target/worker/release/voisu-whisper-runtime.txt""#)
+    );
+    assert!(build_deb.contains(&format!(r#""$root/{check}" "$check_dir""#)));
 
     let aur = read("packaging/aur/voisu/PKGBUILD");
     for dependency in [
@@ -473,14 +487,23 @@ fn packages_ship_the_whisper_cpp_worker_with_its_runtime_and_notices() {
     assert!(aur.contains(r#""$pkgdir/usr/lib/voisu/voisu-local-asr""#));
     assert!(aur.contains("voisu-whisper-runtime.txt"));
     let aur_bin = read("packaging/aur/voisu-bin/PKGBUILD");
-    assert!(aur_bin.contains(r#"install -Dm755 -t "$pkgdir/usr/lib/voisu" worker/*"#));
+    assert!(
+        aur_bin.contains(r#"install -Dm755 -t "$pkgdir/usr/lib/voisu" worker/voisu-local-asr"#)
+    );
+    assert!(aur_bin.contains("done < worker/voisu-whisper-runtime.txt"));
+    assert!(aur_bin.contains(r#""$pkgdir/usr/lib/voisu/voisu-whisper-runtime.txt""#));
+    assert!(!aur_bin.contains("worker/*"));
     assert!(aur_bin.contains("'vulkan-icd-loader'"));
     let release = read(".github/workflows/release.yml");
     assert!(release.contains(r#""$troot/worker/voisu-local-asr""#));
+    assert!(release.contains("done < target/worker/release/voisu-whisper-runtime.txt"));
+    assert!(release.contains(&format!(r#"{check} "$troot/worker""#)));
     assert!(release.contains("cmake libvulkan-dev glslc spirv-headers"));
 
-    // Each install directory is one the daemon looks in.
+    // Each install directory is one the daemon looks in, and it starts only a
+    // worker with its runtime list beside it.
     let lookup = read("crates/voisu-app/src/local_worker/consented.rs");
+    assert!(lookup.contains(r#""voisu-whisper-runtime.txt""#));
     for path in [
         "/usr/libexec/voisu/voisu-local-asr",
         "/usr/lib/voisu/voisu-local-asr",

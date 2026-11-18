@@ -153,6 +153,9 @@ install -D -m 0755 target/worker/release/voisu-local-asr %{buildroot}%{_libexecd
 while read -r lib; do
     install -m 0755 "target/worker/release/$lib" %{buildroot}%{_libexecdir}/voisu/
 done < target/worker/release/voisu-whisper-runtime.txt
+# The daemon starts only a worker whose runtime list sits beside it.
+install -m 0644 target/worker/release/voisu-whisper-runtime.txt %{buildroot}%{_libexecdir}/voisu/
+packaging/ci/check-worker-runtime.sh %{buildroot}%{_libexecdir}/voisu
 install -D -m 0644 packaging/voisu.service %{buildroot}%{_userunitdir}/voisu.service
 install -D -m 0644 packaging/voisu-overlay.service %{buildroot}%{_userunitdir}/voisu-overlay.service
 # Desktop entry makes a resolvable app_id (voisu) available to portal
@@ -192,6 +195,7 @@ install -D -m 0644 packaging/icons/voisu.svg %{buildroot}%{_datadir}/icons/hicol
 %{_bindir}/voisu-daemon
 %dir %{_libexecdir}/voisu
 %{_libexecdir}/voisu/voisu-local-asr
+%{_libexecdir}/voisu/voisu-whisper-runtime.txt
 %{_libexecdir}/voisu/lib*.so*
 %{_userunitdir}/voisu.service
 %{_datadir}/applications/voisu.desktop
