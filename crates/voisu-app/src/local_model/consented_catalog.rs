@@ -247,14 +247,9 @@ pub const PARAKEET_ENTRY: ConsentedCatalogEntry = ConsentedCatalogEntry {
     consent_text: "Download 769,772,225 bytes for parakeet-tdt-0.6b-v3 and its pinned Python/NumPy/NeMo-Speech.cpp v0.1.0 CPU runtime. Licence: CC-BY-4.0. English only. Runs offline on CPU. Development evidence: EN WER 12.8%, warm p50 0.61 s on 4 cores, peak RAM 0.9 GB; one host, one speaker — not the release gate. No automatic GPU or Cloud fallback. This is a Consented Install, not a Bakeoff Winner, and is never selected by default.",
 };
 
-/// TODO(hosting, spec open question 4): the q8_0 quant has no public host
-/// yet. The reserved `.invalid` host is refused by the URL policy before any
-/// network access, so an install fails closed until this constant and
-/// [`WHISPER_CPP_HOSTS`] name the real pinned location and its exact
-/// redirect hosts.
-pub const WHISPER_CPP_Q8_URL: &str =
-    "https://voisu-model-host.invalid/whisper-cpp/ggml-distil-large-v3.5-q8_0.bin";
-pub const WHISPER_CPP_HOSTS: &[&str] = &["voisu-model-host.invalid"];
+/// Voisu's Hugging Face repo, pinned to one commit so the bytes behind the URL
+/// cannot change; the sha256 below is checked after download anyway.
+pub const WHISPER_CPP_Q8_URL: &str = "https://huggingface.co/Anurajjit/voisu-distil-large-v3.5-ggml/resolve/33b03a8479479b1ad96d4b7b51ebdeecbd1d9b71/ggml-distil-large-v3.5-q8_0.bin";
 /// distil-large-v3.5 quantized to q8_0 with whisper.cpp 1.9.5's
 /// `whisper-quantize` (the Phase 0 verdict).
 pub const WHISPER_CPP_Q8: DownloadPin = DownloadPin {
@@ -262,7 +257,7 @@ pub const WHISPER_CPP_Q8: DownloadPin = DownloadPin {
     url: WHISPER_CPP_Q8_URL,
     sha256: "7e570abdf13b681354a2ecc93802e25bf204dd6f8c0dd9f6ecb9478b71b231d7",
     bytes: 818_305_955,
-    hosts: WHISPER_CPP_HOSTS,
+    hosts: WEIGHT_HOSTS,
     requirement: None,
 };
 /// The JFK health clip's size; the entry's total adds it to the model.
@@ -294,23 +289,36 @@ pub const WHISPER_CPP_ENTRY: ConsentedCatalogEntry = ConsentedCatalogEntry {
 };
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::local_model::url_policy::{UrlPolicyError, validate_catalog_url};
 
+    /// A pin still on the reserved placeholder host, as a new entry has
+    /// before its files are published.
+    pub(crate) const PLACEHOLDER_PIN: DownloadPin = DownloadPin {
+        url: "https://voisu-model-host.invalid/whisper-cpp/model.bin",
+        hosts: &["voisu-model-host.invalid"],
+        ..WHISPER_CPP_Q8
+    };
+    pub(crate) const PLACEHOLDER_ENTRY: ConsentedCatalogEntry = ConsentedCatalogEntry {
+        weights: &[PLACEHOLDER_PIN],
+        ..WHISPER_CPP_ENTRY
+    };
+
     #[test]
-    fn only_the_placeholder_hosted_entry_is_unhosted() {
-        assert!(!WHISPER_CPP_ENTRY.is_hosted());
+    fn every_catalog_entry_is_hosted_and_a_placeholder_pin_is_not() {
+        assert!(WHISPER_CPP_ENTRY.is_hosted());
         assert!(CONSENTED_ENTRY.is_hosted());
         assert!(PARAKEET_ENTRY.is_hosted());
+        assert!(!PLACEHOLDER_ENTRY.is_hosted());
     }
 
     #[test]
-    fn the_whisper_cpp_entry_fails_closed_on_the_placeholder_host() {
+    fn the_whisper_cpp_model_url_passes_the_catalog_policy() {
         let pin = WHISPER_CPP_ENTRY.weights[0];
-        assert_eq!(pin.url, WHISPER_CPP_Q8_URL);
+        assert!(validate_catalog_url(pin.url, pin.hosts).is_ok());
         assert_eq!(
-            validate_catalog_url(pin.url, pin.hosts),
+            validate_catalog_url(PLACEHOLDER_PIN.url, PLACEHOLDER_PIN.hosts),
             Err(UrlPolicyError::PlaceholderHost {
                 host: "voisu-model-host.invalid".into()
             })

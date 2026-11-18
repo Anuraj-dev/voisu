@@ -270,14 +270,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn setup_never_offers_an_entry_still_on_the_placeholder_host() {
+    fn setup_offers_the_hosted_whisper_cpp_entry() {
         use crate::local_model::CpuReason;
         use crate::local_model::WHISPER_CPP_ENTRY;
         let suggestion = LocalSuggestion::Cpu {
             model_id: WHISPER_CPP_ENTRY.id,
             reason: CpuReason::NoNvidiaGpu,
         };
-        assert!(suggested_consented_entry(&suggestion).is_none());
+        assert_eq!(
+            suggested_consented_entry(&suggestion).map(|entry| entry.id),
+            Some(WHISPER_CPP_ENTRY.id)
+        );
     }
     use crate::local_model::{CONSENTED_ENTRY, DISTIL_MODEL_ID};
     use crate::local_model::{GpuProbe, NvidiaGpu};

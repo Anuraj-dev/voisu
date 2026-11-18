@@ -2821,14 +2821,14 @@ pub(crate) mod install_tests {
     }
 
     #[test]
-    fn the_catalog_whisper_cpp_entry_fails_closed_before_any_network() {
-        use super::super::consented_catalog::WHISPER_CPP_ENTRY;
+    fn an_entry_on_the_placeholder_host_fails_closed_before_any_network() {
+        use super::super::consented_catalog::tests::PLACEHOLDER_ENTRY;
         let (_temp, store) = store();
         let fetcher = ScriptedFetcher::new(vec![]);
         let builder = FakeBuilder::default();
         let mut request = request(&store, &fetcher, &builder, &WhisperCppHealth);
-        request.consent = ConsentedConsent::accepted_entry(&WHISPER_CPP_ENTRY, 42);
-        let error = install_consented_install(request).unwrap_err();
+        request.consent = ConsentedConsent::accepted_entry(&PLACEHOLDER_ENTRY, 42);
+        let error = install_with_entry(request, &PLACEHOLDER_ENTRY).unwrap_err();
         assert!(
             matches!(
                 &error,
