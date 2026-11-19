@@ -730,6 +730,11 @@ pub(crate) fn unknown_local_device_at(path: &Path) -> Option<String> {
 }
 
 fn raw_local_device_at(path: &Path) -> Option<String> {
+    raw_root_string_at(path, LOCAL_DEVICE_KEY)
+}
+
+/// The root table's `key` as an unquoted string, if the config sets it.
+fn raw_root_string_at(path: &Path, key: &str) -> Option<String> {
     let contents = std::fs::read_to_string(path).ok()?;
     contents
         .lines()
@@ -737,7 +742,7 @@ fn raw_local_device_at(path: &Path) -> Option<String> {
         .take_while(|line| !line.starts_with('['))
         .find_map(|line| {
             let (name, value) = line.split_once('=')?;
-            names_key(name, LOCAL_DEVICE_KEY).then_some(value)
+            names_key(name, key).then_some(value)
         })
         .map(|value| {
             value
@@ -748,6 +753,80 @@ fn raw_local_device_at(path: &Path) -> Option<String> {
 }
 
 pub(crate) fn set_local_device_at(path: &Path, device: LocalDevice) -> Result<PathBuf, String> {
+    set_root_string_at(path, LOCAL_DEVICE_KEY, device.as_str())
+}
+
+/// `local_model`: which Local model tier runs.
+const LOCAL_MODEL_KEY: &str = "local_model";
+
+/// Which Local model tier the user asked for. `auto` picks Accurate on a GPU
+/// and Fast on the CPU; see [`crate::local_model::LocalTier::resolve`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LocalModel {
+    #[default]
+    Auto,
+    Accurate,
+    Fast,
+}
+
+impl LocalModel {
+    pub const ALL: [Self; 3] = [Self::Auto, Self::Accurate, Self::Fast];
+
+    /// The config value and CLI word.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Accurate => "accurate",
+            Self::Fast => "fast",
+        }
+    }
+
+    fn from_value(value: &str) -> Option<Self> {
+        let value = value.trim().to_ascii_lowercase();
+        Self::ALL.into_iter().find(|model| model.as_str() == value)
+    }
+}
+
+/// The Local model setting. Missing, unreadable or unknown values keep
+/// `auto`.
+pub fn local_model() -> LocalModel {
+    local_model_at(&config_path())
+}
+
+/// Persists the Local model tier, keeping every other line.
+pub fn set_local_model(model: LocalModel) -> Result<PathBuf, String> {
+    set_local_model_at(&config_path(), model)
+}
+
+/// User input: `auto`, `accurate` or `fast`.
+pub fn parse_local_model(input: &str) -> Result<LocalModel, String> {
+    LocalModel::from_value(input).ok_or_else(|| "expected auto, accurate or fast".to_owned())
+}
+
+/// A `local_model` value the config sets but Voisu does not know, which
+/// therefore runs as `auto`. Doctor and `voisu local-model` warn about it.
+pub fn unknown_local_model() -> Option<String> {
+    unknown_local_model_at(&config_path())
+}
+
+pub(crate) fn local_model_at(path: &Path) -> LocalModel {
+    raw_root_string_at(path, LOCAL_MODEL_KEY)
+        .and_then(|value| LocalModel::from_value(&value))
+        .unwrap_or_default()
+}
+
+pub(crate) fn unknown_local_model_at(path: &Path) -> Option<String> {
+    raw_root_string_at(path, LOCAL_MODEL_KEY)
+        .filter(|value| LocalModel::from_value(value).is_none())
+}
+
+pub(crate) fn set_local_model_at(path: &Path, model: LocalModel) -> Result<PathBuf, String> {
+    set_root_string_at(path, LOCAL_MODEL_KEY, model.as_str())
+}
+
+/// Writes `key = "value"` into the root table, keeping every other line.
+fn set_root_string_at(path: &Path, key: &str, value: &str) -> Result<PathBuf, String> {
     let parent = path
         .parent()
         .ok_or_else(|| format!("config path has no parent: {}", path.display()))?;
@@ -762,11 +841,10 @@ pub(crate) fn set_local_device_at(path: &Path, device: LocalDevice) -> Result<Pa
             ));
         }
     };
-    let value = format!("\"{}\"", device.as_str());
     write_atomic(
         path,
         parent,
-        &merge_root_value(&existing, LOCAL_DEVICE_KEY, &value),
+        &merge_root_value(&existing, key, &format!("\"{value}\"")),
     )?;
     Ok(path.to_path_buf())
 }
@@ -2710,6 +2788,37 @@ other_key = 5
         assert_eq!(LocalDevice::Auto.manifest_device(), "gpu");
         assert_eq!(LocalDevice::Gpu.manifest_device(), "gpu");
         assert_eq!(LocalDevice::Cpu.manifest_device(), "cpu");
+    }
+
+    #[test]
+    fn local_model_defaults_to_auto_round_trips_and_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("voisu").join("config.toml");
+        assert_eq!(local_model_at(&path), LocalModel::Auto);
+        set_local_device_at(&path, LocalDevice::Cpu).unwrap();
+        set_local_model_at(&path, LocalModel::Fast).unwrap();
+        assert_eq!(local_model_at(&path), LocalModel::Fast);
+        set_local_model_at(&path, LocalModel::Accurate).unwrap();
+        assert_eq!(local_model_at(&path), LocalModel::Accurate);
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents.matches("local_model =").count(), 1, "{contents}");
+        assert!(
+            contents.contains("local_model = \"accurate\"\n"),
+            "{contents}"
+        );
+        assert_eq!(local_device_at(&path), LocalDevice::Cpu);
+        assert_eq!(unknown_local_model_at(&path), None);
+
+        // Unknown values run as auto and are reported, never guessed.
+        std::fs::write(&path, "local_model = \"turbo\"\n").unwrap();
+        assert_eq!(local_model_at(&path), LocalModel::Auto);
+        assert_eq!(unknown_local_model_at(&path).as_deref(), Some("turbo"));
+        std::fs::write(&path, "local_model = \" FAST \"\n").unwrap();
+        assert_eq!(local_model_at(&path), LocalModel::Fast);
+
+        assert_eq!(parse_local_model("Accurate"), Ok(LocalModel::Accurate));
+        assert_eq!(parse_local_model(" auto "), Ok(LocalModel::Auto));
+        assert!(parse_local_model("small.en").is_err());
     }
 
     #[test]

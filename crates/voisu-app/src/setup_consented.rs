@@ -15,13 +15,13 @@ use std::time::{Duration, Instant};
 use voisu_core::{AsrMode, KeyDiagnosis};
 
 use crate::asr_mode::LOCAL_UNAVAILABLE;
-use crate::config::LocalDevice;
+use crate::config::{LocalDevice, LocalModel};
 use crate::local_model::consented::ConsentedRemoveOutcome;
 use crate::local_model::{
-    ConsentedCatalogEntry, ConsentedConsent, ConsentedError, ConsentedInstallRequest, HostHardware,
-    InstallClock, InstallIo, InstallPhase, InstallProgress, ModelStore, OfflineRuntimeBuilder,
-    ProductionHttps, installable_entry_for_consent, models_dir_from_state,
-    remove_consented_install, suggest_local,
+    ACCURATE_ON_CPU_WARNING, ConsentedCatalogEntry, ConsentedConsent, ConsentedError,
+    ConsentedInstallRequest, HostHardware, InstallClock, InstallIo, InstallPhase, InstallProgress,
+    LocalTier, ModelStore, OfflineRuntimeBuilder, ProductionHttps, installable_entry_for_consent,
+    models_dir_from_state, remove_consented_install, suggest_local,
 };
 use crate::local_setup::SetupMaintenance;
 use crate::local_worker::{ConsentedWorkerHealth, whisper_cpp_finds_gpu};
@@ -33,7 +33,7 @@ pub use crate::local_model::{DEVELOPMENT_ROOT_NAME, SystemCommandRunner, probe_h
 const INSTALL_PROMPT: &str = "Download and install now?";
 const INSTALL_DURATION_HINT: &str = "This can take several minutes.";
 #[cfg(test)]
-const INSTALL_SUCCESS: &str = "Installed whisper-cpp-distil-large-v3.5-q8-0 (Consented Install).";
+const INSTALL_SUCCESS: &str = "Installed Accurate (distil-large-v3.5).";
 const DAEMON_RESTARTED: &str = "Restarted the Voisu daemon; Local dictation is ready.";
 const CLOUD_PROMPT: &str = "Also set up Cloud?";
 const CLOUD_SKIPPED: &str = "Cloud skipped; setup will not ask again. To add Cloud later, run `voisu setup` and choose Cloud, or `voisu key set groq`.";
@@ -141,8 +141,41 @@ pub fn consent_summary(entry: &ConsentedCatalogEntry, device: SetupDevice) -> Ve
         format_size(entry.total_download_bytes)
     )];
     lines.extend(no_gpu_note(device).map(Into::into));
+    lines.extend(accurate_on_cpu_warning(entry, device).map(Into::into));
     lines.push("Runs offline after install".into());
     lines
+}
+
+/// The catalog entry setup installs for the `local_model` setting where the
+/// install runs: `auto` is Accurate on a GPU and Fast on the CPU, including
+/// the CPU setup falls to when it finds no GPU.
+#[must_use]
+pub fn setup_entry(
+    model: LocalModel,
+    device: SetupDevice,
+) -> Option<&'static ConsentedCatalogEntry> {
+    let entry = LocalTier::resolve(model, device == SetupDevice::Gpu).entry();
+    (entry.consent_installable && entry.is_hosted()).then_some(entry)
+}
+
+/// `Installed Fast (small.en).`, or the catalog id for an entry that is not
+/// a tier.
+#[must_use]
+pub fn installed_line(entry: &ConsentedCatalogEntry) -> String {
+    match LocalTier::of_entry_id(entry.id) {
+        Some(tier) => format!("Installed {}.", tier.title()),
+        None => format!("Installed {} (Consented Install).", entry.id),
+    }
+}
+
+/// The warning for Accurate where it runs on the CPU.
+#[must_use]
+pub fn accurate_on_cpu_warning(
+    entry: &ConsentedCatalogEntry,
+    device: SetupDevice,
+) -> Option<&'static str> {
+    (device != SetupDevice::Gpu && LocalTier::of_entry_id(entry.id) == Some(LocalTier::Accurate))
+        .then_some(ACCURATE_ON_CPU_WARNING)
 }
 
 /// The one device fact worth a line: `auto` found no GPU, so this install
@@ -165,17 +198,18 @@ pub fn run_consented_install_step(
     interactive: bool,
     installed: bool,
     now_unix: u64,
+    model: LocalModel,
     device: impl FnOnce() -> SetupDevice,
     install: impl FnOnce(ConsentedConsent, SetupDevice) -> Result<(), ConsentedError>,
     restart_daemon: impl FnOnce() -> Result<(), String>,
 ) -> ConsentedInstallStep {
-    if installed || !interactive {
+    if installed || !interactive || suggested_consented_entry(&suggest_local(hw)).is_none() {
         return ConsentedInstallStep::Skipped;
     }
-    let Some(entry) = suggested_consented_entry(&suggest_local(hw)) else {
+    let device = device();
+    let Some(entry) = setup_entry(model, device) else {
         return ConsentedInstallStep::Skipped;
     };
-    let device = device();
     io.writeln("");
     for fact in consent_summary(entry, device) {
         io.writeln(&fact);
@@ -186,7 +220,7 @@ pub fn run_consented_install_step(
             io.writeln(INSTALL_DURATION_HINT);
             match install(ConsentedConsent::accepted_entry(entry, now_unix), device) {
                 Ok(()) => {
-                    io.writeln(&format!("Installed {} (Consented Install).", entry.id));
+                    io.writeln(&installed_line(entry));
                     match restart_daemon() {
                         Ok(()) => io.writeln(DAEMON_RESTARTED),
                         Err(reason) => io.writeln(&format!(
@@ -610,6 +644,337 @@ pub fn run_local_remove(
     }
 }
 
+/// What a new `local_model` setting needs before it can run.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalModelChange {
+    /// The tier it resolves to is the installed one on `device`: saving is
+    /// the switch.
+    InUse {
+        tier: LocalTier,
+        device: SetupDevice,
+    },
+    /// The tier is not installed; it runs only after a consented download.
+    Download {
+        tier: LocalTier,
+        device: SetupDevice,
+    },
+    /// The model store could not be read, so nothing is decided.
+    Unknown(String),
+}
+
+impl SetupDevice {
+    /// Whether Local runs on a GPU on this device.
+    #[must_use]
+    pub fn on_gpu(self) -> bool {
+        self == Self::Gpu
+    }
+
+    /// The device `local_device` names without probing: `auto` asks the
+    /// worker for a GPU, so unprobed it reads as one.
+    #[must_use]
+    pub fn unprobed(local_device: LocalDevice) -> Self {
+        match local_device {
+            LocalDevice::Cpu => Self::Cpu,
+            LocalDevice::Auto | LocalDevice::Gpu => Self::Gpu,
+        }
+    }
+}
+
+/// Plans the switch to `setting` on `device`. One Local model is installed
+/// at a time, so only the installed tier switches without a download.
+#[must_use]
+pub fn plan_local_model(
+    setting: LocalModel,
+    device: SetupDevice,
+    installed: &ConsentedStatus,
+) -> LocalModelChange {
+    let tier = LocalTier::resolve(setting, device.on_gpu());
+    match installed {
+        ConsentedStatus::Installed { entry_id, .. } if entry_id == tier.entry().id => {
+            LocalModelChange::InUse { tier, device }
+        }
+        ConsentedStatus::Unknown(reason) => LocalModelChange::Unknown(reason.clone()),
+        ConsentedStatus::Installed { .. } | ConsentedStatus::NotInstalled => {
+            LocalModelChange::Download { tier, device }
+        }
+    }
+}
+
+/// Plans the switch the way setup picks a device: `local_device` decides,
+/// except that `auto` asks `gpu_found` before any download, so a host
+/// without a GPU gets Fast and the install saves `cpu`
+/// ([`SetupDevice::CpuNoGpu`]). Nothing is probed when no download is ahead.
+#[must_use]
+pub fn plan_local_model_probed(
+    setting: LocalModel,
+    local_device: LocalDevice,
+    installed: &ConsentedStatus,
+    gpu_found: impl FnOnce() -> bool,
+) -> LocalModelChange {
+    let unprobed = plan_local_model(setting, SetupDevice::unprobed(local_device), installed);
+    match unprobed {
+        LocalModelChange::Download { .. } if local_device == LocalDevice::Auto => {
+            plan_local_model(setting, setup_device(local_device, gpu_found), installed)
+        }
+        other => other,
+    }
+}
+
+/// The consent the CLI and the TUI show before a tier download: its name,
+/// then setup's summary (size, the Accurate-on-CPU warning, offline).
+#[must_use]
+pub fn local_model_consent(tier: LocalTier, device: SetupDevice) -> Vec<String> {
+    let mut lines = vec![format!(
+        "{} is not installed. Installing it replaces the installed Local model.",
+        tier.title()
+    )];
+    lines.extend(consent_summary(tier.entry(), device));
+    lines
+}
+
+/// The same consent as one line, for the TUI's yes/no prompt: the name and
+/// the size, and the warning for Accurate on the CPU.
+#[must_use]
+pub fn local_model_question(tier: LocalTier, device: SetupDevice) -> String {
+    let slower = if accurate_on_cpu_warning(tier.entry(), device).is_some() {
+        " Much slower on the CPU."
+    } else {
+        ""
+    };
+    format!(
+        "Download {}, {}?{slower} y/n",
+        tier.title(),
+        format_size(tier.entry().total_download_bytes)
+    )
+}
+
+/// `voisu local-model` with no argument: the setting, the tier it resolves
+/// to, and what runs instead when that tier is not installed. It never
+/// probes: with `local_device = auto` and a download ahead, whether there is
+/// a GPU is unknown until the switch checks, so it claims neither.
+#[must_use]
+pub fn local_model_status_lines(
+    setting: LocalModel,
+    local_device: LocalDevice,
+    installed: &ConsentedStatus,
+) -> Vec<String> {
+    let device = SetupDevice::unprobed(local_device);
+    let on_gpu = device.on_gpu();
+    let plan = plan_local_model(setting, device, installed);
+    let unprobed =
+        local_device == LocalDevice::Auto && matches!(plan, LocalModelChange::Download { .. });
+    let tier = LocalTier::resolve(setting, on_gpu);
+    let resolved = match (unprobed, setting) {
+        (true, LocalModel::Auto) => {
+            "Accurate with a GPU, Fast without; the GPU is checked when it installs".to_owned()
+        }
+        (true, _) => tier.title(),
+        (false, _) => tier.label(on_gpu),
+    };
+    let mut lines = vec![format!("Local model: {} ({resolved})", setting.as_str())];
+    let wanted = if unprobed && setting == LocalModel::Auto {
+        "The Local model it picks".to_owned()
+    } else {
+        tier.title()
+    };
+    match (plan, installed) {
+        (LocalModelChange::InUse { .. }, _) => {}
+        (LocalModelChange::Unknown(reason), _) => {
+            lines.push(format!(
+                "Could not read the installed Local model: {reason}"
+            ));
+        }
+        (LocalModelChange::Download { .. }, ConsentedStatus::Installed { entry_id, .. }) => {
+            let running = LocalTier::of_entry_id(entry_id).map_or_else(
+                || entry_id.clone(),
+                |other| {
+                    if unprobed {
+                        other.title()
+                    } else {
+                        other.label(on_gpu)
+                    }
+                },
+            );
+            lines.push(format!(
+                "{wanted} is not installed, so {running} runs. Run `voisu local-model {}` to install it.",
+                setting.as_str()
+            ));
+        }
+        (LocalModelChange::Download { .. }, _) => lines.push(format!(
+            "{wanted} is not installed. Run `voisu local-model {}` to install it.",
+            setting.as_str()
+        )),
+    }
+    if tier == LocalTier::Accurate && !on_gpu {
+        lines.push(ACCURATE_ON_CPU_WARNING.into());
+    }
+    lines
+}
+
+/// `Local model set to fast: Fast (small.en, CPU) is installed; it runs your next Recording.`
+#[must_use]
+pub fn local_model_in_use_line(setting: LocalModel, tier: LocalTier, on_gpu: bool) -> String {
+    format!(
+        "Local model set to {}: {} is installed; it runs your next Recording.",
+        setting.as_str(),
+        tier.label(on_gpu)
+    )
+}
+
+/// After a tier install. Voisu is not restarted, which could cut off a
+/// Recording: the daemon moves to the new model on its own once idle.
+#[must_use]
+pub fn local_model_switched_line(tier: LocalTier) -> String {
+    format!(
+        "Voisu switches to {} once it is idle, from your next Recording.",
+        tier.title()
+    )
+}
+
+/// `voisu local-model <setting>`: saves a setting whose tier is installed,
+/// and installs a missing tier only after an explicit yes at the consent.
+/// Non-interactive runs never download. Nothing is saved unless the tier it
+/// names ends up installed, so the setting never points at a missing model.
+/// `plan` is [`plan_local_model_probed`]'s answer for `setting`; `save` also
+/// gets its device, so a probe that found no GPU can save `cpu`.
+#[allow(clippy::too_many_arguments)]
+pub fn run_local_model_switch(
+    io: &mut dyn WizardIo,
+    interactive: bool,
+    setting: LocalModel,
+    plan: LocalModelChange,
+    now_unix: u64,
+    save: impl FnOnce(LocalModel, SetupDevice) -> Result<(), String>,
+    install: impl FnOnce(ConsentedConsent, SetupDevice) -> Result<(), ConsentedError>,
+    sweep_replaced: impl FnOnce(),
+) -> LocalRemoveStatus {
+    let (tier, device) = match plan {
+        LocalModelChange::InUse { tier, device } => {
+            return match save(setting, device) {
+                Ok(()) => {
+                    io.writeln(&local_model_in_use_line(setting, tier, device.on_gpu()));
+                    if tier == LocalTier::Accurate && !device.on_gpu() {
+                        io.writeln(ACCURATE_ON_CPU_WARNING);
+                    }
+                    LocalRemoveStatus::Success
+                }
+                Err(message) => LocalRemoveStatus::Failed(message),
+            };
+        }
+        LocalModelChange::Unknown(reason) => {
+            return LocalRemoveStatus::Failed(format!(
+                "Could not read the installed Local model ({}); nothing changed.",
+                reason.trim_end_matches('.')
+            ));
+        }
+        LocalModelChange::Download { tier, device } => (tier, device),
+    };
+    if !interactive {
+        return LocalRemoveStatus::Failed(format!(
+            "{} is not installed and needs a {} download; run `voisu local-model {}` in a terminal to agree to it. Nothing changed.",
+            tier.title(),
+            format_size(tier.entry().total_download_bytes),
+            setting.as_str()
+        ));
+    }
+    for line in local_model_consent(tier, device) {
+        io.writeln(&line);
+    }
+    if ask_yes_no(io, INSTALL_PROMPT, false) != Some(true) {
+        io.writeln("Nothing downloaded; the Local model is unchanged.");
+        return LocalRemoveStatus::Success;
+    }
+    io.writeln(INSTALL_DURATION_HINT);
+    if let Err(error) = install(
+        ConsentedConsent::accepted_entry(tier.entry(), now_unix),
+        device,
+    ) {
+        return LocalRemoveStatus::Failed(format!(
+            "Install failed: {} The Local model is unchanged.",
+            consented_error_line(&error)
+        ));
+    }
+    io.writeln(&installed_line(tier.entry()));
+    if let Err(message) = save(setting, device) {
+        // The install already swapped the model; only the setting is stale.
+        io.writeln(&format!("Warning: could not save local_model ({message})."));
+    }
+    io.writeln(&local_model_switched_line(tier));
+    // Frees a replaced model no worker holds; one still leased is left for
+    // the daemon, which sweeps once it has moved off it.
+    sweep_replaced();
+    LocalRemoveStatus::Success
+}
+
+/// `voisu local-model [auto|accurate|fast]`: with no setting it prints the
+/// setting and the tier it runs; with one it switches through
+/// [`run_local_model_switch`] against the real config and store.
+pub fn run_local_model_command(
+    io: &mut dyn WizardIo,
+    interactive: bool,
+    setting: Option<LocalModel>,
+) -> LocalRemoveStatus {
+    let installed = production_consented_status();
+    let Some(setting) = setting else {
+        for line in local_model_status_lines(
+            crate::config::local_model(),
+            crate::config::local_device(),
+            &installed,
+        ) {
+            io.writeln(&line);
+        }
+        if let Some(unknown) = crate::config::unknown_local_model() {
+            eprintln!(
+                "warning: config sets local_model = \"{unknown}\", which is not auto, accurate or fast; it runs as auto. Run `voisu local-model auto`, `accurate` or `fast` to fix it."
+            );
+        }
+        return LocalRemoveStatus::Success;
+    };
+    let plan = plan_local_model_probed(
+        setting,
+        crate::config::local_device(),
+        &installed,
+        whisper_cpp_finds_gpu,
+    );
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    run_local_model_switch(
+        io,
+        interactive,
+        setting,
+        plan,
+        now_unix,
+        production_save_local_model,
+        production_install,
+        production_sweep_replaced,
+    )
+}
+
+/// Saves `local_model`, and `cpu` as the device when a probe found no GPU,
+/// as setup does, so the worker never asks for a GPU the host lacks.
+pub fn production_save_local_model(setting: LocalModel, device: SetupDevice) -> Result<(), String> {
+    crate::config::set_local_model(setting)?;
+    if device == SetupDevice::CpuNoGpu {
+        crate::config::set_local_device(LocalDevice::Cpu)?;
+    }
+    Ok(())
+}
+
+/// Deletes the models a tier switch replaced, best effort: a tree a worker
+/// still leases is left for a later sweep.
+pub fn production_sweep_replaced() {
+    let Ok(dir) =
+        models_dir_from_state(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+    else {
+        return;
+    };
+    if let Ok(store) = ModelStore::open(dir) {
+        let _ = crate::local_model::remove_replaced_consented_installs(&store);
+    }
+}
+
 #[must_use]
 pub fn consented_error_line(error: &ConsentedError) -> String {
     match error {
@@ -784,6 +1149,7 @@ mod tests {
     use super::*;
     use crate::local_model::{
         CONSENTED_ENTRY, FetchError, GpuProbe, NvidiaGpu, ProgressSink, WHISPER_CPP_ENTRY,
+        WHISPER_CPP_SMALL_EN_ENTRY,
     };
     use crate::setup_engine::{
         ConsentedStatus, EngineChoice, INSTALLED_AVAILABILITY, run_engine_screen,
@@ -875,22 +1241,364 @@ mod tests {
         hw: &HostHardware,
         device: SetupDevice,
     ) -> (ConsentedInstallStep, FakeIo, Vec<SetupDevice>) {
+        let (step, io, installs) = accept_model_on(hw, LocalModel::Auto, device);
+        (
+            step,
+            io,
+            installs.into_iter().map(|(_, device)| device).collect(),
+        )
+    }
+
+    /// A yes for the `model` setting on `device`; returns every install call.
+    fn accept_model_on(
+        hw: &HostHardware,
+        model: LocalModel,
+        device: SetupDevice,
+    ) -> (
+        ConsentedInstallStep,
+        FakeIo,
+        Vec<(ConsentedConsent, SetupDevice)>,
+    ) {
         let mut io = FakeIo::new(vec![Some("y")]);
-        let mut devices = Vec::new();
+        let mut installs = Vec::new();
         let step = run_consented_install_step(
             &mut io,
             hw,
             true,
             false,
             NOW,
+            model,
             || device,
-            |_, device| {
-                devices.push(device);
+            |consent, device| {
+                installs.push((consent, device));
                 Ok(())
             },
             || Ok(()),
         );
-        (step, io, devices)
+        (step, io, installs)
+    }
+
+    /// Runs `voisu local-model <setting>` with fakes on a GPU (`on_gpu`) or
+    /// the CPU; returns the status, the transcript, the saved settings, the
+    /// install calls and the sweeps.
+    fn switch(
+        setting: LocalModel,
+        on_gpu: bool,
+        installed: &ConsentedStatus,
+        interactive: bool,
+        answers: Vec<Option<&str>>,
+    ) -> (
+        LocalRemoveStatus,
+        String,
+        Vec<LocalModel>,
+        Vec<(ConsentedConsent, SetupDevice)>,
+        usize,
+    ) {
+        let device = if on_gpu {
+            SetupDevice::Gpu
+        } else {
+            SetupDevice::Cpu
+        };
+        let plan = plan_local_model(setting, device, installed);
+        switch_with(setting, plan, interactive, answers, Ok(()))
+    }
+
+    fn switch_with(
+        setting: LocalModel,
+        plan: LocalModelChange,
+        interactive: bool,
+        answers: Vec<Option<&str>>,
+        save_result: Result<(), String>,
+    ) -> (
+        LocalRemoveStatus,
+        String,
+        Vec<LocalModel>,
+        Vec<(ConsentedConsent, SetupDevice)>,
+        usize,
+    ) {
+        let mut io = FakeIo::new(answers);
+        let (mut saved, mut installs, mut sweeps) = (Vec::new(), Vec::new(), 0);
+        let status = run_local_model_switch(
+            &mut io,
+            interactive,
+            setting,
+            plan,
+            NOW,
+            |model, _| {
+                save_result.clone()?;
+                saved.push(model);
+                Ok(())
+            },
+            |consent, device| {
+                installs.push((consent, device));
+                Ok(())
+            },
+            || sweeps += 1,
+        );
+        (status, io.transcript(), saved, installs, sweeps)
+    }
+
+    fn installed_entry(entry: &ConsentedCatalogEntry) -> ConsentedStatus {
+        ConsentedStatus::Installed {
+            entry_id: entry.id.into(),
+            device: "cpu".into(),
+        }
+    }
+
+    #[test]
+    fn the_status_names_the_resolved_tier_and_what_runs_instead() {
+        let accurate = installed_entry(&WHISPER_CPP_ENTRY);
+        assert_eq!(
+            local_model_status_lines(LocalModel::Auto, LocalDevice::Gpu, &accurate),
+            ["Local model: auto (Accurate (distil-large-v3.5, GPU))"]
+        );
+        assert_eq!(
+            local_model_status_lines(LocalModel::Fast, LocalDevice::Gpu, &accurate),
+            [
+                "Local model: fast (Fast (small.en, GPU))",
+                "Fast (small.en) is not installed, so Accurate (distil-large-v3.5, GPU) runs. Run `voisu local-model fast` to install it."
+            ]
+        );
+        // `local_device = auto` with a download ahead: no GPU is claimed
+        // before the switch probes for one.
+        assert_eq!(
+            local_model_status_lines(
+                LocalModel::Auto,
+                LocalDevice::Auto,
+                &ConsentedStatus::NotInstalled
+            ),
+            [
+                "Local model: auto (Accurate with a GPU, Fast without; the GPU is checked when it installs)",
+                "The Local model it picks is not installed. Run `voisu local-model auto` to install it."
+            ]
+        );
+        assert_eq!(
+            local_model_status_lines(LocalModel::Fast, LocalDevice::Auto, &accurate),
+            [
+                "Local model: fast (Fast (small.en))",
+                "Fast (small.en) is not installed, so Accurate (distil-large-v3.5) runs. Run `voisu local-model fast` to install it."
+            ]
+        );
+        assert_eq!(
+            local_model_status_lines(
+                LocalModel::Accurate,
+                LocalDevice::Cpu,
+                &ConsentedStatus::NotInstalled
+            ),
+            [
+                "Local model: accurate (Accurate (distil-large-v3.5, CPU))",
+                "Accurate (distil-large-v3.5) is not installed. Run `voisu local-model accurate` to install it.",
+                ACCURATE_ON_CPU_WARNING
+            ]
+        );
+    }
+
+    #[test]
+    fn switching_to_the_installed_tier_saves_without_a_download_or_prompt() {
+        let fast = installed_entry(&WHISPER_CPP_SMALL_EN_ENTRY);
+        let (status, text, saved, installs, sweeps) =
+            switch(LocalModel::Auto, false, &fast, false, vec![]);
+        assert_eq!(status, LocalRemoveStatus::Success);
+        assert_eq!(
+            text,
+            "Local model set to auto: Fast (small.en, CPU) is installed; it runs your next Recording."
+        );
+        assert_eq!(saved, [LocalModel::Auto]);
+        assert!(installs.is_empty() && sweeps == 0);
+
+        // Accurate kept on the CPU is allowed, with the warning.
+        let accurate = installed_entry(&WHISPER_CPP_ENTRY);
+        let (_, text, saved, installs, _) =
+            switch(LocalModel::Accurate, false, &accurate, true, vec![]);
+        assert!(text.ends_with(ACCURATE_ON_CPU_WARNING), "{text}");
+        assert_eq!(saved, [LocalModel::Accurate]);
+        assert!(installs.is_empty());
+    }
+
+    #[test]
+    fn the_one_line_question_names_the_tier_and_its_size() {
+        assert_eq!(
+            local_model_question(LocalTier::Fast, SetupDevice::Cpu),
+            "Download Fast (small.en), 252.6 MiB? y/n"
+        );
+        assert_eq!(
+            local_model_question(LocalTier::Accurate, SetupDevice::Cpu),
+            "Download Accurate (distil-large-v3.5), 780.7 MiB? Much slower on the CPU. y/n"
+        );
+        assert_eq!(
+            local_model_question(LocalTier::Accurate, SetupDevice::Gpu),
+            "Download Accurate (distil-large-v3.5), 780.7 MiB? y/n"
+        );
+    }
+
+    #[test]
+    fn a_missing_tier_downloads_only_after_a_yes_and_never_non_interactively() {
+        let accurate = installed_entry(&WHISPER_CPP_ENTRY);
+        // Non-interactive: refused, nothing saved or fetched.
+        let (status, text, saved, installs, _) =
+            switch(LocalModel::Fast, true, &accurate, false, vec![Some("y")]);
+        assert_eq!(
+            status,
+            LocalRemoveStatus::Failed("Fast (small.en) is not installed and needs a 252.6 MiB download; run `voisu local-model fast` in a terminal to agree to it. Nothing changed.".into())
+        );
+        assert!(text.is_empty() && saved.is_empty() && installs.is_empty());
+
+        // Enter (default no): the consent is shown, nothing else happens.
+        let (status, text, saved, installs, _) =
+            switch(LocalModel::Fast, true, &accurate, true, vec![Some("")]);
+        assert_eq!(status, LocalRemoveStatus::Success);
+        assert!(
+            text.starts_with("Fast (small.en) is not installed. Installing it replaces the installed Local model.\nDownload size: 252.6 MiB\n"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("Nothing downloaded; the Local model is unchanged."),
+            "{text}"
+        );
+        assert!(saved.is_empty() && installs.is_empty());
+
+        // Yes: installs the Fast entry on the GPU, saves and sweeps. Nothing
+        // restarts Voisu: the daemon moves over once idle.
+        let (status, text, saved, installs, sweeps) =
+            switch(LocalModel::Fast, true, &accurate, true, vec![Some("y")]);
+        assert_eq!(status, LocalRemoveStatus::Success);
+        assert_eq!(
+            installs,
+            [(
+                ConsentedConsent::accepted_entry(&WHISPER_CPP_SMALL_EN_ENTRY, NOW),
+                SetupDevice::Gpu
+            )]
+        );
+        assert_eq!(saved, [LocalModel::Fast]);
+        assert_eq!(sweeps, 1);
+        assert!(
+            text.ends_with("Installed Fast (small.en).\nVoisu switches to Fast (small.en) once it is idle, from your next Recording."),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn auto_device_probes_for_a_gpu_only_before_a_download() {
+        let fast = installed_entry(&WHISPER_CPP_SMALL_EN_ENTRY);
+        let probes = std::cell::Cell::new(0);
+        let probe = |found: bool| {
+            let probes = &probes;
+            move || {
+                probes.set(probes.get() + 1);
+                found
+            }
+        };
+        // No GPU: auto picks Fast and the install will save `cpu`.
+        assert_eq!(
+            plan_local_model_probed(
+                LocalModel::Auto,
+                LocalDevice::Auto,
+                &ConsentedStatus::NotInstalled,
+                probe(false)
+            ),
+            LocalModelChange::Download {
+                tier: LocalTier::Fast,
+                device: SetupDevice::CpuNoGpu
+            }
+        );
+        // A GPU: Accurate on it.
+        assert_eq!(
+            plan_local_model_probed(LocalModel::Auto, LocalDevice::Auto, &fast, probe(true)),
+            LocalModelChange::Download {
+                tier: LocalTier::Accurate,
+                device: SetupDevice::Gpu
+            }
+        );
+        // Without a GPU, auto finds Fast already installed: no download.
+        assert_eq!(
+            plan_local_model_probed(LocalModel::Auto, LocalDevice::Auto, &fast, probe(false)),
+            LocalModelChange::InUse {
+                tier: LocalTier::Fast,
+                device: SetupDevice::CpuNoGpu
+            }
+        );
+        assert_eq!(probes.get(), 3);
+        // No download ahead, or a device the user chose: never probed.
+        assert!(matches!(
+            plan_local_model_probed(LocalModel::Fast, LocalDevice::Auto, &fast, probe(true)),
+            LocalModelChange::InUse { .. }
+        ));
+        assert_eq!(
+            plan_local_model_probed(
+                LocalModel::Auto,
+                LocalDevice::Cpu,
+                &ConsentedStatus::NotInstalled,
+                probe(true),
+            ),
+            LocalModelChange::Download {
+                tier: LocalTier::Fast,
+                device: SetupDevice::Cpu
+            }
+        );
+        assert_eq!(probes.get(), 3);
+    }
+
+    #[test]
+    fn a_failed_save_after_the_install_saves_nothing_and_says_so() {
+        let plan = plan_local_model(
+            LocalModel::Fast,
+            SetupDevice::Gpu,
+            &installed_entry(&WHISPER_CPP_ENTRY),
+        );
+        let (status, text, saved, installs, sweeps) = switch_with(
+            LocalModel::Fast,
+            plan,
+            true,
+            vec![Some("y")],
+            Err("config is read-only".into()),
+        );
+        // The model did swap; the setting did not, and the user is told.
+        assert_eq!(status, LocalRemoveStatus::Success);
+        assert_eq!(installs.len(), 1);
+        assert!(saved.is_empty());
+        assert!(
+            text.contains("Warning: could not save local_model (config is read-only)."),
+            "{text}"
+        );
+        assert_eq!(sweeps, 1);
+        // What the setting resolves to now reports the swap honestly.
+        assert_eq!(
+            local_model_status_lines(
+                LocalModel::Auto,
+                LocalDevice::Gpu,
+                &installed_entry(&WHISPER_CPP_SMALL_EN_ENTRY)
+            )[1],
+            "Accurate (distil-large-v3.5) is not installed, so Fast (small.en, GPU) runs. Run `voisu local-model auto` to install it."
+        );
+    }
+
+    #[test]
+    fn accurate_on_the_cpu_is_warned_at_the_consent_and_an_unknown_store_changes_nothing() {
+        let (_, text, _, installs, _) = switch(
+            LocalModel::Accurate,
+            false,
+            &ConsentedStatus::NotInstalled,
+            true,
+            vec![Some("n")],
+        );
+        assert!(text.contains("Download size: 780.7 MiB"), "{text}");
+        assert!(text.contains(ACCURATE_ON_CPU_WARNING), "{text}");
+        assert!(installs.is_empty());
+
+        let (status, _, saved, _, _) = switch(
+            LocalModel::Fast,
+            false,
+            &ConsentedStatus::Unknown("The model store is busy or unavailable.".into()),
+            true,
+            vec![],
+        );
+        assert_eq!(
+            status,
+            LocalRemoveStatus::Failed(
+                "Could not read the installed Local model (The model store is busy or unavailable); nothing changed.".into()
+            )
+        );
+        assert!(saved.is_empty());
     }
 
     fn offer_with_restart(
@@ -910,6 +1618,7 @@ mod tests {
             interactive,
             installed,
             NOW,
+            LocalModel::Auto,
             || SetupDevice::Gpu,
             |consent, _| {
                 recorded.push(consent);
@@ -984,27 +1693,55 @@ mod tests {
     #[test]
     fn every_host_is_offered_whisper_cpp_and_only_a_missing_gpu_is_mentioned() {
         const NOTE: &str = "No GPU found, so it runs on the CPU, more slowly";
+        const FAST_SUCCESS: &str = "Installed Fast (small.en).";
         let cases = [
-            (SetupDevice::Gpu, false),
-            (SetupDevice::Cpu, false),
-            (SetupDevice::CpuNoGpu, true),
+            (SetupDevice::Gpu, false, "780.7 MiB", INSTALL_SUCCESS),
+            (SetupDevice::Cpu, false, "252.6 MiB", FAST_SUCCESS),
+            (SetupDevice::CpuNoGpu, true, "252.6 MiB", FAST_SUCCESS),
         ];
         for hw in [
             host(GpuProbe::Nvidia(vec![gpu(0, 2048)])),
             host(GpuProbe::NoneFound),
             host(GpuProbe::Failed("driver failed".into())),
         ] {
-            for (device, noted) in cases {
+            for (device, noted, size, success) in cases {
                 let (step, io, devices) = accept_on(&hw, device);
                 assert_eq!(step, ConsentedInstallStep::Installed);
                 assert_eq!(devices, [device], "the install gets the device it showed");
                 let text = io.transcript();
                 assert_eq!(text.contains(NOTE), noted, "{text}");
                 assert!(!text.contains("Licence"), "{text}");
-                assert!(text.contains("Download size: 780.7 MiB"), "{text}");
-                assert!(text.contains(INSTALL_SUCCESS), "{text}");
+                assert!(text.contains(&format!("Download size: {size}\n")), "{text}");
+                assert!(text.contains(success), "{text}");
+                assert!(!text.contains("whisper-cpp-"), "ids stay out: {text}");
             }
         }
+    }
+
+    #[test]
+    fn auto_setup_without_a_gpu_installs_fast_and_a_chosen_tier_is_kept() {
+        let hw = host(GpuProbe::NoneFound);
+        let (_, _, installs) = accept_model_on(&hw, LocalModel::Auto, SetupDevice::CpuNoGpu);
+        assert_eq!(
+            installs,
+            [(
+                ConsentedConsent::accepted_entry(&WHISPER_CPP_SMALL_EN_ENTRY, NOW),
+                SetupDevice::CpuNoGpu
+            )]
+        );
+        let (_, _, installs) = accept_model_on(&hw, LocalModel::Auto, SetupDevice::Gpu);
+        assert_eq!(installs[0].0, accepted(), "a GPU host is unchanged");
+        let (_, _, installs) = accept_model_on(&hw, LocalModel::Fast, SetupDevice::Gpu);
+        assert_eq!(installs[0].0.text, WHISPER_CPP_SMALL_EN_ENTRY.consent_text);
+
+        // Accurate where it runs on the CPU is kept, with a warning.
+        let (step, io, installs) = accept_model_on(&hw, LocalModel::Accurate, SetupDevice::Cpu);
+        assert_eq!(step, ConsentedInstallStep::Installed);
+        assert_eq!(installs[0].0, accepted());
+        let text = io.transcript();
+        assert!(text.contains(ACCURATE_ON_CPU_WARNING), "{text}");
+        let (_, io, _) = accept_model_on(&hw, LocalModel::Accurate, SetupDevice::Gpu);
+        assert!(!io.transcript().contains(ACCURATE_ON_CPU_WARNING));
     }
 
     #[test]
@@ -1030,6 +1767,7 @@ mod tests {
                 interactive,
                 installed,
                 NOW,
+                LocalModel::Auto,
                 || panic!("a skipped offer must not probe the GPU"),
                 |_, _| panic!("a skipped offer must not install"),
                 || Ok(()),
@@ -1631,6 +2369,7 @@ mod tests {
             true,
             false,
             NOW,
+            LocalModel::Auto,
             || SetupDevice::Gpu,
             |_, _| panic!("decline must not install"),
             || panic!("decline must not restart the daemon"),
@@ -1638,10 +2377,9 @@ mod tests {
         assert_eq!(step, ConsentedInstallStep::Declined);
         let declined = decline.transcript();
         assert!(
-            declined.contains(&format!(
-                "Recommended for this computer: {} on your GPU (RTX 5050 Laptop)",
-                WHISPER_CPP_ENTRY.id
-            )),
+            declined.contains(
+                "Recommended for this computer: Accurate (distil-large-v3.5) on your GPU (RTX 5050 Laptop)"
+            ),
             "{declined}"
         );
         assert!(declined.contains(SUMMARY_BLOCK), "{declined}");
@@ -1672,6 +2410,7 @@ mod tests {
             true,
             false,
             NOW,
+            LocalModel::Auto,
             || SetupDevice::Gpu,
             |consent, _| {
                 consents.push(consent);
@@ -1827,6 +2566,7 @@ mod tests {
             true,
             false,
             NOW,
+            LocalModel::Auto,
             || SetupDevice::Gpu,
             |_, _| Ok(()),
             || Ok(()),

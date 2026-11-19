@@ -22,7 +22,10 @@ pub enum Context {
     TooSmall,
     AddTermPrompt,
     KeyPrompt,
-    ConfirmPrompt,
+    /// A yes/no question; `yes` names what `y` does.
+    ConfirmPrompt {
+        yes: &'static str,
+    },
     /// Picking one value of a setting, inline under its row.
     ChoicePrompt,
     Overlay,
@@ -99,7 +102,8 @@ pub enum Action {
     OpenHelp,
     Close,
     Submit,
-    ConfirmRemove,
+    /// `y` at a yes/no question.
+    Confirm,
     /// Keep the stored key.
     Keep,
     /// Read a key from the clipboard.
@@ -285,8 +289,8 @@ pub fn bindings(context: &Context) -> Vec<Binding> {
             close("cancel"),
             interrupt(false),
         ],
-        Context::ConfirmPrompt => vec![
-            simple('y', "y", "remove", Action::ConfirmRemove),
+        Context::ConfirmPrompt { yes } => vec![
+            simple('y', "y", yes, Action::Confirm),
             Binding {
                 keys: "n",
                 all_keys: "n Esc",
@@ -477,7 +481,8 @@ pub(super) fn every_context() -> Vec<Context> {
         Context::TooSmall,
         Context::AddTermPrompt,
         Context::KeyPrompt,
-        Context::ConfirmPrompt,
+        Context::ConfirmPrompt { yes: "remove" },
+        Context::ConfirmPrompt { yes: "download" },
         Context::ChoicePrompt,
         Context::Overlay,
         Context::SetupChoice,

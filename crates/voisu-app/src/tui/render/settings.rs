@@ -1,7 +1,8 @@
 //! Settings: one row per setting, and a guide to the selected row: its
-//! description and, for a row with values, every value with one plain line and
-//! `●` on the one in effect. `↵` turns that same guide into the picker, so what
-//! you read is what you pick from.
+//! description, a note on what its value means here (Local model only), and,
+//! for a row with values, every value with one plain line and `●` on the one
+//! in effect. `↵` turns that same guide into the picker, so what you read is
+//! what you pick from.
 //!
 //! From [`PANEL_FROM`] columns the guide sits in a panel to the right of the
 //! rows; narrower, it sits under them.
@@ -42,6 +43,13 @@ fn stacked_layout(app: &App, look: &Look, width: usize, height: usize) -> Vec<Li
             .into_iter()
             .map(|line| single(look, &format!("{UNSELECTED}{line}"), Tone::Dim))
             .collect();
+    if let Some((note, tone)) = app.setting_note(row) {
+        below.extend(
+            text::wrap(&note, width.saturating_sub(indent + 1))
+                .into_iter()
+                .map(|line| single(look, &format!("{UNSELECTED}{line}"), tone)),
+        );
+    }
     below.extend(guide_lines(app, look, row, UNSELECTED, width, false));
 
     let rows_height = SettingsRow::ALL
@@ -66,6 +74,13 @@ fn panel_layout(app: &App, look: &Look, width: usize, height: usize) -> Vec<Line
             .into_iter()
             .map(|line| single(look, &line, Tone::Dim)),
     );
+    if let Some((note, tone)) = app.setting_note(row) {
+        panel.extend(
+            text::wrap(&note, panel_width)
+                .into_iter()
+                .map(|line| single(look, &line, tone)),
+        );
+    }
     let guide = guide_lines(app, look, row, "", panel_width, true);
     if !guide.is_empty() {
         panel.push(Line::default());

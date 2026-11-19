@@ -231,6 +231,9 @@ fn notice_line(app: &App, look: &Look, width: usize) -> (Line<'static>, Option<u
                 String::new(),
                 false,
             ),
+            Prompt::ConfirmDownload { text: question, .. } => {
+                (text::clean_line(question), String::new(), false)
+            }
         };
         let label = look.text(&text::capitalized(&label));
         let lead = format!(" {label}");
@@ -568,17 +571,51 @@ mod tests {
         assert_eq!(lines[13], "   Trigger Key   Not bound");
         assert_eq!(lines[14], "   Local unload  After 5 min");
         assert_eq!(lines[15], "   Local device  Auto");
-        assert_eq!(lines[16], "   Update check  On");
-        assert_eq!(lines[17], "   Star prompt   On");
-        assert_eq!(lines[18], "   Run setup");
-        // Fifteen rows and a two-value guide overfill 80x24 by one line, so
-        // the last row scrolls into view as the selection moves down.
+        assert_eq!(lines[16], "   Local model   Auto");
+        assert_eq!(lines[17], "   Update check  On");
+        assert_eq!(lines[18], "   Star prompt   On");
+        // Sixteen rows and a two-value guide overfill 80x24 by two lines, so
+        // the last rows scroll into view as the selection moves down.
         assert_eq!(lines[19], "   Where your speech becomes text.");
         assert_eq!(
             lines[20],
             "     ● Cloud  Fast and accurate. Needs internet."
         );
         assert_eq!(lines[21], "       Local  Private. Stays on this computer.");
+    }
+
+    #[test]
+    fn the_local_model_row_says_what_runs_and_asks_before_a_download() {
+        let mut app = app_on('2');
+        app.settings_selected = SettingsRow::ALL
+            .iter()
+            .position(|row| *row == SettingsRow::LocalModel)
+            .unwrap();
+        for size in [(80, 24), (120, 40)] {
+            let body = joined(&screen(&mut app, &UNICODE, size));
+            let words = body.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                words.contains(
+                    "Runs Accurate (distil-large-v3.5, GPU). Accurate recommended on your GPU."
+                ),
+                "{size:?}\n{body}"
+            );
+        }
+        let _ = update(
+            &mut app,
+            Msg::Reply(Reply::LocalModelConsent {
+                model: crate::config::LocalModel::Fast,
+                download: crate::tui::model::AgreedDownload {
+                    tier: crate::local_model::LocalTier::Fast,
+                    device: crate::setup_consented::SetupDevice::Cpu,
+                },
+                text: "Download Fast (small.en), 252.6 MiB? y/n".to_owned(),
+            }),
+            at(0),
+        );
+        let lines = screen(&mut app, &UNICODE, (80, 24));
+        assert_eq!(lines[22], " Download Fast (small.en), 252.6 MiB? y/n");
+        assert!(lines[23].starts_with(" y download"), "{}", lines[23]);
     }
 
     #[test]
@@ -654,11 +691,12 @@ mod tests {
         );
         assert_eq!(lines[14], beside("   Local unload  After 5 min", ""));
         assert_eq!(lines[15], beside("   Local device  Auto", ""));
-        assert_eq!(lines[16], beside("   Update check  On", ""));
-        assert_eq!(lines[17], beside("   Star prompt   On", ""));
-        assert_eq!(lines[18], beside("   Run setup", ""));
-        assert_eq!(lines[19], beside("   Star on GitHub", ""));
-        assert_eq!(lines[20], "", "nothing below the rows");
+        assert_eq!(lines[16], beside("   Local model   Auto", ""));
+        assert_eq!(lines[17], beside("   Update check  On", ""));
+        assert_eq!(lines[18], beside("   Star prompt   On", ""));
+        assert_eq!(lines[19], beside("   Run setup", ""));
+        assert_eq!(lines[20], beside("   Star on GitHub", ""));
+        assert_eq!(lines[21], "", "nothing below the rows");
 
         // Picking happens in the panel, the same lines gaining the highlight.
         let _ = press(&mut app, KeyCode::Enter, 0);
@@ -774,11 +812,11 @@ mod tests {
             app.settings_selected = index;
             let row = app.selected_setting();
 
-            // One line taller than 80x24 (which fifteen rows overfill by one),
-            // every row shows beside a guide of up to two values; a taller
-            // guide (Layout, Local unload) scrolls the rows to keep the
+            // Two lines taller than 80x24 (which sixteen rows overfill by
+            // two), every row shows beside a guide of up to two values; a
+            // taller guide (Layout, Local unload) scrolls the rows to keep the
             // selected one in view.
-            let tall = joined(&screen(&mut app, &UNICODE, (80, 25)));
+            let tall = joined(&screen(&mut app, &UNICODE, (80, 26)));
             if row.choices().len() <= 2 {
                 for other in SettingsRow::ALL {
                     assert!(

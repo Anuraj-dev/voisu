@@ -400,7 +400,12 @@ fn install_with_receipt_sync(
         .lock_exclusive()
         .map_err(ConsentedError::Store)?;
     match load_receipt(request.store) {
-        Ok(prior) if prior.entry_id != entry.id => {
+        // One whisper.cpp model replaces another (a Local model tier switch):
+        // the prior tree keeps serving until the new one passes health and
+        // the receipt swaps atomically. A Python install must be removed first.
+        Ok(prior)
+            if prior.entry_id != entry.id && (prior.runs_python() || !entry.runs_whisper_cpp()) =>
+        {
             return Err(ConsentedError::DifferentEntry(prior.entry_id));
         }
         Ok(_) | Err(ConsentedError::Missing) => {}
@@ -1032,6 +1037,51 @@ fn remove_unreceipted_publish_with_sync(
         return Ok(true);
     }
     Ok(false)
+}
+
+/// Deletes whisper.cpp trees the receipt no longer names, as a Local model
+/// tier switch leaves behind. Unlike orphan cleanup it keeps no weights for
+/// resuming: the user moved away from that model, and the disk is often full.
+/// A tree a live worker still leases is left for a later sweep or install.
+/// Returns how many trees were removed.
+pub fn remove_replaced_consented_installs(store: &ModelStore) -> Result<usize, ConsentedError> {
+    remove_replaced_among(store, consented_catalog_entries())
+}
+
+/// [`remove_replaced_consented_installs`] over `entries`, so tests can sweep
+/// fixture entries the way the catalog's are swept.
+fn remove_replaced_among<'a>(
+    store: &ModelStore,
+    entries: impl IntoIterator<Item = &'a ConsentedCatalogEntry>,
+) -> Result<usize, ConsentedError> {
+    let _lock = store.lock_exclusive().map_err(ConsentedError::Store)?;
+    let receipted = match load_receipt(store) {
+        Ok(receipt) => Some(receipt.content_hash),
+        Err(ConsentedError::Missing) => None,
+        Err(error) => return Err(error),
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let hash = content_hash(entry);
+        if !entry.runs_whisper_cpp() || receipted.as_deref() == Some(hash.as_str()) {
+            continue;
+        }
+        let root = install_root(store, entry.id, &hash);
+        if !super::safe_fs::dir_present(&root).map_err(ConsentedError::Fs)? {
+            continue;
+        }
+        let lease = lease_file(store, &hash)?;
+        match flock(&lease, libc::LOCK_EX) {
+            Ok(()) => {
+                fs::remove_dir_all(&root)?;
+                sync_dir(root.parent().expect("version parent"))?;
+                removed += 1;
+            }
+            Err(ConsentedError::Leased) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(removed)
 }
 
 fn lease_file(store: &ModelStore, hash: &str) -> Result<File, ConsentedError> {
@@ -3750,6 +3800,66 @@ pub(crate) mod install_tests {
         assert!(!builder.called.get());
         assert_eq!(load_receipt(&store).unwrap(), prior);
         assert!(verify_with_entry(&store, &prior_entry).is_ok());
+    }
+
+    #[test]
+    fn one_whisper_cpp_model_replaces_another_and_the_old_tree_is_swept() {
+        let (_temp, store) = store();
+        let first = whisper_cpp_entry();
+        let fetcher = ScriptedFetcher::new(vec![ScriptedHop::Body(DATA.to_vec()), clip()]);
+        install_whisper_cpp(&store, &fetcher, InstallIo::default()).unwrap();
+        let old_root = install_root(&store, first.id, &content_hash(&first));
+
+        let second = ConsentedCatalogEntry {
+            id: "whisper-cpp-test-fast",
+            consent_text: "42 bytes; MIT; whisper.cpp fast fixture consent",
+            ..whisper_cpp_entry()
+        };
+        let builder = FakeBuilder::default();
+        let fetcher = ScriptedFetcher::new(vec![ScriptedHop::Body(DATA.to_vec()), clip()]);
+        let mut request = request(&store, &fetcher, &builder, &WhisperCppHealth);
+        request.consent = ConsentedConsent::accepted_entry(&second, 42);
+        let receipt = install_with_entry(request, &second).unwrap();
+        assert_eq!(receipt.entry_id, "whisper-cpp-test-fast");
+        assert_eq!(load_receipt(&store).unwrap(), receipt);
+        verify_with_entry(&store, &second).unwrap();
+        // The old tree outlives the swap so a worker still on it keeps running.
+        assert!(old_root.is_dir());
+        // The sweep after the swap removes exactly that tree.
+        assert_eq!(remove_replaced_among(&store, [&first, &second]).unwrap(), 1);
+        assert!(!old_root.exists(), "the replaced model's tree is swept");
+        assert!(
+            install_root(&store, second.id, &content_hash(&second)).is_dir(),
+            "the receipted model stays"
+        );
+        verify_with_entry(&store, &second).unwrap();
+
+        // The sweep only knows catalog entries; plant a replaced catalog tree
+        // and check it goes, weights and all, while the receipted one stays.
+        let replaced = &crate::local_model::WHISPER_CPP_ENTRY;
+        let replaced_root = install_root(&store, replaced.id, &content_hash(replaced));
+        fs::create_dir_all(replaced_root.join("weights")).unwrap();
+        fs::write(
+            replaced_root.join("weights").join(replaced.weights[0].name),
+            b"w",
+        )
+        .unwrap();
+        let lease = lease_file(&store, &content_hash(replaced)).unwrap();
+        flock(&lease, libc::LOCK_SH).unwrap();
+        assert_eq!(
+            remove_replaced_consented_installs(&store).unwrap(),
+            0,
+            "leased"
+        );
+        assert!(replaced_root.is_dir());
+        drop(lease);
+        assert_eq!(remove_replaced_consented_installs(&store).unwrap(), 1);
+        assert!(!replaced_root.exists());
+        assert!(
+            !partial_dir(&store).exists(),
+            "a replaced model is not cached"
+        );
+        verify_with_entry(&store, &second).unwrap();
     }
 
     #[test]

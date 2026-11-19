@@ -416,6 +416,18 @@ impl Gate {
         readiness
     }
 
+    /// Deletes whisper.cpp trees the Consented Install receipt no longer
+    /// names. Leased trees and a busy store are skipped for a later sweep;
+    /// a failure only leaves disk in use, so it is not reported.
+    fn sweep_replaced_models(&self) {
+        #[cfg(test)]
+        if let Some((store, _)) = self.test_consented.as_ref() {
+            let _ = crate::local_model::remove_replaced_consented_installs(store);
+        }
+        #[cfg(not(test))]
+        sweep_replaced_models_in_store();
+    }
+
     fn observe_consented(&self) -> Option<crate::local_model::consented::ConsentedObservation> {
         #[cfg(test)]
         {
@@ -508,6 +520,9 @@ impl Gate {
                 return self.readiness.clone();
             }
             self.receipt = Some(selected);
+            // The previous model's worker is reaped, so its tree is no longer
+            // leased: a Local model switch frees that disk now.
+            self.sweep_replaced_models();
         } else if self.lifecycle.state() == WorkerState::Ready && self.receipt.is_some() {
             self.readiness = LocalReadiness::Ready {
                 model_identity: self.receipt.as_ref().map(local_model_identity),
@@ -1479,6 +1494,21 @@ fn development_model_changed(
 }
 
 fn local_model_identity(receipt: &ActiveReceipt) -> String {
+    model_identity_on(receipt, crate::config::local_device)
+}
+
+/// A Local model tier reads as `Accurate (distil-large-v3.5, GPU)`, its
+/// device being where the worker runs (`device`, read only for a tier). Other
+/// installs keep their catalog id; the id itself is for `voisu doctor`.
+fn model_identity_on(
+    receipt: &ActiveReceipt,
+    device: impl FnOnce() -> crate::config::LocalDevice,
+) -> String {
+    if is_consented_receipt(receipt)
+        && let Some(tier) = crate::local_model::LocalTier::of_entry_id(&receipt.catalog_id)
+    {
+        return tier.label(crate::local_model::runs_on_gpu(device()));
+    }
     if is_consented_receipt(receipt) {
         format!(
             "{} (Consented Install, {})",
@@ -1506,9 +1536,20 @@ fn is_consented_receipt(receipt: &ActiveReceipt) -> bool {
     receipt.runtime_abi.starts_with("voisu-consented:")
 }
 
+#[cfg(not(test))]
+fn sweep_replaced_models_in_store() {
+    if let Some(store) = models_dir().ok().and_then(|dir| ModelStore::open(dir).ok()) {
+        let _ = crate::local_model::remove_replaced_consented_installs(&store);
+    }
+}
+
 fn gate() -> &'static Mutex<Gate> {
     static GATE: OnceLock<Mutex<Gate>> = OnceLock::new();
     GATE.get_or_init(|| {
+        // A switch whose idle swap never ran (the daemon stopped first) or
+        // whose old tree was still leased left it behind; free it at start.
+        #[cfg(not(test))]
+        sweep_replaced_models_in_store();
         let mut gate = Gate::new();
         gate.published = published_readiness().clone();
         gate.published_sentinel = published_sentinel().clone();
@@ -2669,6 +2710,48 @@ mod tests {
         assert_eq!(gate.lifecycle.state(), WorkerState::Absent);
         assert_eq!(published_snapshot(&gate.published), LocalReadiness::Absent);
         assert_eq!(gate.launch_count, 1);
+    }
+
+    #[test]
+    fn a_local_model_tier_reads_as_its_friendly_name_and_device() {
+        use crate::config::LocalDevice;
+        let receipt = |id: &str| ActiveReceipt {
+            catalog_id: id.into(),
+            catalog_revision: "whisper.cpp-1.9.5".into(),
+            runtime_abi: "voisu-consented:whisper.cpp-1.9.5@gpu".into(),
+            protocol: crate::local_worker::PROTOCOL_VERSION,
+            language: "en".into(),
+            artifact_id: "a".repeat(64),
+            files: std::collections::BTreeMap::new(),
+            receipt_hash: "b".repeat(64),
+        };
+        let accurate = receipt("whisper-cpp-distil-large-v3.5-q8-0");
+        let fast = receipt("whisper-cpp-small-en-q8-0");
+        assert_eq!(
+            model_identity_on(&accurate, || LocalDevice::Auto),
+            "Accurate (distil-large-v3.5, GPU)"
+        );
+        assert_eq!(
+            model_identity_on(&fast, || LocalDevice::Cpu),
+            "Fast (small.en, CPU)"
+        );
+        let status = voisu_core::AsrModeStatus {
+            pending: Some(AsrMode::Local),
+            local_readiness: LocalReadiness::Ready {
+                model_identity: Some(model_identity_on(&fast, || LocalDevice::Cpu)),
+            },
+            active: None,
+            revision: None,
+            admission_error: None,
+            audio_retention: None,
+            local_path_clean: Some(true),
+        };
+        let text = crate::local_status::format_cli_status("status", Some(&status));
+        assert!(
+            text.contains("Local model: ready (Fast (small.en, CPU))\n"),
+            "{text}"
+        );
+        assert!(!text.contains("whisper-cpp-small-en-q8-0"), "{text}");
     }
 
     #[test]

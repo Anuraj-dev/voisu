@@ -160,6 +160,12 @@ pub fn collect_rows() -> Vec<DoctorRow> {
     rows.extend(unknown_local_device_row(
         crate::config::unknown_local_device().as_deref(),
     ));
+    rows.extend(local_model_rows(
+        crate::config::local_model(),
+        crate::local_model::runs_on_gpu(crate::config::local_device()),
+        &crate::setup_consented::production_consented_status(),
+        crate::config::unknown_local_model().as_deref(),
+    ));
 
     if let Some(asr) = inspector
         .daemon_status()
@@ -211,6 +217,69 @@ fn unknown_local_device_row(value: Option<&str>) -> Option<DoctorRow> {
         .value("unknown, using auto")
         .action("run `voisu local-device auto`, `gpu` or `cpu`"),
     )
+}
+
+/// The installed Local model tier by catalog id and pinned sha256, the one
+/// place outside logs that names them, and a WARN when the `local_model`
+/// setting names a tier that is not installed or a value Voisu does not know.
+fn local_model_rows(
+    setting: crate::config::LocalModel,
+    on_gpu: bool,
+    installed: &crate::setup_engine::ConsentedStatus,
+    unknown: Option<&str>,
+) -> Vec<DoctorRow> {
+    use crate::local_model::LocalTier;
+    let mut rows = Vec::new();
+    if let Some(value) = unknown {
+        rows.push(
+            DoctorRow::new(
+                "Local Model Setting",
+                ReadinessStatus::Warn,
+                format!(
+                    "config sets local_model = \"{value}\", which is not auto, accurate or fast; it runs as auto"
+                ),
+            )
+            .value("unknown, using auto")
+            .action("run `voisu local-model auto`, `accurate` or `fast`"),
+        );
+    }
+    let crate::setup_engine::ConsentedStatus::Installed { entry_id, .. } = installed else {
+        return rows;
+    };
+    let Some(running) = LocalTier::of_entry_id(entry_id) else {
+        return rows;
+    };
+    let entry = running.entry();
+    let sha256 = entry.weights.first().map_or("", |pin| pin.sha256);
+    let wanted = LocalTier::resolve(setting, on_gpu);
+    let row = if wanted == running {
+        DoctorRow::new(
+            "Local Model Pin",
+            ReadinessStatus::Pass,
+            format!(
+                "{}: the installed Local model, by catalog id and pinned sha256",
+                running.label(on_gpu)
+            ),
+        )
+    } else {
+        DoctorRow::new(
+            "Local Model Pin",
+            ReadinessStatus::Warn,
+            format!(
+                "local_model = {} picks {}, which is not installed, so {} runs",
+                setting.as_str(),
+                wanted.title(),
+                running.label(on_gpu)
+            ),
+        )
+        .action(format!(
+            "run `voisu local-model {}` to install {}",
+            setting.as_str(),
+            wanted.title()
+        ))
+    };
+    rows.push(row.value(format!("{} sha256:{sha256}", entry.id)));
+    rows
 }
 
 fn local_doctor_row(check: crate::local_doctor::DoctorCheck) -> DoctorRow {
@@ -898,6 +967,64 @@ mod delivery_row_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_installed_tier_shows_its_id_and_pinned_sha_and_a_missing_one_warns() {
+        use crate::config::LocalModel;
+        use crate::setup_engine::ConsentedStatus;
+        let fast = ConsentedStatus::Installed {
+            entry_id: "whisper-cpp-small-en-q8-0".into(),
+            device: "gpu".into(),
+        };
+        let rows = local_model_rows(LocalModel::Auto, false, &fast, None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, ReadinessStatus::Pass);
+        assert_eq!(
+            rows[0].value.as_deref(),
+            Some(
+                "whisper-cpp-small-en-q8-0 sha256:67a179f608ea6114bd3fdb9060e762b588a3fb3bd00c4387971be4d177958067"
+            )
+        );
+        assert!(
+            rows[0].detail.starts_with("Fast (small.en, CPU)"),
+            "{}",
+            rows[0].detail
+        );
+
+        // On a GPU, auto wants Accurate: what runs is still named.
+        let rows = local_model_rows(LocalModel::Auto, true, &fast, Some("medium"));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].status, ReadinessStatus::Warn);
+        assert!(rows[0].detail.contains("\"medium\""), "{}", rows[0].detail);
+        assert_eq!(rows[1].status, ReadinessStatus::Warn);
+        assert!(
+            rows[1]
+                .value
+                .as_deref()
+                .unwrap()
+                .starts_with("whisper-cpp-small-en-q8-0 ")
+        );
+        assert_eq!(
+            rows[1].action.as_deref(),
+            Some("run `voisu local-model auto` to install Accurate (distil-large-v3.5)")
+        );
+
+        // No whisper.cpp tier installed: nothing to pin.
+        assert!(
+            local_model_rows(
+                LocalModel::Fast,
+                false,
+                &ConsentedStatus::NotInstalled,
+                None
+            )
+            .is_empty()
+        );
+        let parakeet = ConsentedStatus::Installed {
+            entry_id: "parakeet-tdt-0.6b-v3".into(),
+            device: "cpu".into(),
+        };
+        assert!(local_model_rows(LocalModel::Auto, false, &parakeet, None).is_empty());
+    }
 
     #[test]
     fn an_unknown_local_device_warns_and_a_known_one_adds_no_row() {
