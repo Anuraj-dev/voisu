@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.91.1
+Version:        0.92.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -206,6 +206,9 @@ install -D -m 0644 packaging/icons/voisu.svg %{buildroot}%{_datadir}/icons/hicol
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Thu Nov 19 2026 Voisu maintainers <voisu@example.invalid> - 0.92.0-1
+- feat(local): keep the Local model loaded by default (#345)
+
 * Thu Nov 19 2026 Voisu maintainers <voisu@example.invalid> - 0.91.1-1
 - fix(local): drop the dialogue dash small.en puts before some transcripts (#344)
 
