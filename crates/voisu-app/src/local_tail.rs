@@ -196,7 +196,7 @@ pub fn decide_transcript(
     match outcome {
         WorkerOutcome::NoText { reason, .. } => Ok(TerminalDecision::NoText { reason }),
         WorkerOutcome::Transcript { text, .. } => {
-            let trimmed = text.trim();
+            let trimmed = without_leading_dialogue_dash(text.trim());
             if trimmed.is_empty() {
                 return Ok(TerminalDecision::NoText {
                     reason: "empty".to_owned(),
@@ -223,6 +223,21 @@ pub fn decide_transcript(
                 Ok(TerminalDecision::Transcript(formatted))
             }
         }
+    }
+}
+
+/// `text` without a leading subtitle dialogue dash: a hyphen, en dash or em
+/// dash followed by whitespace (or nothing). whisper.cpp small.en learned it
+/// from subtitles and opens some Recordings with it; nobody dictates it. A
+/// dash glued to the next word ("-5") is kept.
+fn without_leading_dialogue_dash(text: &str) -> &str {
+    let Some(rest) = text.strip_prefix(['-', '\u{2013}', '\u{2014}']) else {
+        return text;
+    };
+    if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+        rest.trim_start()
+    } else {
+        text
     }
 }
 
@@ -584,6 +599,29 @@ mod tests {
     fn music_notes_and_short_fillers_are_no_text() {
         for text in ["♪", "♪♪", "Shh.", "Mmm.", "Hmm. Hmm.", "Ahem."] {
             assert_eq!(decide(text, &[]), no_text("no words heard"), "{text:?}");
+        }
+    }
+
+    /// whisper.cpp small.en opens some Recordings with a subtitle dialogue
+    /// dash ("- I think we're good to go"); it is never what the user said.
+    #[test]
+    fn a_leading_dialogue_dash_is_dropped() {
+        for text in [
+            "- I think we're good to go.",
+            "-  I think we're good to go.",
+            "  – I think we're good to go.",
+            "— I think we're good to go.",
+        ] {
+            assert_eq!(
+                decide(text, &[]),
+                transcript("I think we're good to go."),
+                "{text:?}"
+            );
+        }
+        assert_eq!(decide("- Thank you.", &[]), no_text("no words heard"));
+        assert_eq!(decide("-", &[]), no_text("empty"));
+        for kept in ["-5 degrees outside", "Use - as the separator"] {
+            assert_eq!(decide(kept, &[]), transcript(kept), "{kept:?}");
         }
     }
 
