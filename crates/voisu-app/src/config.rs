@@ -555,8 +555,10 @@ pub(crate) fn switch_at(path: &Path, switch: Switch) -> bool {
 
 /// `local_idle_unload`: how long an idle Local worker keeps its model loaded.
 const LOCAL_IDLE_UNLOAD_KEY: &str = "local_idle_unload";
-/// Five minutes: Parakeet reloads in about a second, overlapped with speech.
-pub const DEFAULT_LOCAL_IDLE_UNLOAD: Option<Duration> = Some(Duration::from_secs(300));
+/// Never (Raja, 2026-11-19): a whisper.cpp model takes about 13 s to reload,
+/// which a Recording after an unload waits for. A loaded model holds about
+/// 1 GB (small.en: 663 MiB VRAM + ~340 MiB RAM), so unloading is an opt-in.
+pub const DEFAULT_LOCAL_IDLE_UNLOAD: Option<Duration> = None;
 /// Shorter would reload on nearly every Recording.
 pub const MIN_LOCAL_IDLE_UNLOAD: Duration = Duration::from_secs(30);
 pub const MAX_LOCAL_IDLE_UNLOAD: Duration = Duration::from_secs(86_400);
@@ -579,6 +581,8 @@ pub fn set_local_idle_unload(after: Option<Duration>) -> Result<PathBuf, String>
 pub fn local_idle_unload_label(after: Option<Duration>) -> String {
     match after.map(|after| after.as_secs()) {
         None => "never".to_owned(),
+        Some(3600) => "after 1 hour".to_owned(),
+        Some(secs) if secs % 3600 == 0 => format!("after {} hours", secs / 3600),
         Some(secs) if secs % 60 == 0 => format!("after {} min", secs / 60),
         Some(secs) => format!("after {secs} s"),
     }
@@ -2728,11 +2732,11 @@ other_key = 5
     }
 
     #[test]
-    fn local_idle_unload_defaults_to_five_minutes_and_round_trips() {
+    fn local_idle_unload_defaults_to_never_and_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("voisu").join("config.toml");
         assert_eq!(local_idle_unload_at(&path), DEFAULT_LOCAL_IDLE_UNLOAD);
-        assert_eq!(DEFAULT_LOCAL_IDLE_UNLOAD, Some(Duration::from_secs(300)));
+        assert_eq!(DEFAULT_LOCAL_IDLE_UNLOAD, None);
         write_tone(&path, Tone::Informal).unwrap();
         set_local_idle_unload_at(&path, None).unwrap();
         assert_eq!(local_idle_unload_at(&path), None);

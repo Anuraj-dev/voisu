@@ -421,8 +421,7 @@ const TONES: [WritingTone; 2] = [WritingTone::Formal, WritingTone::Informal];
 const fn minutes(n: u64) -> Option<Duration> {
     Some(Duration::from_secs(n * 60))
 }
-const LOCAL_UNLOADS: [Option<Duration>; 5] =
-    [None, minutes(1), minutes(5), minutes(15), minutes(30)];
+const LOCAL_UNLOADS: [Option<Duration>; 3] = [None, minutes(30), minutes(60)];
 const LOCAL_DEVICES: [crate::config::LocalDevice; 3] = crate::config::LocalDevice::ALL;
 const LOCAL_MODELS: [crate::config::LocalModel; 3] = crate::config::LocalModel::ALL;
 
@@ -447,12 +446,13 @@ const TONE_CHOICES: [Choice; 2] = [
     choice("Formal", "Full words and a closing full stop."),
     choice("Informal", "Abbreviations like btw, no final full stop."),
 ];
-const LOCAL_UNLOAD_CHOICES: [Choice; 5] = [
-    choice("Never", "Keeps the Local model loaded."),
-    choice("After 1 min", "Frees memory soonest; reloads as you speak."),
-    choice("After 5 min", "The default."),
-    choice("After 15 min", "Reloads less often."),
-    choice("After 30 min", "Holds memory longest."),
+const LOCAL_UNLOAD_CHOICES: [Choice; 3] = [
+    choice("Never", "The default. Every Recording starts at once."),
+    choice(
+        "After 30 min",
+        "Frees memory sooner; then waits about 15 s.",
+    ),
+    choice("After 1 hour", "Frees memory after a long break."),
 ];
 const LOCAL_DEVICE_CHOICES: [Choice; 3] = [
     choice(
@@ -688,7 +688,7 @@ impl SettingsRow {
                 "The shortcut that starts and stops a Recording. You can't change it here."
             }
             SettingsRow::LocalUnload => {
-                "Frees the Local model's memory when idle. It reloads when you start recording."
+                "Unloading frees about 1-2 GB of memory, but the next Recording waits about 15 s to reload."
             }
             SettingsRow::LocalDevice => {
                 "Where the Local model runs. It applies the next time the model loads."
@@ -1757,11 +1757,11 @@ impl App {
             SettingsRow::Writing => position(&WRITINGS, settings.writing),
             SettingsRow::Rendering => position(&LAYOUTS, settings.rendering),
             SettingsRow::Tone => position(&TONES, settings.tone),
-            // A hand-set value opens on the default.
+            // A hand-set value opens on the default, Never.
             SettingsRow::LocalUnload => LOCAL_UNLOADS
                 .iter()
                 .position(|after| *after == settings.local_idle_unload)
-                .unwrap_or(2),
+                .unwrap_or(0),
             SettingsRow::LocalDevice => position(&LOCAL_DEVICES, settings.local_device),
             SettingsRow::LocalModel => position(&LOCAL_MODELS, settings.local_model),
             _ => return None,
@@ -3487,7 +3487,8 @@ mod tests {
     fn the_local_unload_row_shows_never_whole_minutes_or_seconds() {
         assert_eq!(SettingsRow::LocalUnload.label(), "Local unload");
         for (after, shown) in [
-            (Some(Duration::from_secs(300)), "After 5 min"),
+            (Some(Duration::from_secs(1800)), "After 30 min"),
+            (Some(Duration::from_secs(3600)), "After 1 hour"),
             (None, "Never"),
             (Some(Duration::from_secs(90)), "After 90 s"),
         ] {
@@ -3500,11 +3501,11 @@ mod tests {
 
     #[test]
     fn the_local_unload_row_picks_a_new_timeout_and_applies_without_restart() {
-        let mut app = on_local_unload(Some(Duration::from_secs(300)));
+        let mut app = on_local_unload(Some(Duration::from_secs(3600)));
         assert!(press(&mut app, KeyCode::Enter, 0).is_empty());
         assert!(matches!(
             app.prompt,
-            Some(Prompt::Choice { row: SettingsRow::LocalUnload, picked }) if LOCAL_UNLOADS[picked] == Some(Duration::from_secs(300))
+            Some(Prompt::Choice { row: SettingsRow::LocalUnload, picked }) if LOCAL_UNLOADS[picked] == Some(Duration::from_secs(3600))
         ));
         for _ in 0..5 {
             let _ = press(&mut app, KeyCode::Up, 0);
@@ -3528,7 +3529,7 @@ mod tests {
         assert!(
             matches!(
                 effects.as_slice(),
-                [Effect::Job(Job::SetLocalIdleUnload(Some(after)))] if after.as_secs() == 300
+                [Effect::Job(Job::SetLocalIdleUnload(None))]
             ),
             "{effects:?}"
         );

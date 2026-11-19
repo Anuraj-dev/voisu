@@ -569,7 +569,7 @@ mod tests {
         assert_eq!(lines[11], "   Groq key      Works");
         assert_eq!(lines[12], "   Deepgram key  Can't reach it");
         assert_eq!(lines[13], "   Trigger Key   Not bound");
-        assert_eq!(lines[14], "   Local unload  After 5 min");
+        assert_eq!(lines[14], "   Local unload  Never");
         assert_eq!(lines[15], "   Local device  Auto");
         assert_eq!(lines[16], "   Local model   Auto");
         assert_eq!(lines[17], "   Update check  On");
@@ -689,7 +689,7 @@ mod tests {
                 "    Local  Private. Stays on this computer."
             )
         );
-        assert_eq!(lines[14], beside("   Local unload  After 5 min", ""));
+        assert_eq!(lines[14], beside("   Local unload  Never", ""));
         assert_eq!(lines[15], beside("   Local device  Auto", ""));
         assert_eq!(lines[16], beside("   Local model   Auto", ""));
         assert_eq!(lines[17], beside("   Update check  On", ""));

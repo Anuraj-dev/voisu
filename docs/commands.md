@@ -10,7 +10,7 @@
 | `voisu setup` | Set up step by step: Cloud or Local, keys or Consented Install, Trigger Key |
 | `voisu engine [cloud\|local]` | Transcribe online with Cloud, or on this computer with an installed Local model |
 | `voisu local remove [--yes]` | Remove a Consented Install. `--yes` is required when stdin is not a terminal |
-| `voisu local-unload [off\|SECONDS]` | Free an idle Local model's memory after this long (default 300, from 30 to 86400; `off` or `never` keeps it loaded; one already unloaded reloads at the next Recording). Linux, see [Local unload](linux.md#local-unload) |
+| `voisu local-unload [off\|SECONDS]` | Free an idle Local model's memory after this long (default never, from 30 to 86400 seconds; `off` or `never` keeps it loaded; one already unloaded reloads at the next Recording). Linux, see [Local unload](linux.md#local-unload) |
 | `voisu local-device [auto\|gpu\|cpu]` | Where the whisper.cpp Local model runs: `auto` (default) and `gpu` use the GPU through Vulkan, `cpu` runs it on the processor. Voisu never switches to the CPU on its own. Linux |
 | `voisu local-model [auto\|accurate\|fast]` | Which Local model runs: `accurate` (distil-large-v3.5), `fast` (small.en, about a third of the size, for the CPU), or `auto` (default: Accurate on a GPU, Fast on the CPU). A model that is not installed downloads only after you agree, and replaces the installed one. Linux, see [Local model](linux.md#local-model) |
 | `voisu key set` / `key check <groq\|deepgram>` | Save or check a Groq or Deepgram key (key on stdin) |
