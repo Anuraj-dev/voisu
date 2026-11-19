@@ -414,9 +414,9 @@ fn local_unload(after: Option<Option<std::time::Duration>>) -> ExitCode {
     use voisu_app::config::{local_idle_unload_label, set_local_idle_unload};
     let meaning = |after: Option<std::time::Duration>| {
         if after.is_some() {
-            "an idle Local model frees its memory and reloads when you start recording"
+            "an idle Local model frees about 1-2 GB of memory; the next Recording then waits about 15 s while it reloads"
         } else {
-            "the Local model stays loaded until Voisu stops or you choose Cloud; one already unloaded loads at your next Recording"
+            "the Local model stays loaded, so every Recording starts at once; it holds about 1-2 GB of memory until Voisu stops or you choose Cloud"
         }
     };
     let Some(after) = after else {
