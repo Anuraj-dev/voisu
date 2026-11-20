@@ -7,6 +7,7 @@
 // frames.
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { startsDrag } from './press.js';
 
 // Motion from the Linux overlay (voisu-overlay.rs), on the pill's thin
 // sound bars: many 2 px lines so the row reads as a fine waveform.
@@ -75,6 +76,9 @@ let scale = 1;
 let anchor = { x: 0.5, y: 0.5 };
 // Settings' "Move overlay": idle bars in a dashed ring, and draggable.
 let moving = false;
+// Which move mode is on (overlay.rs `Presenter::move_id`): ✓ and ✗ name
+// it, so one that lands after that move ended cannot finish the next.
+let moveId = null;
 
 function fitScale() {
   const next = window.innerWidth / BASE_WIDTH;
@@ -321,8 +325,7 @@ function sendDrag(start) {
 }
 
 capsule.addEventListener('pointerdown', (event) => {
-  // A press on ✓ or ✗ is a click, not a pick-up.
-  if (!moving || event.button !== 0 || event.target.closest('button')) return;
+  if (!startsDrag(event, moving)) return;
   event.preventDefault();
   capsule.setPointerCapture(event.pointerId);
   dragging = true;
@@ -343,9 +346,9 @@ capsule.addEventListener('lostpointercapture', endDrag);
 // error. One call at a time, so a click and a key together finish once.
 let finishing = false;
 function finishMove(save) {
-  if (!moving || finishing) return;
+  if (!moving || moveId == null || finishing) return;
   finishing = true;
-  invoke('finish_overlay_move', { save })
+  invoke('finish_overlay_move', { moveId, save })
     .catch((error) => console.warn('overlay move finish failed', error))
     .finally(() => {
       finishing = false;
@@ -360,9 +363,10 @@ for (const button of capsule.querySelectorAll('.move-button')) {
 }
 
 // Should the pill ever take the keyboard, Enter saves and Esc cancels, as in
-// Settings. Enter on a focused ✓ or ✗ is left to that button.
+// Settings. Enter on a focused ✓ or ✗ is left to that button. A key held
+// down from before arrives only as repeats, so repeats never finish.
 window.addEventListener('keydown', (event) => {
-  if (!moving || event.defaultPrevented) return;
+  if (!moving || event.defaultPrevented || event.repeat) return;
   if (event.key === 'Escape') {
     event.preventDefault();
     finishMove(false);
@@ -381,8 +385,10 @@ function applyLayout(payload) {
   if (!payload || !(payload.seq > drawnSeq)) return;
   drawnSeq = payload.seq;
   anchor = { x: fraction(payload.x), y: fraction(payload.y) };
-  place();
+  moveId = payload.moving ? (payload.move_id ?? null) : null;
+  // The move look first, so the pill is placed at the width it is drawn.
   setMoving(Boolean(payload.moving));
+  place();
   if (!moving) endDrag();
   invoke('overlay_layout_drawn', { seq: payload.seq }).catch(() => {});
 }

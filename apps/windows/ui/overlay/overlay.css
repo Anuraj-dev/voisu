@@ -164,11 +164,14 @@ body {
   display: none;
 }
 
+/* A fixed width the native side places by (overlay.rs MOVE_PILL_WIDTH), so
+   near an edge the page never shifts the pill off the anchor ✓ saves. */
 .capsule.moving {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: calc(6px * var(--s));
+  width: calc(158px * var(--s));
+  gap: calc(5px * var(--s));
   padding: 0 calc(4px * var(--s));
 }
 

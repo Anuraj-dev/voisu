@@ -33,6 +33,29 @@ const OVERLAY_LAYOUT: &str = "overlay-layout";
 /// from the window width it is given (overlay.js `BASE_WIDTH`).
 const PILL_WIDTH: f64 = 120.0;
 const PILL_HEIGHT: f64 = 32.0;
+/// The pill in move mode, ✗ and ✓ either side of the bars (overlay.css
+/// `.capsule.moving` width). Move mode places by this width, so the page
+/// never has to shift the wider pill off its anchor near an edge, and the
+/// anchor a ✓ saves is the centre the user sees.
+const MOVE_PILL_WIDTH: f64 = 158.0;
+
+/// Which pill a placement is for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Pill {
+    /// Recording, its states and the preview.
+    Plain,
+    /// Move mode, with ✗ and ✓.
+    Moving,
+}
+
+impl Pill {
+    fn width(self) -> f64 {
+        match self {
+            Self::Plain => PILL_WIDTH,
+            Self::Moving => MOVE_PILL_WIDTH,
+        }
+    }
+}
 /// Copied and Error text widen the pill up to this: two lines at most. The
 /// window is always this big (plus the glow room); the area the pill does
 /// not cover is transparent and lets clicks through.
@@ -118,6 +141,9 @@ pub struct Presenter {
     generation: u64,
     terminal_showing: bool,
     moving: bool,
+    /// Counts move modes; the current one's id while `moving`. A ✓ or ✗
+    /// carries the id it was pressed for, so a late one never ends the next.
+    move_id: u64,
     /// What is on screen is the tray preview, not a real Recording.
     previewing: bool,
 }
@@ -190,6 +216,7 @@ impl Presenter {
         self.visible = false;
         self.previewing = false;
         self.moving = true;
+        self.move_id += 1;
         true
     }
 
@@ -198,8 +225,19 @@ impl Presenter {
         std::mem::take(&mut self.moving)
     }
 
+    /// Leaves move mode `id` only: false if it already ended, even if
+    /// another move has started since.
+    pub fn end_move_for(&mut self, id: u64) -> bool {
+        self.move_id() == Some(id) && self.end_move()
+    }
+
     pub fn is_moving(&self) -> bool {
         self.moving
+    }
+
+    /// The current move mode's id, if one is on.
+    pub fn move_id(&self) -> Option<u64> {
+        self.moving.then_some(self.move_id)
     }
 
     /// Visible for a Recording in progress, not just a check mark or error
@@ -272,7 +310,7 @@ impl Area {
     /// screen, say) everything shrinks until the window fits, so the widest
     /// text stays on screen. The page scales by the window width, so it
     /// shrinks with it.
-    fn new(work: Rect, dpi_scale: f64, size: OverlaySize) -> Self {
+    fn new(work: Rect, dpi_scale: f64, size: OverlaySize, pill: Pill) -> Self {
         let width = f64::from(work.right - work.left);
         let height = f64::from(work.bottom - work.top);
         let s = (size.scale() * dpi_scale)
@@ -284,7 +322,7 @@ impl Area {
             top: f64::from(work.top),
             width,
             height,
-            inset_x: PILL_WIDTH * s / 2.0 + EDGE_MARGIN * dpi_scale,
+            inset_x: pill.width() * s / 2.0 + EDGE_MARGIN * dpi_scale,
             inset_y: PILL_HEIGHT * s / 2.0 + EDGE_MARGIN * dpi_scale,
             window_width: px(TEXT_WIDTH + 2.0 * GLOW_PAD),
             window_height: px(TEXT_HEIGHT + 2.0 * GLOW_PAD),
@@ -315,14 +353,15 @@ impl Area {
 /// DPI or taskbar position. The window, sized for the widest text, is
 /// centred on the pill and pushed back inside the work area only where it
 /// would cross an edge, so Copied and Error text grow from the pill centre
-/// and never leave the screen.
+/// and never leave the screen. The clamp keeps the whole `pill` inside.
 pub fn placement(
     work: Rect,
     dpi_scale: f64,
     size: OverlaySize,
     position: Option<OverlayPosition>,
+    pill: Pill,
 ) -> Placement {
-    let area = Area::new(work, dpi_scale, size);
+    let area = Area::new(work, dpi_scale, size, pill);
     let p = position.unwrap_or(DEFAULT_POSITION);
     let (x, y) = area.clamp(area.left + p.x * area.width, area.top + p.y * area.height);
     let (w, h) = (area.window_width, area.window_height);
@@ -356,6 +395,9 @@ pub fn placement(
 /// monitor with this work area, the pill drawn at `anchor` in it. The pill
 /// centre snaps to the centre line, and to the default top or bottom margin,
 /// within 24 px. `None` is the default spot, so Reset has nothing to undo.
+/// The clamp is the plain pill's, the one later shows place: the move
+/// pill's wider clamp would push a drop near an edge further in than it
+/// was shown.
 pub fn dropped_position(
     work: Rect,
     dpi_scale: f64,
@@ -363,7 +405,7 @@ pub fn dropped_position(
     window: Rect,
     anchor: Anchor,
 ) -> Option<OverlayPosition> {
-    let area = Area::new(work, dpi_scale, size);
+    let area = Area::new(work, dpi_scale, size, Pill::Plain);
     let (x, y) = area.clamp(
         f64::from(window.left) + anchor.x * f64::from(window.right - window.left),
         f64::from(window.top) + anchor.y * f64::from(window.bottom - window.top),
@@ -426,8 +468,9 @@ pub fn mac_placement(
     visible: MacFrame,
     size: OverlaySize,
     position: Option<OverlayPosition>,
+    pill: Pill,
 ) -> (MacFrame, Anchor) {
-    let p = placement(visible.flipped(), 1.0, size, position);
+    let p = placement(visible.flipped(), 1.0, size, position, pill);
     (MacFrame::unflipped(p.window), p.anchor)
 }
 
@@ -502,12 +545,25 @@ enum Source<'a> {
     Beside(&'a tauri::WebviewWindow),
 }
 
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+impl Source<'_> {
+    /// The pill this show draws: only move mode shows beside Settings.
+    fn pill(self) -> Pill {
+        match self {
+            Self::Typing => Pill::Plain,
+            Self::Beside(_) => Pill::Moving,
+        }
+    }
+}
+
 /// `overlay-layout` payload, also what the page pulls as it loads.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct LayoutPayload {
     x: f64,
     y: f64,
     moving: bool,
+    /// The move mode on, for the page's ✓ and ✗ to name.
+    move_id: Option<u64>,
     /// The page confirms it drew this one with [`layout_drawn`].
     seq: u64,
 }
@@ -518,7 +574,8 @@ pub struct LayoutPayload {
 #[derive(Debug)]
 struct Layout {
     anchor: Anchor,
-    moving: bool,
+    /// The move mode on, if any.
+    moving: Option<u64>,
     seq: u64,
     drawn: u64,
     /// The held show's click-through.
@@ -530,7 +587,7 @@ impl Layout {
     const fn new() -> Self {
         Self {
             anchor: Anchor { x: 0.5, y: 0.5 },
-            moving: false,
+            moving: None,
             seq: 0,
             drawn: 0,
             held: None,
@@ -539,7 +596,7 @@ impl Layout {
 
     /// Sets the layout. True when the page has yet to draw it: it changed,
     /// or the page never confirmed the current one.
-    fn set(&mut self, anchor: Anchor, moving: bool) -> bool {
+    fn set(&mut self, anchor: Anchor, moving: Option<u64>) -> bool {
         if anchor != self.anchor || moving != self.moving {
             self.anchor = anchor;
             self.moving = moving;
@@ -552,7 +609,8 @@ impl Layout {
         LayoutPayload {
             x: self.anchor.x,
             y: self.anchor.y,
-            moving: self.moving,
+            moving: self.moving.is_some(),
+            move_id: self.moving,
             seq: self.seq,
         }
     }
@@ -597,7 +655,7 @@ fn reveal(app: &AppHandle, take: impl FnOnce(&mut Layout) -> Option<bool>) {
 
 /// Tells the page the layout if it has not drawn it yet; the `seq` it was
 /// told, if so.
-fn update_layout(app: &AppHandle, anchor: Anchor, moving: bool) -> Option<u64> {
+fn update_layout(app: &AppHandle, anchor: Anchor, moving: Option<u64>) -> Option<u64> {
     let payload = {
         let mut layout = lock(&LAYOUT);
         if !layout.set(anchor, moving) {
@@ -720,7 +778,7 @@ fn apply(app: &AppHandle, step: Step) {
     match step {
         Step::Show { place } => {
             let target = place.then(|| native::target(Source::Typing)).flatten();
-            show(app, &window, target, false);
+            show(app, &window, target, None);
         }
         Step::Hide => hide(&window),
         Step::Nothing => {}
@@ -734,9 +792,9 @@ fn show(
     app: &AppHandle,
     window: &tauri::WebviewWindow,
     target: Option<(native::Frame, Anchor)>,
-    moving: bool,
+    moving: Option<u64>,
 ) {
-    let click_through = !moving;
+    let click_through = moving.is_none();
     let Some((frame, anchor)) = target else {
         // A show held for the page shows this state too when it goes ahead.
         if lock(&LAYOUT).held.is_none() {
@@ -767,9 +825,9 @@ fn hide(window: &tauri::WebviewWindow) {
 
 /// Settings' "Move overlay": shows the pill, grabbable, on the monitor that
 /// holds the Settings window. Refused while a real Recording is on screen.
-/// Returns whether move mode is on: not if Settings closed before this ran,
-/// as that close cancels it.
-pub async fn start_move(app: &AppHandle) -> Result<bool, String> {
+/// Returns the id of the move mode now on, for its ✓ or ✗ to name; `None`
+/// if Settings closed before this ran, as that close cancels it.
+pub async fn start_move(app: &AppHandle) -> Result<Option<u64>, String> {
     // Every decision is made here on the main thread, behind the overlay
     // updates already queued, from the presenter's current state.
     on_main(app, |app| {
@@ -780,12 +838,12 @@ pub async fn start_move(app: &AppHandle) -> Result<bool, String> {
             .get_webview_window(crate::SETTINGS_WINDOW)
             .filter(|settings| settings.is_visible().unwrap_or(false))
         else {
-            return Ok(false);
+            return Ok(None);
         };
         {
             let presenter = presenter(app);
-            if presenter.is_moving() {
-                return Ok(true);
+            if let Some(id) = presenter.move_id() {
+                return Ok(Some(id));
             }
             if !presenter.may_move() {
                 return Err("Finish the Recording first.".to_string());
@@ -798,30 +856,35 @@ pub async fn start_move(app: &AppHandle) -> Result<bool, String> {
         };
         // A tray preview gives way; its states still queued go stale.
         end_preview();
-        presenter(app).begin_move();
+        let id = {
+            let mut presenter = presenter(app);
+            presenter.begin_move();
+            presenter.move_id()
+        };
         tracing::info!("overlay move started");
         hide(&window);
-        show(app, &window, Some(target), true);
+        show(app, &window, Some(target), id);
         let _ = app.emit(crate::STATE_CHANGED, ());
-        Ok(true)
+        Ok(id)
     })
     .await?
 }
 
-/// The pill's ✓ (`save`) or ✗, or Enter or Esc. Hides the pill and puts
-/// the overlay back to click-through. With `save`, `store` keeps where the
-/// pill was dropped
-/// (`None` is the default spot) and the next show uses it; all on the main
-/// thread in one step, so a Recording is placed either before ✓, which
-/// it cancels, or after, at the saved spot. Returns what was stored; `None`
-/// if move mode was not on, or for ✗.
+/// The pill's ✓ (`save`) or ✗, or Enter or Esc, for move mode `id`. Hides
+/// the pill and puts the overlay back to click-through. With `save`,
+/// `store` keeps where the pill was dropped (`None` is the default spot)
+/// and the next show uses it; all on the main thread in one step, so a
+/// Recording is placed either before ✓, which it cancels, or after, at the
+/// saved spot. Returns what was stored; `None` if move mode `id` was no
+/// longer on (a later move is left alone), or for ✗.
 pub async fn finish_move(
     app: &AppHandle,
+    id: u64,
     save: bool,
     store: impl FnOnce(&AppHandle, Option<OverlayPosition>) -> Result<(), String> + Send + 'static,
 ) -> Result<Option<Option<OverlayPosition>>, String> {
     on_main(app, move |app| {
-        let ended = presenter(app).end_move();
+        let ended = presenter(app).end_move_for(id);
         let window = app.get_webview_window(OVERLAY_WINDOW);
         let anchor = lock(&LAYOUT).anchor;
         let result = conclude_move(
@@ -906,7 +969,7 @@ fn leave_move(app: &AppHandle) {
         native::set_click_through(&window);
     }
     let anchor = lock(&LAYOUT).anchor;
-    update_layout(app, anchor, false);
+    update_layout(app, anchor, None);
     let _ = app.emit(crate::STATE_CHANGED, ());
 }
 
@@ -1234,7 +1297,7 @@ mod native {
             },
         };
         let (work, dpi_scale) = work_area(monitor)?;
-        let p = placement(work, dpi_scale, size(), position());
+        let p = placement(work, dpi_scale, size(), position(), source.pill());
         Some((p.window, p.anchor))
     }
 
@@ -1408,13 +1471,19 @@ mod native {
     /// mouse pointer, or the one holding `Source::Beside`'s window; else the
     /// main screen.
     pub fn target(source: Source) -> Option<(MacFrame, Anchor)> {
+        let pill = source.pill();
         let mtm = MainThreadMarker::new()?;
         let screen = match source {
             Source::Typing => screen_at(mtm, NSEvent::mouseLocation()),
             Source::Beside(other) => ns_window(other).and_then(NSWindow::screen),
         }
         .or_else(|| NSScreen::mainScreen(mtm))?;
-        Some(mac_placement(visible_frame(&screen), size(), position()))
+        Some(mac_placement(
+            visible_frame(&screen),
+            size(),
+            position(),
+            pill,
+        ))
     }
 
     /// Where the user dropped the pill, on the screen its centre is over.
@@ -1650,7 +1719,7 @@ mod tests {
     #[test]
     fn the_default_pill_sits_top_centre_twelve_px_down_at_any_scale() {
         // 1920x1040 work area at 100%: a 336x64 window, the pill 120x32.
-        let p = placement(FULL_HD, 1.0, OverlaySize::Medium, None);
+        let p = placement(FULL_HD, 1.0, OverlaySize::Medium, None, Pill::Plain);
         assert_eq!(
             (
                 p.window.right - p.window.left,
@@ -1674,7 +1743,7 @@ mod tests {
             right: 0,
             bottom: 1440,
         };
-        let p = placement(left_monitor, 1.5, OverlaySize::Medium, None);
+        let p = placement(left_monitor, 1.5, OverlaySize::Medium, None, Pill::Plain);
         let (l, t, r, b) = pill(p, 1.5, OverlaySize::Medium);
         assert_eq!((r - l, b - t), (180.0, 48.0));
         assert_eq!(t - 60.0, 18.0, "12 logical px at 150%");
@@ -1684,7 +1753,7 @@ mod tests {
             (OverlaySize::Small, (96.0, 25.6)),
             (OverlaySize::Large, (150.0, 40.0)),
         ] {
-            let (l, t, r, b) = pill(placement(FULL_HD, 1.0, size, None), 1.0, size);
+            let (l, t, r, b) = pill(placement(FULL_HD, 1.0, size, None, Pill::Plain), 1.0, size);
             assert!(
                 (r - l - w).abs() < 1e-9 && (b - t - h).abs() < 1e-9,
                 "{size:?}"
@@ -1699,7 +1768,13 @@ mod tests {
 
     #[test]
     fn a_saved_position_is_the_pill_centre_as_fractions_of_the_work_area() {
-        let p = placement(FULL_HD, 1.0, OverlaySize::Medium, at(0.25, 0.5));
+        let p = placement(
+            FULL_HD,
+            1.0,
+            OverlaySize::Medium,
+            at(0.25, 0.5),
+            Pill::Plain,
+        );
         let (l, t, r, b) = pill(p, 1.0, OverlaySize::Medium);
         assert!(((l + r) / 2.0 - 480.0).abs() < 1e-9);
         assert!(((t + b) / 2.0 - 520.0).abs() < 1e-9);
@@ -1713,7 +1788,7 @@ mod tests {
             right: 1920 + 2880,
             bottom: 1800 - 72,
         };
-        let p = placement(laptop, 2.0, OverlaySize::Medium, at(0.25, 0.5));
+        let p = placement(laptop, 2.0, OverlaySize::Medium, at(0.25, 0.5), Pill::Plain);
         let (l, t, r, b) = pill(p, 2.0, OverlaySize::Medium);
         assert!(((l + r) / 2.0 - (1920.0 + 720.0)).abs() < 1.0);
         assert!(((t + b) / 2.0 - 864.0).abs() < 1.0);
@@ -1735,7 +1810,7 @@ mod tests {
                 ),
             ] {
                 for size in [OverlaySize::Small, OverlaySize::Medium, OverlaySize::Large] {
-                    let p = placement(work, dpi, size, position);
+                    let p = placement(work, dpi, size, position, Pill::Plain);
                     let back = dropped_position(work, dpi, size, p.window, p.anchor).unwrap();
                     let want = position.unwrap();
                     assert!(
@@ -1746,7 +1821,7 @@ mod tests {
             }
         }
         // The default spot comes back as the default: nothing to reset.
-        let p = placement(FULL_HD, 1.0, OverlaySize::Medium, None);
+        let p = placement(FULL_HD, 1.0, OverlaySize::Medium, None, Pill::Plain);
         assert_eq!(
             dropped_position(FULL_HD, 1.0, OverlaySize::Medium, p.window, p.anchor),
             None
@@ -1784,7 +1859,7 @@ mod tests {
                 let margin = 12.0 * dpi;
                 for &x in &corners {
                     for &y in &corners {
-                        let p = placement(work, dpi, size, at(x, y));
+                        let p = placement(work, dpi, size, at(x, y), Pill::Plain);
                         assert!(inside(p.window, work), "{x},{y} {work:?} {size:?}: {p:?}");
                         let (l, t, r, b) = pill(p, dpi, size);
                         let tol = 1e-6;
@@ -1799,6 +1874,69 @@ mod tests {
                             assert!((f64::from(work.bottom) - b - margin).abs() < 1e-6);
                         }
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn at_an_edge_the_move_pill_is_drawn_on_its_anchor_and_check_saves_that_spot() {
+        // The page (overlay.js `place`) shifts a capsule that would cross the
+        // glow room, which would draw the 158 px move pill off the anchor a
+        // ✓ saves. Move-mode placement leaves room for it at every edge.
+        let monitors = [
+            (FULL_HD, 1.0),
+            (
+                Rect {
+                    left: 62,
+                    top: 0,
+                    right: 1920,
+                    bottom: 1080,
+                },
+                1.25,
+            ),
+            (
+                Rect {
+                    left: 200,
+                    top: -900,
+                    right: 1640,
+                    bottom: 0,
+                },
+                1.75,
+            ),
+        ];
+        for (work, dpi) in monitors {
+            for size in [OverlaySize::Small, OverlaySize::Medium, OverlaySize::Large] {
+                for x in [0.0, 0.02, 0.98, 1.0] {
+                    let p = placement(work, dpi, size, at(x, 0.5), Pill::Moving);
+                    let w = f64::from(p.window.right - p.window.left);
+                    let s = w / (TEXT_WIDTH + 2.0 * GLOW_PAD);
+                    let (pad, width) = (GLOW_PAD * s, MOVE_PILL_WIDTH * s);
+                    let anchor = p.anchor.x * w;
+                    let drawn = (anchor - width / 2.0).clamp(pad, w - pad - width) + width / 2.0;
+                    assert!(
+                        (drawn - anchor).abs() < 1e-6,
+                        "{x} {work:?} {dpi} {size:?}: drawn at {drawn}, anchor {anchor}"
+                    );
+                    // The whole move pill keeps the 12 px margin (native
+                    // scale: the page's differs by the window's rounding).
+                    let centre = f64::from(p.window.left) + anchor;
+                    let half = MOVE_PILL_WIDTH * size.scale() * dpi / 2.0;
+                    let margin = 12.0 * dpi;
+                    assert!(centre - half >= f64::from(work.left) + margin - 1e-6);
+                    assert!(centre + half <= f64::from(work.right) - margin + 1e-6);
+                    // ✓ without a drag saves the centre the user sees.
+                    let saved = dropped_position(work, dpi, size, p.window, p.anchor).unwrap();
+                    let saved_x =
+                        f64::from(work.left) + saved.x * f64::from(work.right - work.left);
+                    assert!(
+                        (saved_x - centre).abs() < 1e-3,
+                        "{x} {work:?} {dpi} {size:?}: saved {saved_x}, shown {centre}"
+                    );
+                    // And the next Recording draws the plain pill there.
+                    let next = placement(work, dpi, size, Some(saved), Pill::Plain);
+                    let (l, _, r, _) = pill(next, dpi, size);
+                    assert!(((l + r) / 2.0 - centre).abs() < 1e-3);
                 }
             }
         }
@@ -1841,7 +1979,7 @@ mod tests {
                 ),
             ] {
                 let size = OverlaySize::Large;
-                let p = placement(work, dpi, size, position);
+                let p = placement(work, dpi, size, position, Pill::Plain);
                 assert!(inside(p.window, work), "{position:?} {work:?}");
                 let (w, h) = (
                     f64::from(p.window.right - p.window.left),
@@ -1875,7 +2013,7 @@ mod tests {
             right: 200,
             bottom: 50,
         };
-        let p = placement(tiny, 1.0, OverlaySize::Medium, at(1.0, 1.0));
+        let p = placement(tiny, 1.0, OverlaySize::Medium, at(1.0, 1.0), Pill::Plain);
         assert_eq!(p.window.left + p.window.right, 200);
     }
 
@@ -1934,8 +2072,9 @@ mod tests {
             bottom: 830,
         };
         for position in [None, at(0.3, 0.8)] {
-            let (frame, anchor) = mac_placement(visible, OverlaySize::Medium, position);
-            let windows = placement(work, 1.0, OverlaySize::Medium, position);
+            let (frame, anchor) =
+                mac_placement(visible, OverlaySize::Medium, position, Pill::Plain);
+            let windows = placement(work, 1.0, OverlaySize::Medium, position, Pill::Plain);
             assert_eq!(
                 frame.width,
                 f64::from(windows.window.right - windows.window.left)
@@ -1958,7 +2097,7 @@ mod tests {
             }
         }
         // A screen to the left of and below the main one keeps its offset.
-        let (main, _) = mac_placement(visible, OverlaySize::Medium, None);
+        let (main, _) = mac_placement(visible, OverlaySize::Medium, None, Pill::Plain);
         let (side, _) = mac_placement(
             MacFrame {
                 x: -1920.0,
@@ -1967,6 +2106,7 @@ mod tests {
             },
             OverlaySize::Medium,
             None,
+            Pill::Plain,
         );
         assert_eq!(side.x - main.x, -1920.0);
         assert_eq!(side.y - main.y, -370.0);
@@ -2132,6 +2272,75 @@ mod tests {
         );
     }
 
+    /// A finish for move `id` (`save` for ✓ or Enter), as `finish_move`
+    /// does it in one main-thread call.
+    fn finish(
+        presenter: &mut Presenter,
+        id: u64,
+        save: bool,
+        spot: Option<OverlayPosition>,
+        stored: &mut Vec<Option<OverlayPosition>>,
+    ) -> Result<Option<Option<OverlayPosition>>, String> {
+        let ended = presenter.end_move_for(id);
+        conclude_move(
+            ended,
+            save,
+            || Some(spot),
+            |d| {
+                stored.push(d);
+                Ok(())
+            },
+        )
+    }
+
+    /// The pill and Settings each send a finish, and either can land late.
+    /// It names the move it was pressed for, so a late one for move A never
+    /// ends move B.
+    #[test]
+    fn a_late_finish_for_an_earlier_move_leaves_the_next_one_on() {
+        let spot = Some(OverlayPosition { x: 0.2, y: 0.6 });
+        let mut stored = Vec::new();
+        let mut presenter = Presenter::default();
+        assert_eq!(presenter.move_id(), None);
+
+        // ✓ on the pill ends move A.
+        presenter.begin_move();
+        let a = presenter.move_id().unwrap();
+        assert_eq!(
+            finish(&mut presenter, a, true, spot, &mut stored),
+            Ok(Some(spot))
+        );
+        // Settings starts move B before A's Esc from Settings lands.
+        presenter.begin_move();
+        let b = presenter.move_id().unwrap();
+        assert_ne!(a, b);
+        assert_eq!(
+            finish(&mut presenter, a, false, spot, &mut stored),
+            Ok(None)
+        );
+        assert_eq!(finish(&mut presenter, a, true, spot, &mut stored), Ok(None));
+        assert_eq!(presenter.move_id(), Some(b), "B is still on");
+        assert_eq!(stored, [spot], "nothing more stored");
+
+        // B's own ✗ ends it.
+        assert_eq!(
+            finish(&mut presenter, b, false, spot, &mut stored),
+            Ok(None)
+        );
+        assert_eq!(presenter.move_id(), None);
+
+        // A Recording ends move C; a ✓ for C after that stores nothing,
+        // and the id is not reused by the move after.
+        presenter.begin_move();
+        let c = presenter.move_id().unwrap();
+        presenter.on_state(RecordingState::Recording);
+        assert_eq!(finish(&mut presenter, c, true, spot, &mut stored), Ok(None));
+        presenter.on_state(RecordingState::Idle);
+        presenter.begin_move();
+        assert_ne!(presenter.move_id(), Some(c));
+        assert_eq!(stored, [spot]);
+    }
+
     #[test]
     fn a_drop_that_cannot_be_read_or_stored_says_so() {
         let mut stored = Vec::new();
@@ -2153,25 +2362,25 @@ mod tests {
     fn a_show_waits_for_the_page_to_draw_a_new_layout() {
         let mut layout = Layout::new();
         let centre = Anchor { x: 0.5, y: 0.5 };
-        assert!(!layout.set(centre, false), "the page starts on this one");
+        assert!(!layout.set(centre, None), "the page starts on this one");
 
         let edge = Anchor { x: 0.9, y: 0.2 };
-        assert!(layout.set(edge, false), "a new layout to draw");
+        assert!(layout.set(edge, None), "a new layout to draw");
         let seq = layout.payload().seq;
         layout.held = Some(true);
         assert_eq!(layout.drawn(seq - 1), None, "an older draw holds it");
         assert_eq!(layout.drawn(seq), Some(true), "drawn: the show goes ahead");
         assert_eq!(layout.expire(seq), None, "and only once");
-        assert!(!layout.set(edge, false), "already drawn: show at once");
+        assert!(!layout.set(edge, None), "already drawn: show at once");
 
         // Not drawn in time: the wait runs out and the show goes ahead.
-        assert!(layout.set(edge, true));
+        assert!(layout.set(edge, Some(1)));
         let seq = layout.payload().seq;
         layout.held = Some(false);
         assert_eq!(layout.expire(seq - 1), None);
         assert_eq!(layout.expire(seq), Some(false));
         // The same layout again: still not confirmed, so it waits again.
-        assert!(layout.set(edge, true));
+        assert!(layout.set(edge, Some(1)));
         assert_eq!(layout.payload().seq, seq, "unchanged, so no new seq");
     }
 

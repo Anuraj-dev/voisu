@@ -23,7 +23,7 @@ async function drive() {
   // `?x=&y=` puts the pill elsewhere in the window, as near a screen edge.
   const x = Number(params.get('x') ?? 0.5);
   const y = Number(params.get('y') ?? 0.5);
-  emit('overlay-layout', { x, y, moving: name === 'moving', seq: 1 });
+  emit('overlay-layout', { x, y, moving: name === 'moving', move_id: name === 'moving' ? 1 : null, seq: 1 });
   for (const payload of STATES[name] ?? []) emit('recording-state', payload);
   // Done, Copied and Error clear themselves; keep them up for a screenshot.
   if (name === 'done' || name === 'copied' || name === 'error') {

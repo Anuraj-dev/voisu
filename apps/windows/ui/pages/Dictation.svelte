@@ -90,19 +90,25 @@
   }
 
   // The latest start, so a cancel on leaving the page goes after it.
-  let moveRequest = Promise.resolve();
+  let moveRequest = Promise.resolve(null);
+  // The move mode that start opened (null if none). A finish names it, so
+  // one that lands after the pill's ✓ or ✗ cannot end a later move.
+  let moveId = null;
 
   const startMove = () =>
     positionAction(async () => {
       moveRequest = invoke('start_overlay_move');
-      ui.app.overlayMoving = await moveRequest;
+      moveId = (await moveRequest) ?? null;
+      ui.app.overlayMoving = moveId != null;
     }, 'Could not show the overlay.');
 
   // Enter (`save`) or Esc here, like the pill's own ✓ and ✗.
   const finishMove = (save) =>
     positionAction(async () => {
-      ui.app.overlayPosition = await invoke('finish_overlay_move', { save });
+      if (moveId == null) return;
+      ui.app.overlayPosition = await invoke('finish_overlay_move', { moveId, save });
       ui.app.overlayMoving = false;
+      moveId = null;
     }, 'Could not save the overlay position.');
 
   const resetPosition = () =>
@@ -112,10 +118,12 @@
 
   // The overlay is not meant to take focus, so its keys are heard here too:
   // Enter saves, Esc cancels. Enter on a working control is left to it (a
-  // disabled one does nothing).
+  // disabled one does nothing). Repeats never finish: Enter held on "Move
+  // overlay" would otherwise save the moment move mode starts, and a key
+  // pressed before then reaches here only as repeats.
   const CONTROLS = 'button, a, input, select, textarea, [contenteditable]';
   function onKeydown(event) {
-    if (!moving || event.defaultPrevented) return;
+    if (!moving || event.defaultPrevented || event.repeat) return;
     const control = event.target.closest?.(CONTROLS);
     if (event.key === 'Escape') {
       event.preventDefault();
@@ -149,8 +157,8 @@
   // start that lands later would otherwise leave move mode on.
   $effect(() => () => {
     moveRequest
-      .catch(() => {})
-      .then(() => invoke('finish_overlay_move', { save: false }))
+      .catch(() => null)
+      .then((id) => id != null && invoke('finish_overlay_move', { moveId: id, save: false }))
       .catch(() => {});
   });
 </script>

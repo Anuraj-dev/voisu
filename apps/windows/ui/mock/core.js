@@ -50,6 +50,7 @@ const state = {
   overlaySize: 'medium',
   overlayPosition: null,
   overlayMoving: false,
+  moveId: 0,
   boostWords: ['Voisu', 'Deepgram'],
   tone: 'formal',
   trigger: { key: DEFAULT_KEY, label: mac ? 'Ctrl+Option' : 'Ctrl+Win', warnings: [], isDefault: true },
@@ -117,18 +118,23 @@ const COMMANDS = {
   set_tone: ({ tone }) => (state.tone = tone),
   set_overlay_size: ({ size }) => (state.overlaySize = size),
   start_overlay_move: () => {
-    console.info('mock: overlay shown in move mode');
-    state.overlayMoving = true;
-    emit('state-changed', null);
-    return true;
+    if (!state.overlayMoving) {
+      console.info('mock: overlay shown in move mode');
+      state.overlayMoving = true;
+      state.moveId += 1;
+      emit('state-changed', null);
+    }
+    return state.moveId;
   },
   // The overlay page: its layout comes from the `?state=` driver.
   overlay_layout: () => null,
   overlay_layout_drawn: () => {},
   drag_overlay: () => {},
-  // Done saves a spot left of centre, as if the pill were dragged there.
-  finish_overlay_move: ({ save }) => {
-    if (save && state.overlayMoving) state.overlayPosition = { x: 0.3, y: 0.0 };
+  // ✓ saves a spot left of centre, as if the pill were dragged there. A
+  // finish for an earlier move changes nothing.
+  finish_overlay_move: ({ moveId, save }) => {
+    if (!state.overlayMoving || moveId !== state.moveId) return state.overlayPosition;
+    if (save) state.overlayPosition = { x: 0.3, y: 0.0 };
     state.overlayMoving = false;
     emit('state-changed', null);
     return state.overlayPosition;

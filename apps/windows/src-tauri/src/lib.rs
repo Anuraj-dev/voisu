@@ -338,10 +338,10 @@ fn set_overlay_size(app: AppHandle, size: OverlaySize) -> OverlaySize {
 }
 
 /// Settings' "Move overlay": the pill shows beside the window for the user
-/// to drag. True once move mode is on; false if Settings closed first. An
-/// error is the message to show.
+/// to drag. The id of the move mode now on, which its finish names; `None`
+/// if Settings closed first. An error is the message to show.
 #[tauri::command]
-async fn start_overlay_move(app: AppHandle) -> Result<bool, String> {
+async fn start_overlay_move(app: AppHandle) -> Result<Option<u64>, String> {
     overlay::start_move(&app).await
 }
 
@@ -349,13 +349,16 @@ async fn start_overlay_move(app: AppHandle) -> Result<bool, String> {
 /// or Esc keeps the old spot. Either way the overlay hides. Returns the
 /// position now in force; an error is the message to show, with the old
 /// spot kept. The call usually comes from the pill, which hides, so the
-/// error also goes to Settings as [`OVERLAY_MOVE_FAILED`].
+/// error also goes to Settings as [`OVERLAY_MOVE_FAILED`]. `move_id` is the
+/// move mode it was pressed for: a late finish for an earlier one does
+/// nothing.
 #[tauri::command]
 async fn finish_overlay_move(
     app: AppHandle,
+    move_id: u64,
     save: bool,
 ) -> Result<Option<OverlayPosition>, String> {
-    let saved = overlay::finish_move(&app, save, |app, dropped| {
+    let saved = overlay::finish_move(&app, move_id, save, |app, dropped| {
         try_update_settings(app, |settings| settings.overlay_position = dropped).map(|_| ())
     })
     .await
