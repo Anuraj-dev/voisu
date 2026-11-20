@@ -21,7 +21,10 @@ pub const DOUBLE_TAP: Duration = Duration::from_millis(400);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Action {
-    Start(u64),
+    Start {
+        id: u64,
+        hotkey_at: Instant,
+    },
     /// The Recording continues hands-free.
     HandsFree(u64),
     Stop(u64),
@@ -82,7 +85,7 @@ impl GestureMachine {
                 let id = self.next_id;
                 self.next_id += 1;
                 self.state = State::Holding { id, since: now };
-                Some(Action::Start(id))
+                Some(Action::Start { id, hotkey_at: now })
             }
             (State::Holding { id, since }, ChordSignal::Released) => {
                 if now.saturating_duration_since(since) >= MIN_HOLD {
@@ -162,7 +165,13 @@ mod tests {
     #[test]
     fn hold_records_until_release() {
         let (mut g, c) = setup();
-        assert_eq!(g.on_signal(Pressed, c.at(0)), [Action::Start(1)]);
+        assert_eq!(
+            g.on_signal(Pressed, c.at(0)),
+            [Action::Start {
+                id: 1,
+                hotkey_at: c.at(0)
+            }]
+        );
         assert!(g.armed());
         assert_eq!(g.on_signal(Released, c.at(1_500)), [Action::Stop(1)]);
         assert!(!g.armed());
@@ -214,7 +223,13 @@ mod tests {
         g.on_signal(Released, c.at(100));
         assert_eq!(
             g.on_signal(Pressed, c.at(600)),
-            [Action::Cancel(1), Action::Start(2)]
+            [
+                Action::Cancel(1),
+                Action::Start {
+                    id: 2,
+                    hotkey_at: c.at(600)
+                }
+            ]
         );
     }
 
@@ -259,6 +274,12 @@ mod tests {
         assert!(!g.armed());
         // The release of the press the engine refused is ignored.
         assert_eq!(g.on_signal(Released, c.at(2_000)), []);
-        assert_eq!(g.on_signal(Pressed, c.at(3_000)), [Action::Start(2)]);
+        assert_eq!(
+            g.on_signal(Pressed, c.at(3_000)),
+            [Action::Start {
+                id: 2,
+                hotkey_at: c.at(3_000)
+            }]
+        );
     }
 }
