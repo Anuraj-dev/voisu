@@ -28,8 +28,8 @@ commands:
   writing [clean|exact]         fix grammar and misheard words, or keep your words as spoken
   layout [plain|auto|sections]  punctuation only, organize when you speak in parts, or add headings
   tone [formal|informal]        full words, or abbreviations like btw, no final full stop
-  overlay-position [top|bottom|top-left|top-right|bottom-left|bottom-right]
-                                where the on-screen Overlay sits (Linux)
+  overlay-position [move|reset]
+                                show, drag, or reset where the on-screen Overlay sits (Linux)
   dictionary add <term>         add a word Voisu should spell your way
   dictionary remove <term>      remove a word
   dictionary list [--json]      list your words

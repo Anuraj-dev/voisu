@@ -29,7 +29,7 @@ enum CliAction {
     Writing(Option<WritingMode>),
     Layout(Option<RenderingPolicy>),
     Tone(Option<Tone>),
-    OverlayPosition(Option<voisu_app::config::OverlayPosition>),
+    OverlayPosition(OverlayPositionAction),
     DictionaryAdd(String),
     DictionaryRemove(String),
     DictionaryList { json: bool },
@@ -39,6 +39,14 @@ enum CliAction {
     Update(Vec<String>),
     Help,
     Version,
+}
+
+#[derive(Debug)]
+enum OverlayPositionAction {
+    Show,
+    Move,
+    Reset,
+    Set(voisu_app::config::OverlayPosition),
 }
 
 fn main() -> ExitCode {
@@ -650,22 +658,54 @@ fn tone_command(tone: Option<Tone>) -> ExitCode {
     }
 }
 
-/// Reads or persists where the Overlay sits. The overlay re-reads it as each
-/// Recording begins, so a change applies to the next Recording without a restart.
-fn overlay_position_command(position: Option<voisu_app::config::OverlayPosition>) -> ExitCode {
-    let Some(position) = position else {
-        println!(
-            "Overlay position: {}",
-            voisu_app::config::overlay_position().as_str()
-        );
-        return ExitCode::SUCCESS;
+/// Shows, drags, resets or sets where the Overlay sits. The overlay watches
+/// the config file, so a change moves the pill without a restart.
+fn overlay_position_command(action: OverlayPositionAction) -> ExitCode {
+    use voisu_app::config::{self, OverlayPosition};
+    use voisu_app::overlay::move_mode::{self, CancelReason, MoveOutcome};
+    let position = match action {
+        OverlayPositionAction::Show => {
+            println!("Overlay position: {}", config::overlay_position());
+            return ExitCode::SUCCESS;
+        }
+        OverlayPositionAction::Move => {
+            let outcome = move_mode::move_overlay(|| {
+                println!(
+                    "Drag the pill on screen. Click ✓ or press Enter to save; \
+                     click ✗ or press Esc to cancel."
+                );
+            });
+            return match outcome {
+                Ok(MoveOutcome::Saved(position)) => {
+                    println!("Overlay position saved at {position}.");
+                    ExitCode::SUCCESS
+                }
+                Ok(MoveOutcome::Cancelled(reason)) => {
+                    println!(
+                        "{}",
+                        match reason {
+                            CancelReason::Timeout =>
+                                "Move timed out after a minute; the Overlay stays where it was.",
+                            CancelReason::Recording => "Move cancelled: a Recording started.",
+                            CancelReason::User | CancelReason::RequesterGone =>
+                                "Move cancelled; the Overlay stays where it was.",
+                        }
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(message) => fail(1, &message),
+            };
+        }
+        OverlayPositionAction::Reset => OverlayPosition::DEFAULT,
+        OverlayPositionAction::Set(position) => position,
     };
-    match voisu_app::config::set_overlay_position(position) {
+    match config::set_overlay_position(position) {
+        Ok(_) if position == OverlayPosition::DEFAULT => {
+            println!("Overlay position reset to the bottom centre ({position}).");
+            ExitCode::SUCCESS
+        }
         Ok(_) => {
-            println!(
-                "Overlay position set to {}. It applies to your next Recording.",
-                position.as_str()
-            );
+            println!("Overlay position set to {position}.");
             ExitCode::SUCCESS
         }
         Err(message) => fail(4, &message),
@@ -867,10 +907,12 @@ fn parse_command() -> Result<CliAction, String> {
         }
         [command] if command == "tone" => Ok(CliAction::Tone(None)),
         [command, tone] if command == "tone" => Ok(CliAction::Tone(Some(parse_tone(tone)?))),
-        [command] if command == "overlay-position" => Ok(CliAction::OverlayPosition(None)),
-        [command, position] if command == "overlay-position" => Ok(CliAction::OverlayPosition(
-            Some(parse_overlay_position(position)?),
-        )),
+        [command] if command == "overlay-position" => {
+            Ok(CliAction::OverlayPosition(OverlayPositionAction::Show))
+        }
+        [command, action] if command == "overlay-position" => {
+            Ok(CliAction::OverlayPosition(parse_overlay_position(action)?))
+        }
         [dictionary, action, term] if dictionary == "dictionary" && action == "add" => {
             Ok(CliAction::DictionaryAdd(term.clone()))
         }
@@ -961,11 +1003,20 @@ fn parse_tone(value: &str) -> Result<Tone, String> {
     Tone::parse(value).ok_or_else(|| "tone must be formal or informal".to_owned())
 }
 
-fn parse_overlay_position(value: &str) -> Result<voisu_app::config::OverlayPosition, String> {
-    voisu_app::config::OverlayPosition::parse(value).ok_or_else(|| {
-        "overlay-position must be top, bottom, top-left, top-right, bottom-left, or bottom-right"
-            .to_owned()
-    })
+/// `move`, `reset`, or a spot: `X,Y` fractions of the screen such as
+/// `0.500,0.920`. The old preset words still work but are no longer listed.
+fn parse_overlay_position(value: &str) -> Result<OverlayPositionAction, String> {
+    match value {
+        "move" => Ok(OverlayPositionAction::Move),
+        "reset" => Ok(OverlayPositionAction::Reset),
+        _ => voisu_app::config::OverlayPosition::parse(value)
+            .map(OverlayPositionAction::Set)
+            .ok_or_else(|| {
+                "overlay-position takes move, reset, or a spot such as 0.500,0.920 \
+                 (fractions of the screen across and down)"
+                    .to_owned()
+            }),
+    }
 }
 
 fn parse_provider(value: &str) -> Result<Provider, String> {
@@ -998,8 +1049,8 @@ commands:
   writing [clean|exact]         fix grammar and misheard words, or keep your words as spoken
   layout [plain|auto|sections]  punctuation only, organize when you speak in parts, or add headings
   tone [formal|informal]        full words, or abbreviations like btw, no final full stop
-  overlay-position [top|bottom|top-left|top-right|bottom-left|bottom-right]
-                                where the on-screen Overlay sits (Linux)
+  overlay-position [move|reset]
+                                show, drag, or reset where the on-screen Overlay sits (Linux)
   dictionary add <term>         add a word Voisu should spell your way
   dictionary remove <term>      remove a word
   dictionary list [--json]      list your words

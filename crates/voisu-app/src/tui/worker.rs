@@ -61,6 +61,7 @@ impl Workers {
         if matches!(
             job,
             Job::CheckUpdate
+                | Job::MoveOverlay
                 | Job::SetLocalModel {
                     agreed: Some(_),
                     ..
@@ -200,10 +201,21 @@ pub fn execute(job: Job, replies: &Sender<Reply>) {
         )),
         Job::SetOverlayPosition(position) => send(applied_setting(
             config::set_overlay_position(position),
-            format!("Overlay position set to {}.", position.as_str()),
-            "It applies to your next Recording.",
+            if position == config::OverlayPosition::DEFAULT {
+                "Overlay position reset to the bottom centre.".to_owned()
+            } else {
+                format!("Overlay position set to {position}.")
+            },
+            "The pill moves there now.",
             &[Refresh::Settings],
         )),
+        Job::MoveOverlay => send(move_overlay(|| {
+            send(Reply::Applied {
+                kind: Tone::Plain,
+                text: "Drag the pill on screen. ✓ or Enter saves, ✗ or Esc cancels.".to_owned(),
+                refresh: &[],
+            });
+        })),
         Job::SetLocalModel { model, agreed } => send(set_local_model(model, agreed)),
         Job::SetUpdateCheck(on) => send(applied_setting(
             config::set_switch(config::Switch::UpdateCheck, on),
@@ -548,6 +560,35 @@ pub(crate) fn load_shortcut() -> Option<String> {
         Ok(response) if response.ok => Some(trigger_key_value(&response.message)),
         Ok(_) | Err(DaemonClientError::Failed { .. }) => Some("Unknown".to_owned()),
         Err(DaemonClientError::Unavailable | DaemonClientError::Socket(_)) => None,
+    }
+}
+
+/// Runs move mode through the same call `voisu overlay-position move` uses.
+fn move_overlay(on_moving: impl FnOnce()) -> Reply {
+    use crate::overlay::move_mode::{CancelReason, MoveOutcome};
+    let (kind, text) = match crate::overlay::move_mode::move_overlay(on_moving) {
+        Ok(MoveOutcome::Saved(position)) => (
+            Tone::Success,
+            format!("Overlay position saved at {position}."),
+        ),
+        Ok(MoveOutcome::Cancelled(CancelReason::Timeout)) => (
+            Tone::Caution,
+            "Move timed out after a minute; the pill stays where it was.".to_owned(),
+        ),
+        Ok(MoveOutcome::Cancelled(CancelReason::Recording)) => (
+            Tone::Caution,
+            "Move cancelled: a Recording started.".to_owned(),
+        ),
+        Ok(MoveOutcome::Cancelled(_)) => (
+            Tone::Plain,
+            "Move cancelled; the pill stays where it was.".to_owned(),
+        ),
+        Err(message) => (Tone::Failure, message),
+    };
+    Reply::Applied {
+        kind,
+        text,
+        refresh: &[Refresh::Settings],
     }
 }
 

@@ -10,6 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+pub mod move_mode;
+pub mod placement;
 pub mod waveform;
 
 use voisu_core::{
@@ -157,30 +159,45 @@ impl OverlayView {
 }
 
 /// Re-reads the Overlay position off the GTK thread, so showing the pill never
-/// waits on the config file. `refresh` starts a read when a Recording begins;
-/// the next ticks `take` the answer and re-anchor the surface only if it
-/// differs from what was last applied. The pill therefore appears at the last
-/// known spot and moves at most once, within a tick or two.
-#[derive(Default)]
+/// waits on the config file. `refresh` starts a read when a Recording begins
+/// or the config file changes; the next ticks `take` the answer and re-place
+/// the surface only if it differs from what was last applied. The pill
+/// therefore appears at the last known spot and moves at most once, within a
+/// tick or two. A `refresh` while a read is out queues one more read after it,
+/// so a change that lands mid-read is never missed.
 pub struct PositionWatch {
     applied: Option<crate::config::OverlayPosition>,
     pending: Option<std::sync::mpsc::Receiver<crate::config::OverlayPosition>>,
+    again: bool,
+    read: std::sync::Arc<dyn Fn() -> crate::config::OverlayPosition + Send + Sync>,
+}
+
+impl Default for PositionWatch {
+    fn default() -> Self {
+        Self::with_reader(crate::config::overlay_position)
+    }
 }
 
 impl PositionWatch {
-    /// Starts a read unless one is already out.
-    pub fn refresh(&mut self) {
-        self.refresh_with(crate::config::overlay_position);
+    fn with_reader(
+        read: impl Fn() -> crate::config::OverlayPosition + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            applied: None,
+            pending: None,
+            again: false,
+            read: std::sync::Arc::new(read),
+        }
     }
 
-    fn refresh_with(
-        &mut self,
-        read: impl FnOnce() -> crate::config::OverlayPosition + Send + 'static,
-    ) {
+    /// Starts a read, or queues one if a read is already out.
+    pub fn refresh(&mut self) {
         if self.pending.is_some() {
+            self.again = true;
             return;
         }
         let (sender, receiver) = std::sync::mpsc::channel();
+        let read = std::sync::Arc::clone(&self.read);
         // A thread that cannot start drops the sender; `take` then clears it.
         let _ = thread::Builder::new()
             .name("overlay-position".to_owned())
@@ -194,20 +211,20 @@ impl PositionWatch {
     /// applied. Never blocks.
     pub fn take(&mut self) -> Option<crate::config::OverlayPosition> {
         use std::sync::mpsc::TryRecvError;
-        match self.pending.as_ref()?.try_recv() {
-            Ok(position) => {
-                self.pending = None;
-                (self.applied != Some(position)).then(|| {
-                    self.applied = Some(position);
-                    position
-                })
-            }
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => {
-                self.pending = None;
-                None
-            }
+        let answer = match self.pending.as_ref()?.try_recv() {
+            Ok(position) => Some(position),
+            Err(TryRecvError::Empty) => return None,
+            Err(TryRecvError::Disconnected) => None,
+        };
+        self.pending = None;
+        if std::mem::take(&mut self.again) {
+            self.refresh();
         }
+        let position = answer?;
+        (self.applied != Some(position)).then(|| {
+            self.applied = Some(position);
+            position
+        })
     }
 }
 
@@ -499,42 +516,6 @@ pub fn text_pill_width(text_width: i32, glyph_width: i32) -> i32 {
 pub fn text_pill_text_width(pill_width: i32, glyph_width: i32) -> i32 {
     let gap = if glyph_width > 0 { PILL_CONTENT_GAP } else { 0 };
     (pill_width - 2 * PILL_TEXT_PAD_X - gap - glyph_width).max(1)
-}
-
-/// The Layer Shell anchors for a [`crate::config::OverlayPosition`]: each edge
-/// is `Some(margin)` when the surface is anchored to it and `None` otherwise.
-/// A surface anchored to one edge only is centred along the perpendicular one.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct OverlayEdges {
-    pub top: Option<i32>,
-    pub bottom: Option<i32>,
-    pub left: Option<i32>,
-    pub right: Option<i32>,
-}
-
-/// Margin from the top or bottom edge, in logical px.
-pub const EDGE_MARGIN_VERTICAL: i32 = 12;
-/// Margin from the left or right edge, in logical px.
-pub const EDGE_MARGIN_SIDE: i32 = 24;
-
-/// Maps a position preset to Layer Shell anchors and margins: 12 px from the
-/// top or bottom, 24 px from a side, and centred when no side is anchored.
-pub fn overlay_edges(position: crate::config::OverlayPosition) -> OverlayEdges {
-    use crate::config::OverlayPosition as P;
-    let (top, bottom, left, right) = match position {
-        P::Top => (true, false, false, false),
-        P::Bottom => (false, true, false, false),
-        P::TopLeft => (true, false, true, false),
-        P::TopRight => (true, false, false, true),
-        P::BottomLeft => (false, true, true, false),
-        P::BottomRight => (false, true, false, true),
-    };
-    OverlayEdges {
-        top: top.then_some(EDGE_MARGIN_VERTICAL),
-        bottom: bottom.then_some(EDGE_MARGIN_VERTICAL),
-        left: left.then_some(EDGE_MARGIN_SIDE),
-        right: right.then_some(EDGE_MARGIN_SIDE),
-    }
 }
 
 /// Spec floor for the edge-falloff ramp: outermost bars sit at ~45% opacity.
@@ -1298,29 +1279,6 @@ mod tests {
         FeedbackBackend, FeedbackCapabilities, SessionKind, select_feedback_backend,
     };
     use voisu_core::{DaemonState, OverlayEvent, OverlayOutcome, Response, VersionEnvelope};
-
-    #[test]
-    fn position_presets_map_to_anchors_with_12px_vertical_and_24px_side_margins() {
-        use crate::config::OverlayPosition as P;
-        let edges = |top, bottom, left, right| OverlayEdges {
-            top,
-            bottom,
-            left,
-            right,
-        };
-        let expected = [
-            (P::Top, edges(Some(12), None, None, None)),
-            (P::Bottom, edges(None, Some(12), None, None)),
-            (P::TopLeft, edges(Some(12), None, Some(24), None)),
-            (P::TopRight, edges(Some(12), None, None, Some(24))),
-            (P::BottomLeft, edges(None, Some(12), Some(24), None)),
-            (P::BottomRight, edges(None, Some(12), None, Some(24))),
-        ];
-        for (position, want) in expected {
-            assert_eq!(overlay_edges(position), want, "{position:?}");
-        }
-        assert_eq!(overlay_edges(P::default()), overlay_edges(P::Top));
-    }
 
     #[test]
     fn text_pills_widen_from_the_pill_to_320_and_never_past_it() {
@@ -2528,36 +2486,55 @@ mod tests {
     }
 
     #[test]
-    fn the_position_watch_reports_only_a_changed_position_and_never_blocks() {
+    fn the_position_watch_reports_only_changes_never_blocks_and_never_misses_one() {
         use crate::config::OverlayPosition;
+        use std::sync::{Arc, Mutex, mpsc};
+        let at = |x, y| OverlayPosition::from_fractions(x, y).unwrap();
+        let file = Arc::new(Mutex::new(OverlayPosition::DEFAULT));
+        let gate: Arc<Mutex<Option<mpsc::Receiver<()>>>> = Arc::default();
+        let mut watch = PositionWatch::with_reader({
+            let (file, gate) = (Arc::clone(&file), Arc::clone(&gate));
+            move || {
+                let position = *file.lock().unwrap();
+                if let Some(gate) = gate.lock().unwrap().take() {
+                    let _ = gate.recv();
+                }
+                position
+            }
+        });
+        // The last change reported once every read (queued ones too) is done.
         let settle = |watch: &mut PositionWatch| {
             let deadline = Instant::now() + Duration::from_secs(5);
+            let mut last = None;
             loop {
-                let answer = watch.take();
+                if let Some(position) = watch.take() {
+                    last = Some(position);
+                }
                 if watch.pending.is_none() || Instant::now() > deadline {
-                    return answer;
+                    return last;
                 }
                 thread::sleep(Duration::from_millis(2));
             }
         };
-        let mut watch = PositionWatch::default();
         assert_eq!(watch.take(), None, "nothing asked, nothing taken");
-        watch.refresh_with(|| OverlayPosition::Bottom);
-        assert_eq!(settle(&mut watch), Some(OverlayPosition::Bottom));
-        watch.refresh_with(|| OverlayPosition::Bottom);
-        assert_eq!(settle(&mut watch), None, "unchanged means no re-anchor");
-        watch.refresh_with(|| OverlayPosition::TopRight);
-        assert_eq!(settle(&mut watch), Some(OverlayPosition::TopRight));
-        // A slow read never blocks a tick, and a second ask waits its turn.
-        let (release, gate) = std::sync::mpsc::channel::<()>();
-        watch.refresh_with(move || {
-            let _ = gate.recv();
-            OverlayPosition::Top
-        });
+        watch.refresh();
+        assert_eq!(settle(&mut watch), Some(OverlayPosition::DEFAULT));
+        watch.refresh();
+        assert_eq!(settle(&mut watch), None, "unchanged means no re-place");
+        *file.lock().unwrap() = at(0.25, 0.1);
+        watch.refresh();
+        assert_eq!(settle(&mut watch), Some(at(0.25, 0.1)));
+        // A slow read never blocks a tick, and a change saved while it is out
+        // is read after it rather than dropped.
+        let (release, held) = mpsc::channel::<()>();
+        *gate.lock().unwrap() = Some(held);
+        *file.lock().unwrap() = at(0.7, 0.2);
+        watch.refresh();
         assert_eq!(watch.take(), None);
-        watch.refresh_with(|| OverlayPosition::BottomLeft);
+        *file.lock().unwrap() = at(0.9, 0.9);
+        watch.refresh();
         release.send(()).unwrap();
-        assert_eq!(settle(&mut watch), Some(OverlayPosition::Top));
+        assert_eq!(settle(&mut watch), Some(at(0.9, 0.9)));
     }
 
     #[test]

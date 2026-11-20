@@ -832,57 +832,120 @@ pub(crate) fn set_local_model_at(path: &Path, model: LocalModel) -> Result<PathB
 /// `overlay_position`: where the Linux Overlay sits on screen.
 const OVERLAY_POSITION_KEY: &str = "overlay_position";
 
-/// Where the Linux Overlay pill sits. A Wayland app cannot place itself
-/// freely, so these are the Layer Shell anchor presets;
-/// [`crate::overlay::overlay_edges`] maps each to anchors and margins.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum OverlayPosition {
-    /// Top edge, centred.
-    #[default]
-    Top,
-    Bottom,
-    TopLeft,
-    TopRight,
-    BottomLeft,
-    BottomRight,
+/// Where the Linux Overlay pill sits: the pill's centre as fractions of the
+/// output it shows on, `x` from the left edge and `y` from the top, each in
+/// `0..=1`. It is stored in thousandths, so it round-trips through the config
+/// exactly and compares exactly. The overlay clamps it so the whole pill stays
+/// on the output (see [`crate::overlay::placement`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OverlayPosition {
+    x: u16,
+    y: u16,
 }
 
+/// Thousandths in one whole output.
+const OVERLAY_POSITION_SCALE: u16 = 1000;
+
 impl OverlayPosition {
-    pub const ALL: [Self; 6] = [
-        Self::Top,
-        Self::Bottom,
-        Self::TopLeft,
-        Self::TopRight,
-        Self::BottomLeft,
-        Self::BottomRight,
+    /// Bottom centre, 12 px above the bottom edge of a 1080 px output: where
+    /// the Overlay sat before it could move.
+    pub const DEFAULT: Self = Self::BOTTOM;
+    const TOP: Self = Self { x: 500, y: 26 };
+    const BOTTOM: Self = Self { x: 500, y: 974 };
+
+    /// The old preset words, kept so a config or a habit from before free
+    /// placement still works. Each maps to where that preset put the 120x32
+    /// pill on a 1920x1080 output: 12 px from the top or bottom, 24 px from a
+    /// side.
+    const PRESETS: [(&'static str, Self); 6] = [
+        ("top", Self::TOP),
+        ("bottom", Self::BOTTOM),
+        ("top-left", Self { x: 44, y: 26 }),
+        ("top-right", Self { x: 956, y: 26 }),
+        ("bottom-left", Self { x: 44, y: 974 }),
+        ("bottom-right", Self { x: 956, y: 974 }),
     ];
 
-    /// The config value and CLI word.
+    /// A position from fractions of the output, rounded to thousandths. `None`
+    /// unless both are finite and within `0..=1`.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Top => "top",
-            Self::Bottom => "bottom",
-            Self::TopLeft => "top-left",
-            Self::TopRight => "top-right",
-            Self::BottomLeft => "bottom-left",
-            Self::BottomRight => "bottom-right",
-        }
+    pub fn from_fractions(x: f64, y: f64) -> Option<Self> {
+        let thousandths = |value: f64| {
+            (value.is_finite() && (0.0..=1.0).contains(&value))
+                .then(|| (value * f64::from(OVERLAY_POSITION_SCALE)).round() as u16)
+        };
+        Some(Self {
+            x: thousandths(x)?,
+            y: thousandths(y)?,
+        })
     }
 
-    /// Parses the persisted or typed value. Anything else is `None`; readers
-    /// fall back to [`OverlayPosition::Top`].
+    /// The pill centre's distance from the left edge, as a fraction of the
+    /// output's width.
+    #[must_use]
+    pub fn x(self) -> f64 {
+        f64::from(self.x) / f64::from(OVERLAY_POSITION_SCALE)
+    }
+
+    /// The pill centre's distance from the top edge, as a fraction of the
+    /// output's height.
+    #[must_use]
+    pub fn y(self) -> f64 {
+        f64::from(self.y) / f64::from(OVERLAY_POSITION_SCALE)
+    }
+
+    /// Parses the persisted or typed value: `x,y` fractions such as
+    /// `0.500,0.974`, or one of the old preset words. Strict: no spaces, no
+    /// sign or exponent, at most three decimals, both within `0..=1`. Anything
+    /// else is `None`; readers fall back to [`OverlayPosition::DEFAULT`].
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
-        let value = value.trim().to_ascii_lowercase();
-        Self::ALL
-            .into_iter()
-            .find(|position| position.as_str() == value)
+        if let Some((_, preset)) = Self::PRESETS.iter().find(|(word, _)| *word == value) {
+            return Some(*preset);
+        }
+        let (x, y) = value.split_once(',')?;
+        Some(Self {
+            x: parse_thousandths(x)?,
+            y: parse_thousandths(y)?,
+        })
     }
+}
+
+impl Default for OverlayPosition {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// `x,y` with three decimals each: the config value and what the CLI prints.
+impl std::fmt::Display for OverlayPosition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:.3},{:.3}", self.x(), self.y())
+    }
+}
+
+/// `0`, `1`, or `0.` / `1.` followed by one to three digits, as thousandths.
+/// Over one (`1.001`) is refused.
+fn parse_thousandths(value: &str) -> Option<u16> {
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if value.ends_with('.')
+        || fraction.len() > 3
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let whole: u16 = match whole {
+        "0" => 0,
+        "1" => 1,
+        _ => return None,
+    };
+    let digits = format!("{fraction:0<3}");
+    let thousandths = whole * OVERLAY_POSITION_SCALE + digits.parse::<u16>().ok()?;
+    (thousandths <= OVERLAY_POSITION_SCALE).then_some(thousandths)
 }
 
 /// The Overlay position. Missing, unreadable or unrecognised values keep
-/// `top`. The overlay re-reads it as each Recording begins.
+/// [`OverlayPosition::DEFAULT`].
 pub fn overlay_position() -> OverlayPosition {
     overlay_position_at(&config_path())
 }
@@ -893,9 +956,10 @@ pub fn set_overlay_position(position: OverlayPosition) -> Result<PathBuf, String
 }
 
 /// Stricter than the other root keys: the value must be a TOML string, quoted
-/// on both ends, spelling a preset exactly. Anything else (a bare word, an
-/// unterminated quote, odd casing or padding) reads as the default `top`, so a
-/// hand-edit never lands the pill somewhere unintended.
+/// on both ends, spelling a position exactly (see [`OverlayPosition::parse`]).
+/// Anything else (a bare value, an unterminated quote, odd casing or padding)
+/// reads as the default, so a hand-edit never lands the pill somewhere
+/// unintended.
 pub(crate) fn overlay_position_at(path: &Path) -> OverlayPosition {
     let Ok(contents) = std::fs::read_to_string(path) else {
         return OverlayPosition::default();
@@ -909,11 +973,7 @@ pub(crate) fn overlay_position_at(path: &Path) -> OverlayPosition {
             names_key(name, OVERLAY_POSITION_KEY).then_some(value.trim())
         })
         .and_then(quoted_string)
-        .and_then(|word| {
-            OverlayPosition::ALL
-                .into_iter()
-                .find(|p| p.as_str() == word)
-        })
+        .and_then(OverlayPosition::parse)
         .unwrap_or_default()
 }
 
@@ -935,7 +995,7 @@ pub(crate) fn set_overlay_position_at(
     path: &Path,
     position: OverlayPosition,
 ) -> Result<PathBuf, String> {
-    set_root_string_at(path, OVERLAY_POSITION_KEY, position.as_str())
+    set_root_string_at(path, OVERLAY_POSITION_KEY, &position.to_string())
 }
 
 /// Writes `key = "value"` into the root table, keeping every other line.
@@ -1124,7 +1184,7 @@ pub fn config_dir() -> PathBuf {
 
 /// The resolved config path: `$XDG_CONFIG_HOME/voisu/config.toml`, falling back
 /// to `~/.config/voisu/config.toml`. Mirrors the user dictionary resolution.
-pub(crate) fn config_path() -> PathBuf {
+pub fn config_path() -> PathBuf {
     config_dir().join("config.toml")
 }
 
@@ -2935,49 +2995,102 @@ other_key = 5
     }
 
     #[test]
-    fn overlay_position_defaults_to_top_round_trips_and_fails_closed() {
+    fn overlay_position_defaults_to_bottom_centre_round_trips_and_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("voisu").join("config.toml");
-        assert_eq!(overlay_position_at(&path), OverlayPosition::Top);
+        let at = |x, y| OverlayPosition::from_fractions(x, y).unwrap();
+        assert_eq!(overlay_position_at(&path), OverlayPosition::DEFAULT);
+        assert_eq!(OverlayPosition::DEFAULT, at(0.5, 0.974));
 
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "tone = \"informal\"\n").unwrap();
-        for position in OverlayPosition::ALL {
+        for position in [at(0.25, 0.1), at(0.0, 1.0), at(1.0, 0.0), at(0.333, 0.667)] {
             set_overlay_position_at(&path, position).unwrap();
             assert_eq!(overlay_position_at(&path), position);
         }
         let contents = std::fs::read_to_string(&path).unwrap();
         assert_eq!(contents.matches("overlay_position =").count(), 1);
-        assert!(contents.contains("overlay_position = \"bottom-right\"\n"));
+        assert!(contents.contains("overlay_position = \"0.333,0.667\"\n"));
         assert!(contents.contains("tone = \"informal\""), "{contents}");
 
-        // Unknown words, bare or half-quoted values, odd casing or padding, and table-scoped keys fall back to top.
+        // Malformed, out of range, padded or bare values, and table-scoped
+        // keys, fall back to the default.
         for bad in [
             "overlay_position = \"middle\"\n",
-            "overlay_position = \"top_left\"\n",
-            "overlay_position = 3\n",
-            "overlay_position = bottom\n",
-            "overlay_position = \"bottom\n",
-            "overlay_position = bottom\"\n",
-            "overlay_position = \"bottom'\n",
+            "overlay_position = \"0.5\"\n",
+            "overlay_position = \"0.5,\"\n",
+            "overlay_position = \"0.5,0.5,0.5\"\n",
+            "overlay_position = \"1.5,0.5\"\n",
+            "overlay_position = \"1.001,0.5\"\n",
+            "overlay_position = \"-0.1,0.5\"\n",
+            "overlay_position = \"0.5, 0.5\"\n",
+            "overlay_position = \" 0.5,0.5\"\n",
+            "overlay_position = \"0.5000,0.5\"\n",
+            "overlay_position = \"0.,0.5\"\n",
+            "overlay_position = \".5,0.5\"\n",
+            "overlay_position = \"5e-1,0.5\"\n",
+            "overlay_position = \"NaN,0.5\"\n",
+            "overlay_position = 0.5,0.5\n",
+            "overlay_position = \"0.5,0.5\n",
             "overlay_position = \"Bottom\"\n",
-            "overlay_position = \" bottom \"\n",
             "overlay_position = \"\"\n",
-            "overlay_position = \"\n",
-            "[other]\noverlay_position = \"bottom\"\n",
+            "[other]\noverlay_position = \"0.2,0.2\"\n",
         ] {
             std::fs::write(&path, bad).unwrap();
-            assert_eq!(overlay_position_at(&path), OverlayPosition::Top, "{bad}");
+            assert_eq!(
+                overlay_position_at(&path),
+                OverlayPosition::DEFAULT,
+                "{bad}"
+            );
         }
-        std::fs::write(&path, "overlay_position = 'top-left'\n").unwrap();
-        assert_eq!(overlay_position_at(&path), OverlayPosition::TopLeft);
-        std::fs::write(&path, "overlay_position = \"bottom\" # lower\n").unwrap();
-        assert_eq!(overlay_position_at(&path), OverlayPosition::Bottom);
-        assert_eq!(
-            OverlayPosition::parse("top-left"),
-            Some(OverlayPosition::TopLeft)
+        std::fs::write(&path, "overlay_position = '0.1,0.9'\n").unwrap();
+        assert_eq!(overlay_position_at(&path), at(0.1, 0.9));
+        std::fs::write(&path, "overlay_position = \"1,0\" # corner\n").unwrap();
+        assert_eq!(overlay_position_at(&path), at(1.0, 0.0));
+    }
+
+    #[test]
+    fn old_overlay_presets_still_read_as_their_spots() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for (word, x, y) in [
+            ("top", 0.5, 0.026),
+            ("bottom", 0.5, 0.974),
+            ("top-left", 0.044, 0.026),
+            ("top-right", 0.956, 0.026),
+            ("bottom-left", 0.044, 0.974),
+            ("bottom-right", 0.956, 0.974),
+        ] {
+            std::fs::write(&path, format!("overlay_position = \"{word}\"\n")).unwrap();
+            assert_eq!(
+                overlay_position_at(&path),
+                OverlayPosition::from_fractions(x, y).unwrap(),
+                "{word}"
+            );
+        }
+        // A preset is rewritten as fractions the next time the spot is saved.
+        let top = OverlayPosition::parse("top").unwrap();
+        set_overlay_position_at(&path, top).unwrap();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("overlay_position = \"0.500,0.026\"")
         );
-        assert_eq!(OverlayPosition::parse("left"), None);
+    }
+
+    #[test]
+    fn overlay_fractions_must_be_finite_and_within_the_output() {
+        assert_eq!(OverlayPosition::from_fractions(f64::NAN, 0.5), None);
+        assert_eq!(OverlayPosition::from_fractions(0.5, f64::INFINITY), None);
+        assert_eq!(OverlayPosition::from_fractions(-0.01, 0.5), None);
+        assert_eq!(OverlayPosition::from_fractions(0.5, 1.01), None);
+        let rounded = OverlayPosition::from_fractions(0.12345, 0.9996).unwrap();
+        assert_eq!(rounded.to_string(), "0.123,1.000");
+        assert_eq!(
+            OverlayPosition::parse("0.5,0.25").unwrap().to_string(),
+            "0.500,0.250"
+        );
+        assert_eq!(OverlayPosition::parse("1.000,0").unwrap().x(), 1.0);
     }
 
     #[test]

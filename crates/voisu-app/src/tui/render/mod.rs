@@ -572,7 +572,7 @@ mod tests {
         assert_eq!(lines[14], "   Local unload  Never");
         assert_eq!(lines[15], "   Local device  Auto");
         assert_eq!(lines[16], "   Local model   Auto");
-        assert_eq!(lines[17], "   Overlay       Top");
+        assert_eq!(lines[17], "   Overlay       Bottom centre");
         assert_eq!(lines[18], "   Update check  On");
         // Seventeen rows and a two-value guide overfill 80x24 by three lines,
         // so the last rows scroll into view as the selection moves down.
@@ -692,7 +692,7 @@ mod tests {
         assert_eq!(lines[14], beside("   Local unload  Never", ""));
         assert_eq!(lines[15], beside("   Local device  Auto", ""));
         assert_eq!(lines[16], beside("   Local model   Auto", ""));
-        assert_eq!(lines[17], beside("   Overlay       Top", ""));
+        assert_eq!(lines[17], beside("   Overlay       Bottom centre", ""));
         assert_eq!(lines[18], beside("   Update check  On", ""));
         assert_eq!(lines[19], beside("   Star prompt   On", ""));
         assert_eq!(lines[20], beside("   Run setup", ""));
