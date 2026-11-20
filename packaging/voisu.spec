@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        1.0.0
+Version:        1.0.1
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -206,6 +206,9 @@ install -D -m 0644 packaging/icons/voisu.svg %{buildroot}%{_datadir}/icons/hicol
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Fri Nov 20 2026 Voisu maintainers <voisu@example.invalid> - 1.0.1-1
+- fix(packaging): build and ship the Local worker cleanly on Fedora and Ubuntu (#352)
+
 * Fri Nov 20 2026 Voisu maintainers <voisu@example.invalid> - 1.0.0-1
 - docs: cover every Voisu 1.0.0 feature in the README and guides (#349)
 
