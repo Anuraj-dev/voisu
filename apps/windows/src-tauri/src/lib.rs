@@ -300,6 +300,24 @@ fn update_settings(app: &AppHandle, change: impl FnOnce(&mut Settings)) -> Setti
     settings.clone()
 }
 
+/// Like `update_settings`, but all or nothing: a failed write keeps the
+/// settings as they were and returns the message to show.
+fn try_update_settings(
+    app: &AppHandle,
+    change: impl FnOnce(&mut Settings),
+) -> Result<Settings, String> {
+    let state = app.state::<AppState>();
+    let mut settings = state.settings.lock().unwrap();
+    let mut changed = settings.clone();
+    change(&mut changed);
+    if let Err(error) = changed.save(&paths::settings_file()) {
+        tracing::warn!(%error, "settings save failed");
+        return Err("Voisu couldn't save its settings file.".into());
+    }
+    *settings = changed.clone();
+    Ok(changed)
+}
+
 /// Read at each delivery, so it applies from the next Transcript.
 #[tauri::command]
 fn set_auto_paste(app: AppHandle, enabled: bool) -> bool {
@@ -317,24 +335,27 @@ fn set_overlay_size(app: AppHandle, size: OverlaySize) -> OverlaySize {
 }
 
 /// Settings' "Move overlay": the pill shows beside the window for the user
-/// to drag. An error is the message to show.
+/// to drag. True once move mode is on; false if Settings closed first. An
+/// error is the message to show.
 #[tauri::command]
-async fn start_overlay_move(app: AppHandle) -> Result<(), String> {
+async fn start_overlay_move(app: AppHandle) -> Result<bool, String> {
     overlay::start_move(&app).await
 }
 
 /// Done (`save`) stores where the pill was dropped; Cancel keeps the old
-/// spot. Either way the overlay hides. Returns the position now in force.
+/// spot. Either way the overlay hides. Returns the position now in force; an
+/// error is the message to show, with the old spot kept.
 #[tauri::command]
 async fn finish_overlay_move(
     app: AppHandle,
     save: bool,
 ) -> Result<Option<OverlayPosition>, String> {
-    if let Some(dropped) = overlay::finish_move(&app, save).await? {
+    let saved = overlay::finish_move(&app, save, |app, dropped| {
+        try_update_settings(app, |settings| settings.overlay_position = dropped).map(|_| ())
+    })
+    .await?;
+    if let Some(dropped) = saved {
         tracing::info!(?dropped, "overlay position");
-        update_settings(&app, |settings| settings.overlay_position = dropped);
-        overlay::set_position(dropped);
-        let _ = app.emit(STATE_CHANGED, ());
     }
     Ok(app
         .state::<AppState>()
@@ -344,15 +365,34 @@ async fn finish_overlay_move(
         .overlay_position)
 }
 
+/// The page's pull of where to draw the pill, for a page that loads after
+/// the last push.
+#[tauri::command]
+fn overlay_layout() -> overlay::LayoutPayload {
+    overlay::layout()
+}
+
+/// The page drew layout `seq`; a show held for it goes ahead.
+#[tauri::command]
+fn overlay_layout_drawn(app: AppHandle, seq: u64) {
+    overlay::layout_drawn(&app, seq);
+}
+
+/// A press (`start`) or a pointer move on the pill in move mode.
+#[tauri::command]
+async fn drag_overlay(app: AppHandle, start: bool) -> Result<(), String> {
+    overlay::drag(&app, start).await
+}
+
 /// Back to the default top-centre spot, shown in a preview.
 #[tauri::command]
-fn reset_overlay_position(app: AppHandle) -> Option<OverlayPosition> {
+fn reset_overlay_position(app: AppHandle) -> Result<Option<OverlayPosition>, String> {
     tracing::info!("overlay position reset");
     let position =
-        update_settings(&app, |settings| settings.overlay_position = None).overlay_position;
+        try_update_settings(&app, |settings| settings.overlay_position = None)?.overlay_position;
     overlay::set_position(position);
     overlay::preview_placement(&app);
-    position
+    Ok(position)
 }
 
 /// Returns the list as stored (normalized), so the window shows what will be
@@ -711,6 +751,9 @@ pub fn run() {
             set_overlay_size,
             start_overlay_move,
             finish_overlay_move,
+            overlay_layout,
+            overlay_layout_drawn,
+            drag_overlay,
             reset_overlay_position,
             set_boost_words,
             set_tone,
@@ -764,7 +807,7 @@ pub fn run() {
                 // Closing Settings mid-move cancels it, so the overlay never
                 // stays grabbable with no Done button in reach.
                 if window.label() == SETTINGS_WINDOW {
-                    overlay::finish_move_now(window.app_handle(), false);
+                    overlay::cancel_move(window.app_handle());
                 }
             }
         })

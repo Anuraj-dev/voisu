@@ -1,11 +1,7 @@
-// Mock of @tauri-apps/api/window for `npm run dev:mock`. Only the overlay
-// page imports it, so it also drives that page: `overlay.html?state=` picks
-// recording, handsFree, processing, done, copied, error or moving.
+// Drives the overlay page under `npm run dev:mock` (loaded by core.js):
+// `overlay.html?state=` picks recording, handsFree, processing, done,
+// copied, error or moving.
 import { emit, hasListener } from './event.js';
-
-export const getCurrentWindow = () => ({
-  startDragging: async () => console.info('mock: overlay drag'),
-});
 
 const STATES = {
   recording: [{ state: 'recording' }],
@@ -27,7 +23,7 @@ async function drive() {
   // `?x=&y=` puts the pill elsewhere in the window, as near a screen edge.
   const x = Number(params.get('x') ?? 0.5);
   const y = Number(params.get('y') ?? 0.5);
-  emit('overlay-layout', { x, y, moving: name === 'moving' });
+  emit('overlay-layout', { x, y, moving: name === 'moving', seq: 1 });
   for (const payload of STATES[name] ?? []) emit('recording-state', payload);
   // Done, Copied and Error clear themselves; keep them up for a screenshot.
   if (name === 'done' || name === 'copied' || name === 'error') {

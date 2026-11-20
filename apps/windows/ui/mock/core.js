@@ -120,7 +120,12 @@ const COMMANDS = {
     console.info('mock: overlay shown in move mode');
     state.overlayMoving = true;
     emit('state-changed', null);
+    return true;
   },
+  // The overlay page: its layout comes from the `?state=` driver.
+  overlay_layout: () => null,
+  overlay_layout_drawn: () => {},
+  drag_overlay: () => {},
   // Done saves a spot left of centre, as if the pill were dragged there.
   finish_overlay_move: ({ save }) => {
     if (save && state.overlayMoving) state.overlayPosition = { x: 0.3, y: 0.0 };
@@ -225,4 +230,6 @@ async function drive() {
     (await until(() => $('button[aria-label="Replace Groq key"]'))).click();
   }
 }
-drive();
+// The overlay page has its own driver.
+if (location.pathname.endsWith('/overlay.html')) import('./overlay.js');
+else drive();

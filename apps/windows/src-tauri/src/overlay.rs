@@ -118,6 +118,8 @@ pub struct Presenter {
     generation: u64,
     terminal_showing: bool,
     moving: bool,
+    /// What is on screen is the tray preview, not a real Recording.
+    previewing: bool,
 }
 
 impl Presenter {
@@ -138,6 +140,7 @@ impl Presenter {
         }
         // Any other new state supersedes a pending hide.
         self.generation += 1;
+        self.previewing = false;
         self.terminal_showing = state.display_time().is_some();
         if state == RecordingState::Idle {
             return (self.hide(), None);
@@ -146,6 +149,20 @@ impl Presenter {
         self.visible = true;
         let timer = self.terminal_showing.then_some(self.generation);
         (Step::Show { place }, timer)
+    }
+
+    /// [`Presenter::on_state`] for a tray preview's state: what it shows can
+    /// give way to move mode.
+    pub fn on_preview_state(&mut self, state: RecordingState) -> (Step, Option<u64>) {
+        let step = self.on_state(state);
+        self.previewing = true;
+        step
+    }
+
+    /// Move mode may start: nothing is on screen, or only a check mark,
+    /// message or preview.
+    pub fn may_move(&self) -> bool {
+        !self.is_live() || self.previewing
     }
 
     pub fn on_hide_timer(&mut self, generation: u64) -> Step {
@@ -171,6 +188,7 @@ impl Presenter {
         self.generation += 1;
         self.terminal_showing = false;
         self.visible = false;
+        self.previewing = false;
         self.moving = true;
         true
     }
@@ -249,15 +267,23 @@ struct Area {
 
 impl Area {
     /// `dpi_scale` is the monitor's effective DPI / 96. The pill, its text
-    /// room and the glow room grow with `size`; the margins do not.
+    /// room and the glow room grow with `size`; the margins do not. On a
+    /// work area too small for the window (Large at 200 % on a 1280 px
+    /// screen, say) everything shrinks until the window fits, so the widest
+    /// text stays on screen. The page scales by the window width, so it
+    /// shrinks with it.
     fn new(work: Rect, dpi_scale: f64, size: OverlaySize) -> Self {
-        let s = size.scale() * dpi_scale;
+        let width = f64::from(work.right - work.left);
+        let height = f64::from(work.bottom - work.top);
+        let s = (size.scale() * dpi_scale)
+            .min(width / (TEXT_WIDTH + 2.0 * GLOW_PAD))
+            .min(height / (TEXT_HEIGHT + 2.0 * GLOW_PAD));
         let px = |logical: f64| (logical * s).round() as i32;
         Self {
             left: f64::from(work.left),
             top: f64::from(work.top),
-            width: f64::from(work.right - work.left),
-            height: f64::from(work.bottom - work.top),
+            width,
+            height,
             inset_x: PILL_WIDTH * s / 2.0 + EDGE_MARGIN * dpi_scale,
             inset_y: PILL_HEIGHT * s / 2.0 + EDGE_MARGIN * dpi_scale,
             window_width: px(TEXT_WIDTH + 2.0 * GLOW_PAD),
@@ -441,9 +467,11 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// next Recording.
 static SIZE: Mutex<OverlaySize> = Mutex::new(OverlaySize::Medium);
 static POSITION: Mutex<Option<OverlayPosition>> = Mutex::new(None);
-/// Where the pill was last drawn in the window. Done reads it to find the
-/// pill centre in the dragged window.
-static ANCHOR: Mutex<Anchor> = Mutex::new(Anchor { x: 0.5, y: 0.5 });
+/// Where the page draws the pill. Main thread only, except the page's pull.
+static LAYOUT: Mutex<Layout> = Mutex::new(Layout::new());
+/// How long a placed show waits for the page to draw the new layout before
+/// it shows anyway (a page still loading, say).
+const LAYOUT_WAIT: Duration = Duration::from_millis(150);
 
 pub fn set_size(size: OverlaySize) {
     *lock(&SIZE) = size;
@@ -474,22 +502,112 @@ enum Source<'a> {
     Beside(&'a tauri::WebviewWindow),
 }
 
-/// `overlay-layout` payload.
-#[derive(Clone, Serialize)]
-struct LayoutPayload {
+/// `overlay-layout` payload, also what the page pulls as it loads.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct LayoutPayload {
     x: f64,
     y: f64,
     moving: bool,
+    /// The page confirms it drew this one with [`layout_drawn`].
+    seq: u64,
 }
 
-fn emit_layout(app: &AppHandle, moving: bool) {
-    let anchor = *lock(&ANCHOR);
-    let payload = LayoutPayload {
-        x: anchor.x,
-        y: anchor.y,
-        moving,
+/// What the page was told about where to draw the pill, and a placed show
+/// held until the page has drawn it there, so the window never appears
+/// with the pill at its last spot.
+#[derive(Debug)]
+struct Layout {
+    anchor: Anchor,
+    moving: bool,
+    seq: u64,
+    drawn: u64,
+    /// The held show's click-through.
+    held: Option<bool>,
+}
+
+impl Layout {
+    /// The page starts with the pill centred and the move look off.
+    const fn new() -> Self {
+        Self {
+            anchor: Anchor { x: 0.5, y: 0.5 },
+            moving: false,
+            seq: 0,
+            drawn: 0,
+            held: None,
+        }
+    }
+
+    /// Sets the layout. True when the page has yet to draw it: it changed,
+    /// or the page never confirmed the current one.
+    fn set(&mut self, anchor: Anchor, moving: bool) -> bool {
+        if anchor != self.anchor || moving != self.moving {
+            self.anchor = anchor;
+            self.moving = moving;
+            self.seq += 1;
+        }
+        self.drawn != self.seq
+    }
+
+    fn payload(&self) -> LayoutPayload {
+        LayoutPayload {
+            x: self.anchor.x,
+            y: self.anchor.y,
+            moving: self.moving,
+            seq: self.seq,
+        }
+    }
+
+    /// The page drew `seq`: a show held for it goes ahead.
+    fn drawn(&mut self, seq: u64) -> Option<bool> {
+        if seq != self.seq {
+            return None;
+        }
+        self.drawn = seq;
+        self.held.take()
+    }
+
+    /// The wait for `seq` ran out: a show still held for it goes ahead.
+    fn expire(&mut self, seq: u64) -> Option<bool> {
+        if seq == self.seq {
+            self.held.take()
+        } else {
+            None
+        }
+    }
+}
+
+/// The current layout, for the page to pull as it loads: an
+/// `overlay-layout` sent before its listener existed is lost.
+pub fn layout() -> LayoutPayload {
+    lock(&LAYOUT).payload()
+}
+
+/// The page drew layout `seq`: shows the window if it was waiting for that.
+pub fn layout_drawn(app: &AppHandle, seq: u64) {
+    on_main_thread(app, move |app| reveal(app, |layout| layout.drawn(seq)));
+}
+
+/// Main thread only.
+fn reveal(app: &AppHandle, take: impl FnOnce(&mut Layout) -> Option<bool>) {
+    let held = take(&mut lock(&LAYOUT));
+    if let (Some(click_through), Some(window)) = (held, app.get_webview_window(OVERLAY_WINDOW)) {
+        native::show(&window, click_through);
+    }
+}
+
+/// Tells the page the layout if it has not drawn it yet; the `seq` it was
+/// told, if so.
+fn update_layout(app: &AppHandle, anchor: Anchor, moving: bool) -> Option<u64> {
+    let payload = {
+        let mut layout = lock(&LAYOUT);
+        if !layout.set(anchor, moving) {
+            return None;
+        }
+        layout.payload()
     };
+    let seq = payload.seq;
     let _ = app.emit_to(OVERLAY_WINDOW, OVERLAY_LAYOUT, payload);
+    Some(seq)
 }
 
 /// The app's one [`Presenter`]. It is only touched on the main thread, so
@@ -524,10 +642,12 @@ pub fn init(app: &AppHandle) -> tauri::Result<()> {
     // mode lifts only the native bit (see `native::show`).
     window.set_ignore_cursor_events(true)?;
 
+    // Real Recordings only: the preview's states reach the presenter tagged
+    // (see `play_preview`).
     let handle = app.clone();
     app.listen(RECORDING_STATE, move |event| {
         match serde_json::from_str::<RecordingStatePayload>(event.payload()) {
-            Ok(payload) => on_main_thread(&handle, move |app| on_state(app, payload.state)),
+            Ok(payload) => on_main_thread(&handle, move |app| on_state(app, payload.state, false)),
             Err(error) => tracing::warn!(%error, "overlay ignored a recording-state payload"),
         }
     });
@@ -559,11 +679,16 @@ async fn on_main<T: Send + 'static>(
     receive.await.map_err(|error| error.to_string())
 }
 
-fn on_state(app: &AppHandle, state: RecordingState) {
+/// `preview`: the state comes from the tray preview.
+fn on_state(app: &AppHandle, state: RecordingState, preview: bool) {
     let (step, timer, move_cancelled) = {
         let mut presenter = presenter(app);
         let was_moving = presenter.is_moving();
-        let (step, timer) = presenter.on_state(state);
+        let (step, timer) = if preview {
+            presenter.on_preview_state(state)
+        } else {
+            presenter.on_state(state)
+        };
         (step, timer, was_moving && !presenter.is_moving())
     };
     if move_cancelled {
@@ -593,86 +718,194 @@ fn apply(app: &AppHandle, step: Step) {
         return;
     };
     match step {
-        Step::Show { place } => show(app, &window, place.then_some(Source::Typing), false),
-        Step::Hide => native::hide(&window),
+        Step::Show { place } => {
+            let target = place.then(|| native::target(Source::Typing)).flatten();
+            show(app, &window, target, false);
+        }
+        Step::Hide => hide(&window),
         Step::Nothing => {}
     }
 }
 
-/// Shows the window, first placing it on `source`'s monitor when given. The
-/// page hears where the pill goes before the window appears. Main thread only.
-fn show(app: &AppHandle, window: &tauri::WebviewWindow, source: Option<Source>, moving: bool) {
-    let frame = source.and_then(native::target).map(|(frame, anchor)| {
-        *lock(&ANCHOR) = anchor;
-        emit_layout(app, moving);
-        frame
+/// Shows the window, first moving it to `target` when given. A move that
+/// changes where the pill sits in the window waits for the page to draw it
+/// there (or [`LAYOUT_WAIT`]). Main thread only.
+fn show(
+    app: &AppHandle,
+    window: &tauri::WebviewWindow,
+    target: Option<(native::Frame, Anchor)>,
+    moving: bool,
+) {
+    let click_through = !moving;
+    let Some((frame, anchor)) = target else {
+        // A show held for the page shows this state too when it goes ahead.
+        if lock(&LAYOUT).held.is_none() {
+            native::show(window, click_through);
+        }
+        return;
+    };
+    native::place(window, frame);
+    let Some(seq) = update_layout(app, anchor, moving) else {
+        lock(&LAYOUT).held = None;
+        return native::show(window, click_through);
+    };
+    lock(&LAYOUT).held = Some(click_through);
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(LAYOUT_WAIT);
+        on_main_thread(&app, move |app| {
+            reveal(app, |layout| layout.expire(seq));
+        });
     });
-    native::show(window, frame, !moving);
+}
+
+/// Hides the window, dropping a show still waiting for the page.
+fn hide(window: &tauri::WebviewWindow) {
+    lock(&LAYOUT).held = None;
+    native::hide(window);
 }
 
 /// Settings' "Move overlay": shows the pill, grabbable, on the monitor that
 /// holds the Settings window. Refused while a real Recording is on screen.
-pub async fn start_move(app: &AppHandle) -> Result<(), String> {
-    // A tray preview gives way. Its events already emitted are queued ahead
-    // of the work below, and it emits nothing after this.
-    let previewing = preview_gate().running;
-    end_preview();
-    on_main(app, move |app| {
+/// Returns whether move mode is on: not if Settings closed before this ran,
+/// as that close cancels it.
+pub async fn start_move(app: &AppHandle) -> Result<bool, String> {
+    // Every decision is made here on the main thread, behind the overlay
+    // updates already queued, from the presenter's current state.
+    on_main(app, |app| {
         let Some(window) = app.get_webview_window(OVERLAY_WINDOW) else {
             return Err("The overlay isn't available.".to_string());
         };
+        let Some(settings) = app
+            .get_webview_window(crate::SETTINGS_WINDOW)
+            .filter(|settings| settings.is_visible().unwrap_or(false))
+        else {
+            return Ok(false);
+        };
         {
-            let mut presenter = presenter(app);
+            let presenter = presenter(app);
             if presenter.is_moving() {
-                return Ok(());
+                return Ok(true);
             }
-            if presenter.is_live() && !previewing {
+            if !presenter.may_move() {
                 return Err("Finish the Recording first.".to_string());
             }
-            presenter.begin_move();
         }
+        // Fails closed: without a screen to put it on, the pill stays hidden
+        // and click-through.
+        let Some(target) = native::target(Source::Beside(&settings)) else {
+            return Err("Voisu couldn't find the screen Settings is on.".to_string());
+        };
+        // A tray preview gives way; its states still queued go stale.
+        end_preview();
+        presenter(app).begin_move();
         tracing::info!("overlay move started");
-        native::hide(&window);
-        let settings = app.get_webview_window(crate::SETTINGS_WINDOW);
-        let source = settings.as_ref().map_or(Source::Typing, Source::Beside);
-        show(app, &window, Some(source), true);
+        hide(&window);
+        show(app, &window, Some(target), true);
         let _ = app.emit(crate::STATE_CHANGED, ());
-        Ok(())
+        Ok(true)
     })
     .await?
 }
 
 /// Done (`save`) or Cancel. Hides the pill and puts the overlay back to
-/// click-through. With `save`, returns where the pill was dropped (`None` is
-/// the default spot) for the caller to store; `None` if move mode was not on.
+/// click-through. With `save`, `store` keeps where the pill was dropped
+/// (`None` is the default spot) and the next show uses it; all on the main
+/// thread in one step, so a Recording is placed either before Done, which
+/// it cancels, or after, at the saved spot. Returns what was stored; `None`
+/// if move mode was not on, or for Cancel.
 pub async fn finish_move(
     app: &AppHandle,
     save: bool,
+    store: impl FnOnce(&AppHandle, Option<OverlayPosition>) -> Result<(), String> + Send + 'static,
 ) -> Result<Option<Option<OverlayPosition>>, String> {
-    on_main(app, move |app| finish_move_now(app, save)).await
+    on_main(app, move |app| {
+        let ended = presenter(app).end_move();
+        let window = app.get_webview_window(OVERLAY_WINDOW);
+        let anchor = lock(&LAYOUT).anchor;
+        let result = conclude_move(
+            ended,
+            save,
+            || {
+                window
+                    .as_ref()
+                    .and_then(|window| native::dropped(window, anchor))
+            },
+            |dropped| {
+                store(app, dropped)?;
+                set_position(dropped);
+                Ok(())
+            },
+        );
+        if ended {
+            tracing::info!(
+                save,
+                saved = matches!(result, Ok(Some(_))),
+                "overlay move finished"
+            );
+            leave_move(app);
+        }
+        result
+    })
+    .await?
 }
 
-/// [`finish_move`] on the main thread, also used when Settings closes.
-pub fn finish_move_now(app: &AppHandle, save: bool) -> Option<Option<OverlayPosition>> {
-    if !presenter(app).end_move() {
-        return None;
+/// Done or Cancel once move mode has ended: the drop to keep, if any. A drop
+/// that cannot be read, or a store that fails, keeps the old spot and says
+/// so.
+fn conclude_move(
+    ended: bool,
+    save: bool,
+    read_drop: impl FnOnce() -> Option<Option<OverlayPosition>>,
+    store: impl FnOnce(Option<OverlayPosition>) -> Result<(), String>,
+) -> Result<Option<Option<OverlayPosition>>, String> {
+    if !(ended && save) {
+        return Ok(None);
     }
-    let dropped = app
-        .get_webview_window(OVERLAY_WINDOW)
-        .filter(|_| save)
-        .and_then(|window| native::dropped(&window, *lock(&ANCHOR)));
-    tracing::info!(save, saved = dropped.is_some(), "overlay move finished");
-    leave_move(app);
-    dropped
+    let dropped = read_drop().ok_or_else(|| {
+        "Voisu couldn't tell where the overlay was dropped, so it stays where it was.".to_string()
+    })?;
+    store(dropped)?;
+    Ok(Some(dropped))
 }
 
-/// Hidden and click-through again; Settings and the page are told.
+/// Cancels move mode when Settings closes. Main thread only.
+pub fn cancel_move(app: &AppHandle) {
+    if presenter(app).end_move() {
+        tracing::info!("overlay move cancelled: Settings closed");
+        leave_move(app);
+    }
+}
+
+/// While moving, the page reports a press (`start`) and each pointer move
+/// on the pill; the window follows the pointer. Doing it here, not with the
+/// OS move loop, keeps the overlay from taking focus and works without the
+/// press event the Mac's window drag needs.
+pub async fn drag(app: &AppHandle, start: bool) -> Result<(), String> {
+    on_main(app, move |app| {
+        if !presenter(app).is_moving() {
+            return;
+        }
+        if let Some(window) = app.get_webview_window(OVERLAY_WINDOW) {
+            native::drag(&window, start);
+        }
+    })
+    .await
+}
+
+/// Hidden and click-through again; Settings and the page are told. Focus
+/// goes back to Settings if the overlay had it.
 fn leave_move(app: &AppHandle) {
     if let Some(window) = app.get_webview_window(OVERLAY_WINDOW) {
-        native::hide(&window);
+        let settings = app
+            .get_webview_window(crate::SETTINGS_WINDOW)
+            .filter(|settings| settings.is_visible().unwrap_or(false));
+        native::release_focus(&window, settings.as_ref());
+        hide(&window);
         native::set_click_through(&window);
     }
-    emit_layout(app, false);
+    let anchor = lock(&LAYOUT).anchor;
+    update_layout(app, anchor, false);
     let _ = app.emit(crate::STATE_CHANGED, ());
 }
 
@@ -751,7 +984,11 @@ fn emit_preview<S: Serialize + Clone>(
     if !gate.is_current(token) {
         return false;
     }
-    let _ = app.emit(event, payload);
+    // To the pages only; the presenter hears preview states from
+    // `play_preview`, tagged.
+    let _ = app.emit_filter(event, payload, |target| {
+        !matches!(target, tauri::EventTarget::App)
+    });
     true
 }
 
@@ -761,7 +998,17 @@ fn play_preview(app: &AppHandle, token: u64) -> bool {
             state,
             message: None,
         };
-        emit_preview(app, token, RECORDING_STATE, payload)
+        if !emit_preview(app, token, RECORDING_STATE, payload) {
+            return false;
+        }
+        // Dropped if a real Recording or move mode ended the preview first,
+        // so a stale preview state can never end move mode or pose as one.
+        on_main_thread(app, move |app| {
+            if preview_gate().generation == token {
+                on_state(app, state, true);
+            }
+        });
+        true
     };
     if !state(RecordingState::Recording) {
         return false;
@@ -831,49 +1078,94 @@ mod native {
     use windows::Win32::UI::WindowsAndMessaging::{
         GWL_EXSTYLE, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect,
         HWND_TOPMOST, LWA_ALPHA, SW_HIDE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-        SWP_NOZORDER, SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos,
-        ShowWindow, WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-        WS_EX_TRANSPARENT,
+        SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow, SetLayeredWindowAttributes,
+        SetWindowLongPtrW, SetWindowPos, ShowWindow, WS_EX_APPWINDOW, WS_EX_LAYERED,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
     };
 
-    use super::{Anchor, Rect, Source, dropped_position, placement, position, size};
+    use std::sync::Mutex;
+
+    use super::{Anchor, Rect, Source, dropped_position, lock, placement, position, size};
     use crate::settings::OverlayPosition;
 
-    /// Shows the window topmost without activating it, at `frame` if given.
-    /// Click-through unless in move mode.
-    pub fn show(window: &WebviewWindow, frame: Option<Rect>, click_through: bool) {
+    pub type Frame = Rect;
+
+    /// Moves and sizes the window without showing or activating it.
+    pub fn place(window: &WebviewWindow, r: Rect) {
         let Ok(hwnd) = window.hwnd() else { return };
-        assert_styles(hwnd, click_through);
+        let (x, y, w, h) = (r.left, r.top, r.right - r.left, r.bottom - r.top);
         // SAFETY: plain Win32 calls on our own live top-level window, made on
         // the thread that owns it.
         unsafe {
-            if let Some(r) = frame {
-                let (x, y, w, h) = (r.left, r.top, r.right - r.left, r.bottom - r.top);
-                // Moving onto a monitor with another DPI sends WM_DPICHANGED,
-                // which tao answers by resizing. Setting the rect a second
-                // time makes ours the final one.
+            // Moving onto a monitor with another DPI sends WM_DPICHANGED,
+            // which tao answers by resizing. Setting the rect a second time
+            // makes ours the final one.
+            for _ in 0..2 {
                 let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOACTIVATE | SWP_NOZORDER);
-                let _ = SetWindowPos(
-                    hwnd,
-                    Some(HWND_TOPMOST),
-                    x,
-                    y,
-                    w,
-                    h,
-                    SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED,
-                );
-            } else {
-                // Re-assert topmost each time so the pill rises above a
-                // fullscreen-windowed app that went topmost after us.
-                let _ = SetWindowPos(
-                    hwnd,
-                    Some(HWND_TOPMOST),
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED,
-                );
+            }
+        }
+    }
+
+    /// Shows the window topmost where it is, without activating it.
+    /// Click-through unless in move mode.
+    pub fn show(window: &WebviewWindow, click_through: bool) {
+        let Ok(hwnd) = window.hwnd() else { return };
+        assert_styles(hwnd, click_through);
+        // SAFETY: as in `place`. Topmost is re-asserted each time so the pill
+        // rises above a fullscreen-windowed app that went topmost after us.
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED,
+            );
+        }
+    }
+
+    /// The pointer's offset from the window corner, taken at the press.
+    static DRAG: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+
+    /// `start` notes where on the window the pointer pressed; after that the
+    /// window follows the pointer. `SWP_NOACTIVATE`: no OS move loop, so
+    /// nothing hands the overlay focus.
+    pub fn drag(window: &WebviewWindow, start: bool) {
+        let Ok(hwnd) = window.hwnd() else { return };
+        let mut cursor = POINT::default();
+        // SAFETY: read-only queries with valid out-pointers, then a move of
+        // our own window on its thread.
+        unsafe {
+            if GetCursorPos(&mut cursor).is_err() {
+                return;
+            }
+            let mut drag = lock(&DRAG);
+            if start {
+                let mut r = RECT::default();
+                *drag = GetWindowRect(hwnd, &mut r)
+                    .is_ok()
+                    .then(|| (cursor.x - r.left, cursor.y - r.top));
+            } else if let Some((dx, dy)) = *drag {
+                let flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE;
+                let _ = SetWindowPos(hwnd, None, cursor.x - dx, cursor.y - dy, 0, 0, flags);
+            }
+        }
+    }
+
+    /// If the overlay is the foreground window (WebView2 can take focus when
+    /// clicked), hands it back to `to`, so keys reach Settings again.
+    pub fn release_focus(window: &WebviewWindow, to: Option<&WebviewWindow>) {
+        let Ok(hwnd) = window.hwnd() else { return };
+        // SAFETY: a foreground query, and activating our own visible window
+        // while our process holds the foreground.
+        unsafe {
+            if GetForegroundWindow() != hwnd {
+                return;
+            }
+            if let Some(settings) = to.and_then(|to| to.hwnd().ok()) {
+                let _ = SetForegroundWindow(settings);
             }
         }
     }
@@ -1028,9 +1320,13 @@ mod native {
         NSEvent, NSScreen, NSStatusWindowLevel, NSWindow, NSWindowCollectionBehavior,
     };
     use objc2_foundation::{NSPoint, NSRect, NSSize};
+    use std::sync::Mutex;
+
     use tauri::WebviewWindow;
 
-    use super::{Anchor, MacFrame, Source, mac_dropped_position, mac_placement, position, size};
+    use super::{
+        Anchor, MacFrame, Source, lock, mac_dropped_position, mac_placement, position, size,
+    };
     use crate::settings::OverlayPosition;
 
     fn ns_window(window: &WebviewWindow) -> Option<&NSWindow> {
@@ -1040,7 +1336,21 @@ mod native {
         unsafe { ptr.as_ref() }
     }
 
-    pub fn show(window: &WebviewWindow, frame: Option<MacFrame>, click_through: bool) {
+    pub type Frame = MacFrame;
+
+    /// Moves and sizes the window without showing it or drawing.
+    pub fn place(window: &WebviewWindow, frame: MacFrame) {
+        if let Some(ns) = ns_window(window) {
+            let rect = NSRect::new(
+                NSPoint::new(frame.x, frame.y),
+                NSSize::new(frame.width, frame.height),
+            );
+            ns.setFrame_display(rect, false);
+        }
+    }
+
+    /// Orders the panel front where it is, without activating Voisu.
+    pub fn show(window: &WebviewWindow, click_through: bool) {
         let Some(ns) = ns_window(window) else {
             return;
         };
@@ -1053,15 +1363,32 @@ mod native {
                 | NSWindowCollectionBehavior::IgnoresCycle
                 | NSWindowCollectionBehavior::FullScreenAuxiliary,
         );
-        if let Some(frame) = frame {
-            let rect = NSRect::new(
-                NSPoint::new(frame.x, frame.y),
-                NSSize::new(frame.width, frame.height),
-            );
-            ns.setFrame_display(rect, true);
-        }
         ns.orderFrontRegardless();
     }
+
+    /// The pointer's offset from the frame origin, taken at the press.
+    static DRAG: Mutex<Option<(f64, f64)>> = Mutex::new(None);
+
+    /// `start` notes where on the frame the pointer pressed; after that the
+    /// frame follows the pointer. Read from `NSEvent::mouseLocation`, so it
+    /// needs no current event (which `performWindowDrag` does).
+    pub fn drag(window: &WebviewWindow, start: bool) {
+        let Some(ns) = ns_window(window) else {
+            return;
+        };
+        let mouse = NSEvent::mouseLocation();
+        let mut drag = lock(&DRAG);
+        if start {
+            let origin = ns.frame().origin;
+            *drag = Some((mouse.x - origin.x, mouse.y - origin.y));
+        } else if let Some((dx, dy)) = *drag {
+            ns.setFrameOrigin(NSPoint::new(mouse.x - dx, mouse.y - dy));
+        }
+    }
+
+    /// Never key: the panel is shown with `orderFrontRegardless` and its
+    /// drag does not activate it.
+    pub fn release_focus(_window: &WebviewWindow, _to: Option<&WebviewWindow>) {}
 
     pub fn hide(window: &WebviewWindow) {
         if let Some(ns) = ns_window(window) {
@@ -1146,9 +1473,17 @@ mod native {
     use super::{Anchor, Source};
     use crate::settings::OverlayPosition;
 
-    pub fn show(window: &WebviewWindow, _frame: Option<()>, _click_through: bool) {
+    pub type Frame = ();
+
+    pub fn place(_window: &WebviewWindow, _frame: ()) {}
+
+    pub fn show(window: &WebviewWindow, _click_through: bool) {
         let _ = window.show();
     }
+
+    pub fn drag(_window: &WebviewWindow, _start: bool) {}
+
+    pub fn release_focus(_window: &WebviewWindow, _to: Option<&WebviewWindow>) {}
 
     pub fn hide(window: &WebviewWindow) {
         let _ = window.hide();
@@ -1492,14 +1827,28 @@ mod tests {
                     },
                     1.5,
                 ),
+                // Large at 200 % wants an 840 px window; the work area
+                // has 760.
+                (
+                    Rect {
+                        left: 0,
+                        top: 0,
+                        right: 760,
+                        bottom: 1400,
+                    },
+                    2.0,
+                ),
             ] {
                 let size = OverlaySize::Large;
                 let p = placement(work, dpi, size, position);
-                let s = size.scale() * dpi;
+                assert!(inside(p.window, work), "{position:?} {work:?}");
                 let (w, h) = (
                     f64::from(p.window.right - p.window.left),
                     f64::from(p.window.bottom - p.window.top),
                 );
+                // The page scales everything by its window width.
+                let s = w / (TEXT_WIDTH + 2.0 * GLOW_PAD);
+                assert!(s <= size.scale() * dpi + 1e-9);
                 let pad = GLOW_PAD * s;
                 let (text_w, text_h) = (TEXT_WIDTH * s, TEXT_HEIGHT * s);
                 let centre_x = fit(p.anchor.x * w, pad + text_w / 2.0, w - pad - text_w / 2.0);
@@ -1518,7 +1867,7 @@ mod tests {
                 );
             }
         }
-        // A monitor narrower than the window: centred, not panicking.
+        // A monitor smaller than the window: it shrinks to fit, centred.
         let tiny = Rect {
             left: 0,
             top: 0,
@@ -1650,6 +1999,138 @@ mod tests {
             presenter.on_state(RecordingState::Recording).0,
             Step::Show { place: true }
         );
+    }
+
+    #[test]
+    fn move_mode_may_replace_a_preview_but_never_a_live_recording() {
+        let mut presenter = Presenter::default();
+        assert!(presenter.may_move(), "nothing on screen");
+
+        // A preview's Recording may give way.
+        presenter.on_preview_state(RecordingState::Recording);
+        assert!(presenter.is_live());
+        assert!(presenter.may_move());
+
+        // The hotkey ends the preview and a real Recording lands first: the
+        // presenter, not a flag read earlier, says no.
+        presenter.on_state(RecordingState::Recording);
+        assert!(!presenter.may_move());
+        presenter.on_state(RecordingState::Processing);
+        assert!(!presenter.may_move());
+
+        // Its check mark may give way again.
+        presenter.on_state(RecordingState::Done);
+        assert!(presenter.may_move());
+
+        // Move mode clears the preview mark, so the Recording that ends it
+        // is never taken for one.
+        presenter.on_preview_state(RecordingState::Recording);
+        assert!(presenter.begin_move());
+        presenter.on_state(RecordingState::Recording);
+        assert!(!presenter.is_moving());
+        assert!(!presenter.may_move());
+    }
+
+    /// Done's step: the presenter ends move mode, then `conclude_move`
+    /// stores the drop, as `finish_move` does in one main-thread call.
+    fn done(
+        presenter: &mut Presenter,
+        drop: Option<Option<OverlayPosition>>,
+        store: Result<(), String>,
+        stored: &mut Vec<Option<OverlayPosition>>,
+    ) -> Result<Option<Option<OverlayPosition>>, String> {
+        let ended = presenter.end_move();
+        conclude_move(
+            ended,
+            true,
+            || drop,
+            |d| {
+                stored.push(d);
+                store
+            },
+        )
+    }
+
+    #[test]
+    fn done_and_a_recording_are_one_before_the_other() {
+        let spot = Some(OverlayPosition { x: 0.3, y: 0.0 });
+        let mut stored = Vec::new();
+
+        // Done first: the drop is stored, and the Recording after it is
+        // placed afresh (at the saved spot, read at that show).
+        let mut presenter = Presenter::default();
+        presenter.begin_move();
+        assert_eq!(
+            done(&mut presenter, Some(spot), Ok(()), &mut stored),
+            Ok(Some(spot))
+        );
+        assert_eq!(stored, [spot]);
+        assert_eq!(
+            presenter.on_state(RecordingState::Recording).0,
+            Step::Show { place: true }
+        );
+
+        // Recording first: it cancelled the move, so Done stores nothing.
+        stored.clear();
+        let mut presenter = Presenter::default();
+        presenter.begin_move();
+        presenter.on_state(RecordingState::Recording);
+        assert_eq!(
+            done(&mut presenter, Some(spot), Ok(()), &mut stored),
+            Ok(None)
+        );
+        assert!(stored.is_empty());
+
+        // Cancel never stores.
+        presenter.begin_move();
+        let ended = presenter.end_move();
+        assert_eq!(
+            conclude_move(ended, false, || Some(spot), |_| unreachable!()),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn a_drop_that_cannot_be_read_or_stored_says_so() {
+        let mut stored = Vec::new();
+        let mut presenter = Presenter::default();
+        presenter.begin_move();
+        assert!(done(&mut presenter, None, Ok(()), &mut stored).is_err());
+        assert!(stored.is_empty(), "nothing stored for an unreadable drop");
+        assert!(!presenter.is_moving(), "move mode still ends");
+
+        presenter.begin_move();
+        let failed = Err("disk full".to_string());
+        assert_eq!(
+            done(&mut presenter, Some(None), failed.clone(), &mut stored),
+            Err("disk full".to_string())
+        );
+    }
+
+    #[test]
+    fn a_show_waits_for_the_page_to_draw_a_new_layout() {
+        let mut layout = Layout::new();
+        let centre = Anchor { x: 0.5, y: 0.5 };
+        assert!(!layout.set(centre, false), "the page starts on this one");
+
+        let edge = Anchor { x: 0.9, y: 0.2 };
+        assert!(layout.set(edge, false), "a new layout to draw");
+        let seq = layout.payload().seq;
+        layout.held = Some(true);
+        assert_eq!(layout.drawn(seq - 1), None, "an older draw holds it");
+        assert_eq!(layout.drawn(seq), Some(true), "drawn: the show goes ahead");
+        assert_eq!(layout.expire(seq), None, "and only once");
+        assert!(!layout.set(edge, false), "already drawn: show at once");
+
+        // Not drawn in time: the wait runs out and the show goes ahead.
+        assert!(layout.set(edge, true));
+        let seq = layout.payload().seq;
+        layout.held = Some(false);
+        assert_eq!(layout.expire(seq - 1), None);
+        assert_eq!(layout.expire(seq), Some(false));
+        // The same layout again: still not confirmed, so it waits again.
+        assert!(layout.set(edge, true));
+        assert_eq!(layout.payload().seq, seq, "unchanged, so no new seq");
     }
 
     #[test]

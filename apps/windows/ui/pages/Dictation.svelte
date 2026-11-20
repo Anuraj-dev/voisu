@@ -88,10 +88,13 @@
     }
   }
 
+  // The latest start, so a cancel on leaving the page goes after it.
+  let moveRequest = Promise.resolve();
+
   const startMove = () =>
     positionAction(async () => {
-      await invoke('start_overlay_move');
-      ui.app.overlayMoving = true;
+      moveRequest = invoke('start_overlay_move');
+      ui.app.overlayMoving = await moveRequest;
     }, 'Could not show the overlay.');
 
   // Done (`save`) or Cancel.
@@ -106,7 +109,8 @@
       ui.app.overlayPosition = await invoke('reset_overlay_position');
     }, 'Could not reset the overlay position.');
 
-  // The overlay never takes focus, so Esc is heard here.
+  // The overlay is not meant to take focus, so Esc is heard here (the
+  // overlay page cancels on Esc too, should it get the keyboard).
   function onKeydown(event) {
     if (moving && event.key === 'Escape' && !event.defaultPrevented) {
       event.preventDefault();
@@ -114,10 +118,14 @@
     }
   }
 
-  // Leaving the page while moving cancels, so the pill never stays grabbable
-  // with no Done in sight.
+  // Leaving the page cancels any move, so the pill never stays grabbable
+  // with no Done in sight. Always sent, after a start still in flight: a
+  // start that lands later would otherwise leave move mode on.
   $effect(() => () => {
-    if (ui.app.overlayMoving) invoke('finish_overlay_move', { save: false }).catch(() => {});
+    moveRequest
+      .catch(() => {})
+      .then(() => invoke('finish_overlay_move', { save: false }))
+      .catch(() => {});
   });
 </script>
 

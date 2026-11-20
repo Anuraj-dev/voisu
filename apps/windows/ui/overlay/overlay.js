@@ -1,11 +1,12 @@
 // The recording Overlay page. It listens: `recording-state` and
 // `audio-level` come from the Recording engine (or the tray's "Preview
 // overlay"), and `overlay-layout` says where the native side put the pill.
-// The one thing it sends back is a window drag, in move mode. Drawing stops
+// It sends back that it drew a layout and, in move mode, the drag and Esc.
+// Drawing stops
 // whenever the pill is idle or showing the check mark, Copied or an error,
 // so a hidden overlay costs no frames.
+import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { getCurrentWindow } from '@tauri-apps/api/window';
 
 // Motion from the Linux overlay (voisu-overlay.rs), on the pill's 9 bars.
 const BARS = 9;
@@ -289,21 +290,74 @@ window.addEventListener('resize', () => {
 // Text widens the pill and the size changes with it: re-centre on the anchor.
 new ResizeObserver(place).observe(capsule);
 
-// In move mode a press on the pill hands the drag to the OS, which moves the
-// whole window; Settings' Done then reads where the window ended up.
+// In move mode the window follows the pointer while the pill is held. The
+// native side reads the pointer itself, so this only says "pressed" and
+// "moved", one call in flight at a time. Not the OS move loop: that can hand
+// this window the keyboard, and on the Mac it needs the press event.
+let dragging = false;
+let dragBusy = false;
+let dragAgain = false;
+
+function sendDrag(start) {
+  if (dragBusy) {
+    dragAgain = true;
+    return;
+  }
+  dragBusy = true;
+  invoke('drag_overlay', { start })
+    .catch((error) => console.warn('overlay drag failed', error))
+    .finally(() => {
+      dragBusy = false;
+      if (dragAgain && dragging) {
+        dragAgain = false;
+        sendDrag(false);
+      }
+    });
+}
+
 capsule.addEventListener('pointerdown', (event) => {
   if (!moving || event.button !== 0) return;
   event.preventDefault();
-  getCurrentWindow()
-    .startDragging()
-    .catch((error) => console.warn('overlay drag failed', error));
+  capsule.setPointerCapture(event.pointerId);
+  dragging = true;
+  dragAgain = false;
+  sendDrag(true);
+});
+capsule.addEventListener('pointermove', () => {
+  if (dragging && moving) sendDrag(false);
+});
+const endDrag = () => {
+  dragging = false;
+};
+capsule.addEventListener('pointerup', endDrag);
+capsule.addEventListener('lostpointercapture', endDrag);
+
+// Should the pill ever take the keyboard, Esc still cancels the move.
+window.addEventListener('keydown', (event) => {
+  if (!moving || event.key !== 'Escape') return;
+  event.preventDefault();
+  invoke('finish_overlay_move', { save: false }).catch((error) =>
+    console.warn('overlay move cancel failed', error),
+  );
 });
 
-// Sent before each placed show, and when move mode starts or ends.
-listen('overlay-layout', ({ payload }) => {
+// Where to draw the pill, pushed before each placed show and when move mode
+// starts or ends. The native side holds a show until the page says it drew
+// the newest layout (or briefly times out), so the pill never flashes at the
+// old spot. `seq` orders pushes against the pull below.
+let drawnSeq = -1;
+function applyLayout(payload) {
+  if (!payload || !(payload.seq > drawnSeq)) return;
+  drawnSeq = payload.seq;
   anchor = { x: fraction(payload.x), y: fraction(payload.y) };
   place();
   setMoving(Boolean(payload.moving));
-});
+  if (!moving) endDrag();
+  invoke('overlay_layout_drawn', { seq: payload.seq }).catch(() => {});
+}
+listen('overlay-layout', ({ payload }) => applyLayout(payload)).then(() =>
+  // A push sent before the listener was up is caught by pulling once.
+  invoke('overlay_layout').then(applyLayout, () => {}),
+);
 listen('recording-state', ({ payload }) => setState(payload.state, payload.message));
 listen('audio-level', ({ payload }) => onLevel(payload.level));

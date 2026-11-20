@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "overlay",
-  "description": "The recording Overlay: it listens for recording-state, audio-level and overlay-layout events, and starts a window drag in move mode.",
+  "description": "The recording Overlay: it listens for recording-state, audio-level and overlay-layout events. Its move-mode drag and layout acks are app commands, which need no grant.",
   "windows": ["overlay"],
-  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten", "core:window:allow-start-dragging"]
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten"]
 }
