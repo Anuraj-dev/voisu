@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 pub mod move_mode;
 pub mod placement;
+pub mod reveal;
 pub mod waveform;
 
 use voisu_core::{
