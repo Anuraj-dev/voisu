@@ -21,33 +21,32 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          # tools/transcript-quality is a standalone workspace (own Cargo.lock
-          # and target dir); cache it alongside the root workspace.
+          # The standalone tools/transcript-quality workspace has its own target.
           workspaces: |
             .
             tools/transcript-quality
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      # One process per test, no retries (a flake fails the gate), no doctests.
       - name: Workspace suite
-        run: cargo test --workspace --locked
-      # The dpr-eval-late-retain tests are feature-gated in voisu-core
-      # (src/dpr_diagnostics.rs, tests/dpr_diagnostics.rs) and were never run
-      # by the default-feature suite above.
-      - name: dpr-eval-late-retain feature suite
-        run: cargo test -p voisu-core --features dpr-eval-late-retain --locked
-      # Standalone crate excluded from the root workspace: `cargo test
-      # --workspace` cannot see it from the root, so run it via --manifest-path.
-      - name: transcript-quality suite (--locked)
-        run: cargo test --manifest-path tools/transcript-quality/Cargo.toml --locked
-      - name: Hyprland release-gate shell suite
-        run: bash packaging/tests/hyprland-release-gate.sh
-      - name: Local ASR packaging-gate shell suite
-        run: bash packaging/tests/local-asr-release-gate.sh
-      - name: Flake gate — 3 consecutive parallel voisu-app runs
+        run: cargo nextest run --workspace --locked
+      # Two more voisu-app passes make three. A filterset keeps the workspace
+      # feature set, so these reuse the build; `-p voisu-app` would rebuild.
+      - name: Flake gate (2 more voisu-app passes)
+        run: for i in 1 2; do cargo nextest run --workspace --locked -E 'package(voisu-app)'; done
+      - name: Doctests
+        run: cargo test --doc --workspace --locked
+      # dpr-eval-late-retain code exists only under that voisu-core feature;
+      # tools/transcript-quality sits outside the root workspace.
+      - name: Feature-gated and standalone suites
         run: |
-          for i in 1 2 3; do
-            echo "::group::flake run $i"
-            cargo test -p voisu-app --locked
-            echo "::endgroup::"
-          done
+          cargo nextest run -p voisu-core --features dpr-eval-late-retain --locked
+          cargo test --manifest-path tools/transcript-quality/Cargo.toml --locked
+      - name: Packaging shell suites
+        run: |
+          bash packaging/tests/hyprland-release-gate.sh
+          bash packaging/tests/local-asr-release-gate.sh
 
   clippy:
     name: Lint gate (clippy -D warnings, default + overlay)
