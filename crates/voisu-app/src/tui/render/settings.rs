@@ -1,16 +1,18 @@
-//! Settings: one row per setting, and a guide to the selected row: its
-//! description, a note on what its value means here (Local model only), and,
-//! for a row with values, every value with one plain line and `●` on the one
-//! in effect. `↵` turns that same guide into the picker, so what you read is
-//! what you pick from.
+//! Settings: one row per setting, grouped under the headings of
+//! [`SECTIONS`], and a guide to the selected row: its description, a note on
+//! what its value means here (Local model only), and, for a row with values,
+//! every value with one plain line and `●` on the one in effect. `↵` turns
+//! that same guide into the picker, so what you read is what you pick from.
 //!
 //! From [`PANEL_FROM`] columns the guide sits in a panel to the right of the
-//! rows; narrower, it sits under them.
+//! rows; narrower, it sits under them. A blank line parts the sections when
+//! everything fits; when the list scrolls, the top line names the section the
+//! rows below it belong to.
 
 use ratatui::text::{Line, Span};
 
 use super::super::look::{Look, Tone};
-use super::super::model::{App, Prompt, SettingsRow};
+use super::super::model::{App, Prompt, SECTIONS, SettingsRow};
 use super::super::text;
 use super::{Pieces, SELECTED, UNSELECTED, single};
 
@@ -52,10 +54,7 @@ fn stacked_layout(app: &App, look: &Look, width: usize, height: usize) -> Vec<Li
     }
     below.extend(guide_lines(app, look, row, UNSELECTED, width, false));
 
-    let rows_height = SettingsRow::ALL
-        .len()
-        .min(height.saturating_sub(below.len()));
-    let mut lines = row_lines(app, look, width, rows_height);
+    let mut lines = list_lines(app, look, width, height.saturating_sub(below.len()));
     if lines.len() + 1 + below.len() <= height {
         lines.push(Line::default());
     }
@@ -87,7 +86,7 @@ fn panel_layout(app: &App, look: &Look, width: usize, height: usize) -> Vec<Line
         panel.extend(guide);
     }
 
-    let rows = row_lines(app, look, ROWS_WIDTH, SettingsRow::ALL.len().min(height));
+    let rows = list_lines(app, look, ROWS_WIDTH, height);
     let tall = rows.len().max(panel.len()).min(height);
     let mut rows = rows.into_iter();
     let mut panel = panel.into_iter();
@@ -105,37 +104,99 @@ fn panel_layout(app: &App, look: &Look, width: usize, height: usize) -> Vec<Line
         .collect()
 }
 
-/// The setting rows that fit in `height`, scrolled to keep the selection seen.
-fn row_lines(app: &App, look: &Look, width: usize, height: usize) -> Vec<Line<'static>> {
-    let start = text::window_start(app.settings_selected, height);
-    SettingsRow::ALL
+/// One line of the list: a section's heading, a blank between sections, or
+/// the row at that index of [`SettingsRow::ALL`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Item {
+    Heading(&'static str),
+    Gap,
+    Row(usize),
+}
+
+/// The list in [`SECTIONS`] order, with a blank line between sections when
+/// `gaps`.
+fn items(gaps: bool) -> Vec<Item> {
+    let mut items = Vec::new();
+    let mut index = 0;
+    for (number, section) in SECTIONS.iter().enumerate() {
+        if gaps && number > 0 {
+            items.push(Item::Gap);
+        }
+        items.push(Item::Heading(section.title));
+        for _ in section.rows {
+            items.push(Item::Row(index));
+            index += 1;
+        }
+    }
+    items
+}
+
+/// The headings and rows that fit in `height`, scrolled to keep the selection
+/// seen. Rows always line up under one label column.
+fn list_lines(app: &App, look: &Look, width: usize, height: usize) -> Vec<Line<'static>> {
+    let mut items = items(true);
+    if items.len() > height {
+        items = self::items(false);
+    }
+    let selected = app.selected_setting();
+    let at = items
         .iter()
-        .enumerate()
-        .skip(start)
-        .take(height)
-        .map(|(index, row)| {
-            let selected = index == app.settings_selected;
-            let marker = if selected { SELECTED } else { UNSELECTED };
-            let label_tone = if selected { Tone::Bold } else { Tone::Plain };
-            let (value, tone) = app.setting_value(*row);
-            let room = width.saturating_sub(UNSELECTED.len() + LABEL_WIDTH + 1);
-            let tone = if selected && tone == Tone::Plain {
-                Tone::Accent
-            } else {
-                tone
-            };
-            let label = if value.is_empty() {
-                row.label().to_owned()
-            } else {
-                format!("{:<LABEL_WIDTH$}", row.label())
-            };
-            Pieces::new(look)
-                .add(marker, label_tone)
-                .add(&label, label_tone)
-                .add(&text::fit(&value, room), tone)
-                .line()
+        .position(|item| matches!(item, Item::Row(index) if SettingsRow::ALL[*index] == selected))
+        .unwrap_or(0);
+    let start = text::window_start(at, height);
+    let mut shown: Vec<Item> = items.iter().copied().skip(start).take(height).collect();
+    // Scrolled into the middle of a section: its heading takes the top line,
+    // which is never the selected row's.
+    if start > 0
+        && start < at
+        && let Some(heading) = items[..=start]
+            .iter()
+            .rev()
+            .find(|item| matches!(item, Item::Heading(_)))
+    {
+        shown[0] = *heading;
+    }
+    // A heading cut off from all of its rows names nothing; a blank keeps the
+    // guide below in place.
+    if let Some(last) = shown.last_mut()
+        && matches!(last, Item::Heading(_))
+    {
+        *last = Item::Gap;
+    }
+    shown
+        .into_iter()
+        .map(|item| match item {
+            Item::Heading(title) => Pieces::new(look)
+                .add(" ", Tone::Plain)
+                .add(&text::fit(title, width.saturating_sub(1)), Tone::Bold)
+                .line(),
+            Item::Gap => Line::default(),
+            Item::Row(index) => row_line(app, look, width, SettingsRow::ALL[index]),
         })
         .collect()
+}
+
+fn row_line(app: &App, look: &Look, width: usize, row: SettingsRow) -> Line<'static> {
+    let selected = row == app.selected_setting();
+    let marker = if selected { SELECTED } else { UNSELECTED };
+    let label_tone = if selected { Tone::Bold } else { Tone::Plain };
+    let (value, tone) = app.setting_value(row);
+    let room = width.saturating_sub(UNSELECTED.len() + LABEL_WIDTH + 1);
+    let tone = if selected && tone == Tone::Plain {
+        Tone::Accent
+    } else {
+        tone
+    };
+    let label = if value.is_empty() {
+        row.label().to_owned()
+    } else {
+        format!("{:<LABEL_WIDTH$}", row.label())
+    };
+    Pieces::new(look)
+        .add(marker, label_tone)
+        .add(&label, label_tone)
+        .add(&text::fit(&value, room), tone)
+        .line()
 }
 
 /// The row's values, one line each, once the current one is known. `indent`

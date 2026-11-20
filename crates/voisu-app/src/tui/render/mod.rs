@@ -560,28 +560,41 @@ mod tests {
     fn the_settings_tab_matches_the_reference_layout() {
         let mut app = app_on('2');
         let lines = screen(&mut app, &UNICODE, (80, 24));
-        assert_eq!(lines[5], " ▌ Engine        Cloud");
-        assert_eq!(lines[6], "   Delivery      Paste");
-        assert_eq!(lines[7], "   Writing       Clean");
-        assert_eq!(lines[8], "   Layout        Auto");
-        assert_eq!(lines[9], "   Tone          Formal");
-        assert_eq!(lines[10], "   Deepgram      On");
-        assert_eq!(lines[11], "   Groq key      Works");
-        assert_eq!(lines[12], "   Deepgram key  Can't reach it");
-        assert_eq!(lines[13], "   Trigger Key   Not bound");
-        assert_eq!(lines[14], "   Local unload  Never");
-        assert_eq!(lines[15], "   Local device  Auto");
-        assert_eq!(lines[16], "   Local model   Auto");
-        assert_eq!(lines[17], "   Overlay       Bottom centre");
-        assert_eq!(lines[18], "   Update check  On");
-        // Seventeen rows and a two-value guide overfill 80x24 by three lines,
-        // so the last rows scroll into view as the selection moves down.
+        assert_eq!(lines[5], " Dictation");
+        assert_eq!(lines[6], " ▌ Engine        Cloud");
+        assert_eq!(lines[7], "   Trigger Key   Not bound");
+        assert_eq!(lines[8], "   Delivery      Paste");
+        assert_eq!(lines[9], "   Overlay       Bottom centre");
+        assert_eq!(lines[10], " Transcript");
+        assert_eq!(lines[11], "   Writing       Clean");
+        assert_eq!(lines[12], "   Layout        Auto");
+        assert_eq!(lines[13], "   Tone          Formal");
+        assert_eq!(lines[14], " Cloud");
+        assert_eq!(lines[15], "   Groq key      Works");
+        assert_eq!(lines[16], "   Deepgram key  Can't reach it");
+        assert_eq!(lines[17], "   Deepgram      On");
+        // Five sections and a two-value guide overfill 80x24, so the Local and
+        // Voisu sections scroll into view as the selection moves down. The
+        // Local heading would sit alone on the last line, so a blank takes it.
+        assert_eq!(lines[18], "");
         assert_eq!(lines[19], "   Where your speech becomes text.");
         assert_eq!(
             lines[20],
             "     ● Cloud  Fast and accurate. Needs internet."
         );
         assert_eq!(lines[21], "       Local  Private. Stays on this computer.");
+    }
+
+    #[test]
+    fn a_scrolled_list_keeps_its_top_section_named() {
+        let mut app = app_on('2');
+        select(&mut app, SettingsRow::Star);
+        let lines = screen(&mut app, &UNICODE, (80, 24));
+        // Writing scrolled off; its section's heading takes the top line.
+        assert_eq!(lines[5], " Transcript");
+        assert_eq!(lines[6], "   Layout        Auto");
+        assert_eq!(lines[16], " Voisu");
+        assert_eq!(lines[20], " ▌ Star on GitHub");
     }
 
     #[test]
@@ -621,9 +634,9 @@ mod tests {
     #[test]
     fn the_guide_explains_both_tones() {
         let mut app = app_on('2');
-        app.settings_selected = 4;
+        select(&mut app, SettingsRow::Tone);
         let lines = screen(&mut app, &UNICODE, (80, 24));
-        assert_eq!(lines[9], " ▌ Tone          Formal");
+        assert_eq!(lines[13], " ▌ Tone          Formal");
         assert_eq!(lines[19], "   How casual your words read.");
         assert_eq!(
             lines[20],
@@ -638,9 +651,9 @@ mod tests {
     #[test]
     fn the_guide_explains_every_delivery_choice_before_any_is_picked() {
         let mut app = app_on('2');
-        let _ = press(&mut app, KeyCode::Down, 0);
+        select(&mut app, SettingsRow::Delivery);
         let lines = screen(&mut app, &UNICODE, (80, 24));
-        assert_eq!(lines[6], " ▌ Delivery      Paste");
+        assert_eq!(lines[8], " ▌ Delivery      Paste");
         assert_eq!(lines[19], "   How your words reach your window.");
         assert_eq!(lines[20], "     ● Paste  Puts your words into your window.");
         assert_eq!(lines[21], "       Copy   Copies only; you press Ctrl+V.");
@@ -650,7 +663,7 @@ mod tests {
     #[test]
     fn enter_turns_the_guide_into_the_picker_in_place() {
         let mut app = app_on('2');
-        let _ = press(&mut app, KeyCode::Down, 0);
+        select(&mut app, SettingsRow::Delivery);
         let _ = press(&mut app, KeyCode::Enter, 0);
         let _ = press(&mut app, KeyCode::Down, 0);
         let lines = screen(&mut app, &UNICODE, (80, 24));
@@ -669,35 +682,46 @@ mod tests {
         let mut app = app_on('2');
         let lines = screen(&mut app, &UNICODE, (120, 40));
         let beside = |row: &str, panel: &str| format!("{row:<44} │ {panel}").trim_end().to_owned();
-        assert_eq!(lines[5], beside(" ▌ Engine        Cloud", "Engine"));
+        assert_eq!(lines[5], beside(" Dictation", "Engine"));
         assert_eq!(
             lines[6],
-            beside("   Delivery      Paste", "Where your speech becomes text.")
+            beside(" ▌ Engine        Cloud", "Where your speech becomes text.")
         );
-        assert_eq!(lines[7], beside("   Writing       Clean", ""));
+        assert_eq!(lines[7], beside("   Trigger Key   Not bound", ""));
         assert_eq!(
             lines[8],
             beside(
-                "   Layout        Auto",
+                "   Delivery      Paste",
                 "  ● Cloud  Fast and accurate. Needs internet."
             )
         );
         assert_eq!(
             lines[9],
             beside(
-                "   Tone          Formal",
+                "   Overlay       Bottom centre",
                 "    Local  Private. Stays on this computer."
             )
         );
-        assert_eq!(lines[14], beside("   Local unload  Never", ""));
-        assert_eq!(lines[15], beside("   Local device  Auto", ""));
-        assert_eq!(lines[16], beside("   Local model   Auto", ""));
-        assert_eq!(lines[17], beside("   Overlay       Bottom centre", ""));
-        assert_eq!(lines[18], beside("   Update check  On", ""));
-        assert_eq!(lines[19], beside("   Star prompt   On", ""));
-        assert_eq!(lines[20], beside("   Run setup", ""));
-        assert_eq!(lines[21], beside("   Star on GitHub", ""));
-        assert_eq!(lines[22], "", "nothing below the rows");
+        // With room for all of them, a blank line parts the sections.
+        assert_eq!(lines[10], beside("", ""));
+        assert_eq!(lines[11], beside(" Transcript", ""));
+        assert_eq!(lines[12], beside("   Writing       Clean", ""));
+        assert_eq!(lines[13], beside("   Layout        Auto", ""));
+        assert_eq!(lines[14], beside("   Tone          Formal", ""));
+        assert_eq!(lines[16], beside(" Cloud", ""));
+        assert_eq!(lines[17], beside("   Groq key      Works", ""));
+        assert_eq!(lines[18], beside("   Deepgram key  Can't reach it", ""));
+        assert_eq!(lines[19], beside("   Deepgram      On", ""));
+        assert_eq!(lines[21], beside(" Local", ""));
+        assert_eq!(lines[22], beside("   Local model   Auto", ""));
+        assert_eq!(lines[23], beside("   Local device  Auto", ""));
+        assert_eq!(lines[24], beside("   Local unload  Never", ""));
+        assert_eq!(lines[26], beside(" Voisu", ""));
+        assert_eq!(lines[27], beside("   Run setup", ""));
+        assert_eq!(lines[28], beside("   Update check  On", ""));
+        assert_eq!(lines[29], beside("   Star prompt   On", ""));
+        assert_eq!(lines[30], beside("   Star on GitHub", ""));
+        assert_eq!(lines[31], "", "nothing below the rows");
 
         // Picking happens in the panel, the same lines gaining the highlight.
         let _ = press(&mut app, KeyCode::Enter, 0);
@@ -712,8 +736,7 @@ mod tests {
     #[test]
     fn a_narrow_panel_wraps_each_choice_instead_of_cutting_it() {
         let mut app = app_on('2');
-        let _ = press(&mut app, KeyCode::Down, 0);
-        let _ = press(&mut app, KeyCode::Down, 0);
+        select(&mut app, SettingsRow::Writing);
         let lines = screen(&mut app, &UNICODE, (90, 24));
         let at = lines
             .iter()
@@ -733,7 +756,14 @@ mod tests {
                 let lines = screen(&mut app, &UNICODE, size);
                 let body = joined(&lines);
                 assert!(!body.contains('…'), "{size:?} {index}: cut\n{body}");
-                for other in SettingsRow::ALL {
+                // 120x40 holds every section; 90x24 scrolls them, but the
+                // selected row always shows.
+                let shown: &[SettingsRow] = if size.1 >= 40 {
+                    &SettingsRow::ALL
+                } else {
+                    std::slice::from_ref(&row)
+                };
+                for other in shown {
                     assert!(
                         body.contains(other.label()),
                         "{size:?} lost {}",
@@ -813,11 +843,10 @@ mod tests {
             app.settings_selected = index;
             let row = app.selected_setting();
 
-            // Three lines taller than 80x24 (which seventeen rows overfill by
-            // three), every row shows beside a guide of up to two values; a
-            // taller guide (Layout, Local unload) scrolls the rows to keep the
-            // selected one in view.
-            let tall = joined(&screen(&mut app, &UNICODE, (80, 27)));
+            // At 80x32 every section and row shows above a guide of up to two
+            // values; a taller guide (Layout, Local unload) scrolls the rows to
+            // keep the selected one in view.
+            let tall = joined(&screen(&mut app, &UNICODE, (80, 32)));
             if row.choices().len() <= 2 {
                 for other in SettingsRow::ALL {
                     assert!(
@@ -1113,7 +1142,7 @@ mod tests {
         const SECRET: &str = "gsk_secret_value";
         for look in [UNICODE, ASCII] {
             let mut app = app_on('2');
-            app.settings_selected = 6;
+            select(&mut app, SettingsRow::GroqKey);
             let _ = press(&mut app, KeyCode::Enter, 0);
             type_text(&mut app, SECRET, 0);
             let lines = screen(&mut app, &look, (80, 24));
@@ -1135,7 +1164,7 @@ mod tests {
         let mut app = app_on('2');
         app.key_in_check = Some(Provider::Deepgram);
         let lines = screen(&mut app, &UNICODE, (80, 24));
-        assert_eq!(lines[12], "   Deepgram key  Checking…");
+        assert_eq!(lines[16], "   Deepgram key  Checking…");
     }
 
     // --- Footer and overlay agree -------------------------------------------------
@@ -1185,7 +1214,7 @@ mod tests {
     fn without_colour_selection_and_state_are_still_there_in_text() {
         let mut app = app_on('2');
         let lines = screen(&mut app, &NO_COLOR, (80, 24));
-        assert!(lines[5].starts_with(" ▌ Engine"));
+        assert!(lines[6].starts_with(" ▌ Engine"));
         assert!(lines[0].ends_with("● Ready"));
         let terminal = screen_with(&app, &NO_COLOR, (80, 24));
         let buffer = terminal.backend().buffer();
@@ -1240,7 +1269,7 @@ mod tests {
         }
         let mut app = app_on('2');
         let lines = screen(&mut app, &ASCII, (80, 24));
-        assert!(lines[5].starts_with(" > Engine"), "{}", lines[5]);
+        assert!(lines[6].starts_with(" > Engine"), "{}", lines[6]);
         assert_eq!(lines[3].trim().len(), "Settings".len());
     }
 
