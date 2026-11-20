@@ -70,10 +70,12 @@ push tag vX.Y.Z
    build ─── ubuntu:26.04 container: build-deb.sh (release .deb, revision -1),
       │      release binaries, and the AUR voisu-bin tarball + SHA256SUMS.
       │      Uploaded as the `release-artifacts` artifact.
+      │      In parallel with build, smoke-source {fedora:latest, archlinux}
+      │      builds from source (RPM, source PKGBUILD) and needs only validate.
       ▼
-   smoke ─── matrix {ubuntu:26.04, fedora:latest, archlinux}, installs the
-      │      artifact through each distro's REAL package path. PUBLISHING BLOCKS
-      │      ON THIS JOB (see "Smoke gate" below).
+   smoke ─── matrix {ubuntu:26.04, archlinux (arch-bin)}, installs the built
+      │      artifacts through each distro's REAL package path. PUBLISHING
+      │      BLOCKS ON smoke AND smoke-source (see "Smoke gate" below).
       ▼
   publish (only after all smoke legs pass, in parallel except AUR):
      ├─ publish-apt      make-apt-repo.sh (real key, loopback) → push gh-pages
