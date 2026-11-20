@@ -55,6 +55,58 @@
     }
   }
 
+  // Local mode (Windows only): null on macOS, where nothing below shows.
+  const local = $derived(app.local);
+  const mb = (bytes) => Math.round(bytes / 1_000_000);
+  let modeBusy = $state(false);
+
+  async function chooseMode(mode) {
+    if (modeBusy) return;
+    modeBusy = true;
+    errors.mode = '';
+    try {
+      ui.app.mode = await invoke('set_mode', { mode });
+    } catch (e) {
+      errors.mode = typeof e === 'string' ? e : 'Could not change how Voisu transcribes.';
+    } finally {
+      modeBusy = false;
+    }
+  }
+
+  // Consent is this click: nothing downloads until the user asks. A
+  // finished download switches to Local, which is what it was for. A
+  // failure lands in local.error through the state refresh.
+  async function download() {
+    errors.mode = '';
+    try {
+      await invoke('download_local_model');
+    } catch (e) {
+      return;
+    }
+    if (ui.app.local?.installed) await chooseMode('local');
+  }
+
+  async function cancelDownload() {
+    try {
+      await invoke('cancel_local_download');
+    } catch (e) {
+      // The download finishes or fails on its own; the refresh shows which.
+    }
+  }
+
+  async function removeModel() {
+    if (modeBusy) return;
+    modeBusy = true;
+    errors.mode = '';
+    try {
+      await invoke('remove_local_model');
+    } catch (e) {
+      errors.mode = typeof e === 'string' ? e : 'Could not remove the Local model.';
+    } finally {
+      modeBusy = false;
+    }
+  }
+
   let positionBusy = $state(false);
   const moving = $derived(app.overlayMoving);
 
@@ -241,6 +293,89 @@
   <ErrorLine message={errors.position} />
 </div>
 
+{#if local}
+  <h2 class="group-label" id="transcription-title">Transcription</h2>
+  <div class="group" role="group" aria-labelledby="transcription-title">
+    <div class="block">
+      <div class="row">
+        <span class="row-text">
+          <span>Transcribe with</span>
+          <span class="hint">
+            {app.mode === 'local'
+              ? 'Local: on this PC. Nothing you say leaves it.'
+              : 'Cloud: Deepgram and Groq. Fastest, needs your keys.'}
+          </span>
+        </span>
+        <div class="presets">
+          <button
+            type="button"
+            class="chip"
+            class:on={app.mode === 'cloud'}
+            aria-pressed={app.mode === 'cloud'}
+            disabled={modeBusy}
+            onclick={() => chooseMode('cloud')}
+          >
+            Cloud
+          </button>
+          <button
+            type="button"
+            class="chip"
+            class:on={app.mode === 'local'}
+            aria-pressed={app.mode === 'local'}
+            disabled={modeBusy || !local.installed}
+            title={local.installed ? '' : 'Download the Local model first.'}
+            onclick={() => chooseMode('local')}
+          >
+            Local
+          </button>
+        </div>
+      </div>
+    </div>
+    {#if !local.available}
+      <p class="hint">Local mode isn't available in this build of Voisu.</p>
+    {:else if local.downloading}
+      <div class="block" aria-live="polite">
+        <div class="row">
+          <span class="row-text">
+            <span>Downloading the Local model</span>
+            <span class="hint">{mb(local.downloaded)} of {mb(local.total)} MB. Stopping keeps what's done.</span>
+          </span>
+          <button type="button" class="pill" onclick={cancelDownload}>Cancel</button>
+        </div>
+        <progress max={local.total} value={local.downloaded} aria-label="Local model download"></progress>
+      </div>
+    {:else if local.installed}
+      <div class="row">
+        <span class="row-text">
+          <span>Local model</span>
+          <span class="hint">Fast, English. {mb(local.total)} MB on this PC.</span>
+        </span>
+        <button type="button" class="pill" disabled={modeBusy} onclick={removeModel}>Remove</button>
+      </div>
+    {:else}
+      <div class="block">
+        <span class="row-text">
+          <span>Transcribe on this PC</span>
+          <span class="hint">
+            Downloads a {mb(local.total)} MB English model once, then works offline. It runs on the processor, so
+            the Transcript comes a few seconds after you stop, longer on older PCs; a recent 4-core or better CPU
+            with AVX2 works best. Cloud stays available.
+          </span>
+        </span>
+        <button type="button" class="primary small" onclick={download}>
+          {local.downloaded ? 'Resume download' : `Download ${mb(local.total)} MB`}
+        </button>
+      </div>
+    {/if}
+    <ErrorLine message={errors.mode || local.error} />
+    {#if local.error && app.mode === 'local'}
+      <button type="button" class="link" disabled={modeBusy} onclick={() => chooseMode('cloud')}>
+        Switch to Cloud
+      </button>
+    {/if}
+  </div>
+{/if}
+
 <style>
   .presets {
     display: flex;
@@ -262,5 +397,30 @@
   }
   .primary.small {
     padding: 3px 14px;
+    align-self: flex-start;
+  }
+  progress {
+    appearance: none;
+    width: 100%;
+    height: 6px;
+    border: 0;
+    border-radius: 3px;
+    background: var(--overlay-2);
+    overflow: hidden;
+  }
+  progress::-webkit-progress-bar {
+    background: var(--overlay-2);
+  }
+  progress::-webkit-progress-value {
+    background: var(--accent);
+    transition: width 0.25s ease-out;
+  }
+  progress::-moz-progress-bar {
+    background: var(--accent);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    progress::-webkit-progress-value {
+      transition: none;
+    }
   }
 </style>

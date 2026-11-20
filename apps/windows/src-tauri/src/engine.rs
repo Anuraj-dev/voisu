@@ -4,6 +4,10 @@
 //! reconciled by the same voisu-core decision pipeline the Linux daemon runs,
 //! then formatted locally exactly as Linux does.
 //!
+//! With opt-in Local mode (Windows only, ADR 0014) no audio leaves the PC:
+//! the whole Recording goes to the private whisper.cpp worker at stop
+//! ([`crate::local`]) and the Transcript is formatted the same way.
+//!
 //! The engine is one actor task. It reports every lifecycle change as a
 //! `recording-state` event and the mic level as `audio-level`, which the
 //! overlay (W4) listens to. The final Transcript is pasted into the window
@@ -30,6 +34,7 @@ use voisu_core::{
 };
 
 use crate::gesture::Action;
+use crate::local::{self, LocalError};
 use crate::overlay::{
     self, AUDIO_LEVEL, AudioLevelPayload, RECORDING_STATE, RecordingState as Phase,
     RecordingStatePayload,
@@ -37,7 +42,7 @@ use crate::overlay::{
 use crate::platform::capture::{CaptureStartup, CpalCapture, LevelSink};
 use crate::platform::delivery::{self, DeliveryTarget};
 use crate::platform::secrets::CredentialManagerStore;
-use crate::settings::Settings;
+use crate::settings::{Mode, Settings};
 use crate::vocabulary;
 
 /// Both providers must deliver within this after stop, as on Linux.
@@ -211,7 +216,7 @@ enum Captured {
     Done,
     Process {
         audio: RecordingAudio,
-        providers: ProviderCoordinator,
+        providers: Backend,
         limit: Option<CaptureLimit>,
         target: DeliveryTarget,
         /// The boost words this Recording's providers started with, so
@@ -223,9 +228,24 @@ enum Captured {
     /// Cancelled (`None`) or failed: release the mic and provider streams.
     Abort {
         capture: Box<dyn ActiveCapture>,
-        providers: ProviderCoordinator,
+        providers: Backend,
         error: Option<BoundaryError>,
     },
+}
+
+/// Who transcribes this Recording.
+enum Backend {
+    /// Deepgram live and Groq at stop.
+    Cloud(ProviderCoordinator),
+    /// The Local worker, already loading while the user speaks.
+    Local(local::worker::Session),
+}
+
+/// What a Recording needs before the mic opens: the Cloud keys, or the
+/// Local worker and model.
+enum Route {
+    Cloud(RecordingKeys),
+    Local(local::worker::Launch),
 }
 
 impl Engine {
@@ -268,13 +288,26 @@ impl Engine {
         let startup = Arc::new(CaptureStartup::default());
         let mut providers_started = None;
         let mut trigger = StartupTrigger::new(id, actions, &self.ended);
-        let keys = tokio::select! {
-            biased;
-            () = trigger.until_end() => None,
-            result = load_recording_keys() => Some(result),
+        let settings = self.settings();
+        let route = match settings.mode.effective() {
+            Mode::Local => match local::launch(&self.app) {
+                Ok(launch) => Some(Some(Route::Local(launch))),
+                Err(error) => {
+                    tracing::info!(id, ?error, "Recording refused: Local mode not ready");
+                    self.emit_state(Phase::Error, Some(error.message().to_owned()));
+                    local::report(&self.app, error);
+                    startup.log(id, hotkey_at, None);
+                    return Captured::Done;
+                }
+            },
+            Mode::Cloud => tokio::select! {
+                biased;
+                () = trigger.until_end() => None,
+                result = load_recording_keys() => Some(result.map(Route::Cloud)),
+            },
         };
-        let keys = match keys {
-            Some(Some(keys)) => keys,
+        let route = match route {
+            Some(Some(route)) => route,
             Some(None) => {
                 tracing::info!(id, "Recording refused: keys missing");
                 self.emit_state(Phase::Error, Some(KEYS_MISSING.to_owned()));
@@ -291,13 +324,20 @@ impl Engine {
             self.microphone
                 .begin(id, self.level_sink(), Arc::clone(&startup)),
             async {
-                let settings = self.settings();
                 let vocabulary = vocabulary::normalize(&settings.boost_words);
-                let streams = self.start_providers(id, &vocabulary, keys)?;
-                let providers =
-                    ProviderCoordinator::start(PROVIDER_DEADLINE, ABORT_DEADLINE, streams);
+                let backend = match route {
+                    Route::Cloud(keys) => {
+                        let streams = self.start_providers(id, &vocabulary, keys)?;
+                        Backend::Cloud(ProviderCoordinator::start(
+                            PROVIDER_DEADLINE,
+                            ABORT_DEADLINE,
+                            streams,
+                        ))
+                    }
+                    Route::Local(launch) => Backend::Local(local::worker::Session::start(launch)),
+                };
                 providers_started = Some(Instant::now());
-                Ok((providers, vocabulary, settings.tone))
+                Ok((backend, vocabulary, settings.tone))
             },
             |phase| self.emit_state(phase, None),
             &mut trigger,
@@ -481,7 +521,7 @@ impl Engine {
         settings.clone()
     }
 
-    /// Streams capture chunks to Deepgram until the trigger stops or cancels
+    /// Streams capture chunks to Deepgram (Cloud) until the trigger stops or cancels
     /// the Recording, the capture ends, or something fails. Mirrors the
     /// Linux `capture_pump`: actions are always observed, even while a chunk
     /// send is stalled.
@@ -489,7 +529,7 @@ impl Engine {
         &self,
         id: u64,
         capture: &mut Box<dyn ActiveCapture>,
-        providers: &mut ProviderCoordinator,
+        providers: &mut Backend,
         actions: &mut UnboundedReceiver<Action>,
     ) -> Outcome {
         loop {
@@ -510,6 +550,10 @@ impl Engine {
                     return Outcome::Stop(Some(CaptureLimit::RecordingDeadline));
                 }
                 Err(error) => return Outcome::Failed(error),
+            };
+            // Local hears the whole Recording at stop; the capture keeps it.
+            let Backend::Cloud(providers) = providers else {
+                continue;
             };
             let send = providers.stream_audio(chunk);
             tokio::pin!(send);
@@ -579,10 +623,14 @@ impl Engine {
     /// the whole dictionary: Windows has no built-in terms.
     async fn decide(
         &self,
-        providers: ProviderCoordinator,
+        providers: Backend,
         audio: voisu_core::CapturedAudio,
         vocabulary: Vec<String>,
     ) -> Result<String, BoundaryError> {
+        let providers = match providers {
+            Backend::Cloud(providers) => providers,
+            Backend::Local(session) => return self.decide_local(session, audio, &vocabulary).await,
+        };
         let completed = providers.complete_with_timings(audio).await?;
         for failure in &completed.provider_failures {
             tracing::warn!(?failure, "provider did not contribute");
@@ -599,6 +647,43 @@ impl Engine {
             }
         };
         Ok(format_locally(decision.transcript.0, &sources, &vocabulary))
+    }
+
+    /// The Local path: the whole Recording through the worker within
+    /// [`local::decode_deadline`], biased toward the boost words, then the
+    /// Linux Local text pipeline ([`local::finish_transcript`]). No text is a
+    /// silent Recording, as on Linux.
+    async fn decide_local(
+        &self,
+        session: local::worker::Session,
+        audio: voisu_core::CapturedAudio,
+        vocabulary: &[String],
+    ) -> Result<String, BoundaryError> {
+        let pcm = audio.pcm_s16le_mono_16khz().to_vec();
+        let deadline = local::decode_deadline(pcm.len());
+        let prompt = vocabulary::whisper_prompt(vocabulary);
+        let prompt = voisu_core::local_wire::is_valid_prompt(&prompt).then_some(prompt);
+        let started = Instant::now();
+        let heard = match tokio::time::timeout(deadline, session.transcribe(pcm, prompt)).await {
+            Ok(Ok(heard)) => heard,
+            Ok(Err(failure)) => {
+                local::report(&self.app, failure.error);
+                return Err(failure.error.into_boundary(failure.diagnostic));
+            }
+            // Dropping the session killed the worker.
+            Err(_) => {
+                local::report(&self.app, LocalError::TimedOut);
+                return Err(LocalError::TimedOut
+                    .into_boundary(format!("Local worker exceeded {} s", deadline.as_secs())));
+            }
+        };
+        tracing::info!(
+            ms = started.elapsed().as_millis() as u64,
+            "Local transcription"
+        );
+        heard
+            .and_then(|text| local::finish_transcript(&text, vocabulary))
+            .ok_or_else(|| BoundaryError::new(BoundaryKind::SilentRecording, "no words heard"))
     }
 
     fn fail(&self, id: u64, error: &BoundaryError) {
@@ -624,7 +709,7 @@ impl Engine {
                 Phase::Recording | Phase::HandsFree => tray.set_status("Voisu: recording…"),
                 Phase::Processing => tray.set_status("Voisu: transcribing…"),
                 Phase::Idle | Phase::Done | Phase::Copied | Phase::Error => {
-                    tray.set_ready(crate::keys_ready())
+                    tray.set_ready(local::dictation_ready(&self.app))
                 }
             }
         }
@@ -798,8 +883,18 @@ async fn while_busy<F: Future>(
     }
 }
 
-async fn abort(capture: Box<dyn ActiveCapture>, providers: ProviderCoordinator) {
-    let (capture, providers) = tokio::join!(capture.abort(), providers.abort());
+async fn abort(capture: Box<dyn ActiveCapture>, providers: Backend) {
+    let providers = async {
+        match providers {
+            Backend::Cloud(providers) => providers.abort().await,
+            // Dropping the session kills the worker.
+            Backend::Local(session) => {
+                drop(session);
+                Ok(())
+            }
+        }
+    };
+    let (capture, providers) = tokio::join!(capture.abort(), providers);
     if let Err(error) = capture.and(providers) {
         tracing::warn!(diagnostic = error.diagnostic(), "Recording cleanup failed");
     }

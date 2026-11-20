@@ -81,6 +81,34 @@ pub struct Settings {
     /// version differs. None before any; junk reads as None.
     #[serde(deserialize_with = "lenient")]
     pub seen_version: Option<String>,
+    /// Cloud (the default) or opt-in Local mode (Windows only, ADR 0014).
+    /// Anything unknown reads as Cloud. Not written while Cloud, so a Cloud
+    /// user's file is unchanged.
+    #[serde(deserialize_with = "lenient", skip_serializing_if = "Mode::is_cloud")]
+    pub mode: Mode,
+}
+
+/// Where a Recording is transcribed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    /// Deepgram and Groq with the user's keys.
+    #[default]
+    Cloud,
+    /// On this PC with the downloaded whisper.cpp model.
+    Local,
+}
+
+impl Mode {
+    fn is_cloud(&self) -> bool {
+        *self == Self::Cloud
+    }
+
+    /// The mode a Recording uses here: Local exists only on Windows, so a
+    /// settings file carried to a Mac still dictates with Cloud.
+    pub fn effective(self) -> Self {
+        if cfg!(windows) { self } else { Self::Cloud }
+    }
 }
 
 /// A field with a value this version does not understand (a size a later
@@ -148,6 +176,7 @@ impl Default for Settings {
             tone: Tone::Formal,
             star_prompt: true,
             seen_version: None,
+            mode: Mode::Cloud,
         }
     }
 }
@@ -532,5 +561,32 @@ mod tests {
             assert_eq!(settings.seen_version, None, "{json}");
             assert!(!settings.auto_paste, "{json} wiped another setting");
         }
+    }
+
+    #[test]
+    fn mode_is_cloud_unless_local_was_chosen_and_cloud_is_never_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        Settings::default().save(&path).unwrap();
+        assert!(!fs::read_to_string(&path).unwrap().contains("mode"));
+        for value in ["", r#", "mode": "gpu""#, r#", "mode": 3"#] {
+            let json = format!(r#"{{"auto_paste": false{value}}}"#);
+            fs::write(&path, &json).unwrap();
+            let settings = Settings::load(&path);
+            assert_eq!(settings.mode, Mode::Cloud, "{json}");
+            assert!(!settings.auto_paste, "{json} wiped another setting");
+        }
+        let local = Settings {
+            mode: Mode::Local,
+            ..Settings::default()
+        };
+        local.save(&path).unwrap();
+        assert_eq!(Settings::load(&path), local);
+        let expected = if cfg!(windows) {
+            Mode::Local
+        } else {
+            Mode::Cloud
+        };
+        assert_eq!(Mode::Local.effective(), expected);
     }
 }

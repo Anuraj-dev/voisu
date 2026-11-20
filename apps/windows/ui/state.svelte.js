@@ -42,6 +42,11 @@ export const ui = $state({
     showStar: false,
     // The dictation under way when the window loaded: { state, elapsedMs }.
     phase: null,
+    // 'cloud' | 'local'; always 'cloud' on macOS.
+    mode: 'cloud',
+    // Windows only: { available, installed, downloading, downloaded, total,
+    // error }; null on macOS, which offers no Local mode.
+    local: null,
   },
   // False until the first get_state, so nothing renders on guessed state.
   loaded: false,
@@ -82,6 +87,9 @@ export async function installUpdate() {
 export const pendingNotes = () => itemsFor(ui.app.updateNotes, ui.app.platform);
 
 export const keysReady = () => ui.app.groqSaved && ui.app.deepgramSaved;
+
+// Local mode dictates without the Cloud keys, so it skips Setup too.
+export const dictationReady = () => keysReady() || ui.app.mode === 'local';
 
 export const isMac = () => ui.app.platform === 'mac';
 

@@ -92,7 +92,22 @@ const state = {
   showStar: screen === 'star' || screen === 'star-closed',
   // Twelve seconds in, so the timer reads 0:12.
   phase: screen === 'recording' ? { state: 'recording', elapsedMs: 12_000 } : null,
+  mode: 'cloud',
+  // Local mode is Windows only. `?local=installed` starts with the model on
+  // disk; otherwise Dictation offers the download.
+  local: mac
+    ? null
+    : {
+        available: true,
+        installed: params.get('local') === 'installed',
+        downloading: false,
+        downloaded: 0,
+        total: 264_829_639,
+        error: null,
+      },
 };
+// A fake download: about five seconds end to end; Cancel keeps its place.
+let downloadTimer = null;
 const transcript = inSetup
   ? null
   : "Can we move the design review to Thursday at three? I'll send the updated mockups before then.";
@@ -114,6 +129,41 @@ const COMMANDS = {
     return state.trigger;
   },
   set_auto_paste: ({ enabled }) => (state.autoPaste = enabled),
+  set_mode: ({ mode }) => {
+    if (mode === 'local' && !state.local?.installed) throw 'Download the Local model first.';
+    state.mode = mode;
+    if (state.local) state.local.error = null;
+    emit('state-changed', null);
+    return mode;
+  },
+  download_local_model: () =>
+    new Promise((resolve) => {
+      const local = state.local;
+      Object.assign(local, { downloading: true, error: null });
+      emit('state-changed', null);
+      downloadTimer = setInterval(() => {
+        if (!local.downloading) {
+          clearInterval(downloadTimer);
+          return resolve();
+        }
+        local.downloaded = Math.min(local.total, local.downloaded + local.total / 20);
+        if (local.downloaded >= local.total) {
+          Object.assign(local, { downloading: false, installed: true });
+          clearInterval(downloadTimer);
+          resolve();
+        }
+        emit('state-changed', null);
+      }, 250);
+    }),
+  cancel_local_download: () => {
+    state.local.downloading = false;
+    emit('state-changed', null);
+  },
+  remove_local_model: () => {
+    state.mode = 'cloud';
+    Object.assign(state.local, { installed: false, downloaded: 0, error: null });
+    emit('state-changed', null);
+  },
   set_tone: ({ tone }) => (state.tone = tone),
   start_overlay_move: () => {
     if (!state.overlayMoving) {

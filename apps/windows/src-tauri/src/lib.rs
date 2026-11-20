@@ -10,6 +10,7 @@ mod chord;
 mod engine;
 #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 mod gesture;
+mod local;
 mod logging;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod mac_keys;
@@ -68,6 +69,13 @@ pub struct AppState {
 pub(crate) fn keys_ready() -> bool {
     let mut store = CredentialManagerStore;
     store.has_key(Provider::Groq) && store.has_key(Provider::Deepgram)
+}
+
+/// Puts the tray's ready state in step with the keys and the chosen mode.
+pub(crate) fn refresh_tray(app: &AppHandle) {
+    if let Some(tray) = app.state::<AppState>().tray.get() {
+        tray.set_ready(local::dictation_ready(app));
+    }
 }
 
 pub(crate) fn show_settings(app: &AppHandle) {
@@ -150,6 +158,11 @@ struct UiState {
     /// The dictation under way, if any; later changes arrive as
     /// `recording-state` events.
     phase: Option<engine::PhaseNow>,
+    /// Cloud or Local; always Cloud off Windows.
+    mode: settings::Mode,
+    /// Local mode's download and error state; `None` off Windows, where the
+    /// window offers no Local.
+    local: Option<local::LocalUi>,
 }
 
 #[derive(Serialize)]
@@ -268,6 +281,8 @@ fn get_state(app: AppHandle) -> UiState {
             .unwrap()
             .show(local_today(), settings.star_prompt),
         phase: engine::current_phase(&app),
+        mode: settings.mode.effective(),
+        local: local::ui(&app),
     }
 }
 
@@ -284,7 +299,7 @@ fn set_trigger_key(app: AppHandle, key: String) -> Result<UiTrigger, String> {
     update_settings(&app, |settings| settings.hotkey = chord);
     let trigger = UiTrigger::of(chord);
     if let Some(tray) = app.state::<AppState>().tray.get() {
-        tray.set_trigger(trigger.label.clone(), keys_ready());
+        tray.set_trigger(trigger.label.clone(), local::dictation_ready(&app));
     }
     let _ = app.emit(STATE_CHANGED, ());
     Ok(trigger)
@@ -601,9 +616,7 @@ const KEY_STORE: &str = if cfg!(target_os = "macos") {
 fn on_keys_saved(app: &AppHandle) {
     let state = app.state::<AppState>();
     let ready = keys_ready();
-    if let Some(tray) = state.tray.get() {
-        tray.set_ready(ready);
-    }
+    refresh_tray(app);
     let pending = ready && !state.settings.lock().unwrap().autostart_default_applied;
     if pending && apply_autostart(app, true) {
         let mut settings = state.settings.lock().unwrap();
@@ -748,6 +761,7 @@ pub fn run() {
             star: Mutex::new(StarPrompt::load(&paths::star_prompt_file())),
             tray: OnceLock::new(),
         })
+        .manage(local::LocalState::default())
         .invoke_handler(tauri::generate_handler![
             get_state,
             save_keys,
@@ -771,7 +785,11 @@ pub fn run() {
             mark_version_seen,
             star_on_github,
             close_star_banner,
-            engine::last_transcript
+            engine::last_transcript,
+            local::set_mode,
+            local::download_local_model,
+            local::cancel_local_download,
+            local::remove_local_model
         ])
         .setup(|app| {
             // A menu bar app: no Dock icon and no app menu; the tray opens
@@ -779,7 +797,8 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             let handle = app.handle();
-            let ready = keys_ready();
+            // Local mode dictates without the Cloud keys.
+            let ready = local::dictation_ready(handle);
             let chord = app.state::<AppState>().settings.lock().unwrap().hotkey;
             let tray = tray::build(
                 handle,
@@ -794,7 +813,7 @@ pub fn run() {
             }
             overlay::init(handle)?;
             let at_login = std::env::args().any(|arg| arg == AUTOSTART_ARG);
-            tracing::info!(keys_ready = ready, at_login, "startup");
+            tracing::info!(dictation_ready = ready, at_login, "startup");
             if setup::should_open_window(at_login, ready) {
                 show_settings(handle);
             }

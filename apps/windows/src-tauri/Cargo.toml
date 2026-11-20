@@ -1,7 +1,7 @@
 [package]
 name = "voisu-windows"
 version = "1.2.0"
-description = "Voisu for Windows and macOS: tray app for cloud voice dictation"
+description = "Voisu for Windows and macOS: tray app for voice dictation"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -28,8 +28,14 @@ dirs = "6"
 # on Windows, the login Keychain on macOS. Elsewhere the crate falls back to
 # its mock store; Linux builds exist only for local checks.
 keyring = "3.6"
+# The Local model download (Windows): Rustls with ring, as voisu-cloud
+# builds it, so no second TLS stack enters the tree.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
+# Checks the Local model and pins the Local worker in its manifest.
+sha2 = "0.10"
 tauri = { version = "2.12", features = ["tray-icon"] }
 tauri-plugin-autostart = "2.7"
 # The one-time star prompt notification, sent from Rust only.
