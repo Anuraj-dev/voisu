@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Dictating | Voisu docs</title>
-<meta name="description" content="Gestures on Windows, Mac and Linux, hands-free, the recording capsule, where the text goes and getting your last Transcript back.">
+<meta name="description" content="Gestures on Windows, Mac and Linux, hands-free, the overlay pill, where the text goes and getting your last Transcript back.">
 <link rel="canonical" href="https://anuraj-dev.github.io/voisu/docs/using.html">
 <meta name="color-scheme" content="light dark">
 <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#17191d">
@@ -15,7 +15,7 @@
 <meta property="og:type" content="article">
 <meta property="og:site_name" content="Voisu">
 <meta property="og:title" content="Dictating | Voisu docs">
-<meta property="og:description" content="Gestures on Windows, Mac and Linux, hands-free, the recording capsule, where the text goes and getting your last Transcript back.">
+<meta property="og:description" content="Gestures on Windows, Mac and Linux, hands-free, the overlay pill, where the text goes and getting your last Transcript back.">
 <meta property="og:url" content="https://anuraj-dev.github.io/voisu/docs/using.html">
 <meta property="og:image" content="https://anuraj-dev.github.io/voisu/assets/og.png">
 <meta property="og:image:width" content="1200">
@@ -77,13 +77,13 @@
 
   <main id="main" class="doc">
 <h1>Dictating</h1>
-<p class="lead">Start a Recording, speak, stop, and the Transcript lands at your cursor. This page covers the gestures on each platform, what the capsule is telling you, and how to get your words back when a paste doesn't land.</p>
+<p class="lead">Start a Recording, speak, stop, and the Transcript lands at your cursor. This page covers the gestures on each platform, what the overlay pill is telling you, and how to get your words back when a paste doesn't land.</p>
 
 <nav class="toc" aria-label="On this page">
   <a href="#windows">Windows gestures</a>
   <a href="#mac">Mac gestures</a>
   <a href="#linux">Linux Trigger Key</a>
-  <a href="#overlay">The capsule</a>
+  <a href="#overlay">The overlay pill</a>
   <a href="#delivery">Where the text goes</a>
   <a href="#last">Your last Transcript</a>
   <a href="#speaking">Speaking tips</a>
@@ -115,16 +115,22 @@
 </ol>
 <p>The same thing works from a terminal or a script with <code>voisu toggle</code>. <code>voisu shortcut</code> shows which key your desktop approved.</p>
 
-<h2 id="overlay">The capsule</h2>
-<p>The Overlay is a small capsule near the bottom of your screen. It never takes focus, so it can't steal your cursor.</p>
+<h2 id="overlay">The overlay pill</h2>
+<p>The Overlay is a small pill with white sound bars, at the bottom centre of your screen by default. It never takes focus, so it can't steal your cursor. On Linux it shows on the monitor you're working on (KDE Plasma and Hyprland).</p>
 <ul class="state-list">
   <li><span class="sw sw-rec"></span><strong>Recording</strong><span>Live level bars follow your voice. On Windows, a green dot at the left means hands-free.</span></li>
   <li><span class="sw sw-proc"></span><strong>Processing</strong><span>A light sweeps across the bars while the providers finish and Voisu builds the Transcript.</span></li>
-  <li><span class="sw sw-ok"></span><strong>Delivered</strong><span>Your text appears, a check mark shows for a moment, and the capsule goes away.</span></li>
+  <li><span class="sw sw-ok"></span><strong>Delivered</strong><span>Your text appears, a check mark shows for a moment, and the pill goes away.</span></li>
   <li><span class="sw sw-fail"></span><strong>Problem</strong><span>A short message says what went wrong, such as no microphone, nothing heard, or a paste that couldn't land.</span></li>
 </ul>
-<p>The capsule is optional on Linux: it's the <code>voisu-overlay</code> package on Fedora and the <code>overlay@voisu.app</code> GNOME Shell extension on Ubuntu. On X11 the same feedback arrives as desktop notifications. On Windows the tray's <strong>Preview overlay</strong> item shows it without recording.</p>
-<p>On Windows you can make the capsule smaller or larger under <strong>Overlay size</strong> in <a href="settings.html#windows">Settings</a>.</p>
+<p>The pill is optional on Linux: it's the <code>voisu-overlay</code> package on Fedora and the <code>overlay@voisu.app</code> GNOME Shell extension on Ubuntu. On X11 the same feedback arrives as desktop notifications. On Windows the tray's <strong>Preview overlay</strong> item shows it without recording.</p>
+<h3 id="move-overlay">Move the pill</h3>
+<p>Put the pill anywhere on screen. While you move it, it widens to show ✗ on its left and ✓ on its right.</p>
+<ul>
+  <li><strong>Windows and Mac:</strong> in <a href="settings.html#windows">Settings</a>, open <strong>Dictation</strong> and choose <strong>Move overlay</strong>. Drag the pill, then click ✓ or press <kbd>Enter</kbd> to save, or ✗ or <kbd>Esc</kbd> to cancel. <strong>Reset position</strong> puts it back at the bottom centre.</li>
+  <li><strong>Linux:</strong> in <code>voisu</code>, open <strong>Settings → Overlay → Move</strong>, or run <code>voisu overlay-position move</code>, and save or cancel the same way. <strong>Reset</strong> or <code>voisu overlay-position reset</code> puts it back. This needs KDE Plasma or Hyprland; the GNOME extension's pill stays where it is.</li>
+</ul>
+<p>Starting a Recording cancels a move that hasn't been saved.</p>
 
 <h2 id="delivery">Where the text goes</h2>
 <p><strong>Windows.</strong> Voisu pastes into the window that had focus when you <em>started</em> the Recording, even if you clicked somewhere else while talking. It then puts your previous clipboard back. Terminals get the paste shortcut they expect: <kbd>Ctrl</kbd>&nbsp;<kbd>Shift</kbd>&nbsp;<kbd>V</kbd> for Windows Terminal, Alacritty and WezTerm, <kbd>Shift</kbd>&nbsp;<kbd>Insert</kbd> for the classic console, PuTTY, Git Bash and ConEmu. Voisu's paste is kept out of Windows clipboard history (<kbd>Win</kbd>&nbsp;<kbd>V</kbd>).</p>
@@ -144,15 +150,15 @@
 <h2 id="last">Your last Transcript</h2>
 <p>When a paste doesn't land, the words aren't lost.</p>
 <ul>
-  <li><strong>Windows:</strong> open <strong>Settings…</strong> from the tray. The <strong>Last Transcript</strong> card on the Overview tab shows your most recent Transcript with a <strong>Copy</strong> button. It's held in memory only and is gone when Voisu quits.</li>
+  <li><strong>Windows and Mac:</strong> open <strong>Settings…</strong> from the tray or menu bar. The <strong>Last Transcript</strong> card on the Home page shows your most recent Transcript with a <strong>Copy</strong> button. It's held in memory only and is gone when Voisu quits.</li>
   <li><strong>Linux:</strong> the Transcript is usually still on your clipboard, so paste it with <kbd>Ctrl</kbd>&nbsp;<kbd>V</kbd> (or <kbd>Ctrl</kbd>&nbsp;<kbd>Shift</kbd>&nbsp;<kbd>V</kbd> in a terminal). <code>voisu history</code> lists recent Recordings, newest first, with the start of each Transcript, and <code>voisu history --json</code> gives the full text.</li>
 </ul>
 
 <h2 id="speaking">Speaking tips</h2>
 <ul>
   <li>Speak naturally, in full sentences. Voisu adds punctuation and capitals for you.</li>
-  <li>On Linux you can also say marks the way you'd read them: “dash dash”, “slash”, “quote … unquote”, “new paragraph”, or “first … second …” for a numbered list.</li>
-  <li>Teach Voisu names and jargon it gets wrong. On Windows, add them under <strong>Boost words</strong> in <a href="settings.html#windows">Settings</a>. On Linux, use <code>voisu dictionary add &lt;term&gt;</code> (see <a href="settings.html#linux">Settings</a>).</li>
+  <li>You can also say marks the way you'd read them: “dash dash”, “slash”, “quote … unquote”, “new paragraph”, or “first … second …” for a numbered list.</li>
+  <li>Teach Voisu names and jargon it gets wrong. On Windows and Mac, add them on the <strong>Words</strong> page in <a href="settings.html#windows">Settings</a>. On Linux, use <code>voisu dictionary add &lt;term&gt;</code> (see <a href="settings.html#linux">Settings</a>).</li>
 </ul>
 
     <nav class="pager" aria-label="Docs pages">

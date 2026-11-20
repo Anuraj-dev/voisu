@@ -77,7 +77,7 @@
 
   <main id="main" class="doc">
 <h1>Troubleshooting</h1>
-<p class="lead">Most problems are one of a handful of things: the paste couldn't land, the desktop hasn't granted a permission, or a key or microphone isn't set up. Start with the message the capsule showed you.</p>
+<p class="lead">Most problems are one of a handful of things: the paste couldn't land, the desktop hasn't granted a permission, or a key or microphone isn't set up. Start with the message the pill showed you.</p>
 
 <div class="callout tip">
   <p><strong>On Linux, open <code>voisu</code> or run <code>voisu doctor</code> first.</strong> It checks the daemon, the shortcut and RemoteDesktop portals, the clipboard and your keys, and tells you what to do about anything that fails. <code>voisu doctor --verbose</code> shows the reasoning behind each check.</p>
@@ -121,7 +121,7 @@
 <div class="code"><pre><span class="p">$ </span>rm ~/.local/state/voisu/remote-desktop.restore-token
 <span class="p">$ </span>systemctl --user restart voisu.service</pre></div>
 <p>This clears only Voisu's own saved grant. A permission your desktop remembers by itself isn't cleared by this.</p>
-<p>On GNOME, a few <code>voisu doctor</code> results are expected: <em>Paste action</em> and <em>Paste backend</em> show SKIP (they're Hyprland checks), and <em>Focus guard</em> shows WARN because GNOME can't report the focused window. The capsule is the <code>overlay@voisu.app</code> Shell extension there, so an inactive <code>voisu-overlay.service</code> is normal.</p>
+<p>On GNOME, a few <code>voisu doctor</code> results are expected: <em>Paste action</em> and <em>Paste backend</em> show SKIP (they're Hyprland checks), and <em>Focus guard</em> shows WARN because GNOME can't report the focused window. The pill is the <code>overlay@voisu.app</code> Shell extension there, so an inactive <code>voisu-overlay.service</code> is normal.</p>
 
 <h2 id="keys">Keys</h2>
 <ul>
@@ -138,7 +138,7 @@
 </ul>
 
 <h2 id="paste">The paste didn't land</h2>
-<p>Your words are kept either way. On Windows, copy them from the <strong>Last Transcript</strong> card on the Overview tab (<strong>Settings…</strong> in the tray). On Linux they're on your clipboard.</p>
+<p>Your words are kept either way. On Windows and Mac, copy them from the <strong>Last Transcript</strong> card on the Home page (<strong>Settings…</strong> in the tray or menu bar). On Linux they're on your clipboard.</p>
 <div class="table-scroll">
 <table>
   <thead><tr><th>Windows message</th><th>What it means</th></tr></thead>
@@ -163,7 +163,7 @@
 <p>The installer isn't code-signed yet, so Microsoft Defender SmartScreen may show “Windows protected your PC” the first time you run it. Choose <strong>More info</strong>, then <strong>Run anyway</strong>. The installer comes from the project's <a href="https://github.com/Anuraj-dev/voisu/releases">GitHub releases</a>, and updates after that are signature-checked before they install.</p>
 
 <h2 id="report">Reporting a bug</h2>
-<p><a href="https://github.com/Anuraj-dev/voisu/issues">Open an issue on GitHub</a> with your OS, desktop and what the capsule said. On Linux, <code>voisu history</code> lists recent Recordings with their IDs, and <code>voisu export &lt;id&gt;</code> writes a redacted export of one you can attach. On Windows, the log folder is shown at the bottom of the settings window.</p>
+<p><a href="https://github.com/Anuraj-dev/voisu/issues">Open an issue on GitHub</a> with your OS, desktop and what the pill said. On Linux, <code>voisu history</code> lists recent Recordings with their IDs, and <code>voisu export &lt;id&gt;</code> writes a redacted export of one you can attach. On Windows, the log folder is shown at the bottom of the settings window.</p>
 <p>Nothing is sent anywhere unless you attach it yourself.</p>
 
     <nav class="pager" aria-label="Docs pages">

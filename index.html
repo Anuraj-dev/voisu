@@ -75,7 +75,7 @@
 
       <figure class="hero-demo">
         <div class="stage-wrap">
-        <div class="stage" data-hero role="img" aria-label="Demo: someone holds Ctrl and Win, the Voisu capsule shows their voice as moving level bars, then the spoken sentence appears as typed text in the open window.">
+        <div class="stage" data-hero role="img" aria-label="Demo: someone holds Ctrl and Win, the Voisu overlay pill shows their voice as moving level bars, then the spoken sentence appears as typed text in the open window.">
           <div class="win">
             <div class="win-bar">
               <span class="win-title">Re: Thursday · Mail</span>
@@ -108,13 +108,13 @@
         <div>
           <h2 id="how-title">Three beats, no window to switch to</h2>
         </div>
-        <p>Voisu sits in the background: the tray on Windows, a user service on Linux. A small capsule floats over your screen while it listens, and gets out of the way when your text arrives.</p>
+        <p>Voisu sits in the background: the tray on Windows, the menu bar on a Mac, a user service on Linux. A small pill floats over your screen while it listens, and gets out of the way when your text arrives.</p>
       </div>
       <ol class="beats">
         <li>
           <span class="num">Recording</span>
           <h3>Press and talk</h3>
-          <p>Hold <kbd>Ctrl</kbd>&nbsp;<kbd>Win</kbd> on Windows or <kbd>Control</kbd>&nbsp;<kbd>Option</kbd> on a Mac, or press your Trigger Key on Linux. The capsule shows your voice as it comes in.</p>
+          <p>Hold <kbd>Ctrl</kbd>&nbsp;<kbd>Win</kbd> on Windows or <kbd>Control</kbd>&nbsp;<kbd>Option</kbd> on a Mac, or press your Trigger Key on Linux. The pill shows your voice as it comes in.</p>
         </li>
         <li>
           <span class="num">Processing</span>
@@ -158,17 +158,27 @@
 
         <article class="card">
           <h3>Nothing vanishes</h3>
-          <p>If a paste can't land, Voisu tells you why and keeps the Transcript: on your clipboard, or one click away under <em>Last transcript</em> on Windows.</p>
+          <p>If a paste can't land, Voisu tells you why and keeps the Transcript: on your clipboard, or one click away under <em>Last transcript</em> on Windows and Mac.</p>
         </article>
 
         <article class="card">
           <h3>Your keys, your keyring</h3>
-          <p>API keys live in your desktop keyring or Windows Credential Manager. Logs and history stay on your machine.</p>
+          <p>API keys live in your desktop keyring, Windows Credential Manager or the macOS Keychain. Logs and history stay on your machine.</p>
         </article>
 
         <article class="card">
           <h3>No root, no raw input</h3>
           <p>On Linux, Voisu uses your desktop's portals for the shortcut and typing. It never needs <code>uinput</code> or access to input devices.</p>
+        </article>
+
+        <article class="card">
+          <h3>Local on Linux, if you like</h3>
+          <p>Switch to Local and your speech never leaves the computer. Voisu runs a whisper.cpp model on your GPU or CPU after asking before a one-time download. Local models are Linux only for now.</p>
+        </article>
+
+        <article class="card">
+          <h3>An overlay you can place</h3>
+          <p>The pill sits at the bottom centre. Drag it anywhere, save with ✓ or cancel with ✗, and Reset puts it back. On Linux this works on KDE Plasma and Hyprland.</p>
         </article>
 
         <article class="card half">
@@ -178,7 +188,7 @@
 
         <article class="card half">
           <h3>Say the punctuation</h3>
-          <p>On Linux, speak marks the way you'd read them: “dash dash”, “slash”, “quote … unquote”, “new paragraph”, or “first … second …” for a numbered list.</p>
+          <p>Speak marks the way you'd read them: “dash dash”, “slash”, “quote … unquote”, “new paragraph”, or “first … second …” for a numbered list.</p>
         </article>
       </div>
     </div>
@@ -270,7 +280,7 @@
           </div>
           <div class="step">
           <p class="step-label"><span class="n">2</span>Finish setup</p>
-          <p class="small">Setup asks for your API keys, enables the daemon and the native GNOME capsule, and uses <kbd>Ctrl</kbd>&nbsp;<kbd>Space</kbd> by default. If it asks, log out and back in, or reboot.</p>
+          <p class="small">Setup asks for your API keys, enables the daemon and the native GNOME overlay, and uses <kbd>Ctrl</kbd>&nbsp;<kbd>Space</kbd> by default. If it asks, log out and back in, or reboot.</p>
           <div class="code"><pre><span class="p">$ </span>voisu setup</pre></div>
           </div>
           </div>
