@@ -72,8 +72,7 @@ button:disabled {
 }
 
 button:focus-visible,
-.switch input:focus-visible + .track,
-.segmented label:has(input:focus-visible) {
+.switch input:focus-visible + .track {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
@@ -242,39 +241,6 @@ textarea::placeholder {
 
 .switch input:disabled + .track {
   opacity: 0.6;
-}
-
-.segmented {
-  display: flex;
-  gap: 2px;
-  padding: 2px;
-  border-radius: 32px;
-  background: var(--overlay-2);
-  border: 1px solid var(--border);
-}
-
-.segmented label {
-  position: relative;
-  padding: 2px 12px;
-  border-radius: 32px;
-  color: var(--text-2);
-  cursor: pointer;
-  transition: background 0.15s, color 0.15s;
-}
-
-.segmented label.on {
-  background: var(--accent);
-  color: var(--surface);
-}
-
-.segmented input {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  margin: 0;
-  opacity: 0;
-  cursor: pointer;
 }
 
 .chip {

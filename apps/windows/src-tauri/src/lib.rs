@@ -40,13 +40,16 @@ use voisu_core::{Provider, SecretStore, Tone};
 use platform::hotkey::{is_dead_key, key_label};
 use platform::permissions::{self, Pane, Permissions};
 use platform::secrets::CredentialManagerStore;
-use settings::{OverlaySize, Settings};
+use settings::{OverlayPosition, Settings};
 use setup::{KeyInputs, KeyResult};
 use star_prompt::StarPrompt;
 use trigger_key::TriggerChord;
 
 const SETTINGS_WINDOW: &str = "settings";
 const STATE_CHANGED: &str = "state-changed";
+/// Saving the overlay's spot from the pill failed; the payload is the message
+/// for Settings to show.
+const OVERLAY_MOVE_FAILED: &str = "overlay-move-failed";
 /// Passed by the HKCU Run entry (the LaunchAgent on macOS) so a login launch
 /// stays in the tray.
 const AUTOSTART_ARG: &str = "--autostart";
@@ -111,7 +114,13 @@ struct UiState {
     autostart: bool,
     version: String,
     auto_paste: bool,
-    overlay_size: OverlaySize,
+    /// `None` is the default bottom-centre spot.
+    overlay_position: Option<OverlayPosition>,
+    /// The overlay is showing for the user to drag it.
+    overlay_moving: bool,
+    /// The latest move mode's id, on or ended (0 before the first), so a
+    /// start answer that lands after its move ended is ignored.
+    last_overlay_move: u64,
     boost_words: Vec<String>,
     tone: Tone,
     trigger: UiTrigger,
@@ -231,13 +240,16 @@ const PLATFORM: &str = if cfg!(target_os = "macos") {
 fn get_state(app: AppHandle) -> UiState {
     let mut store = CredentialManagerStore;
     let settings = app.state::<AppState>().settings.lock().unwrap().clone();
+    let (last_overlay_move, overlay_moving) = overlay::last_move(&app);
     UiState {
         groq_saved: store.has_key(Provider::Groq),
         deepgram_saved: store.has_key(Provider::Deepgram),
         autostart: autostart_enabled(&app),
         version: app.package_info().version.to_string(),
         auto_paste: settings.auto_paste,
-        overlay_size: settings.overlay_size,
+        overlay_position: settings.overlay_position,
+        overlay_moving,
+        last_overlay_move,
         boost_words: settings.boost_words,
         tone: settings.tone,
         trigger: UiTrigger::of(settings.hotkey),
@@ -294,6 +306,24 @@ fn update_settings(app: &AppHandle, change: impl FnOnce(&mut Settings)) -> Setti
     settings.clone()
 }
 
+/// Like `update_settings`, but all or nothing: a failed write keeps the
+/// settings as they were and returns the message to show.
+fn try_update_settings(
+    app: &AppHandle,
+    change: impl FnOnce(&mut Settings),
+) -> Result<Settings, String> {
+    let state = app.state::<AppState>();
+    let mut settings = state.settings.lock().unwrap();
+    let mut changed = settings.clone();
+    change(&mut changed);
+    if let Err(error) = changed.save(&paths::settings_file()) {
+        tracing::warn!(%error, "settings save failed");
+        return Err("Voisu couldn't save its settings file.".into());
+    }
+    *settings = changed.clone();
+    Ok(changed)
+}
+
 /// Read at each delivery, so it applies from the next Transcript.
 #[tauri::command]
 fn set_auto_paste(app: AppHandle, enabled: bool) -> bool {
@@ -301,13 +331,73 @@ fn set_auto_paste(app: AppHandle, enabled: bool) -> bool {
     update_settings(&app, |settings| settings.auto_paste = enabled).auto_paste
 }
 
+/// Settings' "Move overlay": the pill shows beside the window for the user
+/// to drag. The id of the move mode now on, which its finish names; `None`
+/// if Settings closed first. An error is the message to show.
 #[tauri::command]
-fn set_overlay_size(app: AppHandle, size: OverlaySize) -> OverlaySize {
-    tracing::info!(?size, "overlay size");
-    let size = update_settings(&app, |settings| settings.overlay_size = size).overlay_size;
-    overlay::set_size(size);
-    overlay::preview_size(&app);
-    size
+async fn start_overlay_move(app: AppHandle) -> Result<Option<u64>, String> {
+    overlay::start_move(&app).await
+}
+
+/// The pill's ✓ or Enter (`save`) stores where the pill was dropped; its ✗
+/// or Esc keeps the old spot. Either way the overlay hides. Returns the
+/// position now in force; an error is the message to show, with the old
+/// spot kept. The call usually comes from the pill, which hides, so the
+/// error also goes to Settings as [`OVERLAY_MOVE_FAILED`]. `move_id` is the
+/// move mode it was pressed for: a late finish for an earlier one does
+/// nothing.
+#[tauri::command]
+async fn finish_overlay_move(
+    app: AppHandle,
+    move_id: u64,
+    save: bool,
+) -> Result<Option<OverlayPosition>, String> {
+    let saved = overlay::finish_move(&app, move_id, save, |app, dropped| {
+        try_update_settings(app, |settings| settings.overlay_position = dropped).map(|_| ())
+    })
+    .await
+    .inspect_err(|message| {
+        let _ = app.emit_to(SETTINGS_WINDOW, OVERLAY_MOVE_FAILED, message);
+    })?;
+    if let Some(dropped) = saved {
+        tracing::info!(?dropped, "overlay position");
+    }
+    Ok(app
+        .state::<AppState>()
+        .settings
+        .lock()
+        .unwrap()
+        .overlay_position)
+}
+
+/// The page's pull of where to draw the pill, for a page that loads after
+/// the last push.
+#[tauri::command]
+fn overlay_layout() -> overlay::LayoutPayload {
+    overlay::layout()
+}
+
+/// The page drew layout `seq`; a show held for it goes ahead.
+#[tauri::command]
+fn overlay_layout_drawn(app: AppHandle, seq: u64) {
+    overlay::layout_drawn(&app, seq);
+}
+
+/// A press (`start`) or a pointer move on the pill in move mode `move_id`.
+#[tauri::command]
+async fn drag_overlay(app: AppHandle, move_id: u64, start: bool) -> Result<(), String> {
+    overlay::drag(&app, move_id, start).await
+}
+
+/// Back to the default bottom-centre spot, shown in a preview.
+#[tauri::command]
+fn reset_overlay_position(app: AppHandle) -> Result<Option<OverlayPosition>, String> {
+    tracing::info!("overlay position reset");
+    let position =
+        try_update_settings(&app, |settings| settings.overlay_position = None)?.overlay_position;
+    overlay::set_position(position);
+    overlay::preview_placement(&app);
+    Ok(position)
 }
 
 /// Returns the list as stored (normalized), so the window shows what will be
@@ -663,7 +753,12 @@ pub fn run() {
             save_keys,
             set_autostart,
             set_auto_paste,
-            set_overlay_size,
+            start_overlay_move,
+            finish_overlay_move,
+            overlay_layout,
+            overlay_layout_drawn,
+            drag_overlay,
+            reset_overlay_position,
             set_boost_words,
             set_tone,
             set_trigger_key,
@@ -693,13 +788,10 @@ pub fn run() {
                 trigger_label(chord),
             )?;
             let _ = app.state::<AppState>().tray.set(tray);
-            overlay::set_size(
-                app.state::<AppState>()
-                    .settings
-                    .lock()
-                    .unwrap()
-                    .overlay_size,
-            );
+            {
+                let settings = app.state::<AppState>().settings.lock().unwrap().clone();
+                overlay::set_position(settings.overlay_position);
+            }
             overlay::init(handle)?;
             let at_login = std::env::args().any(|arg| arg == AUTOSTART_ARG);
             tracing::info!(keys_ready = ready, at_login, "startup");
@@ -715,6 +807,11 @@ pub fn run() {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
+                // Closing Settings mid-move cancels it, so the overlay never
+                // stays grabbable with no Done button in reach.
+                if window.label() == SETTINGS_WINDOW {
+                    overlay::cancel_move(window.app_handle());
+                }
             }
         })
         .build(tauri::generate_context!())

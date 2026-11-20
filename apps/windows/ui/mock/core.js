@@ -34,6 +34,8 @@ const SCREENS = [
   // What's new with the pending update's notes under "Ready to install".
   'whats-new-pending',
   'replace-key',
+  // Dictation with the overlay in move mode.
+  'overlay-moving',
 ];
 if (!SCREENS.includes(screen)) console.warn(`unknown ?screen=${asked}; try ${SCREENS.join(', ')}`);
 const pending = screen === 'update' || screen === 'whats-new-pending';
@@ -45,7 +47,9 @@ const state = {
   autostart: true,
   version: '0.79.0',
   autoPaste: true,
-  overlaySize: 'medium',
+  overlayPosition: null,
+  overlayMoving: false,
+  lastOverlayMove: 0,
   boostWords: ['Voisu', 'Deepgram'],
   tone: 'formal',
   trigger: { key: DEFAULT_KEY, label: mac ? 'Ctrl+Option' : 'Ctrl+Win', warnings: [], isDefault: true },
@@ -111,7 +115,29 @@ const COMMANDS = {
   },
   set_auto_paste: ({ enabled }) => (state.autoPaste = enabled),
   set_tone: ({ tone }) => (state.tone = tone),
-  set_overlay_size: ({ size }) => (state.overlaySize = size),
+  start_overlay_move: () => {
+    if (!state.overlayMoving) {
+      console.info('mock: overlay shown in move mode');
+      state.overlayMoving = true;
+      state.lastOverlayMove += 1;
+      emit('state-changed', null);
+    }
+    return state.lastOverlayMove;
+  },
+  // The overlay page: its layout comes from the `?state=` driver.
+  overlay_layout: () => null,
+  overlay_layout_drawn: () => {},
+  drag_overlay: () => {},
+  // ✓ saves a spot left of centre, as if the pill were dragged there. A
+  // finish for an earlier move changes nothing.
+  finish_overlay_move: ({ moveId, save }) => {
+    if (!state.overlayMoving || moveId !== state.lastOverlayMove) return state.overlayPosition;
+    if (save) state.overlayPosition = { x: 0.3, y: 0.0 };
+    state.overlayMoving = false;
+    emit('state-changed', null);
+    return state.overlayPosition;
+  },
+  reset_overlay_position: () => (state.overlayPosition = null),
   set_autostart: ({ enabled }) => (state.autostart = enabled),
   set_boost_words: ({ words }) => (state.boostWords = [...new Set(words.map((w) => w.trim()).filter(Boolean))]),
   save_keys: async ({ groq, deepgram }) => {
@@ -200,9 +226,14 @@ async function drive() {
     await open(screen);
   } else if (screen === 'whats-new-pending') {
     await open('whats-new');
+  } else if (screen === 'overlay-moving') {
+    await open('dictation');
+    (await until(() => $('#move-overlay'))).click();
   } else if (screen === 'replace-key') {
     await open('keys');
     (await until(() => $('button[aria-label="Replace Groq key"]'))).click();
   }
 }
-drive();
+// The overlay page has its own driver.
+if (location.pathname.endsWith('/overlay.html')) import('./overlay.js');
+else drive();

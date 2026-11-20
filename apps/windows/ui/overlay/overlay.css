@@ -1,8 +1,10 @@
-/* The recording Overlay capsule. Values follow DESIGN.md and the Linux GTK
-   overlay (crates/voisu-app/src/bin/voisu-overlay.rs). The window is 8 px
-   larger than the capsule on every side so the error glow is not clipped.
-   Sizes are the medium capsule times --s, which overlay.js sets from the
-   window width the chosen Overlay size gave it. */
+/* The recording Overlay pill. Colours follow DESIGN.md and the Linux GTK
+   overlay (crates/voisu-app/src/bin/voisu-overlay.rs). The window is as big
+   as the widest text state (320x48) plus 8 px of glow room on every side;
+   the pill sits inside it where overlay.js puts it, and the rest of the
+   window is transparent and lets clicks through. Sizes are the one Linux
+   pill times --s, which overlay.js sets from the window width: 1, except
+   on a work area too small for the window. */
 :root {
   --s: 1;
   --surface: rgba(23, 25, 29, 0.96);
@@ -10,6 +12,8 @@
   --failure: #ff8a8a;
   --notice: #ffb454;
   --text: #f4f5f7;
+  --ring: rgba(244, 245, 247, 0.7);
+  --outline: rgba(244, 245, 247, 0.28);
 }
 
 *,
@@ -25,48 +29,75 @@ body {
   height: 100%;
   overflow: hidden;
   background: transparent;
+  /* WKWebView (macOS) needs the prefix to keep a drag from selecting text. */
+  -webkit-user-select: none;
   user-select: none;
   cursor: default;
 }
 
 body {
-  display: grid;
-  place-items: center;
+  position: relative;
   font-family: 'Segoe UI Variable', 'Segoe UI', system-ui, sans-serif;
 }
 
+/* overlay.js sets --x/--y (the pill's top-left corner) so the pill's centre
+   lands on the anchor the native side placed the window around. 120x40
+   (overlay.rs PILL_WIDTH/PILL_HEIGHT), with the Linux pill's
+   faint white outline; the error state's red border overrides it. */
 .capsule {
-  width: calc(280px * var(--s));
-  height: calc(64px * var(--s));
-  padding: calc(12px * var(--s)) calc(8px * var(--s));
-  border-radius: calc(32px * var(--s));
-  border: 1px solid transparent;
+  position: absolute;
+  left: var(--x, 50%);
+  top: var(--y, 50%);
+  min-width: calc(120px * var(--s));
+  height: calc(40px * var(--s));
+  border-radius: calc(20px * var(--s));
+  border: 1px solid var(--outline);
+  padding: calc(5px * var(--s)) calc(7px * var(--s));
   background: var(--surface);
   display: grid;
   place-items: center;
 }
 
+/* Copied and Error carry text: the pill widens to fit it, up to 320 px and
+   two lines, growing taller for the second line. */
+.capsule.copied,
+.capsule.error {
+  width: max-content;
+  max-width: calc(320px * var(--s));
+  height: auto;
+  min-height: calc(40px * var(--s));
+  padding: calc(4px * var(--s)) calc(14px * var(--s));
+}
+
+/* Room for the full 26-bar row (2 px bars, 2 px gaps: 102 px). */
 .meter {
-  /* The capsule's content box: 280x64 less the 12px/8px padding (scaled) and
-     the 1px border (not scaled). */
-  width: calc(264px * var(--s) - 2px);
-  height: calc(40px * var(--s) - 2px);
+  width: calc(104px * var(--s));
+  height: calc(28px * var(--s));
   display: block;
 }
 
-.message {
+.message,
+.copied-text {
   margin: 0;
-  padding: 0 calc(16px * var(--s));
-  max-width: 100%;
-  color: var(--failure);
-  font-size: calc(11pt * var(--s));
+  font-size: calc(10.5pt * var(--s));
   font-weight: 600;
   line-height: 1.2;
   text-align: center;
+  text-wrap: balance;
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
+}
+
+.message {
+  color: var(--failure);
+}
+
+/* Copied: calm amber text, no red border or glow (the Linux Copied phase). The
+   Transcript is safe on the clipboard; the user only has to paste it. */
+.copied-text {
+  color: var(--notice);
 }
 
 .message[hidden],
@@ -78,12 +109,14 @@ body {
 /* Delivered: the check mark alone, like the Linux Success phase. */
 .check {
   color: var(--accent);
-  font-size: calc(14pt * var(--s));
+  font-size: calc(13pt * var(--s));
   font-weight: 600;
   line-height: 1;
 }
 
-.capsule.done .meter {
+.capsule.done .meter,
+.capsule.copied .meter,
+.capsule.error .meter {
   display: none;
 }
 
@@ -104,30 +137,112 @@ body {
   }
 }
 
-/* Copied: calm amber text, no border or glow (the Linux Copied phase). The
-   Transcript is safe on the clipboard; the user only has to paste it. */
-.copied-text {
-  margin: 0;
-  padding: 0 calc(16px * var(--s));
-  color: var(--notice);
-  font-size: calc(11pt * var(--s));
-  font-weight: 600;
-  line-height: 1.2;
-  text-align: center;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.capsule.copied .meter {
-  display: none;
-}
-
 .capsule.error {
   border-color: rgba(255, 138, 138, 0.9);
   box-shadow: 0 0 calc(8px * var(--s)) rgba(255, 138, 138, 0.35);
 }
 
-.capsule.error .meter {
+/* Move mode (Settings' "Move overlay"): idle bars inside a dashed ring, and
+   the pill can be picked up and saved or cancelled from its own buttons.
+   Only this mode takes the mouse; the native side keeps the window
+   click-through otherwise. */
+.capsule.moving {
+  outline: 1.5px dashed var(--ring);
+  outline-offset: 3px;
+  cursor: grab;
+  touch-action: none;
+}
+
+.capsule.moving:active {
+  cursor: grabbing;
+}
+
+/* The state shown on the pill: bars, check mark, Copied or error text. */
+.face {
+  display: grid;
+  place-items: center;
+}
+
+/* Move mode puts ✗ (cancel) and ✓ (save) either side of the idle bars:
+   24 px round targets, a red ✗ and a green ✓ as on Linux. */
+.move-button {
   display: none;
+}
+
+/* A fixed width the native side places by (overlay.rs MOVE_PILL_WIDTH), so
+   near an edge the page never shifts the pill off the anchor ✓ saves. */
+.capsule.moving {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: calc(158px * var(--s));
+  gap: calc(5px * var(--s));
+  padding: 0 calc(4px * var(--s));
+}
+
+/* What is left between ✗ and ✓; overlay.js draws the bars that fit. */
+.capsule.moving .meter {
+  width: calc(88px * var(--s));
+}
+
+.capsule.moving .move-button {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: calc(24px * var(--s));
+  height: calc(24px * var(--s));
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  transition:
+    background-color 120ms ease-out,
+    transform 120ms ease-out;
+}
+
+.move-button svg {
+  width: calc(14px * var(--s));
+  height: calc(14px * var(--s));
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.75;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+#move-cancel {
+  color: var(--failure);
+}
+
+#move-cancel:hover {
+  background: rgba(255, 138, 138, 0.22);
+}
+
+#move-save {
+  color: var(--accent);
+}
+
+#move-save:hover {
+  background: rgba(101, 214, 160, 0.28);
+}
+
+.move-button:active {
+  transform: scale(0.9);
+}
+
+.move-button:focus-visible {
+  outline: 1.5px solid var(--text);
+  outline-offset: 1px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .capsule.moving .move-button {
+    transition: none;
+  }
+
+  .move-button:active {
+    transform: none;
+  }
 }
