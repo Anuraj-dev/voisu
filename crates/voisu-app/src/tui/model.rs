@@ -121,6 +121,8 @@ pub struct SettingsSnapshot {
     pub local_device: crate::config::LocalDevice,
     /// Which Local model tier the user asked for.
     pub local_model: crate::config::LocalModel,
+    /// Where the on-screen Overlay sits.
+    pub overlay_position: crate::config::OverlayPosition,
     /// The tier installed now, if a whisper.cpp tier is. One Local model is
     /// installed at a time.
     pub installed_tier: Option<LocalTier>,
@@ -231,6 +233,7 @@ pub enum Job {
     SetDeepgram(bool),
     SetLocalIdleUnload(Option<Duration>),
     SetLocalDevice(crate::config::LocalDevice),
+    SetOverlayPosition(crate::config::OverlayPosition),
     /// Switches the Local model. Without `agreed`, a tier that is not
     /// installed only asks; with it, that download runs, and only if it is
     /// still the one the switch needs.
@@ -290,6 +293,7 @@ impl fmt::Debug for Job {
             Job::SetDeepgram(enabled) => write!(f, "SetDeepgram({enabled})"),
             Job::SetLocalIdleUnload(after) => write!(f, "SetLocalIdleUnload({after:?})"),
             Job::SetLocalDevice(device) => write!(f, "SetLocalDevice({device:?})"),
+            Job::SetOverlayPosition(position) => write!(f, "SetOverlayPosition({position:?})"),
             Job::SetLocalModel { model, agreed } => {
                 write!(f, "SetLocalModel({model:?}, agreed: {agreed:?})")
             }
@@ -424,6 +428,7 @@ const fn minutes(n: u64) -> Option<Duration> {
 const LOCAL_UNLOADS: [Option<Duration>; 3] = [None, minutes(30), minutes(60)];
 const LOCAL_DEVICES: [crate::config::LocalDevice; 3] = crate::config::LocalDevice::ALL;
 const LOCAL_MODELS: [crate::config::LocalModel; 3] = crate::config::LocalModel::ALL;
+const OVERLAY_POSITIONS: [crate::config::OverlayPosition; 6] = crate::config::OverlayPosition::ALL;
 
 const ENGINE_CHOICES: [Choice; 2] = [
     choice("Cloud", "Fast and accurate. Needs internet."),
@@ -462,6 +467,14 @@ const LOCAL_DEVICE_CHOICES: [Choice; 3] = [
     choice("GPU", "A GPU only, never the CPU."),
     choice("CPU", "Works anywhere; several times slower."),
 ];
+const OVERLAY_POSITION_CHOICES: [Choice; 6] = [
+    choice("Top", "Centered at the top of the screen."),
+    choice("Bottom", "Centered at the bottom of the screen."),
+    choice("Top left", "The top-left corner."),
+    choice("Top right", "The top-right corner."),
+    choice("Bottom left", "The bottom-left corner."),
+    choice("Bottom right", "The bottom-right corner."),
+];
 
 const LOCAL_MODEL_CHOICES: [Choice; 3] = [
     choice("Auto", "Accurate on a GPU, Fast on the CPU."),
@@ -474,6 +487,10 @@ const LOCAL_MODEL_CHOICES: [Choice; 3] = [
 
 pub fn local_model_label(model: crate::config::LocalModel) -> &'static str {
     LOCAL_MODEL_CHOICES[position(&LOCAL_MODELS, model)].label
+}
+
+pub fn overlay_position_label(spot: crate::config::OverlayPosition) -> &'static str {
+    OVERLAY_POSITION_CHOICES[position(&OVERLAY_POSITIONS, spot)].label
 }
 
 pub fn local_device_label(device: crate::config::LocalDevice) -> &'static str {
@@ -593,6 +610,7 @@ pub enum SettingsRow {
     LocalUnload,
     LocalDevice,
     LocalModel,
+    OverlayPosition,
     UpdateCheck,
     StarPrompt,
     RunSetup,
@@ -600,7 +618,7 @@ pub enum SettingsRow {
 }
 
 impl SettingsRow {
-    pub const ALL: [SettingsRow; 16] = [
+    pub const ALL: [SettingsRow; 17] = [
         SettingsRow::Engine,
         SettingsRow::Delivery,
         SettingsRow::Writing,
@@ -613,6 +631,7 @@ impl SettingsRow {
         SettingsRow::LocalUnload,
         SettingsRow::LocalDevice,
         SettingsRow::LocalModel,
+        SettingsRow::OverlayPosition,
         SettingsRow::UpdateCheck,
         SettingsRow::StarPrompt,
         SettingsRow::RunSetup,
@@ -626,6 +645,7 @@ impl SettingsRow {
             SettingsRow::Writing => "Writing",
             SettingsRow::Rendering => "Layout",
             SettingsRow::Tone => "Tone",
+            SettingsRow::OverlayPosition => "Overlay",
             SettingsRow::Deepgram => "Deepgram",
             SettingsRow::GroqKey => "Groq key",
             SettingsRow::DeepgramKey => "Deepgram key",
@@ -648,6 +668,7 @@ impl SettingsRow {
             SettingsRow::Writing => &WRITING_CHOICES,
             SettingsRow::Rendering => &LAYOUT_CHOICES,
             SettingsRow::Tone => &TONE_CHOICES,
+            SettingsRow::OverlayPosition => &OVERLAY_POSITION_CHOICES,
             SettingsRow::LocalUnload => &LOCAL_UNLOAD_CHOICES,
             SettingsRow::LocalDevice => &LOCAL_DEVICE_CHOICES,
             SettingsRow::LocalModel => &LOCAL_MODEL_CHOICES,
@@ -674,6 +695,9 @@ impl SettingsRow {
             SettingsRow::Writing => "How much Voisu tidies your words.",
             SettingsRow::Rendering => "How your words are laid out.",
             SettingsRow::Tone => "How casual your words read.",
+            SettingsRow::OverlayPosition => {
+                "Where the on-screen pill sits. It applies to your next Recording."
+            }
             SettingsRow::Deepgram => {
                 "Uses Deepgram alongside Groq for better accuracy on technical \
                  words. Off uses Groq alone."
@@ -1087,6 +1111,9 @@ impl App {
             }),
             SettingsRow::Tone => self.settings.map_or_else(loading, |settings| {
                 plain(tone_label(settings.tone).to_owned())
+            }),
+            SettingsRow::OverlayPosition => self.settings.map_or_else(loading, |settings| {
+                plain(overlay_position_label(settings.overlay_position).to_owned())
             }),
             SettingsRow::Deepgram => self.settings.map_or_else(loading, |settings| {
                 plain(if settings.deepgram { "On" } else { "Off" }.to_owned())
@@ -1703,6 +1730,7 @@ impl App {
             | SettingsRow::Writing
             | SettingsRow::Rendering
             | SettingsRow::Tone
+            | SettingsRow::OverlayPosition
             | SettingsRow::LocalUnload
             | SettingsRow::LocalDevice
             | SettingsRow::LocalModel => {
@@ -1757,6 +1785,7 @@ impl App {
             SettingsRow::Writing => position(&WRITINGS, settings.writing),
             SettingsRow::Rendering => position(&LAYOUTS, settings.rendering),
             SettingsRow::Tone => position(&TONES, settings.tone),
+            SettingsRow::OverlayPosition => position(&OVERLAY_POSITIONS, settings.overlay_position),
             // A hand-set value opens on the default, Never.
             SettingsRow::LocalUnload => LOCAL_UNLOADS
                 .iter()
@@ -1840,6 +1869,10 @@ impl App {
             SettingsRow::Tone => {
                 settings.tone = TONES[picked];
                 Job::SetTone(settings.tone)
+            }
+            SettingsRow::OverlayPosition => {
+                settings.overlay_position = OVERLAY_POSITIONS[picked];
+                Job::SetOverlayPosition(settings.overlay_position)
             }
             SettingsRow::LocalUnload => {
                 settings.local_idle_unload = LOCAL_UNLOADS[picked];
@@ -2136,6 +2169,7 @@ pub(super) mod test_support {
             local_idle_unload: crate::config::DEFAULT_LOCAL_IDLE_UNLOAD,
             local_device: crate::config::LocalDevice::Auto,
             local_model: crate::config::LocalModel::Auto,
+            overlay_position: crate::config::OverlayPosition::Top,
             installed_tier: Some(crate::local_model::LocalTier::Accurate),
             update_check: true,
             star_prompt: true,
@@ -3205,6 +3239,54 @@ mod tests {
             "{effects:?}"
         );
         assert_eq!(app.setting_value(SettingsRow::LocalDevice).0, "CPU");
+        assert!(app.restart_pending.is_empty());
+    }
+
+    #[test]
+    fn the_overlay_position_row_shows_and_picks_a_spot() {
+        use crate::config::OverlayPosition;
+        let mut app = ready_app();
+        app.tab = Tab::Settings;
+        app.settings_selected = SettingsRow::ALL
+            .iter()
+            .position(|row| *row == SettingsRow::OverlayPosition)
+            .unwrap();
+        assert_eq!(SettingsRow::OverlayPosition.label(), "Overlay");
+        assert_eq!(SettingsRow::OverlayPosition.choices().len(), 6);
+        assert!(
+            SettingsRow::OverlayPosition
+                .description()
+                .contains("next Recording")
+        );
+        assert_eq!(
+            app.setting_value(SettingsRow::OverlayPosition),
+            ("Top".to_owned(), Tone::Plain)
+        );
+        assert!(press(&mut app, KeyCode::Enter, 0).is_empty());
+        assert!(matches!(
+            app.prompt,
+            Some(Prompt::Choice {
+                row: SettingsRow::OverlayPosition,
+                picked: 0
+            })
+        ));
+        for _ in 0..5 {
+            let _ = press(&mut app, KeyCode::Down, 0);
+        }
+        let effects = press(&mut app, KeyCode::Enter, 0);
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Job(Job::SetOverlayPosition(
+                    OverlayPosition::BottomRight
+                ))]
+            ),
+            "{effects:?}"
+        );
+        assert_eq!(
+            app.setting_value(SettingsRow::OverlayPosition).0,
+            "Bottom right"
+        );
         assert!(app.restart_pending.is_empty());
     }
 

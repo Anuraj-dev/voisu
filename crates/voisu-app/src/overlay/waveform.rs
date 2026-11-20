@@ -124,7 +124,8 @@ impl Waveform {
 
     /// The level for bar `index` of a `count`-bar row mirrored about its
     /// centre: the two middle bars show the head, the outer bars the oldest
-    /// history.
+    /// history. A row narrower than the history steps over slots so it still
+    /// spans the whole history instead of only its newest few samples.
     pub fn bar_level(&self, index: usize, count: usize) -> f64 {
         let half = count / 2;
         let slot = if index < half {
@@ -132,7 +133,8 @@ impl Waveform {
         } else {
             index - half
         };
-        self.slot_level(slot)
+        let stride = (HISTORY / half.max(1)).max(1);
+        self.slot_level(slot * stride)
     }
 }
 
@@ -283,6 +285,28 @@ mod tests {
         assert!(
             (waveform.bar_level(0, count) - waveform.slot_level(HISTORY - 1)).abs() < EPS,
             "the outermost bar shows the oldest history"
+        );
+    }
+
+    #[test]
+    fn a_narrow_row_is_mirrored_and_still_spans_the_history() {
+        let mut waveform = Waveform::default();
+        for target in [0.3, 0.8, 0.5, 1.0, 0.2, 0.9, 0.4, 0.6] {
+            waveform.set_target(target);
+            waveform.advance(0.045);
+        }
+        let count = super::super::PILL_BAR_COUNT;
+        for index in 0..count {
+            let mirrored = waveform.bar_level(count - 1 - index, count);
+            assert!((waveform.bar_level(index, count) - mirrored).abs() < EPS);
+        }
+        assert!((waveform.bar_level(count / 2, count) - waveform.slot_level(0)).abs() < EPS);
+        // The outermost bar reaches well past the newest few samples.
+        let stride = HISTORY / (count / 2);
+        assert!(stride > 1);
+        assert!(
+            (waveform.bar_level(0, count) - waveform.slot_level((count / 2 - 1) * stride)).abs()
+                < EPS
         );
     }
 

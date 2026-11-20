@@ -29,6 +29,7 @@ enum CliAction {
     Writing(Option<WritingMode>),
     Layout(Option<RenderingPolicy>),
     Tone(Option<Tone>),
+    OverlayPosition(Option<voisu_app::config::OverlayPosition>),
     DictionaryAdd(String),
     DictionaryRemove(String),
     DictionaryList { json: bool },
@@ -66,6 +67,7 @@ fn main() -> ExitCode {
         Ok(CliAction::Writing(mode)) => writing(mode),
         Ok(CliAction::Layout(policy)) => layout(policy),
         Ok(CliAction::Tone(tone)) => tone_command(tone),
+        Ok(CliAction::OverlayPosition(position)) => overlay_position_command(position),
         Ok(CliAction::DictionaryAdd(term)) => dictionary_add(&term),
         Ok(CliAction::DictionaryRemove(term)) => dictionary_remove(&term),
         Ok(CliAction::DictionaryList { json }) => dictionary_list(json),
@@ -648,6 +650,28 @@ fn tone_command(tone: Option<Tone>) -> ExitCode {
     }
 }
 
+/// Reads or persists where the Overlay sits. The overlay re-reads it each time
+/// it appears, so a change applies to the next Recording without a restart.
+fn overlay_position_command(position: Option<voisu_app::config::OverlayPosition>) -> ExitCode {
+    let Some(position) = position else {
+        println!(
+            "Overlay position: {}",
+            voisu_app::config::overlay_position().as_str()
+        );
+        return ExitCode::SUCCESS;
+    };
+    match voisu_app::config::set_overlay_position(position) {
+        Ok(_) => {
+            println!(
+                "Overlay position set to {}. It applies to your next Recording.",
+                position.as_str()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(message) => fail(4, &message),
+    }
+}
+
 fn tone_meaning(tone: Tone) -> &'static str {
     match tone {
         Tone::Formal => "full words and a final full stop",
@@ -843,6 +867,10 @@ fn parse_command() -> Result<CliAction, String> {
         }
         [command] if command == "tone" => Ok(CliAction::Tone(None)),
         [command, tone] if command == "tone" => Ok(CliAction::Tone(Some(parse_tone(tone)?))),
+        [command] if command == "overlay-position" => Ok(CliAction::OverlayPosition(None)),
+        [command, position] if command == "overlay-position" => Ok(CliAction::OverlayPosition(
+            Some(parse_overlay_position(position)?),
+        )),
         [dictionary, action, term] if dictionary == "dictionary" && action == "add" => {
             Ok(CliAction::DictionaryAdd(term.clone()))
         }
@@ -933,6 +961,13 @@ fn parse_tone(value: &str) -> Result<Tone, String> {
     Tone::parse(value).ok_or_else(|| "tone must be formal or informal".to_owned())
 }
 
+fn parse_overlay_position(value: &str) -> Result<voisu_app::config::OverlayPosition, String> {
+    voisu_app::config::OverlayPosition::parse(value).ok_or_else(|| {
+        "overlay-position must be top, bottom, top-left, top-right, bottom-left, or bottom-right"
+            .to_owned()
+    })
+}
+
 fn parse_provider(value: &str) -> Result<Provider, String> {
     match value {
         "groq" => Ok(Provider::Groq),
@@ -963,6 +998,8 @@ commands:
   writing [clean|exact]         fix grammar and misheard words, or keep your words as spoken
   layout [plain|auto|sections]  punctuation only, organize when you speak in parts, or add headings
   tone [formal|informal]        full words, or abbreviations like btw, no final full stop
+  overlay-position [top|bottom|top-left|top-right|bottom-left|bottom-right]
+                                where the on-screen Overlay sits (Linux)
   dictionary add <term>         add a word Voisu should spell your way
   dictionary remove <term>      remove a word
   dictionary list [--json]      list your words

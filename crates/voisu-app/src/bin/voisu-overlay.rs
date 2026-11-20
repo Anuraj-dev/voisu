@@ -21,13 +21,14 @@ use voisu_app::local_overlay::TriggerRepeatLatch;
 use voisu_app::overlay::waveform::{Waveform, poll_target};
 use voisu_app::overlay::{
     LIMIT_WARNING_CLASS, LevelPollAction, LevelPollLatch, LimitWarning, LimitWarningLatch,
-    NoSpeechNotifyLatch, ObservedSignal, OverlayPhase, OverlayView, PresentationController,
-    PresentationTracker, RecordingNotifyLatch, RungNotification, STATUS_POLL_PERIOD,
-    STATUS_ROUND_TRIP_DEADLINE, StatusCadence, StatusWorker, TickAction, TickObservation,
-    VISUAL_BAR_COUNT, connect_within, edge_falloff_alpha, fetch_status, limit_notification_body,
-    limit_warning_class, limit_warning_from_response, notification_rung_choice, phase_glyph,
-    poll_tick, read_until_eof_within, recording_bar_height, recording_bar_rgb, recording_identity,
-    recording_remaining, resting_floor, sweep_brightness, write_within,
+    NoSpeechNotifyLatch, ObservedSignal, OverlayPhase, OverlayView, PILL_BAR_COUNT, PILL_BAR_GAP,
+    PILL_HEIGHT, PILL_MAX_LINES, PILL_WIDTH, PresentationController, PresentationTracker,
+    RecordingNotifyLatch, RungNotification, STATUS_POLL_PERIOD, STATUS_ROUND_TRIP_DEADLINE,
+    StatusCadence, StatusWorker, TickAction, TickObservation, connect_within, edge_falloff_alpha,
+    fetch_status, limit_notification_body, limit_warning_class, limit_warning_from_response,
+    notification_rung_choice, overlay_edges, phase_glyph, poll_tick, read_until_eof_within,
+    recording_bar_height, recording_bar_rgb, recording_identity, recording_remaining,
+    resting_floor, sweep_brightness, text_pill_text_width, text_pill_width, write_within,
 };
 use voisu_core::{Command, Request, Response, socket_path};
 
@@ -258,8 +259,8 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
 
     let window = gtk::ApplicationWindow::builder()
         .application(application)
-        .default_width(280)
-        .default_height(64)
+        .default_width(PILL_WIDTH)
+        .default_height(PILL_HEIGHT)
         .resizable(false)
         .decorated(false)
         .focusable(false)
@@ -269,8 +270,7 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
     if selection.backend == FeedbackBackend::LayerShell {
         window.init_layer_shell();
         window.set_layer(Layer::Overlay);
-        window.set_anchor(Edge::Bottom, true);
-        window.set_margin(Edge::Bottom, 24);
+        apply_position(&window, voisu_app::config::overlay_position());
         window.set_keyboard_mode(KeyboardMode::None);
         window.set_exclusive_zone(-1);
     }
@@ -317,15 +317,15 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
         .label("")
         .halign(gtk::Align::Center)
         .valign(gtk::Align::Center)
+        .justify(gtk::Justification::Center)
         .build();
     label.add_css_class("state-label");
     label.set_hexpand(true);
     label.set_vexpand(true);
-    let meter = gtk::DrawingArea::builder().content_height(40).build();
+    let meter = gtk::DrawingArea::builder().content_height(24).build();
     // Graphics-first phases (Recording/Processing/NoSpeech) hide the label and
     // glyph widgets entirely (see render_surface), so the meter is the only
-    // visible child and must be free to fill the whole capsule interior
-    // instead of a fixed 150px slot.
+    // visible child and must be free to fill the whole pill interior.
     meter.set_hexpand(true);
     meter.set_halign(gtk::Align::Fill);
     // The pre-waveform glyph slot ("⚠" on Failure, "✓" on Success). It is
@@ -363,12 +363,13 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
         }
     });
     let capsule = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-    // The capsule must BE the 280x64 pill, not a smaller box floated inside it.
+    // The capsule must BE the 120x32 pill, not a smaller box floated inside it.
     // GTK widget margins sit OUTSIDE the styled background, so set_margin_* would
-    // shrink the drawn pill to ~240x40 and let peak bars bleed past its rounded
-    // corners. Fill the whole window instead and push the interior spacing inward
-    // with CSS `padding` (which GTK paints INSIDE the background) — see the CSS
-    // below. Result: capsule 280x64 (radius 32), meter interior 264x40.
+    // shrink the drawn pill and let peak bars bleed past its rounded corners.
+    // Fill the whole window instead and push the interior spacing inward with CSS
+    // `padding` (which GTK paints INSIDE the background) — see the CSS below.
+    // Result: capsule 120x32 (radius 16), meter interior 104x24. A text state
+    // widens it (see `size_pill`).
     capsule.set_hexpand(true);
     capsule.set_vexpand(true);
     capsule.append(&label);
@@ -380,10 +381,11 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
     let css = gtk::CssProvider::new();
     css.load_from_data(
         "window.background { background: transparent; }
-         .capsule { background: rgba(23, 25, 29, 0.96); border-radius: 32px; padding: 12px 8px; }
-         .capsule .state-label, .capsule .meter { color: #F4F5F7; font-size: 11pt; font-weight: 600; }
+         .capsule { background: rgba(23, 25, 29, 0.96); border-radius: 16px; border: 1px solid transparent; padding: 3px 7px; }
+         .capsule.failure, .capsule.loading, .capsule.unavailable, .capsule.copied { padding: 4px 14px; }
+         .capsule .state-label, .capsule .meter { color: #F4F5F7; font-size: 10pt; font-weight: 600; }
          .capsule.processing .state-label, .capsule.processing .meter { color: #8FB4FF; }
-         .capsule.success .state-label, .capsule.success .meter { color: #65D6A0; font-size: 14pt; }
+         .capsule.success .state-label, .capsule.success .meter { color: #65D6A0; font-size: 13pt; }
          .capsule.failure { border: 1px solid rgba(255, 138, 138, 0.9); box-shadow: 0 0 8px rgba(255, 138, 138, 0.35); }
          .capsule.failure .state-label, .capsule.failure .meter { color: #FF8A8A; }
          .capsule.loading .state-label, .capsule.loading .meter { color: #8FB4FF; }
@@ -1100,8 +1102,67 @@ fn render_surface(
     let glyph_text = phase_glyph(view.phase);
     glyph.set_label(glyph_text);
     glyph.set_visible(!glyph_text.is_empty());
+    size_pill(capsule, label, glyph);
+    if !window.is_visible() && window.is_layer_window() {
+        // The overlay is hidden between Recordings, so re-reading the setting
+        // as it appears applies a change at once and without a restart.
+        apply_position(window, voisu_app::config::overlay_position());
+    }
     window.set_visible(true);
     meter.queue_draw();
+}
+
+/// Anchors and margins the Layer Shell surface for `position`. Every edge is
+/// set, so moving from one preset to another never leaves a stale anchor.
+fn apply_position(window: &gtk::ApplicationWindow, position: voisu_app::config::OverlayPosition) {
+    let edges = overlay_edges(position);
+    for (edge, margin) in [
+        (Edge::Top, edges.top),
+        (Edge::Bottom, edges.bottom),
+        (Edge::Left, edges.left),
+        (Edge::Right, edges.right),
+    ] {
+        window.set_anchor(edge, margin.is_some());
+        window.set_margin(edge, margin.unwrap_or(0));
+    }
+}
+
+/// Sizes the pill for what it shows: 120x32 for bars and the check mark, and
+/// for text widened to fit, up to `PILL_MAX_WIDTH`, wrapping to two lines.
+/// The label's own width request is the text width, so the capsule is exactly
+/// the pill and the window follows it.
+fn size_pill(capsule: &gtk::Box, label: &gtk::Label, glyph: &gtk::Label) {
+    if !label.is_visible() {
+        label.set_size_request(-1, -1);
+        capsule.set_size_request(PILL_WIDTH, PILL_HEIGHT);
+        return;
+    }
+    // Measure the text on one line to know how wide it wants to be.
+    label.set_wrap(false);
+    label.set_size_request(-1, -1);
+    label.set_max_width_chars(-1);
+    let natural = label.measure(gtk::Orientation::Horizontal, -1).1;
+    let glyph_width = if glyph.is_visible() {
+        glyph.measure(gtk::Orientation::Horizontal, -1).1
+    } else {
+        0
+    };
+    let width = text_pill_width(natural, glyph_width);
+    let text_width = text_pill_text_width(width, glyph_width);
+    // Wrapped, ellipsized at the second line, with the width pinned: the
+    // label's natural width then is the request, not its unwrapped length.
+    label.set_wrap(true);
+    label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    label.set_lines(PILL_MAX_LINES);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    label.set_max_width_chars(1);
+    label.set_width_chars(1);
+    let height = label
+        .measure(gtk::Orientation::Vertical, text_width)
+        .1
+        .max(0);
+    label.set_size_request(text_width, height);
+    capsule.set_size_request(width, -1);
 }
 
 /// Cadence of the Level poll on its dedicated worker thread. The meter itself
@@ -1231,18 +1292,18 @@ fn draw_meter(
 ) {
     let MeterState { phase, warning } = state;
     let centre = f64::from(height) / 2.0;
-    // content_height 40 minus a 2px inset -> 38px drawable (floor 3.8, max swing 34.2).
+    // content_height 24 minus a 2px inset -> 22px drawable (floor 2.2, max swing 19.8).
     let drawable = f64::from(height) - 2.0;
-    let gap = 2.0;
-    let count = VISUAL_BAR_COUNT;
+    let gap = PILL_BAR_GAP;
+    let count = PILL_BAR_COUNT;
     let bar_width = (f64::from(width) - gap * (count - 1) as f64) / count as f64;
-    // Corner-fit proof (no explicit clip needed): the 264x40 meter sits inside
-    // the 280x64 capsule (radius 32) at 8px horizontal / 12px vertical padding,
-    // both centred on the window's mid-line (y=32). The tightest point is the
-    // first/last bar's outer edge at window x=8 (or x=272), 24px from the corner
-    // arc's centre; there the pill's half-height is sqrt(32^2 - 24^2) ~= 21.2px,
-    // so the pill spans ~42.3px vertically vs a 38px max bar (19px each side).
-    // 19 < 21.2, so even a full-height peak bar stays inside the rounded corner.
+    // Corner-fit proof (no explicit clip needed): the 104x24 meter sits inside
+    // the 120x32 pill (radius 16) at 8px horizontal / 4px vertical (padding plus
+    // border), centred on the window's mid-line (y=16). The tightest point is the
+    // first/last bar's outer edge at window x=8, 8px from the corner arc's
+    // centre; there the pill's half-height is sqrt(16^2 - 8^2) ~= 13.9px versus
+    // a 22px max bar (11px each side). 11 < 13.9, so even a full-height peak bar
+    // stays inside the rounded corner.
     let elapsed = sweep_started.elapsed().as_secs_f64();
     for index in 0..count {
         let (bar_height, alpha, colour) = match phase {

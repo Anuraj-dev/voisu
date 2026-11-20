@@ -572,10 +572,10 @@ mod tests {
         assert_eq!(lines[14], "   Local unload  Never");
         assert_eq!(lines[15], "   Local device  Auto");
         assert_eq!(lines[16], "   Local model   Auto");
-        assert_eq!(lines[17], "   Update check  On");
-        assert_eq!(lines[18], "   Star prompt   On");
-        // Sixteen rows and a two-value guide overfill 80x24 by two lines, so
-        // the last rows scroll into view as the selection moves down.
+        assert_eq!(lines[17], "   Overlay       Top");
+        assert_eq!(lines[18], "   Update check  On");
+        // Seventeen rows and a two-value guide overfill 80x24 by three lines,
+        // so the last rows scroll into view as the selection moves down.
         assert_eq!(lines[19], "   Where your speech becomes text.");
         assert_eq!(
             lines[20],
@@ -692,11 +692,12 @@ mod tests {
         assert_eq!(lines[14], beside("   Local unload  Never", ""));
         assert_eq!(lines[15], beside("   Local device  Auto", ""));
         assert_eq!(lines[16], beside("   Local model   Auto", ""));
-        assert_eq!(lines[17], beside("   Update check  On", ""));
-        assert_eq!(lines[18], beside("   Star prompt   On", ""));
-        assert_eq!(lines[19], beside("   Run setup", ""));
-        assert_eq!(lines[20], beside("   Star on GitHub", ""));
-        assert_eq!(lines[21], "", "nothing below the rows");
+        assert_eq!(lines[17], beside("   Overlay       Top", ""));
+        assert_eq!(lines[18], beside("   Update check  On", ""));
+        assert_eq!(lines[19], beside("   Star prompt   On", ""));
+        assert_eq!(lines[20], beside("   Run setup", ""));
+        assert_eq!(lines[21], beside("   Star on GitHub", ""));
+        assert_eq!(lines[22], "", "nothing below the rows");
 
         // Picking happens in the panel, the same lines gaining the highlight.
         let _ = press(&mut app, KeyCode::Enter, 0);
@@ -812,11 +813,11 @@ mod tests {
             app.settings_selected = index;
             let row = app.selected_setting();
 
-            // Two lines taller than 80x24 (which sixteen rows overfill by
-            // two), every row shows beside a guide of up to two values; a
+            // Three lines taller than 80x24 (which seventeen rows overfill by
+            // three), every row shows beside a guide of up to two values; a
             // taller guide (Layout, Local unload) scrolls the rows to keep the
             // selected one in view.
-            let tall = joined(&screen(&mut app, &UNICODE, (80, 26)));
+            let tall = joined(&screen(&mut app, &UNICODE, (80, 27)));
             if row.choices().len() <= 2 {
                 for other in SettingsRow::ALL {
                     assert!(

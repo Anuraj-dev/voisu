@@ -65,7 +65,7 @@ Run `voisu` with no arguments in a terminal. It is a full-screen, keyboard-only 
 | `q` | Quit |
 
 - **Home** shows what matters now: ready to dictate, or the one problem and the single key that fixes it. `d` runs every `voisu doctor` check.
-- **Settings** covers Engine, Delivery, Writing, Layout, Tone, Deepgram, your keys and Local unload. Each choice is explained beside it, and Settings offers a restart when the service needs one.
+- **Settings** covers Engine, Delivery, Writing, Layout, Tone, Deepgram, your keys, Local unload and Overlay (where the pill sits). Each choice is explained beside it, and Settings offers a restart when the service needs one.
 - **Dictionary** holds the words Voisu should spell your way. `a` adds, `d` removes. Local mode on the Whisper-based model also hands your words to the model as a hint before it transcribes, and corrects by sound: a name it wrote as it heard it ("voice you") becomes your entry ("Voisu") when the entry has two or more syllables. Cloud mode corrects exact spellings only.
 - **History** lists recent Recordings. `c` copies one.
 

@@ -829,6 +829,82 @@ pub(crate) fn set_local_model_at(path: &Path, model: LocalModel) -> Result<PathB
     set_root_string_at(path, LOCAL_MODEL_KEY, model.as_str())
 }
 
+/// `overlay_position`: where the Linux Overlay sits on screen.
+const OVERLAY_POSITION_KEY: &str = "overlay_position";
+
+/// Where the Linux Overlay pill sits. A Wayland app cannot place itself
+/// freely, so these are the Layer Shell anchor presets;
+/// [`crate::overlay::overlay_edges`] maps each to anchors and margins.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OverlayPosition {
+    /// Top edge, centred.
+    #[default]
+    Top,
+    Bottom,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl OverlayPosition {
+    pub const ALL: [Self; 6] = [
+        Self::Top,
+        Self::Bottom,
+        Self::TopLeft,
+        Self::TopRight,
+        Self::BottomLeft,
+        Self::BottomRight,
+    ];
+
+    /// The config value and CLI word.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Top => "top",
+            Self::Bottom => "bottom",
+            Self::TopLeft => "top-left",
+            Self::TopRight => "top-right",
+            Self::BottomLeft => "bottom-left",
+            Self::BottomRight => "bottom-right",
+        }
+    }
+
+    /// Parses the persisted or typed value. Anything else is `None`; readers
+    /// fall back to [`OverlayPosition::Top`].
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim().to_ascii_lowercase();
+        Self::ALL
+            .into_iter()
+            .find(|position| position.as_str() == value)
+    }
+}
+
+/// The Overlay position. Missing, unreadable or unrecognised values keep
+/// `top`. The overlay re-reads it each time it appears.
+pub fn overlay_position() -> OverlayPosition {
+    overlay_position_at(&config_path())
+}
+
+/// Persists the Overlay position, keeping every other line.
+pub fn set_overlay_position(position: OverlayPosition) -> Result<PathBuf, String> {
+    set_overlay_position_at(&config_path(), position)
+}
+
+pub(crate) fn overlay_position_at(path: &Path) -> OverlayPosition {
+    raw_root_string_at(path, OVERLAY_POSITION_KEY)
+        .and_then(|value| OverlayPosition::parse(&value))
+        .unwrap_or_default()
+}
+
+pub(crate) fn set_overlay_position_at(
+    path: &Path,
+    position: OverlayPosition,
+) -> Result<PathBuf, String> {
+    set_root_string_at(path, OVERLAY_POSITION_KEY, position.as_str())
+}
+
 /// Writes `key = "value"` into the root table, keeping every other line.
 fn set_root_string_at(path: &Path, key: &str, value: &str) -> Result<PathBuf, String> {
     let parent = path
@@ -2823,6 +2899,42 @@ other_key = 5
         assert_eq!(parse_local_model("Accurate"), Ok(LocalModel::Accurate));
         assert_eq!(parse_local_model(" auto "), Ok(LocalModel::Auto));
         assert!(parse_local_model("small.en").is_err());
+    }
+
+    #[test]
+    fn overlay_position_defaults_to_top_round_trips_and_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("voisu").join("config.toml");
+        assert_eq!(overlay_position_at(&path), OverlayPosition::Top);
+
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "tone = \"informal\"\n").unwrap();
+        for position in OverlayPosition::ALL {
+            set_overlay_position_at(&path, position).unwrap();
+            assert_eq!(overlay_position_at(&path), position);
+        }
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents.matches("overlay_position =").count(), 1);
+        assert!(contents.contains("overlay_position = \"bottom-right\"\n"));
+        assert!(contents.contains("tone = \"informal\""), "{contents}");
+
+        // Unknown, wrongly cased words and table-scoped keys fall back to top.
+        for bad in [
+            "overlay_position = \"middle\"\n",
+            "overlay_position = \"top_left\"\n",
+            "overlay_position = 3\n",
+            "[other]\noverlay_position = \"bottom\"\n",
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert_eq!(overlay_position_at(&path), OverlayPosition::Top, "{bad}");
+        }
+        std::fs::write(&path, "overlay_position = ' Top-Left '\n").unwrap();
+        assert_eq!(overlay_position_at(&path), OverlayPosition::TopLeft);
+        assert_eq!(
+            OverlayPosition::parse("top-left"),
+            Some(OverlayPosition::TopLeft)
+        );
+        assert_eq!(OverlayPosition::parse("left"), None);
     }
 
     #[test]

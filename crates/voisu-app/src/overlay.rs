@@ -379,19 +379,88 @@ impl LevelPollLatch {
 
 // ---- Waveform drawing math (pure; the cairo adapter in the bin consumes it) ----
 
-/// Number of bars drawn in the meter row: 22 slots of level history mirrored
-/// about the centre (see `waveform`), as on the Windows overlay.
+/// Bars in the older, wider meter row: 22 slots of level history mirrored
+/// about the centre (see `waveform`), as on the Windows overlay. The pill
+/// draws [`PILL_BAR_COUNT`] of them; this stays the reference density the
+/// history length and sweep tuning were set against.
 pub const VISUAL_BAR_COUNT: usize = 44;
+
+/// Bars the 120x32 pill draws. Each one reads a spaced slot of the same
+/// history, so the row spans as much time as the 44-bar one did.
+pub const PILL_BAR_COUNT: usize = 12;
+/// Gap between pill bars, in pixels.
+pub const PILL_BAR_GAP: f64 = 3.0;
+
+/// The Overlay pill: 120x32 logical px (Windows' Medium), a full-radius capsule.
+pub const PILL_WIDTH: i32 = 120;
+pub const PILL_HEIGHT: i32 = 32;
+/// A pill that carries text widens up to here, then wraps to a second line.
+pub const PILL_MAX_WIDTH: i32 = 320;
+/// Text pills show at most this many lines.
+pub const PILL_MAX_LINES: i32 = 2;
+/// Horizontal CSS padding plus border inside a text pill, per side.
+pub const PILL_TEXT_PAD_X: i32 = 15;
+/// Space between the text and a glyph beside it.
+pub const PILL_CONTENT_GAP: i32 = 10;
+
+/// The width a text pill takes: the unwrapped text and any glyph beside it,
+/// plus padding, never narrower than the bar pill nor wider than
+/// [`PILL_MAX_WIDTH`]. Text that does not fit wraps to [`PILL_MAX_LINES`].
+pub fn text_pill_width(text_width: i32, glyph_width: i32) -> i32 {
+    let gap = if glyph_width > 0 { PILL_CONTENT_GAP } else { 0 };
+    (text_width + gap + glyph_width + 2 * PILL_TEXT_PAD_X).clamp(PILL_WIDTH, PILL_MAX_WIDTH)
+}
+
+/// The width left for the text inside a pill of `pill_width`.
+pub fn text_pill_text_width(pill_width: i32, glyph_width: i32) -> i32 {
+    let gap = if glyph_width > 0 { PILL_CONTENT_GAP } else { 0 };
+    (pill_width - 2 * PILL_TEXT_PAD_X - gap - glyph_width).max(1)
+}
+
+/// The Layer Shell anchors for a [`crate::config::OverlayPosition`]: each edge
+/// is `Some(margin)` when the surface is anchored to it and `None` otherwise.
+/// A surface anchored to one edge only is centred along the perpendicular one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OverlayEdges {
+    pub top: Option<i32>,
+    pub bottom: Option<i32>,
+    pub left: Option<i32>,
+    pub right: Option<i32>,
+}
+
+/// Margin from the top or bottom edge, in logical px.
+pub const EDGE_MARGIN_VERTICAL: i32 = 12;
+/// Margin from the left or right edge, in logical px.
+pub const EDGE_MARGIN_SIDE: i32 = 24;
+
+/// Maps a position preset to Layer Shell anchors and margins: 12 px from the
+/// top or bottom, 24 px from a side, and centred when no side is anchored.
+pub fn overlay_edges(position: crate::config::OverlayPosition) -> OverlayEdges {
+    use crate::config::OverlayPosition as P;
+    let (top, bottom, left, right) = match position {
+        P::Top => (true, false, false, false),
+        P::Bottom => (false, true, false, false),
+        P::TopLeft => (true, false, true, false),
+        P::TopRight => (true, false, false, true),
+        P::BottomLeft => (false, true, true, false),
+        P::BottomRight => (false, true, false, true),
+    };
+    OverlayEdges {
+        top: top.then_some(EDGE_MARGIN_VERTICAL),
+        bottom: bottom.then_some(EDGE_MARGIN_VERTICAL),
+        left: left.then_some(EDGE_MARGIN_SIDE),
+        right: right.then_some(EDGE_MARGIN_SIDE),
+    }
+}
 
 /// Spec floor for the edge-falloff ramp: outermost bars sit at ~45% opacity.
 const EDGE_FALLOFF_MIN: f64 = 0.45;
 /// One full left→right pass of the Processing light sweep.
 const SWEEP_PERIOD_SECS: f64 = 1.2;
-/// Sweep bump width in bar units (gaussian sigma). Chosen relative to the
-/// 44-bar visual row: at 2.2× the density of the old 20-bar row (44/20), the
-/// sigma is scaled by the same factor (2.0 × 44/20 = 4.4) so the light-sweep
-/// bump keeps the same VISUAL width on screen.
-const SWEEP_SIGMA_BARS: f64 = 4.4;
+/// Sweep bump width as a fraction of the row (gaussian sigma / bar count), so
+/// the light-sweep bump keeps the same VISUAL width whatever the density. Set
+/// from the 44-bar row's 4.4-bar sigma.
+const SWEEP_SIGMA_FRACTION: f64 = 0.1;
 /// Resting-bar brightness away from the sweep bump, and the uniform
 /// reduced-motion brightness. Chosen so the sweep reads as light passing
 /// through visible bars, not bars blinking on from black.
@@ -431,11 +500,12 @@ pub fn sweep_brightness(
     if reduced_motion {
         return SWEEP_REDUCED_MOTION_BRIGHTNESS;
     }
+    let sigma = count as f64 * SWEEP_SIGMA_FRACTION;
     let progress = (elapsed_secs.rem_euclid(SWEEP_PERIOD_SECS)) / SWEEP_PERIOD_SECS;
-    let travel = count as f64 + 6.0 * SWEEP_SIGMA_BARS;
-    let position = progress * travel - 3.0 * SWEEP_SIGMA_BARS;
+    let travel = count as f64 + 6.0 * sigma;
+    let position = progress * travel - 3.0 * sigma;
     let distance = index as f64 + 0.5 - position;
-    let bump = (-distance * distance / (2.0 * SWEEP_SIGMA_BARS * SWEEP_SIGMA_BARS)).exp();
+    let bump = (-distance * distance / (2.0 * sigma * sigma)).exp();
     SWEEP_BASE_BRIGHTNESS + (1.0 - SWEEP_BASE_BRIGHTNESS) * bump
 }
 
@@ -1144,6 +1214,63 @@ mod tests {
         FeedbackBackend, FeedbackCapabilities, SessionKind, select_feedback_backend,
     };
     use voisu_core::{DaemonState, OverlayEvent, OverlayOutcome, Response, VersionEnvelope};
+
+    #[test]
+    fn position_presets_map_to_anchors_with_12px_vertical_and_24px_side_margins() {
+        use crate::config::OverlayPosition as P;
+        let edges = |top, bottom, left, right| OverlayEdges {
+            top,
+            bottom,
+            left,
+            right,
+        };
+        let expected = [
+            (P::Top, edges(Some(12), None, None, None)),
+            (P::Bottom, edges(None, Some(12), None, None)),
+            (P::TopLeft, edges(Some(12), None, Some(24), None)),
+            (P::TopRight, edges(Some(12), None, None, Some(24))),
+            (P::BottomLeft, edges(None, Some(12), Some(24), None)),
+            (P::BottomRight, edges(None, Some(12), None, Some(24))),
+        ];
+        for (position, want) in expected {
+            assert_eq!(overlay_edges(position), want, "{position:?}");
+        }
+        assert_eq!(overlay_edges(P::default()), overlay_edges(P::Top));
+    }
+
+    #[test]
+    fn text_pills_widen_from_the_pill_to_320_and_never_past_it() {
+        // Short text keeps the 120 px pill; longer text widens it.
+        assert_eq!(text_pill_width(30, 0), PILL_WIDTH);
+        assert_eq!(text_pill_width(150, 0), 150 + 2 * PILL_TEXT_PAD_X);
+        assert_eq!(
+            text_pill_width(150, 14),
+            150 + PILL_CONTENT_GAP + 14 + 2 * PILL_TEXT_PAD_X
+        );
+        assert_eq!(text_pill_width(900, 0), PILL_MAX_WIDTH);
+        assert_eq!(text_pill_width(900, 14), PILL_MAX_WIDTH);
+        // The text gets what the padding and glyph leave.
+        assert_eq!(
+            text_pill_text_width(PILL_MAX_WIDTH, 0),
+            PILL_MAX_WIDTH - 2 * PILL_TEXT_PAD_X
+        );
+        assert_eq!(
+            text_pill_text_width(PILL_MAX_WIDTH, 14),
+            PILL_MAX_WIDTH - 2 * PILL_TEXT_PAD_X - PILL_CONTENT_GAP - 14
+        );
+    }
+
+    #[test]
+    fn the_pill_bars_keep_the_recording_and_state_colours() {
+        assert_eq!(recording_bar_rgb(None), (0.949, 0.949, 0.949));
+        assert_eq!(
+            recording_bar_rgb(Some(LimitWarning::Approaching)),
+            (1.0, 0.706, 0.329)
+        );
+        let bars = PILL_BAR_COUNT as f64;
+        let row = bars * 5.0 + (bars - 1.0) * PILL_BAR_GAP;
+        assert!(row <= f64::from(PILL_WIDTH) - 16.0, "bars fit the pill");
+    }
 
     #[test]
     fn red_level_poll_timer_uses_observed_recording_edges() {

@@ -198,6 +198,12 @@ pub fn execute(job: Job, replies: &Sender<Reply>) {
             "It applies the next time the Local model loads.",
             &[Refresh::Settings],
         )),
+        Job::SetOverlayPosition(position) => send(applied_setting(
+            config::set_overlay_position(position),
+            format!("Overlay position set to {}.", position.as_str()),
+            "It applies to your next Recording.",
+            &[Refresh::Settings],
+        )),
         Job::SetLocalModel { model, agreed } => send(set_local_model(model, agreed)),
         Job::SetUpdateCheck(on) => send(applied_setting(
             config::set_switch(config::Switch::UpdateCheck, on),
@@ -275,6 +281,7 @@ fn load_settings() -> SettingsSnapshot {
         local_idle_unload: config::local_idle_unload(),
         local_device: config::local_device(),
         local_model: config::local_model(),
+        overlay_position: config::overlay_position(),
         installed_tier: match crate::setup_consented::production_consented_status() {
             ConsentedStatus::Installed { entry_id, .. } => {
                 crate::local_model::LocalTier::of_entry_id(&entry_id)
