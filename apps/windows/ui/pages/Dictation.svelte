@@ -5,12 +5,6 @@
   import ToggleRow from '../ToggleRow.svelte';
   import ErrorLine from '../ErrorLine.svelte';
 
-  const SIZES = [
-    { id: 'small', name: 'Small' },
-    { id: 'medium', name: 'Medium' },
-    { id: 'large', name: 'Large' },
-  ];
-
   // One message per section, shown under the section that failed.
   let errors = $state({});
   let triggerBusy = $state(false);
@@ -58,18 +52,6 @@
     } finally {
       box.checked = ui.app.tone === 'informal';
       toneBusy = false;
-    }
-  }
-
-  async function chooseSize(size) {
-    errors.appearance = '';
-    try {
-      ui.app.overlaySize = await invoke('set_overlay_size', { size });
-    } catch (e) {
-      errors.appearance = 'Could not change the overlay size.';
-      // The DOM radio moved but the stored size did not; move it back.
-      const current = document.querySelector(`input[name="overlay-size"][value="${ui.app.overlaySize}"]`);
-      if (current) current.checked = true;
     }
   }
 
@@ -223,28 +205,6 @@
     onchange={toggleTone}
   />
   <ErrorLine message={errors.dictation} />
-  <div class="row">
-    <span class="row-text">
-      <span id="size-label">Overlay size</span>
-      <span class="hint">The pill that shows while you dictate.</span>
-    </span>
-    <div class="segmented" class:off={moving} role="radiogroup" aria-labelledby="size-label">
-      {#each SIZES as size (size.id)}
-        <label class:on={app.overlaySize === size.id}>
-          <input
-            type="radio"
-            name="overlay-size"
-            value={size.id}
-            checked={app.overlaySize === size.id}
-            disabled={moving}
-            onchange={() => chooseSize(size.id)}
-          />
-          {size.name}
-        </label>
-      {/each}
-    </div>
-  </div>
-  <ErrorLine message={errors.appearance} />
   <div class="row" role="group" aria-labelledby="position-label">
     <span class="row-text" aria-live="polite">
       {#if moving}
@@ -295,11 +255,5 @@
   }
   .primary.small {
     padding: 3px 14px;
-  }
-  .segmented.off {
-    opacity: 0.5;
-  }
-  .segmented.off input {
-    cursor: not-allowed;
   }
 </style>

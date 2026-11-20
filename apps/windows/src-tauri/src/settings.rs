@@ -11,27 +11,6 @@ use voisu_core::Tone;
 
 use crate::trigger_key::TriggerChord;
 
-/// How large the recording Overlay draws. Medium is the 120x40 pill.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OverlaySize {
-    Small,
-    #[default]
-    Medium,
-    Large,
-}
-
-impl OverlaySize {
-    /// Factor applied to the whole pill window and everything in it.
-    pub fn scale(self) -> f64 {
-        match self {
-            Self::Small => 0.8,
-            Self::Medium => 1.0,
-            Self::Large => 1.25,
-        }
-    }
-}
-
 /// Where the user put the recording Overlay: the pill centre as fractions
 /// (0.0–1.0) of the work area of whichever monitor it shows on. A value out
 /// of range, not a number or missing a coordinate does not deserialize, so
@@ -81,8 +60,6 @@ pub struct Settings {
     /// clipboard and Last transcript.
     #[serde(deserialize_with = "lenient_on")]
     pub auto_paste: bool,
-    #[serde(deserialize_with = "lenient")]
-    pub overlay_size: OverlaySize,
     /// None is the default spot: centred, 96.4 % of the way down.
     /// Junk reads as None.
     #[serde(deserialize_with = "lenient")]
@@ -166,7 +143,6 @@ impl Default for Settings {
             autostart_default_applied: false,
             hotkey: TriggerChord::default(),
             auto_paste: true,
-            overlay_size: OverlaySize::Medium,
             overlay_position: None,
             boost_words: vec!["Voisu".to_owned()],
             tone: Tone::Formal,
@@ -331,11 +307,9 @@ mod tests {
     }
 
     #[test]
-    fn defaults_paste_automatically_at_the_medium_size_boosting_voisu() {
+    fn defaults_paste_automatically_boosting_voisu() {
         let settings = Settings::default();
         assert!(settings.auto_paste);
-        assert_eq!(settings.overlay_size, OverlaySize::Medium);
-        assert_eq!(settings.overlay_size.scale(), 1.0);
         assert_eq!(settings.boost_words, ["Voisu"]);
         assert_eq!(settings.tone, Tone::Formal);
         assert!(settings.star_prompt);
@@ -384,14 +358,12 @@ mod tests {
         let path = dir.path().join("settings.json");
         let settings = Settings {
             auto_paste: false,
-            overlay_size: OverlaySize::Large,
             boost_words: vec!["Voisu".to_owned(), "Tauri".to_owned()],
             tone: Tone::Informal,
             ..Settings::default()
         };
         settings.save(&path).unwrap();
         let json = fs::read_to_string(&path).unwrap();
-        assert!(json.contains(r#""overlay_size": "large""#), "{json}");
         assert!(json.contains(r#""tone": "informal""#), "{json}");
         assert!(json.contains(r#""auto_paste": false"#), "{json}");
         assert_eq!(Settings::load(&path), settings);
@@ -404,15 +376,39 @@ mod tests {
         fs::write(
             &path,
             br#"{"autostart_default_applied": true, "auto_paste": "yes",
-                 "overlay_size": "huge", "boost_words": ["Voisu"], "tone": "casual"}"#,
+                 "boost_words": ["Voisu"], "tone": "casual"}"#,
         )
         .unwrap();
         let settings = Settings::load(&path);
         assert!(settings.autostart_default_applied);
         assert!(settings.auto_paste, "a mistyped toggle keeps its default");
-        assert_eq!(settings.overlay_size, OverlaySize::Medium);
         assert_eq!(settings.boost_words, ["Voisu"]);
         assert_eq!(settings.tone, Tone::Formal, "an unknown tone is formal");
+    }
+
+    #[test]
+    fn a_file_with_the_removed_overlay_size_still_loads_and_drops_it() {
+        // The Small / Medium / Large setting is gone; the pill is one size.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            br#"{"autostart_default_applied": true, "overlay_size": "large",
+                 "overlay_position": {"x": 0.25, "y": 0.5}, "tone": "informal"}"#,
+        )
+        .unwrap();
+        let settings = Settings::load(&path);
+        assert_eq!(
+            settings,
+            Settings {
+                autostart_default_applied: true,
+                overlay_position: OverlayPosition::new(0.25, 0.5),
+                tone: Tone::Informal,
+                ..Settings::default()
+            }
+        );
+        settings.save(&path).unwrap();
+        assert!(!fs::read_to_string(&path).unwrap().contains("overlay_size"));
     }
 
     #[test]

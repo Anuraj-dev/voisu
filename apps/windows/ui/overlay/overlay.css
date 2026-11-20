@@ -2,9 +2,9 @@
    overlay (crates/voisu-app/src/bin/voisu-overlay.rs). The window is as big
    as the widest text state (320x48) plus 8 px of glow room on every side;
    the pill sits inside it where overlay.js puts it, and the rest of the
-   window is transparent and lets clicks through. Sizes are the medium pill
-   times --s, which overlay.js sets from the window width the chosen Overlay
-   size gave it. */
+   window is transparent and lets clicks through. Sizes are the one Linux
+   pill times --s, which overlay.js sets from the window width: 1, except
+   on a work area too small for the window. */
 :root {
   --s: 1;
   --surface: rgba(23, 25, 29, 0.96);
@@ -41,8 +41,8 @@ body {
 }
 
 /* overlay.js sets --x/--y (the pill's top-left corner) so the pill's centre
-   lands on the anchor the native side placed the window around. 120x40 at
-   the medium size (overlay.rs PILL_WIDTH/PILL_HEIGHT), with the Linux pill's
+   lands on the anchor the native side placed the window around. 120x40
+   (overlay.rs PILL_WIDTH/PILL_HEIGHT), with the Linux pill's
    faint white outline; the error state's red border overrides it. */
 .capsule {
   position: absolute;
@@ -164,8 +164,7 @@ body {
 }
 
 /* Move mode puts ✗ (cancel) and ✓ (save) either side of the idle bars:
-   24 px round targets at the medium size, a red ✗ and a green ✓ as on
-   Linux. */
+   24 px round targets, a red ✗ and a green ✓ as on Linux. */
 .move-button {
   display: none;
 }

@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Listener, Manager, WebviewUrl, WebviewWindowBuilder};
 
-use crate::settings::{OverlayPosition, OverlaySize};
+use crate::settings::OverlayPosition;
 
 pub const OVERLAY_WINDOW: &str = "overlay";
 /// W2 → W4 contract: emitted on every Recording lifecycle change.
@@ -29,8 +29,9 @@ pub const AUDIO_LEVEL: &str = "audio-level";
 /// it is in move mode. Sent before each placed show.
 const OVERLAY_LAYOUT: &str = "overlay-layout";
 
-/// The pill at the medium size, in logical pixels. The page scales itself
-/// from the window width it is given (overlay.js `BASE_WIDTH`).
+/// The pill, in logical pixels: one size, as on Linux. The page scales
+/// itself from the window width it is given (overlay.js `BASE_WIDTH`), which
+/// differs from the logical size only on a work area too small for it.
 const PILL_WIDTH: f64 = 120.0;
 const PILL_HEIGHT: f64 = 40.0;
 /// The pill in move mode, ✗ and ✓ either side of the bars (overlay.css
@@ -63,8 +64,7 @@ const TEXT_WIDTH: f64 = 320.0;
 const TEXT_HEIGHT: f64 = 48.0;
 /// Transparent room around the pill for the error state's 8 px glow.
 const GLOW_PAD: f64 = 8.0;
-/// Least gap between the pill and any work-area edge. Not scaled by the
-/// Overlay size.
+/// Least gap between the pill and any work-area edge, in logical pixels.
 const EDGE_MARGIN: f64 = 12.0;
 /// Saving (the pill's ✓) snaps the pill to the centre line, the default
 /// spot's line, or the top or bottom margin, when it is dropped this close.
@@ -305,16 +305,15 @@ struct Area {
 }
 
 impl Area {
-    /// `dpi_scale` is the monitor's effective DPI / 96. The pill, its text
-    /// room and the glow room grow with `size`; the margins do not. On a
-    /// work area too small for the window (Large at 200 % on a 1280 px
-    /// screen, say) everything shrinks until the window fits, so the widest
-    /// text stays on screen. The page scales by the window width, so it
-    /// shrinks with it.
-    fn new(work: Rect, dpi_scale: f64, size: OverlaySize, pill: Pill) -> Self {
+    /// `dpi_scale` is the monitor's effective DPI / 96. On a work area too
+    /// small for the window (200 % on a 640 px wide screen, say) the pill,
+    /// its text room and the glow room shrink until the window fits, so the
+    /// widest text stays on screen; the margins do not. The page scales by
+    /// the window width, so it shrinks with it.
+    fn new(work: Rect, dpi_scale: f64, pill: Pill) -> Self {
         let width = f64::from(work.right - work.left);
         let height = f64::from(work.bottom - work.top);
-        let s = (size.scale() * dpi_scale)
+        let s = dpi_scale
             .min(width / (TEXT_WIDTH + 2.0 * GLOW_PAD))
             .min(height / (TEXT_HEIGHT + 2.0 * GLOW_PAD));
         let px = |logical: f64| (logical * s).round() as i32;
@@ -358,11 +357,10 @@ impl Area {
 pub fn placement(
     work: Rect,
     dpi_scale: f64,
-    size: OverlaySize,
     position: Option<OverlayPosition>,
     pill: Pill,
 ) -> Placement {
-    let area = Area::new(work, dpi_scale, size, pill);
+    let area = Area::new(work, dpi_scale, pill);
     let p = position.unwrap_or(DEFAULT_POSITION);
     let (x, y) = area.clamp(area.left + p.x * area.width, area.top + p.y * area.height);
     let (w, h) = (area.window_width, area.window_height);
@@ -403,11 +401,10 @@ pub fn placement(
 pub fn dropped_position(
     work: Rect,
     dpi_scale: f64,
-    size: OverlaySize,
     window: Rect,
     anchor: Anchor,
 ) -> Option<OverlayPosition> {
-    let area = Area::new(work, dpi_scale, size, Pill::Plain);
+    let area = Area::new(work, dpi_scale, Pill::Plain);
     let (x, y) = area.clamp(
         f64::from(window.left) + anchor.x * f64::from(window.right - window.left),
         f64::from(window.top) + anchor.y * f64::from(window.bottom - window.top),
@@ -468,11 +465,10 @@ impl MacFrame {
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn mac_placement(
     visible: MacFrame,
-    size: OverlaySize,
     position: Option<OverlayPosition>,
     pill: Pill,
 ) -> (MacFrame, Anchor) {
-    let p = placement(visible.flipped(), 1.0, size, position, pill);
+    let p = placement(visible.flipped(), 1.0, position, pill);
     (MacFrame::unflipped(p.window), p.anchor)
 }
 
@@ -480,11 +476,10 @@ pub fn mac_placement(
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn mac_dropped_position(
     visible: MacFrame,
-    size: OverlaySize,
     frame: MacFrame,
     anchor: Anchor,
 ) -> Option<OverlayPosition> {
-    dropped_position(visible.flipped(), 1.0, size, frame.flipped(), anchor)
+    dropped_position(visible.flipped(), 1.0, frame.flipped(), anchor)
 }
 
 /// Speech-like fake level for "Preview overlay": syllable bumps (~4 Hz) under
@@ -507,10 +502,9 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// The size and saved position the next show places the pill at. Read on the
-/// main thread at each hidden → visible edge, so a change applies from the
-/// next Recording.
-static SIZE: Mutex<OverlaySize> = Mutex::new(OverlaySize::Medium);
+/// The saved position the next show places the pill at. Read on the main
+/// thread at each hidden → visible edge, so a change applies from the next
+/// Recording.
 static POSITION: Mutex<Option<OverlayPosition>> = Mutex::new(None);
 /// Where the page draws the pill. Main thread only, except the page's pull.
 static LAYOUT: Mutex<Layout> = Mutex::new(Layout::new());
@@ -518,20 +512,11 @@ static LAYOUT: Mutex<Layout> = Mutex::new(Layout::new());
 /// it shows anyway (a page still loading, say).
 const LAYOUT_WAIT: Duration = Duration::from_millis(150);
 
-pub fn set_size(size: OverlaySize) {
-    *lock(&SIZE) = size;
-}
-
 pub fn set_position(position: Option<OverlayPosition>) {
     *lock(&POSITION) = position;
 }
 
-/// Only the Windows and macOS placements read these.
-#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
-fn size() -> OverlaySize {
-    *lock(&SIZE)
-}
-
+/// Only the Windows and macOS placements read this.
 #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 fn position() -> Option<OverlayPosition> {
     *lock(&POSITION)
@@ -1094,7 +1079,7 @@ fn play_preview(app: &AppHandle, token: u64) -> bool {
     state(RecordingState::Done)
 }
 
-/// Shows the pill at the size or position just chosen: re-places a preview
+/// Shows the pill at the position just chosen: re-places a preview
 /// already on screen, or starts one. A real Recording on screen keeps its
 /// place until it ends.
 pub fn preview_placement(app: &AppHandle) {
@@ -1151,7 +1136,7 @@ mod native {
 
     use std::sync::Mutex;
 
-    use super::{Anchor, Rect, Source, dropped_position, lock, placement, position, size};
+    use super::{Anchor, Rect, Source, dropped_position, lock, placement, position};
     use crate::settings::OverlayPosition;
 
     pub type Frame = Rect;
@@ -1299,7 +1284,7 @@ mod native {
             },
         };
         let (work, dpi_scale) = work_area(monitor)?;
-        let p = placement(work, dpi_scale, size(), position(), source.pill());
+        let p = placement(work, dpi_scale, position(), source.pill());
         Some((p.window, p.anchor))
     }
 
@@ -1324,7 +1309,7 @@ mod native {
             right: r.right,
             bottom: r.bottom,
         };
-        Some(dropped_position(work, dpi_scale, size(), window, anchor))
+        Some(dropped_position(work, dpi_scale, window, anchor))
     }
 
     /// The monitor holding the foreground window, else the cursor's monitor.
@@ -1390,9 +1375,7 @@ mod native {
 
     use tauri::WebviewWindow;
 
-    use super::{
-        Anchor, MacFrame, Source, lock, mac_dropped_position, mac_placement, position, size,
-    };
+    use super::{Anchor, MacFrame, Source, lock, mac_dropped_position, mac_placement, position};
     use crate::settings::OverlayPosition;
 
     fn ns_window(window: &WebviewWindow) -> Option<&NSWindow> {
@@ -1480,12 +1463,7 @@ mod native {
             Source::Beside(other) => ns_window(other).and_then(NSWindow::screen),
         }
         .or_else(|| NSScreen::mainScreen(mtm))?;
-        Some(mac_placement(
-            visible_frame(&screen),
-            size(),
-            position(),
-            pill,
-        ))
+        Some(mac_placement(visible_frame(&screen), position(), pill))
     }
 
     /// Where the user dropped the pill, on the screen its centre is over.
@@ -1507,12 +1485,7 @@ mod native {
         let screen = screen_at(mtm, centre)
             .or_else(|| ns.screen())
             .or_else(|| NSScreen::mainScreen(mtm))?;
-        Some(mac_dropped_position(
-            visible_frame(&screen),
-            size(),
-            frame,
-            anchor,
-        ))
+        Some(mac_dropped_position(visible_frame(&screen), frame, anchor))
     }
 
     fn screen_at(mtm: MainThreadMarker, point: NSPoint) -> Option<Retained<NSScreen>> {
@@ -1701,8 +1674,8 @@ mod tests {
     }
 
     /// The pill's rectangle on screen, in physical pixels.
-    fn pill(p: Placement, dpi_scale: f64, size: OverlaySize) -> (f64, f64, f64, f64) {
-        let s = size.scale() * dpi_scale;
+    fn pill(p: Placement, dpi_scale: f64) -> (f64, f64, f64, f64) {
+        let s = dpi_scale;
         let w = f64::from(p.window.right - p.window.left);
         let h = f64::from(p.window.bottom - p.window.top);
         let x = f64::from(p.window.left) + p.anchor.x * w;
@@ -1722,7 +1695,7 @@ mod tests {
     fn the_default_pill_sits_bottom_centre_clear_of_the_taskbar_at_any_scale() {
         // 1920x1040 work area at 100%: a 336x64 window, the pill 120x40, its
         // centre 96.4 % of the way down, above the 12 px bottom margin.
-        let p = placement(FULL_HD, 1.0, OverlaySize::Medium, None, Pill::Plain);
+        let p = placement(FULL_HD, 1.0, None, Pill::Plain);
         assert_eq!(
             (
                 p.window.right - p.window.left,
@@ -1730,7 +1703,7 @@ mod tests {
             ),
             (336, 64)
         );
-        let (l, t, r, b) = pill(p, 1.0, OverlaySize::Medium);
+        let (l, t, r, b) = pill(p, 1.0);
         assert_eq!((l, r, b - t), (900.0, 1020.0, 40.0));
         assert!(((t + b) / 2.0 - 0.964 * 1040.0).abs() < 1e-6);
         assert!(1040.0 - b > 12.0, "clear of the bottom margin: {b}");
@@ -1743,43 +1716,17 @@ mod tests {
             right: 0,
             bottom: 1440,
         };
-        let p = placement(left_monitor, 1.5, OverlaySize::Medium, None, Pill::Plain);
-        let (l, t, r, b) = pill(p, 1.5, OverlaySize::Medium);
+        let p = placement(left_monitor, 1.5, None, Pill::Plain);
+        let (l, t, r, b) = pill(p, 1.5);
         assert_eq!((r - l, b - t), (180.0, 60.0));
         assert!(((t + b) / 2.0 - (60.0 + 0.964 * 1380.0)).abs() < 1e-6);
         assert_eq!(l - -2560.0, 0.0 - r, "centred");
-
-        for (size, (w, h)) in [
-            (OverlaySize::Small, (96.0, 32.0)),
-            (OverlaySize::Large, (150.0, 50.0)),
-        ] {
-            let (l, t, r, b) = pill(placement(FULL_HD, 1.0, size, None, Pill::Plain), 1.0, size);
-            assert!(
-                (r - l - w).abs() < 1e-9 && (b - t - h).abs() < 1e-9,
-                "{size:?}"
-            );
-            assert!(
-                ((t + b) / 2.0 - 0.964 * 1040.0).abs() < 1e-6,
-                "{size:?} keeps the default line"
-            );
-            assert!(1040.0 - b >= 12.0, "{size:?} keeps the 12 px margin");
-            assert!(
-                ((l + r) / 2.0 - 960.0).abs() < 1e-9,
-                "{size:?} stays centred"
-            );
-        }
     }
 
     #[test]
     fn a_saved_position_is_the_pill_centre_as_fractions_of_the_work_area() {
-        let p = placement(
-            FULL_HD,
-            1.0,
-            OverlaySize::Medium,
-            at(0.25, 0.5),
-            Pill::Plain,
-        );
-        let (l, t, r, b) = pill(p, 1.0, OverlaySize::Medium);
+        let p = placement(FULL_HD, 1.0, at(0.25, 0.5), Pill::Plain);
+        let (l, t, r, b) = pill(p, 1.0);
         assert!(((l + r) / 2.0 - 480.0).abs() < 1e-9);
         assert!(((t + b) / 2.0 - 520.0).abs() < 1e-9);
         // Away from the edges the window is centred on the pill.
@@ -1792,8 +1739,8 @@ mod tests {
             right: 1920 + 2880,
             bottom: 1800 - 72,
         };
-        let p = placement(laptop, 2.0, OverlaySize::Medium, at(0.25, 0.5), Pill::Plain);
-        let (l, t, r, b) = pill(p, 2.0, OverlaySize::Medium);
+        let p = placement(laptop, 2.0, at(0.25, 0.5), Pill::Plain);
+        let (l, t, r, b) = pill(p, 2.0);
         assert!(((l + r) / 2.0 - (1920.0 + 720.0)).abs() < 1.0);
         assert!(((t + b) / 2.0 - 864.0).abs() < 1.0);
     }
@@ -1808,28 +1755,24 @@ mod tests {
         };
         for position in [at(0.25, 0.5), at(0.8, 0.3), at(0.1, 0.9), at(0.62, 0.71)] {
             for (work, dpi) in [(FULL_HD, 1.0), (left_monitor, 1.25)] {
-                for size in [OverlaySize::Small, OverlaySize::Medium, OverlaySize::Large] {
-                    let p = placement(work, dpi, size, position, Pill::Plain);
-                    let back = dropped_position(work, dpi, size, p.window, p.anchor).unwrap();
-                    let want = position.unwrap();
-                    assert!(
-                        (back.x - want.x).abs() < 1e-3 && (back.y - want.y).abs() < 1e-3,
-                        "{want:?} came back as {back:?} on {work:?} at {dpi} {size:?}"
-                    );
-                }
+                let p = placement(work, dpi, position, Pill::Plain);
+                let back = dropped_position(work, dpi, p.window, p.anchor).unwrap();
+                let want = position.unwrap();
+                assert!(
+                    (back.x - want.x).abs() < 1e-3 && (back.y - want.y).abs() < 1e-3,
+                    "{want:?} came back as {back:?} on {work:?} at {dpi}"
+                );
             }
         }
         // The default spot comes back as the default, though it is within
         // snap distance of the bottom margin: nothing to reset.
         for (work, dpi) in [(FULL_HD, 1.0), (left_monitor, 1.25)] {
-            for size in [OverlaySize::Small, OverlaySize::Medium, OverlaySize::Large] {
-                let p = placement(work, dpi, size, None, Pill::Plain);
-                assert_eq!(
-                    dropped_position(work, dpi, size, p.window, p.anchor),
-                    None,
-                    "{work:?} {dpi} {size:?}"
-                );
-            }
+            let p = placement(work, dpi, None, Pill::Plain);
+            assert_eq!(
+                dropped_position(work, dpi, p.window, p.anchor),
+                None,
+                "{work:?} {dpi}"
+            );
         }
     }
 
@@ -1860,24 +1803,22 @@ mod tests {
         ];
         let corners = [0.0, 0.5, 1.0];
         for (work, dpi) in monitors {
-            for size in [OverlaySize::Small, OverlaySize::Medium, OverlaySize::Large] {
-                let margin = 12.0 * dpi;
-                for &x in &corners {
-                    for &y in &corners {
-                        let p = placement(work, dpi, size, at(x, y), Pill::Plain);
-                        assert!(inside(p.window, work), "{x},{y} {work:?} {size:?}: {p:?}");
-                        let (l, t, r, b) = pill(p, dpi, size);
-                        let tol = 1e-6;
-                        assert!(l >= f64::from(work.left) + margin - tol, "{x},{y} left");
-                        assert!(t >= f64::from(work.top) + margin - tol, "{x},{y} top");
-                        assert!(r <= f64::from(work.right) - margin + tol, "{x},{y} right");
-                        assert!(b <= f64::from(work.bottom) - margin + tol, "{x},{y} bottom");
-                        if x == 0.0 {
-                            assert!((l - f64::from(work.left) - margin).abs() < 1e-6);
-                        }
-                        if y == 1.0 {
-                            assert!((f64::from(work.bottom) - b - margin).abs() < 1e-6);
-                        }
+            let margin = 12.0 * dpi;
+            for &x in &corners {
+                for &y in &corners {
+                    let p = placement(work, dpi, at(x, y), Pill::Plain);
+                    assert!(inside(p.window, work), "{x},{y} {work:?}: {p:?}");
+                    let (l, t, r, b) = pill(p, dpi);
+                    let tol = 1e-6;
+                    assert!(l >= f64::from(work.left) + margin - tol, "{x},{y} left");
+                    assert!(t >= f64::from(work.top) + margin - tol, "{x},{y} top");
+                    assert!(r <= f64::from(work.right) - margin + tol, "{x},{y} right");
+                    assert!(b <= f64::from(work.bottom) - margin + tol, "{x},{y} bottom");
+                    if x == 0.0 {
+                        assert!((l - f64::from(work.left) - margin).abs() < 1e-6);
+                    }
+                    if y == 1.0 {
+                        assert!((f64::from(work.bottom) - b - margin).abs() < 1e-6);
                     }
                 }
             }
@@ -1911,38 +1852,35 @@ mod tests {
             ),
         ];
         for (work, dpi) in monitors {
-            for size in [OverlaySize::Small, OverlaySize::Medium, OverlaySize::Large] {
-                for x in [0.0, 0.02, 0.98, 1.0] {
-                    let p = placement(work, dpi, size, at(x, 0.5), Pill::Moving);
-                    let w = f64::from(p.window.right - p.window.left);
-                    let s = w / (TEXT_WIDTH + 2.0 * GLOW_PAD);
-                    let (pad, width) = (GLOW_PAD * s, MOVE_PILL_WIDTH * s);
-                    let anchor = p.anchor.x * w;
-                    let drawn = (anchor - width / 2.0).clamp(pad, w - pad - width) + width / 2.0;
-                    assert!(
-                        (drawn - anchor).abs() < 1e-6,
-                        "{x} {work:?} {dpi} {size:?}: drawn at {drawn}, anchor {anchor}"
-                    );
-                    // The whole move pill keeps the 12 px margin (native
-                    // scale: the page's differs by the window's rounding).
-                    let centre = f64::from(p.window.left) + anchor;
-                    let half = MOVE_PILL_WIDTH * size.scale() * dpi / 2.0;
-                    let margin = 12.0 * dpi;
-                    assert!(centre - half >= f64::from(work.left) + margin - 1e-6);
-                    assert!(centre + half <= f64::from(work.right) - margin + 1e-6);
-                    // ✓ without a drag saves the centre the user sees.
-                    let saved = dropped_position(work, dpi, size, p.window, p.anchor).unwrap();
-                    let saved_x =
-                        f64::from(work.left) + saved.x * f64::from(work.right - work.left);
-                    assert!(
-                        (saved_x - centre).abs() < 1e-3,
-                        "{x} {work:?} {dpi} {size:?}: saved {saved_x}, shown {centre}"
-                    );
-                    // And the next Recording draws the plain pill there.
-                    let next = placement(work, dpi, size, Some(saved), Pill::Plain);
-                    let (l, _, r, _) = pill(next, dpi, size);
-                    assert!(((l + r) / 2.0 - centre).abs() < 1e-3);
-                }
+            for x in [0.0, 0.02, 0.98, 1.0] {
+                let p = placement(work, dpi, at(x, 0.5), Pill::Moving);
+                let w = f64::from(p.window.right - p.window.left);
+                let s = w / (TEXT_WIDTH + 2.0 * GLOW_PAD);
+                let (pad, width) = (GLOW_PAD * s, MOVE_PILL_WIDTH * s);
+                let anchor = p.anchor.x * w;
+                let drawn = (anchor - width / 2.0).clamp(pad, w - pad - width) + width / 2.0;
+                assert!(
+                    (drawn - anchor).abs() < 1e-6,
+                    "{x} {work:?} {dpi}: drawn at {drawn}, anchor {anchor}"
+                );
+                // The whole move pill keeps the 12 px margin (native
+                // scale: the page's differs by the window's rounding).
+                let centre = f64::from(p.window.left) + anchor;
+                let half = MOVE_PILL_WIDTH * dpi / 2.0;
+                let margin = 12.0 * dpi;
+                assert!(centre - half >= f64::from(work.left) + margin - 1e-6);
+                assert!(centre + half <= f64::from(work.right) - margin + 1e-6);
+                // ✓ without a drag saves the centre the user sees.
+                let saved = dropped_position(work, dpi, p.window, p.anchor).unwrap();
+                let saved_x = f64::from(work.left) + saved.x * f64::from(work.right - work.left);
+                assert!(
+                    (saved_x - centre).abs() < 1e-3,
+                    "{x} {work:?} {dpi}: saved {saved_x}, shown {centre}"
+                );
+                // And the next Recording draws the plain pill there.
+                let next = placement(work, dpi, Some(saved), Pill::Plain);
+                let (l, _, r, _) = pill(next, dpi);
+                assert!(((l + r) / 2.0 - centre).abs() < 1e-3);
             }
         }
     }
@@ -1971,20 +1909,18 @@ mod tests {
                     },
                     1.5,
                 ),
-                // Large at 200 % wants an 840 px window; the work area
-                // has 760.
+                // At 200 % the window wants 672 px; the work area has 600.
                 (
                     Rect {
                         left: 0,
                         top: 0,
-                        right: 760,
+                        right: 600,
                         bottom: 1400,
                     },
                     2.0,
                 ),
             ] {
-                let size = OverlaySize::Large;
-                let p = placement(work, dpi, size, position, Pill::Plain);
+                let p = placement(work, dpi, position, Pill::Plain);
                 assert!(inside(p.window, work), "{position:?} {work:?}");
                 let (w, h) = (
                     f64::from(p.window.right - p.window.left),
@@ -1992,7 +1928,7 @@ mod tests {
                 );
                 // The page scales everything by its window width.
                 let s = w / (TEXT_WIDTH + 2.0 * GLOW_PAD);
-                assert!(s <= size.scale() * dpi + 1e-9);
+                assert!(s <= dpi + 1e-9);
                 let pad = GLOW_PAD * s;
                 let (text_w, text_h) = (TEXT_WIDTH * s, TEXT_HEIGHT * s);
                 let centre_x = fit(p.anchor.x * w, pad + text_w / 2.0, w - pad - text_w / 2.0);
@@ -2018,13 +1954,12 @@ mod tests {
             right: 200,
             bottom: 50,
         };
-        let p = placement(tiny, 1.0, OverlaySize::Medium, at(1.0, 1.0), Pill::Plain);
+        let p = placement(tiny, 1.0, at(1.0, 1.0), Pill::Plain);
         assert_eq!(p.window.left + p.window.right, 200);
     }
 
     #[test]
     fn dropping_near_the_centre_line_the_default_line_or_a_margin_snaps_to_it() {
-        let size = OverlaySize::Medium;
         // Builds the dragged window around a pill centred at (x, y).
         let drop = |work: Rect, dpi: f64, x: f64, y: f64| {
             let (w, h) = ((336.0 * dpi).round() as i32, (64.0 * dpi).round() as i32);
@@ -2034,7 +1969,7 @@ mod tests {
                 right: (x - f64::from(w) / 2.0).round() as i32 + w,
                 bottom: (y - f64::from(h) / 2.0).round() as i32 + h,
             };
-            dropped_position(work, dpi, size, window, Anchor { x: 0.5, y: 0.5 })
+            dropped_position(work, dpi, window, Anchor { x: 0.5, y: 0.5 })
         };
         // The default line is 0.964 of the way down; the margin lines are
         // the clamp limits, the pill's 12 px from the work area edges.
@@ -2084,9 +2019,8 @@ mod tests {
             bottom: 830,
         };
         for position in [None, at(0.3, 0.8)] {
-            let (frame, anchor) =
-                mac_placement(visible, OverlaySize::Medium, position, Pill::Plain);
-            let windows = placement(work, 1.0, OverlaySize::Medium, position, Pill::Plain);
+            let (frame, anchor) = mac_placement(visible, position, Pill::Plain);
+            let windows = placement(work, 1.0, position, Pill::Plain);
             assert_eq!(
                 frame.width,
                 f64::from(windows.window.right - windows.window.left)
@@ -2101,7 +2035,7 @@ mod tests {
             assert!((anchor.x - windows.anchor.x).abs() < 1e-9);
             assert!((anchor.y - windows.anchor.y).abs() < 1e-9);
             // Dropping the frame where it was gives the position back.
-            let back = mac_dropped_position(visible, OverlaySize::Medium, frame, anchor);
+            let back = mac_dropped_position(visible, frame, anchor);
             match (back, position) {
                 (None, None) => {}
                 (Some(b), Some(p)) => assert!((b.x - p.x).abs() < 1e-3 && (b.y - p.y).abs() < 1e-3),
@@ -2109,14 +2043,13 @@ mod tests {
             }
         }
         // A screen to the left of and below the main one keeps its offset.
-        let (main, _) = mac_placement(visible, OverlaySize::Medium, None, Pill::Plain);
+        let (main, _) = mac_placement(visible, None, Pill::Plain);
         let (side, _) = mac_placement(
             MacFrame {
                 x: -1920.0,
                 y: -300.0,
                 ..visible
             },
-            OverlaySize::Medium,
             None,
             Pill::Plain,
         );

@@ -40,7 +40,7 @@ use voisu_core::{Provider, SecretStore, Tone};
 use platform::hotkey::{is_dead_key, key_label};
 use platform::permissions::{self, Pane, Permissions};
 use platform::secrets::CredentialManagerStore;
-use settings::{OverlayPosition, OverlaySize, Settings};
+use settings::{OverlayPosition, Settings};
 use setup::{KeyInputs, KeyResult};
 use star_prompt::StarPrompt;
 use trigger_key::TriggerChord;
@@ -114,7 +114,6 @@ struct UiState {
     autostart: bool,
     version: String,
     auto_paste: bool,
-    overlay_size: OverlaySize,
     /// `None` is the default bottom-centre spot.
     overlay_position: Option<OverlayPosition>,
     /// The overlay is showing for the user to drag it.
@@ -244,7 +243,6 @@ fn get_state(app: AppHandle) -> UiState {
         autostart: autostart_enabled(&app),
         version: app.package_info().version.to_string(),
         auto_paste: settings.auto_paste,
-        overlay_size: settings.overlay_size,
         overlay_position: settings.overlay_position,
         overlay_moving: overlay::is_moving(&app),
         boost_words: settings.boost_words,
@@ -326,15 +324,6 @@ fn try_update_settings(
 fn set_auto_paste(app: AppHandle, enabled: bool) -> bool {
     tracing::info!(enabled, "auto-paste");
     update_settings(&app, |settings| settings.auto_paste = enabled).auto_paste
-}
-
-#[tauri::command]
-fn set_overlay_size(app: AppHandle, size: OverlaySize) -> OverlaySize {
-    tracing::info!(?size, "overlay size");
-    let size = update_settings(&app, |settings| settings.overlay_size = size).overlay_size;
-    overlay::set_size(size);
-    overlay::preview_placement(&app);
-    size
 }
 
 /// Settings' "Move overlay": the pill shows beside the window for the user
@@ -759,7 +748,6 @@ pub fn run() {
             save_keys,
             set_autostart,
             set_auto_paste,
-            set_overlay_size,
             start_overlay_move,
             finish_overlay_move,
             overlay_layout,
@@ -797,7 +785,6 @@ pub fn run() {
             let _ = app.state::<AppState>().tray.set(tray);
             {
                 let settings = app.state::<AppState>().settings.lock().unwrap().clone();
-                overlay::set_size(settings.overlay_size);
                 overlay::set_position(settings.overlay_position);
             }
             overlay::init(handle)?;

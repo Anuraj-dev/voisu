@@ -47,7 +47,6 @@ const state = {
   autostart: true,
   version: '0.79.0',
   autoPaste: true,
-  overlaySize: 'medium',
   overlayPosition: null,
   overlayMoving: false,
   moveId: 0,
@@ -116,7 +115,6 @@ const COMMANDS = {
   },
   set_auto_paste: ({ enabled }) => (state.autoPaste = enabled),
   set_tone: ({ tone }) => (state.tone = tone),
-  set_overlay_size: ({ size }) => (state.overlaySize = size),
   start_overlay_move: () => {
     if (!state.overlayMoving) {
       console.info('mock: overlay shown in move mode');

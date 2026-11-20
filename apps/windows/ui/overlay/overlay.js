@@ -39,11 +39,12 @@ const COPIED_HOLD_MS = 2500;
 // so the state is told by shape and position, not colour alone.
 const HANDS_FREE_RGB = '101, 214, 160';
 const HANDS_FREE_SLOTS = 4;
-// Width of the medium overlay window: the widest text pill plus glow room
-// (overlay.rs TEXT_WIDTH + 2 * GLOW_PAD). The native side sizes the window
-// for the chosen Overlay size; the page scales everything by the ratio.
+// Width of the overlay window: the widest text pill plus glow room
+// (overlay.rs TEXT_WIDTH + 2 * GLOW_PAD). The native side shrinks the window
+// only on a work area too small for it; the page scales everything by the
+// ratio, so it is 1 everywhere else.
 const BASE_WIDTH = 336;
-// Glow room the pill keeps clear of (overlay.rs GLOW_PAD), at the medium size.
+// Glow room the pill keeps clear of (overlay.rs GLOW_PAD), unscaled.
 const GLOW_PAD = 8;
 
 const LABELS = {
@@ -293,8 +294,8 @@ const fraction = (value) => {
 
 fitScale();
 place();
-// The native side resizes the window when the pill is shown at another
-// Overlay size, or moves it to a monitor with another DPI.
+// The native side resizes the window when it moves it to a monitor with
+// another DPI or one too small for it.
 window.addEventListener('resize', () => {
   fitScale();
   place();

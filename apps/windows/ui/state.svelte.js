@@ -12,7 +12,6 @@ export const ui = $state({
     autostart: false,
     version: '',
     autoPaste: true,
-    overlaySize: 'medium',
     // { x, y }: the pill centre as fractions of the work area; null is the
     // default spot, bottom centre.
     overlayPosition: null,
