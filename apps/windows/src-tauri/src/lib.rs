@@ -40,7 +40,7 @@ use voisu_core::{Provider, SecretStore, Tone};
 use platform::hotkey::{is_dead_key, key_label};
 use platform::permissions::{self, Pane, Permissions};
 use platform::secrets::CredentialManagerStore;
-use settings::{OverlaySize, Settings};
+use settings::{OverlayPosition, OverlaySize, Settings};
 use setup::{KeyInputs, KeyResult};
 use star_prompt::StarPrompt;
 use trigger_key::TriggerChord;
@@ -112,6 +112,10 @@ struct UiState {
     version: String,
     auto_paste: bool,
     overlay_size: OverlaySize,
+    /// `None` is the default top-centre spot.
+    overlay_position: Option<OverlayPosition>,
+    /// The overlay is showing for the user to drag it.
+    overlay_moving: bool,
     boost_words: Vec<String>,
     tone: Tone,
     trigger: UiTrigger,
@@ -238,6 +242,8 @@ fn get_state(app: AppHandle) -> UiState {
         version: app.package_info().version.to_string(),
         auto_paste: settings.auto_paste,
         overlay_size: settings.overlay_size,
+        overlay_position: settings.overlay_position,
+        overlay_moving: overlay::is_moving(&app),
         boost_words: settings.boost_words,
         tone: settings.tone,
         trigger: UiTrigger::of(settings.hotkey),
@@ -306,8 +312,47 @@ fn set_overlay_size(app: AppHandle, size: OverlaySize) -> OverlaySize {
     tracing::info!(?size, "overlay size");
     let size = update_settings(&app, |settings| settings.overlay_size = size).overlay_size;
     overlay::set_size(size);
-    overlay::preview_size(&app);
+    overlay::preview_placement(&app);
     size
+}
+
+/// Settings' "Move overlay": the pill shows beside the window for the user
+/// to drag. An error is the message to show.
+#[tauri::command]
+async fn start_overlay_move(app: AppHandle) -> Result<(), String> {
+    overlay::start_move(&app).await
+}
+
+/// Done (`save`) stores where the pill was dropped; Cancel keeps the old
+/// spot. Either way the overlay hides. Returns the position now in force.
+#[tauri::command]
+async fn finish_overlay_move(
+    app: AppHandle,
+    save: bool,
+) -> Result<Option<OverlayPosition>, String> {
+    if let Some(dropped) = overlay::finish_move(&app, save).await? {
+        tracing::info!(?dropped, "overlay position");
+        update_settings(&app, |settings| settings.overlay_position = dropped);
+        overlay::set_position(dropped);
+        let _ = app.emit(STATE_CHANGED, ());
+    }
+    Ok(app
+        .state::<AppState>()
+        .settings
+        .lock()
+        .unwrap()
+        .overlay_position)
+}
+
+/// Back to the default top-centre spot, shown in a preview.
+#[tauri::command]
+fn reset_overlay_position(app: AppHandle) -> Option<OverlayPosition> {
+    tracing::info!("overlay position reset");
+    let position =
+        update_settings(&app, |settings| settings.overlay_position = None).overlay_position;
+    overlay::set_position(position);
+    overlay::preview_placement(&app);
+    position
 }
 
 /// Returns the list as stored (normalized), so the window shows what will be
@@ -664,6 +709,9 @@ pub fn run() {
             set_autostart,
             set_auto_paste,
             set_overlay_size,
+            start_overlay_move,
+            finish_overlay_move,
+            reset_overlay_position,
             set_boost_words,
             set_tone,
             set_trigger_key,
@@ -693,13 +741,11 @@ pub fn run() {
                 trigger_label(chord),
             )?;
             let _ = app.state::<AppState>().tray.set(tray);
-            overlay::set_size(
-                app.state::<AppState>()
-                    .settings
-                    .lock()
-                    .unwrap()
-                    .overlay_size,
-            );
+            {
+                let settings = app.state::<AppState>().settings.lock().unwrap().clone();
+                overlay::set_size(settings.overlay_size);
+                overlay::set_position(settings.overlay_position);
+            }
             overlay::init(handle)?;
             let at_login = std::env::args().any(|arg| arg == AUTOSTART_ARG);
             tracing::info!(keys_ready = ready, at_login, "startup");
@@ -715,6 +761,11 @@ pub fn run() {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
+                // Closing Settings mid-move cancels it, so the overlay never
+                // stays grabbable with no Done button in reach.
+                if window.label() == SETTINGS_WINDOW {
+                    overlay::finish_move_now(window.app_handle(), false);
+                }
             }
         })
         .build(tauri::generate_context!())

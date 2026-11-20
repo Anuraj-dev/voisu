@@ -11,7 +11,7 @@ use voisu_core::Tone;
 
 use crate::trigger_key::TriggerChord;
 
-/// How large the recording Overlay draws. Medium is the DESIGN.md capsule.
+/// How large the recording Overlay draws. Medium is the 120x32 pill.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OverlaySize {
@@ -22,7 +22,7 @@ pub enum OverlaySize {
 }
 
 impl OverlaySize {
-    /// Factor applied to the whole capsule window and everything in it.
+    /// Factor applied to the whole pill window and everything in it.
     pub fn scale(self) -> f64 {
         match self {
             Self::Small => 0.8,
@@ -32,7 +32,40 @@ impl OverlaySize {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Where the user put the recording Overlay: the pill centre as fractions
+/// (0.0–1.0) of the work area of whichever monitor it shows on. A value out
+/// of range, not a number or missing a coordinate does not deserialize, so
+/// the setting reads as `None`: the default top-centre.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "RawPosition")]
+pub struct OverlayPosition {
+    pub x: f64,
+    pub y: f64,
+}
+
+impl OverlayPosition {
+    /// `None` unless both values are finite and within 0.0–1.0.
+    pub fn new(x: f64, y: f64) -> Option<Self> {
+        let usable = |v: f64| (0.0..=1.0).contains(&v);
+        (usable(x) && usable(y)).then_some(Self { x, y })
+    }
+}
+
+#[derive(Deserialize)]
+struct RawPosition {
+    x: f64,
+    y: f64,
+}
+
+impl TryFrom<RawPosition> for OverlayPosition {
+    type Error = &'static str;
+
+    fn try_from(raw: RawPosition) -> Result<Self, Self::Error> {
+        Self::new(raw.x, raw.y).ok_or("overlay position outside 0.0-1.0")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
 pub struct Settings {
     /// Start at login is switched on once, after the first successful setup.
@@ -50,6 +83,10 @@ pub struct Settings {
     pub auto_paste: bool,
     #[serde(deserialize_with = "lenient")]
     pub overlay_size: OverlaySize,
+    /// None is the default rule: top-centre, 12 px below the work area top.
+    /// Junk reads as None.
+    #[serde(deserialize_with = "lenient")]
+    pub overlay_position: Option<OverlayPosition>,
     /// The user's boost words, normalized (see `vocabulary::normalize`).
     #[serde(deserialize_with = "lenient_terms")]
     pub boost_words: Vec<String>,
@@ -121,6 +158,7 @@ impl Default for Settings {
             hotkey: TriggerChord::default(),
             auto_paste: true,
             overlay_size: OverlaySize::Medium,
+            overlay_position: None,
             boost_words: vec!["Voisu".to_owned()],
             tone: Tone::Formal,
             star_prompt: true,
@@ -376,6 +414,84 @@ mod tests {
         assert_eq!(Settings::load(&path).boost_words, ["Voisu", "Tauri"]);
         fs::write(&path, br#"{"boost_words": "Voisu"}"#).unwrap();
         assert!(Settings::load(&path).boost_words.is_empty());
+    }
+
+    #[test]
+    fn an_overlay_position_round_trips_as_fractions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let moved = Settings {
+            overlay_position: OverlayPosition::new(0.25, 1.0),
+            ..Settings::default()
+        };
+        assert!(moved.overlay_position.is_some());
+        moved.save(&path).unwrap();
+        let json = fs::read_to_string(&path).unwrap();
+        assert!(json.contains(r#""x": 0.25"#), "{json}");
+        assert!(json.contains(r#""y": 1.0"#), "{json}");
+        assert_eq!(Settings::load(&path), moved);
+
+        // The default writes null and reads back as the default.
+        Settings::default().save(&path).unwrap();
+        let json = fs::read_to_string(&path).unwrap();
+        assert!(json.contains(r#""overlay_position": null"#), "{json}");
+        assert_eq!(Settings::load(&path).overlay_position, None);
+    }
+
+    #[test]
+    fn a_missing_or_unusable_overlay_position_is_the_default_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        for value in [
+            // A file from before the field.
+            "",
+            r#", "overlay_position": null"#,
+            r#", "overlay_position": "top""#,
+            r#", "overlay_position": {"x": 0.5}"#,
+            r#", "overlay_position": {"x": "0.5", "y": 0.5}"#,
+            r#", "overlay_position": {"x": 1.5, "y": 0.5}"#,
+            r#", "overlay_position": {"x": 0.5, "y": -0.1}"#,
+        ] {
+            let json = format!(r#"{{"auto_paste": false{value}}}"#);
+            fs::write(&path, &json).unwrap();
+            let settings = Settings::load(&path);
+            assert_eq!(settings.overlay_position, None, "{json}");
+            assert!(!settings.auto_paste, "{json} wiped another setting");
+        }
+        // Extra keys inside the object are ignored like any unknown key.
+        fs::write(&path, br#"{"overlay_position": {"x": 0, "y": 1, "z": 3}}"#).unwrap();
+        assert_eq!(
+            Settings::load(&path).overlay_position,
+            OverlayPosition::new(0.0, 1.0)
+        );
+    }
+
+    #[test]
+    fn a_nan_or_infinite_overlay_position_is_never_stored_or_loaded() {
+        for (x, y) in [
+            (f64::NAN, 0.5),
+            (0.5, f64::NAN),
+            (f64::INFINITY, 0.5),
+            (0.5, f64::NEG_INFINITY),
+        ] {
+            assert_eq!(OverlayPosition::new(x, y), None, "{x} {y}");
+        }
+        // JSON has no NaN: serde_json writes it as null, which loads as the
+        // default rather than failing the whole file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let nan = Settings {
+            overlay_position: Some(OverlayPosition {
+                x: f64::NAN,
+                y: 0.5,
+            }),
+            auto_paste: false,
+            ..Settings::default()
+        };
+        nan.save(&path).unwrap();
+        let settings = Settings::load(&path);
+        assert_eq!(settings.overlay_position, None);
+        assert!(!settings.auto_paste);
     }
 
     #[test]

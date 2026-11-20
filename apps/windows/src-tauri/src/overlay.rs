@@ -1,9 +1,11 @@
-//! The recording Overlay: a small capsule with live level bars at the bottom
-//! centre of the active monitor while Voisu records.
+//! The recording Overlay: a small pill with live level bars, by default at
+//! the top centre of the active monitor, while Voisu records. The user can
+//! move it from Settings; the spot is kept as fractions of the work area.
 //!
 //! The window is created once at startup and never takes focus, never appears
 //! in the taskbar or Alt+Tab, and lets clicks through. It is driven only by the
-//! W2 events below; it never feeds anything back into Recording.
+//! W2 events below; it never feeds anything back into Recording. The one
+//! exception to click-through is move mode, which Settings starts and ends.
 //!
 //! Visibility is native (Win32), not Tauri's `show()`/`hide()`: in tao 0.37,
 //! `show()` recomputes `GWL_EXSTYLE` from tao's own flags (dropping
@@ -16,22 +18,36 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Listener, Manager, WebviewUrl, WebviewWindowBuilder};
 
-use crate::settings::OverlaySize;
+use crate::settings::{OverlayPosition, OverlaySize};
 
 pub const OVERLAY_WINDOW: &str = "overlay";
 /// W2 → W4 contract: emitted on every Recording lifecycle change.
 pub const RECORDING_STATE: &str = "recording-state";
 /// W2 → W4 contract: at most 30 Hz, only while recording or hands-free.
 pub const AUDIO_LEVEL: &str = "audio-level";
+/// To the overlay page only: where in its window the pill sits, and whether
+/// it is in move mode. Sent before each placed show.
+const OVERLAY_LAYOUT: &str = "overlay-layout";
 
-/// DESIGN.md capsule at the medium size, in logical pixels. The page scales
-/// itself from the window width it is given (overlay.js `BASE_WIDTH`).
-const CAPSULE_WIDTH: f64 = 280.0;
-const CAPSULE_HEIGHT: f64 = 64.0;
-/// Transparent room around the capsule for the error state's 8 px glow.
+/// The pill at the medium size, in logical pixels. The page scales itself
+/// from the window width it is given (overlay.js `BASE_WIDTH`).
+const PILL_WIDTH: f64 = 120.0;
+const PILL_HEIGHT: f64 = 32.0;
+/// Copied and Error text widen the pill up to this: two lines at most. The
+/// window is always this big (plus the glow room); the area the pill does
+/// not cover is transparent and lets clicks through.
+const TEXT_WIDTH: f64 = 320.0;
+const TEXT_HEIGHT: f64 = 48.0;
+/// Transparent room around the pill for the error state's 8 px glow.
 const GLOW_PAD: f64 = 8.0;
-/// DESIGN.md outer margin between the capsule and the work-area bottom.
-const BOTTOM_MARGIN: f64 = 24.0;
+/// Least gap between the pill and any work-area edge; the default spot is
+/// this far below the top. Not scaled by the Overlay size.
+const EDGE_MARGIN: f64 = 12.0;
+/// Done snaps the pill to the centre line, or to the default top or bottom
+/// margin, when it is dropped this close to it.
+const SNAP_DISTANCE: f64 = 24.0;
+/// What `None` means: centred, at the top margin.
+const DEFAULT_POSITION: OverlayPosition = OverlayPosition { x: 0.5, y: 0.0 };
 /// Long enough to read a one-line error, then the capsule hides.
 const ERROR_DISPLAY: Duration = Duration::from_secs(3);
 /// The Delivered check mark, as brief as the Linux overlay's: the Transcript
@@ -94,19 +110,27 @@ pub enum Step {
     Nothing,
 }
 
-/// Pure visibility logic: which states show the capsule, and which pending
-/// hide timer (after `done` or `error`) is still current.
+/// Pure visibility logic: which states show the pill, which pending hide
+/// timer (after `done` or `error`) is still current, and move mode.
 #[derive(Debug, Default)]
 pub struct Presenter {
     visible: bool,
     generation: u64,
     terminal_showing: bool,
+    moving: bool,
 }
 
 impl Presenter {
     /// Returns the window step and, for `done` and `error`, the generation a
     /// delayed [`Presenter::on_hide_timer`] call must carry to still apply.
+    /// Any state but `idle` ends move mode first: Recording always wins.
     pub fn on_state(&mut self, state: RecordingState) -> (Step, Option<u64>) {
+        if self.moving {
+            if state == RecordingState::Idle {
+                return (Step::Nothing, None);
+            }
+            self.moving = false;
+        }
         // An `idle` right after `done` or `error` (the preview ends that way)
         // leaves the check mark or message up until its own timer hides it.
         if state == RecordingState::Idle && self.terminal_showing {
@@ -137,6 +161,29 @@ impl Presenter {
         self.visible
     }
 
+    /// Enters move mode, which takes over the window: a check mark or message
+    /// still up is dropped and its timer goes stale. The caller shows the
+    /// window itself. False if already moving.
+    pub fn begin_move(&mut self) -> bool {
+        if self.moving {
+            return false;
+        }
+        self.generation += 1;
+        self.terminal_showing = false;
+        self.visible = false;
+        self.moving = true;
+        true
+    }
+
+    /// Leaves move mode; false if it was not on. The caller hides the window.
+    pub fn end_move(&mut self) -> bool {
+        std::mem::take(&mut self.moving)
+    }
+
+    pub fn is_moving(&self) -> bool {
+        self.moving
+    }
+
     /// Visible for a Recording in progress, not just a check mark or error
     /// waiting out its timer.
     pub fn is_live(&self) -> bool {
@@ -161,23 +208,157 @@ pub struct Rect {
     pub bottom: i32,
 }
 
-/// Where the overlay window goes on a monitor: centred horizontally, with the
-/// capsule's bottom edge `BOTTOM_MARGIN` above the work area. `dpi_scale` is
-/// the monitor's effective DPI / 96. The capsule and its glow room grow with
-/// `size`; the margin does not.
-pub fn placement(work: Rect, dpi_scale: f64, size: OverlaySize) -> Rect {
-    let px = |logical: f64| (logical * dpi_scale).round() as i32;
-    let s = size.scale();
-    let width = px((CAPSULE_WIDTH + 2.0 * GLOW_PAD) * s);
-    let height = px((CAPSULE_HEIGHT + 2.0 * GLOW_PAD) * s);
-    let left = work.left + (work.right - work.left - width) / 2;
-    let bottom = work.bottom - px(BOTTOM_MARGIN - GLOW_PAD * s);
-    Rect {
-        left,
-        top: bottom - height,
-        right: left + width,
-        bottom,
+/// The pill centre as fractions of the overlay window, y down, for the page.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Anchor {
+    pub x: f64,
+    pub y: f64,
+}
+
+/// Where the overlay window goes, and where in it the pill is drawn.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Placement {
+    pub window: Rect,
+    pub anchor: Anchor,
+}
+
+/// `v` within `lo..=hi`, or the middle when the range is empty (a work area
+/// smaller than what must fit in it).
+fn fit(v: f64, lo: f64, hi: f64) -> f64 {
+    if lo > hi {
+        (lo + hi) / 2.0
+    } else {
+        v.clamp(lo, hi)
     }
+}
+
+/// One monitor's work area with the pill and window sizes on it, in physical
+/// pixels.
+struct Area {
+    left: f64,
+    top: f64,
+    width: f64,
+    height: f64,
+    /// Pill half sizes plus the edge margin: how near an edge its centre may go.
+    inset_x: f64,
+    inset_y: f64,
+    window_width: i32,
+    window_height: i32,
+    snap: f64,
+}
+
+impl Area {
+    /// `dpi_scale` is the monitor's effective DPI / 96. The pill, its text
+    /// room and the glow room grow with `size`; the margins do not.
+    fn new(work: Rect, dpi_scale: f64, size: OverlaySize) -> Self {
+        let s = size.scale() * dpi_scale;
+        let px = |logical: f64| (logical * s).round() as i32;
+        Self {
+            left: f64::from(work.left),
+            top: f64::from(work.top),
+            width: f64::from(work.right - work.left),
+            height: f64::from(work.bottom - work.top),
+            inset_x: PILL_WIDTH * s / 2.0 + EDGE_MARGIN * dpi_scale,
+            inset_y: PILL_HEIGHT * s / 2.0 + EDGE_MARGIN * dpi_scale,
+            window_width: px(TEXT_WIDTH + 2.0 * GLOW_PAD),
+            window_height: px(TEXT_HEIGHT + 2.0 * GLOW_PAD),
+            snap: SNAP_DISTANCE * dpi_scale,
+        }
+    }
+
+    /// The nearest pill centre that keeps the whole pill inside the margins.
+    fn clamp(&self, x: f64, y: f64) -> (f64, f64) {
+        (
+            fit(
+                x,
+                self.left + self.inset_x,
+                self.left + self.width - self.inset_x,
+            ),
+            fit(
+                y,
+                self.top + self.inset_y,
+                self.top + self.height - self.inset_y,
+            ),
+        )
+    }
+}
+
+/// Where the overlay window goes on a monitor for the saved `position` (the
+/// default top-centre for `None`). The pill centre is the saved fraction of
+/// this work area, clamped so the pill stays inside it on any monitor size,
+/// DPI or taskbar position. The window, sized for the widest text, is
+/// centred on the pill and pushed back inside the work area only where it
+/// would cross an edge, so Copied and Error text grow from the pill centre
+/// and never leave the screen.
+pub fn placement(
+    work: Rect,
+    dpi_scale: f64,
+    size: OverlaySize,
+    position: Option<OverlayPosition>,
+) -> Placement {
+    let area = Area::new(work, dpi_scale, size);
+    let p = position.unwrap_or(DEFAULT_POSITION);
+    let (x, y) = area.clamp(area.left + p.x * area.width, area.top + p.y * area.height);
+    let (w, h) = (area.window_width, area.window_height);
+    let left = fit(
+        x - f64::from(w) / 2.0,
+        area.left,
+        area.left + area.width - f64::from(w),
+    )
+    .round() as i32;
+    let top = fit(
+        y - f64::from(h) / 2.0,
+        area.top,
+        area.top + area.height - f64::from(h),
+    )
+    .round() as i32;
+    Placement {
+        window: Rect {
+            left,
+            top,
+            right: left + w,
+            bottom: top + h,
+        },
+        anchor: Anchor {
+            x: (x - f64::from(left)) / f64::from(w),
+            y: (y - f64::from(top)) / f64::from(h),
+        },
+    }
+}
+
+/// The position to save after the user dragged the window to `window` on a
+/// monitor with this work area, the pill drawn at `anchor` in it. The pill
+/// centre snaps to the centre line, and to the default top or bottom margin,
+/// within 24 px. `None` is the default spot, so Reset has nothing to undo.
+pub fn dropped_position(
+    work: Rect,
+    dpi_scale: f64,
+    size: OverlaySize,
+    window: Rect,
+    anchor: Anchor,
+) -> Option<OverlayPosition> {
+    let area = Area::new(work, dpi_scale, size);
+    let (x, y) = area.clamp(
+        f64::from(window.left) + anchor.x * f64::from(window.right - window.left),
+        f64::from(window.top) + anchor.y * f64::from(window.bottom - window.top),
+    );
+    let near = |a: f64, b: f64| (a - b).abs() <= area.snap;
+    let (_, top_line) = area.clamp(x, area.top);
+    let (_, bottom_line) = area.clamp(x, area.top + area.height);
+    let fx = if near(x, area.left + area.width / 2.0) {
+        0.5
+    } else {
+        (x - area.left) / area.width
+    };
+    let fy = if near(y, top_line) {
+        0.0
+    } else if near(y, bottom_line) {
+        1.0
+    } else {
+        (y - area.top) / area.height
+    };
+    OverlayPosition::new(fx.clamp(0.0, 1.0), fy.clamp(0.0, 1.0))
+        .filter(|position| *position != DEFAULT_POSITION)
 }
 
 /// A rectangle in AppKit points: origin at the bottom left, y growing up.
@@ -189,24 +370,50 @@ pub struct MacFrame {
     pub height: f64,
 }
 
+impl MacFrame {
+    /// The same rectangle with y flipped to grow down, as [`placement`] works.
+    fn flipped(self) -> Rect {
+        Rect {
+            left: self.x.round() as i32,
+            top: -(self.y + self.height).round() as i32,
+            right: (self.x + self.width).round() as i32,
+            bottom: -self.y.round() as i32,
+        }
+    }
+
+    fn unflipped(r: Rect) -> Self {
+        Self {
+            x: f64::from(r.left),
+            y: f64::from(-r.bottom),
+            width: f64::from(r.right - r.left),
+            height: f64::from(r.bottom - r.top),
+        }
+    }
+}
+
 /// The overlay's frame on a Mac screen whose visible frame (below the menu
 /// bar, above the Dock) is `visible`. [`placement`] with y flipped: AppKit
-/// works in points, so the backing scale needs no part in it.
+/// works in points, so the backing scale needs no part in it. The anchor is
+/// for the page, whose y grows down.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub fn mac_placement(visible: MacFrame, size: OverlaySize) -> MacFrame {
-    let work = Rect {
-        left: visible.x.round() as i32,
-        top: -(visible.y + visible.height).round() as i32,
-        right: (visible.x + visible.width).round() as i32,
-        bottom: -visible.y.round() as i32,
-    };
-    let r = placement(work, 1.0, size);
-    MacFrame {
-        x: f64::from(r.left),
-        y: f64::from(-r.bottom),
-        width: f64::from(r.right - r.left),
-        height: f64::from(r.bottom - r.top),
-    }
+pub fn mac_placement(
+    visible: MacFrame,
+    size: OverlaySize,
+    position: Option<OverlayPosition>,
+) -> (MacFrame, Anchor) {
+    let p = placement(visible.flipped(), 1.0, size, position);
+    (MacFrame::unflipped(p.window), p.anchor)
+}
+
+/// [`dropped_position`] for a window frame on a Mac screen.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn mac_dropped_position(
+    visible: MacFrame,
+    size: OverlaySize,
+    frame: MacFrame,
+    anchor: Anchor,
+) -> Option<OverlayPosition> {
+    dropped_position(visible.flipped(), 1.0, size, frame.flipped(), anchor)
 }
 
 /// Speech-like fake level for "Preview overlay": syllable bumps (~4 Hz) under
@@ -223,22 +430,66 @@ pub fn preview_level(seconds: f64) -> f32 {
     (syllable * phrase * pause).clamp(0.0, 1.0) as f32
 }
 
-/// The size the next show places the capsule at. Read on the main thread at
-/// each hidden → visible edge, so a change applies from the next Recording.
-static SIZE: Mutex<OverlaySize> = Mutex::new(OverlaySize::Medium);
-
-pub fn set_size(size: OverlaySize) {
-    *SIZE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = size;
-}
-
-/// Only the Windows and macOS placements read it.
-#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
-fn size() -> OverlaySize {
-    *SIZE
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The size and saved position the next show places the pill at. Read on the
+/// main thread at each hidden → visible edge, so a change applies from the
+/// next Recording.
+static SIZE: Mutex<OverlaySize> = Mutex::new(OverlaySize::Medium);
+static POSITION: Mutex<Option<OverlayPosition>> = Mutex::new(None);
+/// Where the pill was last drawn in the window. Done reads it to find the
+/// pill centre in the dragged window.
+static ANCHOR: Mutex<Anchor> = Mutex::new(Anchor { x: 0.5, y: 0.5 });
+
+pub fn set_size(size: OverlaySize) {
+    *lock(&SIZE) = size;
+}
+
+pub fn set_position(position: Option<OverlayPosition>) {
+    *lock(&POSITION) = position;
+}
+
+/// Only the Windows and macOS placements read these.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+fn size() -> OverlaySize {
+    *lock(&SIZE)
+}
+
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+fn position() -> Option<OverlayPosition> {
+    *lock(&POSITION)
+}
+
+/// Which monitor a placed show uses.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+enum Source<'a> {
+    /// The one being typed on: the Recording rule.
+    Typing,
+    /// The one holding this window: move mode, beside Settings.
+    Beside(&'a tauri::WebviewWindow),
+}
+
+/// `overlay-layout` payload.
+#[derive(Clone, Serialize)]
+struct LayoutPayload {
+    x: f64,
+    y: f64,
+    moving: bool,
+}
+
+fn emit_layout(app: &AppHandle, moving: bool) {
+    let anchor = *lock(&ANCHOR);
+    let payload = LayoutPayload {
+        x: anchor.x,
+        y: anchor.y,
+        moving,
+    };
+    let _ = app.emit_to(OVERLAY_WINDOW, OVERLAY_LAYOUT, payload);
 }
 
 /// The app's one [`Presenter`]. It is only touched on the main thread, so
@@ -254,10 +505,7 @@ pub fn init(app: &AppHandle) -> tauri::Result<()> {
         WebviewUrl::App("overlay/overlay.html".into()),
     )
     .title("Voisu overlay")
-    .inner_size(
-        CAPSULE_WIDTH + 2.0 * GLOW_PAD,
-        CAPSULE_HEIGHT + 2.0 * GLOW_PAD,
-    )
+    .inner_size(TEXT_WIDTH + 2.0 * GLOW_PAD, TEXT_HEIGHT + 2.0 * GLOW_PAD)
     .decorations(false)
     .transparent(true)
     .shadow(false)
@@ -266,10 +514,14 @@ pub fn init(app: &AppHandle) -> tauri::Result<()> {
     .skip_taskbar(true)
     .focusable(false)
     .focused(false)
+    // macOS: the first click on the never-key pill reaches the page, so a
+    // drag can start in move mode.
+    .accept_first_mouse(true)
     .visible(false)
     .build()?;
     // tao maps this to WS_EX_TRANSPARENT | WS_EX_LAYERED: hit-testing passes
-    // through to the window underneath.
+    // through to the window underneath. tao's flag stays set for good; move
+    // mode lifts only the native bit (see `native::show`).
     window.set_ignore_cursor_events(true)?;
 
     let handle = app.clone();
@@ -292,8 +544,32 @@ fn on_main_thread(app: &AppHandle, work: impl FnOnce(&AppHandle) + Send + 'stati
     }
 }
 
+/// Runs `work` on the main thread, behind every overlay update already
+/// queued, and returns its result.
+async fn on_main<T: Send + 'static>(
+    app: &AppHandle,
+    work: impl FnOnce(&AppHandle) -> T + Send + 'static,
+) -> Result<T, String> {
+    let (send, receive) = tokio::sync::oneshot::channel();
+    let handle = app.clone();
+    app.run_on_main_thread(move || {
+        let _ = send.send(work(&handle));
+    })
+    .map_err(|error| error.to_string())?;
+    receive.await.map_err(|error| error.to_string())
+}
+
 fn on_state(app: &AppHandle, state: RecordingState) {
-    let (step, timer) = presenter(app).on_state(state);
+    let (step, timer, move_cancelled) = {
+        let mut presenter = presenter(app);
+        let was_moving = presenter.is_moving();
+        let (step, timer) = presenter.on_state(state);
+        (step, timer, was_moving && !presenter.is_moving())
+    };
+    if move_cancelled {
+        tracing::info!("overlay move cancelled by a Recording");
+        leave_move(app);
+    }
     apply(app, step);
     if let (Some(generation), Some(delay)) = (timer, state.display_time()) {
         let app = app.clone();
@@ -308,11 +584,7 @@ fn on_state(app: &AppHandle, state: RecordingState) {
 }
 
 fn presenter(app: &AppHandle) -> std::sync::MutexGuard<'_, Presenter> {
-    let state = app.state::<OverlayPresenter>().inner();
-    state
-        .0
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    lock(&app.state::<OverlayPresenter>().inner().0)
 }
 
 /// Main thread only.
@@ -321,10 +593,92 @@ fn apply(app: &AppHandle, step: Step) {
         return;
     };
     match step {
-        Step::Show { place } => native::show(&window, place),
+        Step::Show { place } => show(app, &window, place.then_some(Source::Typing), false),
         Step::Hide => native::hide(&window),
         Step::Nothing => {}
     }
+}
+
+/// Shows the window, first placing it on `source`'s monitor when given. The
+/// page hears where the pill goes before the window appears. Main thread only.
+fn show(app: &AppHandle, window: &tauri::WebviewWindow, source: Option<Source>, moving: bool) {
+    let frame = source.and_then(native::target).map(|(frame, anchor)| {
+        *lock(&ANCHOR) = anchor;
+        emit_layout(app, moving);
+        frame
+    });
+    native::show(window, frame, !moving);
+}
+
+/// Settings' "Move overlay": shows the pill, grabbable, on the monitor that
+/// holds the Settings window. Refused while a real Recording is on screen.
+pub async fn start_move(app: &AppHandle) -> Result<(), String> {
+    // A tray preview gives way. Its events already emitted are queued ahead
+    // of the work below, and it emits nothing after this.
+    let previewing = preview_gate().running;
+    end_preview();
+    on_main(app, move |app| {
+        let Some(window) = app.get_webview_window(OVERLAY_WINDOW) else {
+            return Err("The overlay isn't available.".to_string());
+        };
+        {
+            let mut presenter = presenter(app);
+            if presenter.is_moving() {
+                return Ok(());
+            }
+            if presenter.is_live() && !previewing {
+                return Err("Finish the Recording first.".to_string());
+            }
+            presenter.begin_move();
+        }
+        tracing::info!("overlay move started");
+        native::hide(&window);
+        let settings = app.get_webview_window(crate::SETTINGS_WINDOW);
+        let source = settings.as_ref().map_or(Source::Typing, Source::Beside);
+        show(app, &window, Some(source), true);
+        let _ = app.emit(crate::STATE_CHANGED, ());
+        Ok(())
+    })
+    .await?
+}
+
+/// Done (`save`) or Cancel. Hides the pill and puts the overlay back to
+/// click-through. With `save`, returns where the pill was dropped (`None` is
+/// the default spot) for the caller to store; `None` if move mode was not on.
+pub async fn finish_move(
+    app: &AppHandle,
+    save: bool,
+) -> Result<Option<Option<OverlayPosition>>, String> {
+    on_main(app, move |app| finish_move_now(app, save)).await
+}
+
+/// [`finish_move`] on the main thread, also used when Settings closes.
+pub fn finish_move_now(app: &AppHandle, save: bool) -> Option<Option<OverlayPosition>> {
+    if !presenter(app).end_move() {
+        return None;
+    }
+    let dropped = app
+        .get_webview_window(OVERLAY_WINDOW)
+        .filter(|_| save)
+        .and_then(|window| native::dropped(&window, *lock(&ANCHOR)));
+    tracing::info!(save, saved = dropped.is_some(), "overlay move finished");
+    leave_move(app);
+    dropped
+}
+
+/// Hidden and click-through again; Settings and the page are told.
+fn leave_move(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window(OVERLAY_WINDOW) {
+        native::hide(&window);
+        native::set_click_through(&window);
+    }
+    emit_layout(app, false);
+    let _ = app.emit(crate::STATE_CHANGED, ());
+}
+
+pub fn is_moving(app: &AppHandle) -> bool {
+    app.try_state::<OverlayPresenter>()
+        .is_some_and(|state| lock(&state.inner().0).is_moving())
 }
 
 /// Generation of the running tray preview. A real Recording bumps it, and
@@ -377,9 +731,7 @@ impl PreviewGate {
 }
 
 fn preview_gate() -> std::sync::MutexGuard<'static, PreviewGate> {
-    PREVIEW
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    lock(&PREVIEW)
 }
 
 /// Called by the engine as a real Recording starts: stops any preview.
@@ -429,10 +781,10 @@ fn play_preview(app: &AppHandle, token: u64) -> bool {
     state(RecordingState::Done)
 }
 
-/// Shows the capsule at the size just chosen: re-places a preview already
-/// on screen, or starts one. A real Recording on screen keeps its size until
-/// it ends.
-pub fn preview_size(app: &AppHandle) {
+/// Shows the pill at the size or position just chosen: re-places a preview
+/// already on screen, or starts one. A real Recording on screen keeps its
+/// place until it ends.
+pub fn preview_placement(app: &AppHandle) {
     if !preview_gate().running {
         return preview(app);
     }
@@ -449,8 +801,11 @@ pub fn preview_size(app: &AppHandle) {
 /// Recording is on screen or another preview runs, and stops at once when a
 /// real Recording starts.
 pub fn preview(app: &AppHandle) {
-    if presenter(app).is_live() {
-        return;
+    {
+        let presenter = presenter(app);
+        if presenter.is_live() || presenter.is_moving() {
+            return;
+        }
     }
     let Some(token) = preview_gate().begin() else {
         return;
@@ -467,29 +822,32 @@ pub fn preview(app: &AppHandle) {
 #[cfg(windows)]
 mod native {
     use tauri::WebviewWindow;
-    use windows::Win32::Foundation::{COLORREF, HWND, POINT};
+    use windows::Win32::Foundation::{COLORREF, HWND, POINT, RECT};
     use windows::Win32::Graphics::Gdi::{
         GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL, MONITORINFO,
         MonitorFromPoint, MonitorFromWindow,
     };
     use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
     use windows::Win32::UI::WindowsAndMessaging::{
-        GWL_EXSTYLE, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW, HWND_TOPMOST, LWA_ALPHA,
-        SW_HIDE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-        SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-        WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+        GWL_EXSTYLE, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect,
+        HWND_TOPMOST, LWA_ALPHA, SW_HIDE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SWP_NOZORDER, SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos,
+        ShowWindow, WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        WS_EX_TRANSPARENT,
     };
 
-    use super::{Rect, placement, size};
+    use super::{Anchor, Rect, Source, dropped_position, placement, position, size};
+    use crate::settings::OverlayPosition;
 
-    pub fn show(window: &WebviewWindow, place: bool) {
+    /// Shows the window topmost without activating it, at `frame` if given.
+    /// Click-through unless in move mode.
+    pub fn show(window: &WebviewWindow, frame: Option<Rect>, click_through: bool) {
         let Ok(hwnd) = window.hwnd() else { return };
-        assert_styles(hwnd);
-        let target = if place { target_rect() } else { None };
+        assert_styles(hwnd, click_through);
         // SAFETY: plain Win32 calls on our own live top-level window, made on
         // the thread that owns it.
         unsafe {
-            if let Some(r) = target {
+            if let Some(r) = frame {
                 let (x, y, w, h) = (r.left, r.top, r.right - r.left, r.bottom - r.top);
                 // Moving onto a monitor with another DPI sends WM_DPICHANGED,
                 // which tao answers by resizing. Setting the rect a second
@@ -505,7 +863,7 @@ mod native {
                     SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED,
                 );
             } else {
-                // Re-assert topmost each time so the capsule rises above a
+                // Re-assert topmost each time so the pill rises above a
                 // fullscreen-windowed app that went topmost after us.
                 let _ = SetWindowPos(
                     hwnd,
@@ -529,20 +887,38 @@ mod native {
         }
     }
 
-    /// No activation, no taskbar button or Alt+Tab entry, click-through.
-    /// Re-applied before every show because tao rewrites GWL_EXSTYLE from its
-    /// own flags whenever one of them changes, and it has no tool-window flag.
-    /// The showing `SetWindowPos` carries SWP_FRAMECHANGED so the change lands.
+    /// After move mode: the hidden window lets clicks through again.
+    pub fn set_click_through(window: &WebviewWindow) {
+        if let Ok(hwnd) = window.hwnd() {
+            assert_styles(hwnd, true);
+        }
+    }
+
+    /// No activation, no taskbar button or Alt+Tab entry, and click-through
+    /// except in move mode. Re-applied before every show because tao
+    /// rewrites GWL_EXSTYLE from its own flags whenever one of them changes,
+    /// and it has no tool-window flag. The showing `SetWindowPos` carries
+    /// SWP_FRAMECHANGED so the change lands.
+    ///
+    /// Move mode clears only the native WS_EX_TRANSPARENT; tao's own
+    /// ignore-cursor flag stays set, so any tao rewrite errs towards
+    /// click-through.
     ///
     /// tao still believes this window is hidden. Calling a tao setter that
-    /// changes its window flags (always-on-top, resizable, …) while the capsule
+    /// changes its window flags (always-on-top, resizable, …) while the pill
     /// is up would rewrite the styles without WS_VISIBLE; don't.
-    fn assert_styles(hwnd: HWND) {
-        let add = (WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT | WS_EX_LAYERED).0;
+    fn assert_styles(hwnd: HWND, click_through: bool) {
+        let add = (WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED).0 as isize;
+        let transparent = WS_EX_TRANSPARENT.0 as isize;
         // SAFETY: reading and writing our own window's extended style.
         unsafe {
             let current = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-            let wanted = (current | add as isize) & !(WS_EX_APPWINDOW.0 as isize);
+            let mut wanted = (current | add) & !(WS_EX_APPWINDOW.0 as isize);
+            if click_through {
+                wanted |= transparent;
+            } else {
+                wanted &= !transparent;
+            }
             if wanted != current {
                 SetWindowLongPtrW(hwnd, GWL_EXSTYLE, wanted);
             }
@@ -555,8 +931,46 @@ mod native {
         }
     }
 
+    /// The window rect and pill anchor for a placed show on `source`'s monitor.
+    pub fn target(source: Source) -> Option<(Rect, Anchor)> {
+        let monitor = match source {
+            Source::Typing => typing_monitor(),
+            // SAFETY: a read-only query on our own Settings window.
+            Source::Beside(other) => unsafe {
+                MonitorFromWindow(other.hwnd().ok()?, MONITOR_DEFAULTTONEAREST)
+            },
+        };
+        let (work, dpi_scale) = work_area(monitor)?;
+        let p = placement(work, dpi_scale, size(), position());
+        Some((p.window, p.anchor))
+    }
+
+    /// Where the user dropped the pill, on the monitor its centre is over.
+    pub fn dropped(window: &WebviewWindow, anchor: Anchor) -> Option<Option<OverlayPosition>> {
+        let hwnd = window.hwnd().ok()?;
+        let mut r = RECT::default();
+        // SAFETY: read-only Win32 queries on our own window with valid
+        // out-pointers.
+        let monitor = unsafe {
+            GetWindowRect(hwnd, &mut r).ok()?;
+            let centre = POINT {
+                x: r.left + (anchor.x * f64::from(r.right - r.left)).round() as i32,
+                y: r.top + (anchor.y * f64::from(r.bottom - r.top)).round() as i32,
+            };
+            MonitorFromPoint(centre, MONITOR_DEFAULTTONEAREST)
+        };
+        let (work, dpi_scale) = work_area(monitor)?;
+        let window = Rect {
+            left: r.left,
+            top: r.top,
+            right: r.right,
+            bottom: r.bottom,
+        };
+        Some(dropped_position(work, dpi_scale, size(), window, anchor))
+    }
+
     /// The monitor holding the foreground window, else the cursor's monitor.
-    fn target_rect() -> Option<Rect> {
+    fn typing_monitor() -> HMONITOR {
         // SAFETY: read-only Win32 queries with valid out-pointers.
         unsafe {
             let mut monitor = HMONITOR::default();
@@ -569,6 +983,14 @@ mod native {
                 let _ = GetCursorPos(&mut cursor);
                 monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
             }
+            monitor
+        }
+    }
+
+    /// The monitor's work area (taskbar excluded) and effective DPI / 96.
+    fn work_area(monitor: HMONITOR) -> Option<(Rect, f64)> {
+        // SAFETY: read-only Win32 queries with valid out-pointers.
+        unsafe {
             let mut info = MONITORINFO {
                 cbSize: size_of::<MONITORINFO>() as u32,
                 ..Default::default()
@@ -581,7 +1003,7 @@ mod native {
                 dpi_x = 96;
             }
             let work = info.rcWork;
-            Some(placement(
+            Some((
                 Rect {
                     left: work.left,
                     top: work.top,
@@ -589,26 +1011,27 @@ mod native {
                     bottom: work.bottom,
                 },
                 f64::from(dpi_x) / 96.0,
-                size(),
             ))
         }
     }
 }
 
-/// The capsule as a Mac panel: shown with `orderFrontRegardless`, so Voisu
+/// The pill as a Mac panel: shown with `orderFrontRegardless`, so Voisu
 /// never activates and the focused app keeps the keyboard (tao's `show`
 /// makes the window key). Above full-screen apps on every Space, and
-/// click-through.
+/// click-through except in move mode.
 #[cfg(target_os = "macos")]
 mod native {
     use objc2::MainThreadMarker;
+    use objc2::rc::Retained;
     use objc2_app_kit::{
         NSEvent, NSScreen, NSStatusWindowLevel, NSWindow, NSWindowCollectionBehavior,
     };
     use objc2_foundation::{NSPoint, NSRect, NSSize};
     use tauri::WebviewWindow;
 
-    use super::{MacFrame, mac_placement, size};
+    use super::{Anchor, MacFrame, Source, mac_dropped_position, mac_placement, position, size};
+    use crate::settings::OverlayPosition;
 
     fn ns_window(window: &WebviewWindow) -> Option<&NSWindow> {
         let ptr = window.ns_window().ok()?.cast::<NSWindow>();
@@ -617,12 +1040,12 @@ mod native {
         unsafe { ptr.as_ref() }
     }
 
-    pub fn show(window: &WebviewWindow, place: bool) {
-        let (Some(mtm), Some(ns)) = (MainThreadMarker::new(), ns_window(window)) else {
+    pub fn show(window: &WebviewWindow, frame: Option<MacFrame>, click_through: bool) {
+        let Some(ns) = ns_window(window) else {
             return;
         };
         ns.setLevel(NSStatusWindowLevel);
-        ns.setIgnoresMouseEvents(true);
+        ns.setIgnoresMouseEvents(click_through);
         ns.setHasShadow(false);
         ns.setCollectionBehavior(
             NSWindowCollectionBehavior::CanJoinAllSpaces
@@ -630,7 +1053,7 @@ mod native {
                 | NSWindowCollectionBehavior::IgnoresCycle
                 | NSWindowCollectionBehavior::FullScreenAuxiliary,
         );
-        if place && let Some(frame) = target_frame(mtm) {
+        if let Some(frame) = frame {
             let rect = NSRect::new(
                 NSPoint::new(frame.x, frame.y),
                 NSSize::new(frame.width, frame.height),
@@ -646,86 +1069,105 @@ mod native {
         }
     }
 
-    /// The screen under the mouse pointer, else the main screen.
-    fn target_frame(mtm: MainThreadMarker) -> Option<MacFrame> {
-        let mouse = NSEvent::mouseLocation();
+    /// After move mode: the hidden window lets clicks through again.
+    pub fn set_click_through(window: &WebviewWindow) {
+        if let Some(ns) = ns_window(window) {
+            ns.setIgnoresMouseEvents(true);
+        }
+    }
+
+    /// The frame and pill anchor for a placed show: on the screen under the
+    /// mouse pointer, or the one holding `Source::Beside`'s window; else the
+    /// main screen.
+    pub fn target(source: Source) -> Option<(MacFrame, Anchor)> {
+        let mtm = MainThreadMarker::new()?;
+        let screen = match source {
+            Source::Typing => screen_at(mtm, NSEvent::mouseLocation()),
+            Source::Beside(other) => ns_window(other).and_then(NSWindow::screen),
+        }
+        .or_else(|| NSScreen::mainScreen(mtm))?;
+        Some(mac_placement(visible_frame(&screen), size(), position()))
+    }
+
+    /// Where the user dropped the pill, on the screen its centre is over.
+    pub fn dropped(window: &WebviewWindow, anchor: Anchor) -> Option<Option<OverlayPosition>> {
+        let mtm = MainThreadMarker::new()?;
+        let ns = ns_window(window)?;
+        let f = ns.frame();
+        let frame = MacFrame {
+            x: f.origin.x,
+            y: f.origin.y,
+            width: f.size.width,
+            height: f.size.height,
+        };
+        // The anchor's y grows down from the window top; AppKit's grows up.
+        let centre = NSPoint::new(
+            frame.x + anchor.x * frame.width,
+            frame.y + frame.height - anchor.y * frame.height,
+        );
+        let screen = screen_at(mtm, centre)
+            .or_else(|| ns.screen())
+            .or_else(|| NSScreen::mainScreen(mtm))?;
+        Some(mac_dropped_position(
+            visible_frame(&screen),
+            size(),
+            frame,
+            anchor,
+        ))
+    }
+
+    fn screen_at(mtm: MainThreadMarker, point: NSPoint) -> Option<Retained<NSScreen>> {
         let inside = |screen: &NSScreen| {
             let f = screen.frame();
-            (f.origin.x..f.origin.x + f.size.width).contains(&mouse.x)
-                && (f.origin.y..f.origin.y + f.size.height).contains(&mouse.y)
+            (f.origin.x..f.origin.x + f.size.width).contains(&point.x)
+                && (f.origin.y..f.origin.y + f.size.height).contains(&point.y)
         };
-        let screen = NSScreen::screens(mtm)
-            .iter()
-            .find(|screen| inside(screen))
-            .or_else(|| NSScreen::mainScreen(mtm))?;
+        NSScreen::screens(mtm).iter().find(|screen| inside(screen))
+    }
+
+    /// Below the menu bar and above the Dock.
+    fn visible_frame(screen: &NSScreen) -> MacFrame {
         let v = screen.visibleFrame();
-        Some(mac_placement(
-            MacFrame {
-                x: v.origin.x,
-                y: v.origin.y,
-                width: v.size.width,
-                height: v.size.height,
-            },
-            size(),
-        ))
+        MacFrame {
+            x: v.origin.x,
+            y: v.origin.y,
+            width: v.size.width,
+            height: v.size.height,
+        }
     }
 }
 
-/// Linux builds exist only for local checks and tests.
+/// Linux builds exist only for local checks and tests: no placement and no
+/// move mode.
 #[cfg(not(any(windows, target_os = "macos")))]
 mod native {
     use tauri::WebviewWindow;
 
-    pub fn show(window: &WebviewWindow, _place: bool) {
+    use super::{Anchor, Source};
+    use crate::settings::OverlayPosition;
+
+    pub fn show(window: &WebviewWindow, _frame: Option<()>, _click_through: bool) {
         let _ = window.show();
     }
 
     pub fn hide(window: &WebviewWindow) {
         let _ = window.hide();
     }
+
+    pub fn set_click_through(_window: &WebviewWindow) {}
+
+    pub fn target(_source: Source) -> Option<((), Anchor)> {
+        None
+    }
+
+    pub fn dropped(_window: &WebviewWindow, _anchor: Anchor) -> Option<Option<OverlayPosition>> {
+        None
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_mac_capsule_sits_centred_above_the_dock_in_points() {
-        // A 1440x900 point screen with a 25 pt menu bar and a 70 pt Dock.
-        let visible = MacFrame {
-            x: 0.0,
-            y: 70.0,
-            width: 1440.0,
-            height: 805.0,
-        };
-        let frame = mac_placement(visible, OverlaySize::Medium);
-        let windows = placement(
-            Rect {
-                left: 0,
-                top: 25,
-                right: 1440,
-                bottom: 830,
-            },
-            1.0,
-            OverlaySize::Medium,
-        );
-        assert_eq!(frame.width, f64::from(windows.right - windows.left));
-        assert_eq!(frame.height, f64::from(windows.bottom - windows.top));
-        assert_eq!(frame.x, f64::from(windows.left));
-        // The same gap above the Dock as above the taskbar.
-        assert_eq!(frame.y - visible.y, f64::from(830 - windows.bottom));
-        // A screen to the left of and below the main one keeps its offset.
-        let side = mac_placement(
-            MacFrame {
-                x: -1920.0,
-                y: -300.0,
-                ..visible
-            },
-            OverlaySize::Medium,
-        );
-        assert_eq!(side.x - frame.x, -1920.0);
-        assert_eq!(side.y - frame.y, -370.0);
-    }
 
     fn state_json(json: &str) -> Result<RecordingStatePayload, serde_json::Error> {
         serde_json::from_str(json)
@@ -840,61 +1282,374 @@ mod tests {
         );
     }
 
-    #[test]
-    fn places_bottom_centre_of_the_work_area_at_any_scale() {
-        // 1920x1040 work area (taskbar excluded) at 100%: 296x80 window,
-        // capsule bottom 24 px above the work area.
-        let work = Rect {
-            left: 0,
-            top: 0,
-            right: 1920,
-            bottom: 1040,
-        };
-        assert_eq!(
-            placement(work, 1.0, OverlaySize::Medium),
-            Rect {
-                left: 812,
-                top: 944,
-                right: 1108,
-                bottom: 1024
-            }
-        );
-        // A second monitor left of the primary at 150%.
-        let left_monitor = Rect {
-            left: -2560,
-            top: 0,
-            right: 0,
-            bottom: 1392,
-        };
-        let r = placement(left_monitor, 1.5, OverlaySize::Medium);
-        assert_eq!((r.right - r.left, r.bottom - r.top), (444, 120));
-        assert_eq!(r.left - left_monitor.left, left_monitor.right - r.right);
-        assert_eq!(left_monitor.bottom - r.bottom, 24);
+    const FULL_HD: Rect = Rect {
+        left: 0,
+        top: 0,
+        right: 1920,
+        bottom: 1040,
+    };
+
+    fn at(x: f64, y: f64) -> Option<OverlayPosition> {
+        Some(OverlayPosition::new(x, y).unwrap())
+    }
+
+    /// The pill's rectangle on screen, in physical pixels.
+    fn pill(p: Placement, dpi_scale: f64, size: OverlaySize) -> (f64, f64, f64, f64) {
+        let s = size.scale() * dpi_scale;
+        let w = f64::from(p.window.right - p.window.left);
+        let h = f64::from(p.window.bottom - p.window.top);
+        let x = f64::from(p.window.left) + p.anchor.x * w;
+        let y = f64::from(p.window.top) + p.anchor.y * h;
+        let (half_w, half_h) = (PILL_WIDTH * s / 2.0, PILL_HEIGHT * s / 2.0);
+        (x - half_w, y - half_h, x + half_w, y + half_h)
+    }
+
+    fn inside(r: Rect, outer: Rect) -> bool {
+        r.left >= outer.left
+            && r.top >= outer.top
+            && r.right <= outer.right
+            && r.bottom <= outer.bottom
     }
 
     #[test]
-    fn sizes_scale_the_window_but_keep_the_capsule_margin() {
-        let work = Rect {
+    fn the_default_pill_sits_top_centre_twelve_px_down_at_any_scale() {
+        // 1920x1040 work area at 100%: a 336x64 window, the pill 120x32.
+        let p = placement(FULL_HD, 1.0, OverlaySize::Medium, None);
+        assert_eq!(
+            (
+                p.window.right - p.window.left,
+                p.window.bottom - p.window.top
+            ),
+            (336, 64)
+        );
+        assert_eq!(
+            pill(p, 1.0, OverlaySize::Medium),
+            (900.0, 12.0, 1020.0, 44.0)
+        );
+        // The window cannot centre on a pill this near the top, so it stops
+        // at the work area and the pill sits above its middle.
+        assert_eq!(p.window.top, 0);
+        assert!(p.anchor.y < 0.5);
+
+        // A second monitor left of the primary at 150%, with a top taskbar.
+        let left_monitor = Rect {
+            left: -2560,
+            top: 60,
+            right: 0,
+            bottom: 1440,
+        };
+        let p = placement(left_monitor, 1.5, OverlaySize::Medium, None);
+        let (l, t, r, b) = pill(p, 1.5, OverlaySize::Medium);
+        assert_eq!((r - l, b - t), (180.0, 48.0));
+        assert_eq!(t - 60.0, 18.0, "12 logical px at 150%");
+        assert_eq!(l - -2560.0, 0.0 - r, "centred");
+
+        for (size, (w, h)) in [
+            (OverlaySize::Small, (96.0, 25.6)),
+            (OverlaySize::Large, (150.0, 40.0)),
+        ] {
+            let (l, t, r, b) = pill(placement(FULL_HD, 1.0, size, None), 1.0, size);
+            assert!(
+                (r - l - w).abs() < 1e-9 && (b - t - h).abs() < 1e-9,
+                "{size:?}"
+            );
+            assert!((t - 12.0).abs() < 1e-9, "{size:?} keeps the 12 px margin");
+            assert!(
+                ((l + r) / 2.0 - 960.0).abs() < 1e-9,
+                "{size:?} stays centred"
+            );
+        }
+    }
+
+    #[test]
+    fn a_saved_position_is_the_pill_centre_as_fractions_of_the_work_area() {
+        let p = placement(FULL_HD, 1.0, OverlaySize::Medium, at(0.25, 0.5));
+        let (l, t, r, b) = pill(p, 1.0, OverlaySize::Medium);
+        assert!(((l + r) / 2.0 - 480.0).abs() < 1e-9);
+        assert!(((t + b) / 2.0 - 520.0).abs() < 1e-9);
+        // Away from the edges the window is centred on the pill.
+        assert!((p.anchor.x - 0.5).abs() < 1e-9 && (p.anchor.y - 0.5).abs() < 1e-9);
+
+        // The same fractions on a smaller, denser monitor elsewhere.
+        let laptop = Rect {
+            left: 1920,
+            top: 0,
+            right: 1920 + 2880,
+            bottom: 1800 - 72,
+        };
+        let p = placement(laptop, 2.0, OverlaySize::Medium, at(0.25, 0.5));
+        let (l, t, r, b) = pill(p, 2.0, OverlaySize::Medium);
+        assert!(((l + r) / 2.0 - (1920.0 + 720.0)).abs() < 1.0);
+        assert!(((t + b) / 2.0 - 864.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn placing_then_dropping_where_it_was_gives_the_same_position() {
+        for position in [at(0.25, 0.5), at(0.8, 0.3), at(0.1, 0.9), at(0.62, 0.71)] {
+            for (work, dpi) in [
+                (FULL_HD, 1.0),
+                (
+                    Rect {
+                        left: -1280,
+                        top: 40,
+                        right: 0,
+                        bottom: 1024,
+                    },
+                    1.25,
+                ),
+            ] {
+                for size in [OverlaySize::Small, OverlaySize::Medium, OverlaySize::Large] {
+                    let p = placement(work, dpi, size, position);
+                    let back = dropped_position(work, dpi, size, p.window, p.anchor).unwrap();
+                    let want = position.unwrap();
+                    assert!(
+                        (back.x - want.x).abs() < 1e-3 && (back.y - want.y).abs() < 1e-3,
+                        "{want:?} came back as {back:?} on {work:?} at {dpi} {size:?}"
+                    );
+                }
+            }
+        }
+        // The default spot comes back as the default: nothing to reset.
+        let p = placement(FULL_HD, 1.0, OverlaySize::Medium, None);
+        assert_eq!(
+            dropped_position(FULL_HD, 1.0, OverlaySize::Medium, p.window, p.anchor),
+            None
+        );
+    }
+
+    #[test]
+    fn the_pill_and_its_window_stay_inside_the_work_area_at_every_edge_and_corner() {
+        let monitors = [
+            (FULL_HD, 1.0),
+            // Taskbar on the left, 125%.
+            (
+                Rect {
+                    left: 62,
+                    top: 0,
+                    right: 1920,
+                    bottom: 1080,
+                },
+                1.25,
+            ),
+            // A small monitor above the primary, 175%.
+            (
+                Rect {
+                    left: 200,
+                    top: -900,
+                    right: 1640,
+                    bottom: 0,
+                },
+                1.75,
+            ),
+        ];
+        let corners = [0.0, 0.5, 1.0];
+        for (work, dpi) in monitors {
+            for size in [OverlaySize::Small, OverlaySize::Medium, OverlaySize::Large] {
+                let margin = 12.0 * dpi;
+                for &x in &corners {
+                    for &y in &corners {
+                        let p = placement(work, dpi, size, at(x, y));
+                        assert!(inside(p.window, work), "{x},{y} {work:?} {size:?}: {p:?}");
+                        let (l, t, r, b) = pill(p, dpi, size);
+                        let tol = 1e-6;
+                        assert!(l >= f64::from(work.left) + margin - tol, "{x},{y} left");
+                        assert!(t >= f64::from(work.top) + margin - tol, "{x},{y} top");
+                        assert!(r <= f64::from(work.right) - margin + tol, "{x},{y} right");
+                        assert!(b <= f64::from(work.bottom) - margin + tol, "{x},{y} bottom");
+                        if x == 0.0 {
+                            assert!((l - f64::from(work.left) - margin).abs() < 1e-6);
+                        }
+                        if y == 1.0 {
+                            assert!((f64::from(work.bottom) - b - margin).abs() < 1e-6);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn text_in_a_corner_grows_from_the_pill_and_never_leaves_the_screen() {
+        // The page widens the pill about its centre and pushes it back inside
+        // the window (less the glow room) where it would cross an edge. The
+        // window is inside the work area, so the widest two-line text is too.
+        for position in [
+            None,
+            at(0.0, 0.0),
+            at(1.0, 0.0),
+            at(0.0, 1.0),
+            at(1.0, 1.0),
+            at(0.5, 1.0),
+        ] {
+            for (work, dpi) in [
+                (FULL_HD, 1.0),
+                (
+                    Rect {
+                        left: 0,
+                        top: 0,
+                        right: 1366,
+                        bottom: 728,
+                    },
+                    1.5,
+                ),
+            ] {
+                let size = OverlaySize::Large;
+                let p = placement(work, dpi, size, position);
+                let s = size.scale() * dpi;
+                let (w, h) = (
+                    f64::from(p.window.right - p.window.left),
+                    f64::from(p.window.bottom - p.window.top),
+                );
+                let pad = GLOW_PAD * s;
+                let (text_w, text_h) = (TEXT_WIDTH * s, TEXT_HEIGHT * s);
+                let centre_x = fit(p.anchor.x * w, pad + text_w / 2.0, w - pad - text_w / 2.0);
+                let centre_y = fit(p.anchor.y * h, pad + text_h / 2.0, h - pad - text_h / 2.0);
+                let left = f64::from(p.window.left) + centre_x - text_w / 2.0;
+                let top = f64::from(p.window.top) + centre_y - text_h / 2.0;
+                assert!(left - pad >= f64::from(work.left) - 1e-6, "{position:?}");
+                assert!(top - pad >= f64::from(work.top) - 1e-6, "{position:?}");
+                assert!(
+                    left + text_w + pad <= f64::from(work.right) + 1e-6,
+                    "{position:?}"
+                );
+                assert!(
+                    top + text_h + pad <= f64::from(work.bottom) + 1e-6,
+                    "{position:?}"
+                );
+            }
+        }
+        // A monitor narrower than the window: centred, not panicking.
+        let tiny = Rect {
             left: 0,
             top: 0,
-            right: 1920,
-            bottom: 1040,
+            right: 200,
+            bottom: 50,
         };
-        for (size, (w, h)) in [
-            (OverlaySize::Small, (237, 64)),
-            (OverlaySize::Large, (370, 100)),
-        ] {
-            let r = placement(work, 1.0, size);
-            assert_eq!((r.right - r.left, r.bottom - r.top), (w, h), "{size:?}");
-            let (left_gap, right_gap) = (r.left - work.left, work.right - r.right);
-            assert!((left_gap - right_gap).abs() <= 1, "{size:?} stays centred");
-            // The glow room scales too, so the capsule edge stays 24 px up.
-            let glow = (GLOW_PAD * size.scale()).round() as i32;
-            assert_eq!(work.bottom - (r.bottom - glow), 24, "{size:?}");
+        let p = placement(tiny, 1.0, OverlaySize::Medium, at(1.0, 1.0));
+        assert_eq!(p.window.left + p.window.right, 200);
+    }
+
+    #[test]
+    fn dropping_near_the_centre_line_or_a_default_margin_snaps_to_it() {
+        let size = OverlaySize::Medium;
+        // Builds the dragged window around a pill centred at (x, y).
+        let drop = |work: Rect, dpi: f64, x: f64, y: f64| {
+            let (w, h) = ((336.0 * dpi).round() as i32, (64.0 * dpi).round() as i32);
+            let window = Rect {
+                left: (x - f64::from(w) / 2.0).round() as i32,
+                top: (y - f64::from(h) / 2.0).round() as i32,
+                right: (x - f64::from(w) / 2.0).round() as i32 + w,
+                bottom: (y - f64::from(h) / 2.0).round() as i32 + h,
+            };
+            dropped_position(work, dpi, size, window, Anchor { x: 0.5, y: 0.5 })
+        };
+        // 20 px off the centre line, 23 px below the default top: default.
+        assert_eq!(drop(FULL_HD, 1.0, 980.0, 28.0 + 23.0), None);
+        // 30 px off the centre line stays there.
+        let p = drop(FULL_HD, 1.0, 990.0, 28.0).unwrap();
+        assert!((p.x - 990.0 / 1920.0).abs() < 1e-9 && p.y == 0.0);
+        // Near the bottom margin line (pill bottom 12 px above the work area).
+        let p = drop(FULL_HD, 1.0, 400.0, 1040.0 - 28.0 - 20.0).unwrap();
+        assert_eq!(p.y, 1.0);
+        assert!((p.x - 400.0 / 1920.0).abs() < 1e-9);
+        // Mid-screen is kept as is.
+        let p = drop(FULL_HD, 1.0, 1500.0, 700.0).unwrap();
+        assert!((p.y - 700.0 / 1040.0).abs() < 1e-9);
+        // Dragged partly off screen: clamped, then snapped to the top margin.
+        assert_eq!(drop(FULL_HD, 1.0, 960.0, -40.0), None);
+        // The snap distance is logical: 24 px at 200% is 48 physical px.
+        let hi = Rect {
+            left: 0,
+            top: 0,
+            right: 3840,
+            bottom: 2080,
+        };
+        assert_eq!(drop(hi, 2.0, 1920.0 + 46.0, 56.0 + 40.0), None);
+        assert!(drop(hi, 2.0, 1920.0 + 50.0, 56.0).is_some());
+    }
+
+    #[test]
+    fn a_mac_pill_uses_the_same_rule_with_y_flipped() {
+        // A 1440x900 point screen with a 25 pt menu bar and a 70 pt Dock.
+        let visible = MacFrame {
+            x: 0.0,
+            y: 70.0,
+            width: 1440.0,
+            height: 805.0,
+        };
+        let work = Rect {
+            left: 0,
+            top: 25,
+            right: 1440,
+            bottom: 830,
+        };
+        for position in [None, at(0.3, 0.8)] {
+            let (frame, anchor) = mac_placement(visible, OverlaySize::Medium, position);
+            let windows = placement(work, 1.0, OverlaySize::Medium, position);
+            assert_eq!(
+                frame.width,
+                f64::from(windows.window.right - windows.window.left)
+            );
+            assert_eq!(
+                frame.height,
+                f64::from(windows.window.bottom - windows.window.top)
+            );
+            assert_eq!(frame.x, f64::from(windows.window.left));
+            // The same gap above the Dock as above the taskbar.
+            assert_eq!(frame.y - visible.y, f64::from(830 - windows.window.bottom));
+            assert!((anchor.x - windows.anchor.x).abs() < 1e-9);
+            assert!((anchor.y - windows.anchor.y).abs() < 1e-9);
+            // Dropping the frame where it was gives the position back.
+            let back = mac_dropped_position(visible, OverlaySize::Medium, frame, anchor);
+            match (back, position) {
+                (None, None) => {}
+                (Some(b), Some(p)) => assert!((b.x - p.x).abs() < 1e-3 && (b.y - p.y).abs() < 1e-3),
+                other => panic!("{other:?}"),
+            }
         }
-        // 125% DPI and large: physical pixels, still bottom-centred.
-        let r = placement(work, 1.25, OverlaySize::Large);
-        assert_eq!((r.right - r.left, r.bottom - r.top), (463, 125));
+        // A screen to the left of and below the main one keeps its offset.
+        let (main, _) = mac_placement(visible, OverlaySize::Medium, None);
+        let (side, _) = mac_placement(
+            MacFrame {
+                x: -1920.0,
+                y: -300.0,
+                ..visible
+            },
+            OverlaySize::Medium,
+            None,
+        );
+        assert_eq!(side.x - main.x, -1920.0);
+        assert_eq!(side.y - main.y, -370.0);
+    }
+
+    #[test]
+    fn move_mode_takes_over_the_window_and_a_recording_ends_it() {
+        let mut presenter = Presenter::default();
+        // A check mark still up gives way; its timer goes stale.
+        let (_, timer) = presenter.on_state(RecordingState::Done);
+        assert!(presenter.begin_move());
+        assert!(!presenter.begin_move(), "already moving");
+        assert!(presenter.is_moving());
+        assert_eq!(presenter.on_hide_timer(timer.unwrap()), Step::Nothing);
+        // A stray idle leaves the pill where the user is dragging it.
+        assert_eq!(presenter.on_state(RecordingState::Idle).0, Step::Nothing);
+        assert!(presenter.is_moving());
+        // Recording always wins: move mode ends and the pill is placed anew.
+        assert_eq!(
+            presenter.on_state(RecordingState::Recording),
+            (Step::Show { place: true }, None)
+        );
+        assert!(!presenter.is_moving());
+        assert!(!presenter.end_move(), "already ended by the Recording");
+        assert_eq!(presenter.on_state(RecordingState::Idle).0, Step::Hide);
+
+        // Done or Cancel ends it, and the next Recording places as usual.
+        assert!(presenter.begin_move());
+        assert!(presenter.end_move());
+        assert_eq!(
+            presenter.on_state(RecordingState::Recording).0,
+            Step::Show { place: true }
+        );
     }
 
     #[test]

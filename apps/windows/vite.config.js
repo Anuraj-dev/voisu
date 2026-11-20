@@ -18,6 +18,7 @@ export default defineConfig(({ mode }) => ({
           alias: [
             { find: /^@tauri-apps\/api\/core$/, replacement: page('./ui/mock/core.js') },
             { find: /^@tauri-apps\/api\/event$/, replacement: page('./ui/mock/event.js') },
+            { find: /^@tauri-apps\/api\/window$/, replacement: page('./ui/mock/window.js') },
           ],
         }
       : {},
