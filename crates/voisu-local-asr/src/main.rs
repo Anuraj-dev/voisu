@@ -5,6 +5,7 @@
 //! `voisu-local-asr --probe-gpu`: print the GPU the worker would use as
 //! `<device> <description>` and exit 0, or exit 3 when there is none.
 
+#[cfg(unix)]
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
