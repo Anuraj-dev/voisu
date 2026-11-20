@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        1.1.0
+Version:        1.2.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -206,6 +206,9 @@ install -D -m 0644 packaging/icons/voisu.svg %{buildroot}%{_datadir}/icons/hicol
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Fri Nov 20 2026 Voisu maintainers <voisu@example.invalid> - 1.2.0-1
+- feat(windows): keep the dictation on the clipboard like Linux (#357)
+
 * Fri Nov 20 2026 Voisu maintainers <voisu@example.invalid> - 1.1.0-1
 - feat(tui): group settings into clear sections (#358)
 - ci(test): run the Test gate on cargo-nextest and fix the overlay move flake (#356)
