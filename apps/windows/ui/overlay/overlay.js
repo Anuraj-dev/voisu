@@ -8,16 +8,18 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 
-// Motion from the Linux overlay (voisu-overlay.rs), on the pill's 9 bars.
-const BARS = 9;
+// Motion from the Linux overlay (voisu-overlay.rs), on the pill's thin
+// sound bars: many 2 px lines so the row reads as a fine waveform.
+const BARS = 21;
 const CENTRE = (BARS - 1) / 2;
 const HISTORY = CENTRE + 1; // newest level at the centre, oldest at the edges
-const GAP = 3;
+const GAP = 2;
+const BAR_WIDTH = 2;
 const BAR_RGB = '242, 242, 242';
 const ATTACK = 0.65;
 const RELEASE = 0.16;
 const SWEEP_PERIOD_MS = 1200;
-const SWEEP_SIGMA = 1.6;
+const SWEEP_SIGMA = 3.7; // about the same share of the row as 1.6 of 9 bars
 const SWEEP_BASE = 0.35;
 const REDUCED_BRIGHTNESS = 0.6;
 const FRAME_MS = 1000 / 30;
@@ -32,10 +34,10 @@ const DONE_HOLD_MS = 600;
 // side hides it after 2 s (overlay.rs COPIED_DISPLAY); like an error, the
 // page holds it a little longer so the text never blanks first.
 const COPIED_HOLD_MS = 2500;
-// Hands-free shows a Recording-green dot in place of the two leftmost bars,
+// Hands-free shows a Recording-green dot in place of the leftmost bars,
 // so the state is told by shape and position, not colour alone.
 const HANDS_FREE_RGB = '101, 214, 160';
-const HANDS_FREE_SLOTS = 2;
+const HANDS_FREE_SLOTS = 4;
 // Width of the medium overlay window: the widest text pill plus glow room
 // (overlay.rs TEXT_WIDTH + 2 * GLOW_PAD). The native side sizes the window
 // for the chosen Overlay size; the page scales everything by the ratio.
@@ -133,7 +135,9 @@ function draw(now) {
   ctx.clearRect(0, 0, width, height);
 
   const gap = GAP * scale;
-  const barWidth = (width - gap * (BARS - 1)) / BARS;
+  const barWidth = BAR_WIDTH * scale;
+  // Fixed thin bars, the row centred in the meter.
+  const left = Math.max(0, (width - (barWidth * BARS + gap * (BARS - 1))) / 2);
   const drawable = height - 2;
   const floor = Math.max(0.15 * drawable, 1.5);
   const first = state === 'handsFree' ? HANDS_FREE_SLOTS : 0;
@@ -142,7 +146,7 @@ function draw(now) {
     const r = Math.min(3.5 * scale, (HANDS_FREE_SLOTS * (barWidth + gap) - gap) / 2);
     ctx.fillStyle = `rgb(${HANDS_FREE_RGB})`;
     ctx.beginPath();
-    ctx.arc(r, height / 2, r, 0, 2 * Math.PI);
+    ctx.arc(left + r, height / 2, r, 0, 2 * Math.PI);
     ctx.fill();
   }
 
@@ -154,7 +158,7 @@ function draw(now) {
     } else {
       barHeight = floor + barLevel(i) * (drawable - floor);
     }
-    const x = i * (barWidth + gap);
+    const x = left + i * (barWidth + gap);
     const y = (height - barHeight) / 2;
     ctx.fillStyle = `rgba(${BAR_RGB}, ${alpha})`;
     ctx.beginPath();
