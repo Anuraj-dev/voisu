@@ -87,7 +87,7 @@ Cloud transcription runs on two free API keys, one from Groq and one from Deepgr
 
 - [Windows guide](docs/windows.md) and the illustrated [Windows setup walkthrough](https://anuraj-dev.github.io/voisu/docs/windows-setup.html)
 - [macOS guide](docs/macos.md) and the illustrated [Mac setup walkthrough](https://anuraj-dev.github.io/voisu/docs/macos-setup.html)
-- [Linux guide](docs/linux.md)
+- [Linux guide](docs/linux.md), including a [walkthrough of the terminal interface](docs/linux.md#every-settings-row) and [switching to Local](docs/linux.md#switch-to-local-step-by-step)
 - [Command reference](docs/commands.md)
 - [Website guides](https://anuraj-dev.github.io/voisu/docs/): getting started, settings, providers, privacy and troubleshooting
 - [Agent install guide](https://anuraj-dev.github.io/voisu/agent-install.md)

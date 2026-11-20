@@ -73,6 +73,50 @@ If nothing is set up yet, `voisu` opens on the setup screens: Cloud or Local, yo
 
 Keys pause while you dictate, so words that land in the terminal never trigger an action.
 
+### Every Settings row
+
+On the Settings tab, `↑` `↓` picks a row and `↵` opens its choices (or turns a switch on and off); `↵` again picks one. Each row has a CLI command that does the same thing.
+
+| Row | What it does | Choices | Command |
+| --- | --- | --- | --- |
+| Engine | Where your speech becomes text | Cloud (needs internet), Local (stays on this computer) | `voisu engine cloud\|local` |
+| Delivery | How your words reach your window | Paste, Copy (you press Ctrl+V) | `voisu delivery paste\|copy` |
+| Writing | How much Voisu tidies your words | Clean, Exact | `voisu writing clean\|exact` |
+| Layout | How your words are laid out | Plain, Auto, Sections | `voisu layout plain\|auto\|sections` |
+| Tone | How casual your words read | Formal, Informal (btw, no final full stop) | `voisu tone formal\|informal` |
+| Deepgram | Uses Deepgram alongside Groq, for technical words. Off uses Groq alone | On, Off | `voisu deepgram on\|off` |
+| Groq key, Deepgram key | `↵` enters a new key, checked before it is saved | | `voisu key set groq\|deepgram` |
+| Trigger Key | Shows your shortcut. Change it in your desktop (see [Trigger Key by desktop](#trigger-key-by-desktop)) | | `voisu shortcut` |
+| Local unload | When an idle Local model frees its memory | Never, After 30 min, After 1 hour | `voisu local-unload off\|SECONDS` |
+| Local device | Where the Local model runs | Auto, GPU, CPU | `voisu local-device auto\|gpu\|cpu` |
+| Local model | Which Local model runs | Auto, Accurate, Fast | `voisu local-model auto\|accurate\|fast` |
+| Overlay | Where the on-screen pill sits | Move, Reset | `voisu overlay-position move\|reset\|<x,y>` |
+| Update check | Reads the newest version number from GitHub once a day | On, Off | `voisu update-check on\|off` |
+| Star prompt | Lets Voisu ask for a GitHub star after a few days of use | On, Off | `voisu star-prompt on\|off` |
+| Run setup | Walks through your keys, Engine and Trigger Key again. Safe to re-run | | `voisu setup` |
+| Star on GitHub | Opens Voisu's GitHub page | | `voisu star` |
+
+A few changes apply only when Voisu restarts. The row says so, and `r` restarts Voisu.
+
+### Switch to Local, step by step
+
+Local transcription runs on Linux only. The Windows and macOS apps use Cloud.
+
+1. Run `voisu` and open **Settings** (`2`).
+2. If Local is already installed, pick **Engine → Local** and you are done. If not, Voisu says *Local isn't ready yet. Choose Run setup to install it.*
+3. Pick **Run setup**. On *Where should your speech become text?* choose **Local**.
+4. *Install Local?* shows how much Voisu downloads, once. Without a GPU it adds *No GPU found, so it runs on the CPU, more slowly.* Choose **Install** to download, or **Not now** to keep using Cloud. Nothing downloads until you choose Install.
+5. *Installing Local* shows the progress, then *Checking it works*. Keep the window open; it can take a few minutes. If the download stops, `↵` tries again and carries on where it stopped.
+
+Setup installs Accurate when it finds a GPU and Fast when it does not.
+
+### Pick the Local model and where it runs
+
+- **Local model:** **Auto** runs Accurate on a GPU and Fast on the CPU. **Accurate** (distil-large-v3.5) is the most accurate, best on a GPU. **Fast** (small.en) is a third of the size and quick on the CPU. Picking a model that is not installed asks first, for example *Download Fast (small.en), 252.6 MiB? y/n*. `y` downloads it, and it replaces the installed model at your next Recording. Pressing `q` during a download asks you to press it again before quitting.
+- **Local device:** **Auto** uses your best GPU; without one, Local stops with an error. **GPU** uses a GPU only, never the CPU. **CPU** works anywhere but is several times slower. The change applies the next time the Local model loads.
+
+The same from a script: `voisu local-model fast`, `voisu local-device cpu`, `voisu engine local`. See [Local transcription](#local-transcription-consented-install) for the details.
+
 ## Overlay
 
 The Overlay is a small pill with white sound bars that shows while you dictate, then a short result such as *Pasted* or *Copied*. It sits at the bottom centre by default. On KDE Plasma and Hyprland it shows on the monitor you are working on.
