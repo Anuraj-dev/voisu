@@ -20,15 +20,16 @@ use voisu_app::feedback::{
 use voisu_app::local_overlay::TriggerRepeatLatch;
 use voisu_app::overlay::waveform::{Waveform, poll_target};
 use voisu_app::overlay::{
-    LIMIT_WARNING_CLASS, LevelPollAction, LevelPollLatch, LimitWarning, LimitWarningLatch,
-    NoSpeechNotifyLatch, ObservedSignal, OverlayPhase, OverlayView, PILL_BAR_COUNT, PILL_BAR_GAP,
-    PILL_HEIGHT, PILL_MAX_LINES, PILL_WIDTH, PresentationController, PresentationTracker,
-    RecordingNotifyLatch, RungNotification, STATUS_POLL_PERIOD, STATUS_ROUND_TRIP_DEADLINE,
-    StatusCadence, StatusWorker, TickAction, TickObservation, connect_within, edge_falloff_alpha,
-    fetch_status, limit_notification_body, limit_warning_class, limit_warning_from_response,
-    notification_rung_choice, overlay_edges, phase_glyph, poll_tick, read_until_eof_within,
-    recording_bar_height, recording_bar_rgb, recording_identity, recording_remaining,
-    resting_floor, sweep_brightness, text_pill_text_width, text_pill_width, write_within,
+    LIMIT_APPROACHING_CLASS, LIMIT_WARNING_CLASS, LevelPollAction, LevelPollLatch, LimitWarning,
+    LimitWarningLatch, NoSpeechNotifyLatch, ObservedSignal, OverlayPhase, OverlayView,
+    PILL_BAR_COUNT, PILL_BAR_GAP, PILL_HEIGHT, PILL_MAX_LINES, PILL_WIDTH, PositionWatch,
+    PresentationController, PresentationTracker, RecordingNotifyLatch, RungNotification,
+    STATUS_POLL_PERIOD, STATUS_ROUND_TRIP_DEADLINE, StatusCadence, StatusWorker, TickAction,
+    TickObservation, connect_within, edge_falloff_alpha, fetch_status, limit_notification_body,
+    limit_warning_class, limit_warning_from_response, notification_rung_choice, overlay_edges,
+    phase_glyph, pill_text, poll_tick, read_until_eof_within, recording_bar_height,
+    recording_bar_rgb, recording_identity, recording_remaining, resting_floor, sweep_brightness,
+    text_pill_text_width, text_pill_width, write_within,
 };
 use voisu_core::{Command, Request, Response, socket_path};
 
@@ -382,7 +383,7 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
     css.load_from_data(
         "window.background { background: transparent; }
          .capsule { background: rgba(23, 25, 29, 0.96); border-radius: 16px; border: 1px solid transparent; padding: 3px 7px; }
-         .capsule.failure, .capsule.loading, .capsule.unavailable, .capsule.copied { padding: 4px 14px; }
+         .capsule.failure, .capsule.loading, .capsule.unavailable, .capsule.copied, .capsule.nospeech, .capsule.limitsoon { padding: 4px 14px; }
          .capsule .state-label, .capsule .meter { color: #F4F5F7; font-size: 10pt; font-weight: 600; }
          .capsule.processing .state-label, .capsule.processing .meter { color: #8FB4FF; }
          .capsule.success .state-label, .capsule.success .meter { color: #65D6A0; font-size: 13pt; }
@@ -392,6 +393,7 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
          .capsule.unavailable .state-label, .capsule.unavailable .meter { color: #FFB454; }
          .capsule.nospeech .state-label, .capsule.nospeech .meter { color: #FFB454; }
          .capsule.copied .state-label { color: #FFB454; }
+         .capsule.limitsoon .state-label { color: #FFB454; }
          .capsule.limitwarn { border: 1px solid rgba(255, 138, 138, 0.9); box-shadow: 0 0 8px rgba(255, 138, 138, 0.35); }",
     );
     capsule.add_css_class("capsule");
@@ -481,6 +483,7 @@ fn install_surface_feedback(
     let trigger_latch = Rc::new(RefCell::new(TriggerRepeatLatch::default()));
     let cadence = Rc::new(Cell::new(STATUS_POLL_PERIOD));
     let tick_cadence = Rc::clone(&cadence);
+    let mut position_watch = PositionWatch::default();
     poll_at_cadence(cadence, move || {
         if switched.get() {
             // A genuine surface-creation failure handed feedback to the
@@ -526,6 +529,15 @@ fn install_surface_feedback(
         {
             sweep_started.set(Instant::now());
         }
+        // Re-read the position whenever a Recording begins, or the pill comes
+        // up from hidden, off this thread; the answer is applied below.
+        let before = rendered.get().phase;
+        if view.phase != OverlayPhase::Hidden
+            && (before == OverlayPhase::Hidden
+                || (view.phase == OverlayPhase::Recording && before != OverlayPhase::Recording))
+        {
+            position_watch.refresh();
+        }
         render_surface(
             CapsuleSurface {
                 window: &window,
@@ -537,7 +549,13 @@ fn install_surface_feedback(
             &rendered,
             view,
             warning,
+            remaining,
         );
+        if let Some(position) = position_watch.take()
+            && window.is_layer_window()
+        {
+            apply_position(&window, position);
+        }
         match level_latch.borrow_mut().observe(signal) {
             LevelPollAction::Arm => {
                 // A new Recording starts from silence, never from the last
@@ -1033,6 +1051,7 @@ fn render_surface(
     rendered: &Cell<MeterState>,
     view: OverlayView,
     warning: Option<LimitWarning>,
+    remaining: Option<Duration>,
 ) {
     let CapsuleSurface {
         window,
@@ -1051,6 +1070,7 @@ fn render_surface(
         "nospeech",
         "copied",
         LIMIT_WARNING_CLASS,
+        LIMIT_APPROACHING_CLASS,
     ] {
         capsule.remove_css_class(class);
     }
@@ -1084,8 +1104,11 @@ fn render_surface(
         window.set_visible(false);
         return;
     }
-    let text = view.capsule_text();
-    label.set_label(text);
+    let text = pill_text(view, warning, remaining);
+    if view.phase == OverlayPhase::Recording && !text.is_empty() {
+        capsule.add_css_class(LIMIT_APPROACHING_CLASS);
+    }
+    label.set_label(&text);
     label.set_visible(!text.is_empty());
     // The accessible description lives on the capsule box, not the label: the
     // label is hidden for every graphics-first phase (Recording/Processing/
@@ -1095,19 +1118,17 @@ fn render_surface(
     capsule.update_property(&[gtk::accessible::Property::Description(
         announcement_for_overlay(view),
     )]);
-    meter.set_visible(matches!(
-        view.phase,
-        OverlayPhase::Recording | OverlayPhase::Processing | OverlayPhase::NoSpeech
-    ));
+    meter.set_visible(
+        text.is_empty()
+            && matches!(
+                view.phase,
+                OverlayPhase::Recording | OverlayPhase::Processing | OverlayPhase::NoSpeech
+            ),
+    );
     let glyph_text = phase_glyph(view.phase);
     glyph.set_label(glyph_text);
     glyph.set_visible(!glyph_text.is_empty());
-    size_pill(capsule, label, glyph);
-    if !window.is_visible() && window.is_layer_window() {
-        // The overlay is hidden between Recordings, so re-reading the setting
-        // as it appears applies a change at once and without a restart.
-        apply_position(window, voisu_app::config::overlay_position());
-    }
+    size_pill(window, capsule, label, glyph);
     window.set_visible(true);
     meter.queue_draw();
 }
@@ -1131,10 +1152,19 @@ fn apply_position(window: &gtk::ApplicationWindow, position: voisu_app::config::
 /// for text widened to fit, up to `PILL_MAX_WIDTH`, wrapping to two lines.
 /// The label's own width request is the text width, so the capsule is exactly
 /// the pill and the window follows it.
-fn size_pill(capsule: &gtk::Box, label: &gtk::Label, glyph: &gtk::Label) {
+fn size_pill(
+    window: &gtk::ApplicationWindow,
+    capsule: &gtk::Box,
+    label: &gtk::Label,
+    glyph: &gtk::Label,
+) {
     if !label.is_visible() {
+        // Back to the bare pill: reset the window's size explicitly, so a wide
+        // text state never leaves the surface wider than the bars.
         label.set_size_request(-1, -1);
         capsule.set_size_request(PILL_WIDTH, PILL_HEIGHT);
+        window.set_default_size(PILL_WIDTH, PILL_HEIGHT);
+        window.queue_resize();
         return;
     }
     // Measure the text on one line to know how wide it wants to be.
@@ -1163,6 +1193,8 @@ fn size_pill(capsule: &gtk::Box, label: &gtk::Label, glyph: &gtk::Label) {
         .max(0);
     label.set_size_request(text_width, height);
     capsule.set_size_request(width, -1);
+    window.set_default_size(width, -1);
+    window.queue_resize();
 }
 
 /// Cadence of the Level poll on its dedicated worker thread. The meter itself

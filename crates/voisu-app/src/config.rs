@@ -882,7 +882,7 @@ impl OverlayPosition {
 }
 
 /// The Overlay position. Missing, unreadable or unrecognised values keep
-/// `top`. The overlay re-reads it each time it appears.
+/// `top`. The overlay re-reads it as each Recording begins.
 pub fn overlay_position() -> OverlayPosition {
     overlay_position_at(&config_path())
 }
@@ -892,10 +892,43 @@ pub fn set_overlay_position(position: OverlayPosition) -> Result<PathBuf, String
     set_overlay_position_at(&config_path(), position)
 }
 
+/// Stricter than the other root keys: the value must be a TOML string, quoted
+/// on both ends, spelling a preset exactly. Anything else (a bare word, an
+/// unterminated quote, odd casing or padding) reads as the default `top`, so a
+/// hand-edit never lands the pill somewhere unintended.
 pub(crate) fn overlay_position_at(path: &Path) -> OverlayPosition {
-    raw_root_string_at(path, OVERLAY_POSITION_KEY)
-        .and_then(|value| OverlayPosition::parse(&value))
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return OverlayPosition::default();
+    };
+    contents
+        .lines()
+        .map(|line| strip_comment(line).trim())
+        .take_while(|line| !line.starts_with('['))
+        .find_map(|line| {
+            let (name, value) = line.split_once('=')?;
+            names_key(name, OVERLAY_POSITION_KEY).then_some(value.trim())
+        })
+        .and_then(quoted_string)
+        .and_then(|word| {
+            OverlayPosition::ALL
+                .into_iter()
+                .find(|p| p.as_str() == word)
+        })
         .unwrap_or_default()
+}
+
+/// The inside of a TOML basic (`"…"`) or literal (`'…'`) string, only when both
+/// quotes are there.
+fn quoted_string(value: &str) -> Option<&str> {
+    let inner = value
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .or_else(|| {
+            value
+                .strip_prefix('\'')
+                .and_then(|rest| rest.strip_suffix('\''))
+        })?;
+    Some(inner)
 }
 
 pub(crate) fn set_overlay_position_at(
@@ -2918,18 +2951,28 @@ other_key = 5
         assert!(contents.contains("overlay_position = \"bottom-right\"\n"));
         assert!(contents.contains("tone = \"informal\""), "{contents}");
 
-        // Unknown, wrongly cased words and table-scoped keys fall back to top.
+        // Unknown words, bare or half-quoted values, odd casing or padding, and table-scoped keys fall back to top.
         for bad in [
             "overlay_position = \"middle\"\n",
             "overlay_position = \"top_left\"\n",
             "overlay_position = 3\n",
+            "overlay_position = bottom\n",
+            "overlay_position = \"bottom\n",
+            "overlay_position = bottom\"\n",
+            "overlay_position = \"bottom'\n",
+            "overlay_position = \"Bottom\"\n",
+            "overlay_position = \" bottom \"\n",
+            "overlay_position = \"\"\n",
+            "overlay_position = \"\n",
             "[other]\noverlay_position = \"bottom\"\n",
         ] {
             std::fs::write(&path, bad).unwrap();
             assert_eq!(overlay_position_at(&path), OverlayPosition::Top, "{bad}");
         }
-        std::fs::write(&path, "overlay_position = ' Top-Left '\n").unwrap();
+        std::fs::write(&path, "overlay_position = 'top-left'\n").unwrap();
         assert_eq!(overlay_position_at(&path), OverlayPosition::TopLeft);
+        std::fs::write(&path, "overlay_position = \"bottom\" # lower\n").unwrap();
+        assert_eq!(overlay_position_at(&path), OverlayPosition::Bottom);
         assert_eq!(
             OverlayPosition::parse("top-left"),
             Some(OverlayPosition::TopLeft)

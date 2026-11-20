@@ -156,6 +156,87 @@ impl OverlayView {
     }
 }
 
+/// Re-reads the Overlay position off the GTK thread, so showing the pill never
+/// waits on the config file. `refresh` starts a read when a Recording begins;
+/// the next ticks `take` the answer and re-anchor the surface only if it
+/// differs from what was last applied. The pill therefore appears at the last
+/// known spot and moves at most once, within a tick or two.
+#[derive(Default)]
+pub struct PositionWatch {
+    applied: Option<crate::config::OverlayPosition>,
+    pending: Option<std::sync::mpsc::Receiver<crate::config::OverlayPosition>>,
+}
+
+impl PositionWatch {
+    /// Starts a read unless one is already out.
+    pub fn refresh(&mut self) {
+        self.refresh_with(crate::config::overlay_position);
+    }
+
+    fn refresh_with(
+        &mut self,
+        read: impl FnOnce() -> crate::config::OverlayPosition + Send + 'static,
+    ) {
+        if self.pending.is_some() {
+            return;
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        // A thread that cannot start drops the sender; `take` then clears it.
+        let _ = thread::Builder::new()
+            .name("overlay-position".to_owned())
+            .spawn(move || {
+                let _ = sender.send(read());
+            });
+        self.pending = Some(receiver);
+    }
+
+    /// The position to apply now, if a finished read differs from the one last
+    /// applied. Never blocks.
+    pub fn take(&mut self) -> Option<crate::config::OverlayPosition> {
+        use std::sync::mpsc::TryRecvError;
+        match self.pending.as_ref()?.try_recv() {
+            Ok(position) => {
+                self.pending = None;
+                (self.applied != Some(position)).then(|| {
+                    self.applied = Some(position);
+                    position
+                })
+            }
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                self.pending = None;
+                None
+            }
+        }
+    }
+}
+
+/// The CSS class that turns the pill's text amber while the limit approaches.
+pub const LIMIT_APPROACHING_CLASS: &str = "limitsoon";
+
+/// The words the pill shows. Text states (Loading, Unavailable, Failure,
+/// Copied) carry their own; silence and the last minute of a Recording are text
+/// states too, so they widen the pill like the rest. The final ten seconds keep
+/// the amber bars and red border: a countdown in words would lag its own
+/// second. Empty means the pill shows bars or a glyph instead.
+pub fn pill_text(
+    view: OverlayView,
+    warning: Option<LimitWarning>,
+    remaining: Option<Duration>,
+) -> std::borrow::Cow<'static, str> {
+    use std::borrow::Cow;
+    match (view.phase, warning) {
+        (OverlayPhase::NoSpeech, _) => Cow::Borrowed(view.visible_label),
+        (OverlayPhase::Recording, Some(LimitWarning::Approaching)) => remaining
+            .and_then(|left| limit_notification_body(LimitWarning::Approaching, left))
+            .map_or(
+                Cow::Borrowed(limit_warning_body(LimitWarning::Approaching)),
+                Cow::Owned,
+            ),
+        _ => Cow::Borrowed(view.capsule_text()),
+    }
+}
+
 /// The text glyph shown in the capsule's glyph slot. Graphics-first phases
 /// (Recording's live bars, Processing's light sweep, NoSpeech's amber floor)
 /// carry no glyph; only Success ("✓") and Failure ("⚠") keep one.
@@ -2440,6 +2521,84 @@ mod tests {
                 notify_no_speech: false,
                 notify_limit: None,
             },
+        );
+    }
+
+    #[test]
+    fn the_position_watch_reports_only_a_changed_position_and_never_blocks() {
+        use crate::config::OverlayPosition;
+        let settle = |watch: &mut PositionWatch| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let answer = watch.take();
+                if watch.pending.is_none() || Instant::now() > deadline {
+                    return answer;
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+        };
+        let mut watch = PositionWatch::default();
+        assert_eq!(watch.take(), None, "nothing asked, nothing taken");
+        watch.refresh_with(|| OverlayPosition::Bottom);
+        assert_eq!(settle(&mut watch), Some(OverlayPosition::Bottom));
+        watch.refresh_with(|| OverlayPosition::Bottom);
+        assert_eq!(settle(&mut watch), None, "unchanged means no re-anchor");
+        watch.refresh_with(|| OverlayPosition::TopRight);
+        assert_eq!(settle(&mut watch), Some(OverlayPosition::TopRight));
+        // A slow read never blocks a tick, and a second ask waits its turn.
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        watch.refresh_with(move || {
+            let _ = gate.recv();
+            OverlayPosition::Top
+        });
+        assert_eq!(watch.take(), None);
+        watch.refresh_with(|| OverlayPosition::BottomLeft);
+        release.send(()).unwrap();
+        assert_eq!(settle(&mut watch), Some(OverlayPosition::Top));
+    }
+
+    #[test]
+    fn silence_and_the_last_minute_are_text_states_in_the_pill() {
+        let at = |secs| Some(Duration::from_secs(secs));
+        assert_eq!(
+            pill_text(OverlayView::no_speech(), None, None),
+            "Didn't catch any speech"
+        );
+        let phase_view = |phase| OverlayView {
+            phase,
+            visible_label: "",
+            accessible_label: "",
+        };
+        let recording = phase_view(OverlayPhase::Recording);
+        assert_eq!(pill_text(recording, None, at(120)), "");
+        // The first tick of the warning says exactly what the notification does.
+        assert_eq!(
+            pill_text(recording, Some(LimitWarning::Approaching), at(60)),
+            limit_warning_body(LimitWarning::Approaching)
+        );
+        assert_eq!(
+            pill_text(recording, Some(LimitWarning::Approaching), at(42)),
+            "Approaching the recording limit — about 42 seconds left"
+        );
+        // Without a reading, the nominal wording stands in.
+        assert_eq!(
+            pill_text(recording, Some(LimitWarning::Approaching), None),
+            limit_warning_body(LimitWarning::Approaching)
+        );
+        // The final ten seconds stay as bars with the red border.
+        assert_eq!(pill_text(recording, Some(LimitWarning::Final), at(8)), "");
+        // A warning only speaks for a Recording that is still on screen.
+        assert_eq!(
+            pill_text(
+                phase_view(OverlayPhase::Processing),
+                Some(LimitWarning::Approaching),
+                at(40)
+            ),
+            ""
+        );
+        assert_eq!(
+            pill_text(OverlayView::copied(), None, None),
+            OverlayView::copied().visible_label
         );
     }
 

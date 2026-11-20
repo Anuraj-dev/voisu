@@ -650,8 +650,8 @@ fn tone_command(tone: Option<Tone>) -> ExitCode {
     }
 }
 
-/// Reads or persists where the Overlay sits. The overlay re-reads it each time
-/// it appears, so a change applies to the next Recording without a restart.
+/// Reads or persists where the Overlay sits. The overlay re-reads it as each
+/// Recording begins, so a change applies to the next Recording without a restart.
 fn overlay_position_command(position: Option<voisu_app::config::OverlayPosition>) -> ExitCode {
     let Some(position) = position else {
         println!(
