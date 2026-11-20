@@ -113,7 +113,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let trigger = spawn(tx).unwrap();
         trigger.signal(ChordSignal::Pressed);
-        assert_eq!(recv(&mut rx), Action::Start(1));
+        assert!(matches!(recv(&mut rx), Action::Start { id: 1, .. }));
         trigger.signal(ChordSignal::Released);
         // The thread wakes on its own once the double-tap window lapses.
         thread::sleep(DOUBLE_TAP + Duration::from_millis(50));
@@ -126,7 +126,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let trigger = spawn(tx).unwrap();
         trigger.signal(ChordSignal::Pressed);
-        assert_eq!(recv(&mut rx), Action::Start(1));
+        assert!(matches!(recv(&mut rx), Action::Start { id: 1, .. }));
         thread::sleep(MIN_HOLD + Duration::from_millis(20));
         trigger.signal(ChordSignal::Released);
         assert_eq!(recv(&mut rx), Action::Stop(1));
@@ -137,7 +137,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let trigger = spawn(tx).unwrap();
         trigger.signal(ChordSignal::Pressed);
-        assert_eq!(recv(&mut rx), Action::Start(1));
+        assert!(matches!(recv(&mut rx), Action::Start { id: 1, .. }));
         let deadline = Instant::now() + Duration::from_secs(2);
         while !trigger.armed() {
             assert!(Instant::now() < deadline);

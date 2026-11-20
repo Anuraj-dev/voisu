@@ -9,19 +9,22 @@
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{ErrorKind, FromSample, SampleFormat, SizedSample};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, oneshot};
 use voisu_core::{
-    ActiveCapture, AudioCapture, AudioChunk, BoundaryError, BoundaryFuture, BoundaryKind,
-    CaptureLimit, CapturedAudio, DeadlineClock,
+    ActiveCapture, AudioChunk, BoundaryError, BoundaryFuture, BoundaryKind, CaptureLimit,
+    CapturedAudio, DeadlineClock,
 };
 
 use crate::audio::{self, CHUNK_BYTES, LEVEL_WINDOW, Resampler, TARGET_RATE};
+
+mod device_cache;
+use device_cache::InputCache;
 
 /// The longest Recording, as on Linux.
 pub const RECORDING_DEADLINE: Duration = Duration::from_secs(600);
@@ -53,61 +56,105 @@ const MIC_FAILED: &str = "The microphone stopped working.";
 /// Recording captures. Called from the audio thread: it must not block.
 pub type LevelSink = Arc<dyn Fn(f32) + Send + Sync>;
 
-pub struct CpalCapture {
-    levels: LevelSink,
+#[derive(Default)]
+pub(crate) struct CaptureStartup {
+    stream: Mutex<StreamStartup>,
+    first_audio: OnceLock<Instant>,
 }
 
-impl CpalCapture {
-    pub fn new(levels: LevelSink) -> Self {
-        Self { levels }
+#[derive(Default)]
+struct StreamStartup {
+    thread_spawned: Option<Instant>,
+    device_resolved: Option<Instant>,
+    stream_built: Option<Instant>,
+    play_returned: Option<Instant>,
+}
+
+impl CaptureStartup {
+    pub(crate) fn log(&self, id: u64, hotkey_at: Instant, providers_started: Option<Instant>) {
+        let elapsed_ms =
+            |at: Option<Instant>| at.map(|at| at.saturating_duration_since(hotkey_at).as_millis());
+        let stream = self.stream.lock().unwrap();
+        tracing::info!(
+            id,
+            thread_spawned_ms = ?elapsed_ms(stream.thread_spawned),
+            device_resolved_ms = ?elapsed_ms(stream.device_resolved),
+            stream_built_ms = ?elapsed_ms(stream.stream_built),
+            play_returned_ms = ?elapsed_ms(stream.play_returned),
+            first_audio_ms = ?elapsed_ms(self.first_audio.get().copied()),
+            providers_started_ms = ?elapsed_ms(providers_started),
+            "Recording startup"
+        );
     }
 }
 
-impl AudioCapture for CpalCapture {
-    /// Opens the default mic and starts capturing. Blocks until the stream
-    /// runs or fails, so call it off the async runtime.
-    fn begin(&mut self, recording_id: u64) -> Result<Box<dyn ActiveCapture>, BoundaryError> {
-        if microphone_blocked() {
-            return Err(blocked_error(
-                "microphone access is denied in privacy settings",
-            ));
+pub(crate) struct CpalCapture {
+    input: InputCache,
+}
+
+impl CpalCapture {
+    pub(crate) fn new() -> Self {
+        Self {
+            input: InputCache::new(),
         }
+    }
+
+    /// Opens the default mic off the runtime and waits for audio to flow.
+    pub(crate) async fn begin(
+        &self,
+        recording_id: u64,
+        levels: LevelSink,
+        startup: Arc<CaptureStartup>,
+    ) -> Result<Box<dyn ActiveCapture>, BoundaryError> {
         let shared = Arc::new(Shared {
-            pipeline: Mutex::new(Pipeline::new(Arc::clone(&self.levels))),
+            pipeline: Mutex::new(Pipeline::new(levels)),
             wake: Notify::new(),
+            startup,
         });
         let (control_tx, control_rx) = mpsc::channel();
-        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (ready_tx, ready_rx) = oneshot::channel();
         let thread_shared = Arc::clone(&shared);
         let thread_control = control_tx.clone();
+        let cached_input = self.input.take();
+        let refresh = self.input.refresh_after_capture();
         let worker = thread::Builder::new()
             .name(format!("voisu-capture-{recording_id}"))
-            .spawn(move || run_capture(thread_shared, thread_control, control_rx, ready_tx))
+            .spawn(move || {
+                thread_shared.startup.stream.lock().unwrap().thread_spawned = Some(Instant::now());
+                run_capture(
+                    thread_shared,
+                    thread_control,
+                    control_rx,
+                    ready_tx,
+                    cached_input,
+                );
+                refresh();
+            })
             .map_err(|error| {
                 BoundaryError::new(
                     BoundaryKind::Capture,
                     format!("capture thread unavailable: {error}"),
                 )
             })?;
-        let opened = ready_rx.recv_timeout(OPEN_TIMEOUT).unwrap_or_else(|_| {
-            Err(Failure::new(
-                BoundaryKind::Capture,
-                "microphone did not open in time".into(),
-                MIC_FAILED,
-            ))
-        });
-        if let Err(failure) = opened {
-            let _ = control_tx.send(Control::Stop);
-            return Err(failure.into_error());
-        }
-        tracing::info!(recording_id, "capture started");
-        Ok(Box::new(CpalActiveCapture {
+        // Owning the stop guard before awaiting also releases the stream if
+        // startup is cancelled or times out.
+        let mut capture = Box::new(CpalActiveCapture {
             shared,
             control: control_tx,
             worker: Some(worker),
             started: Instant::now(),
             pcm: Vec::new(),
-        }))
+        });
+        capture.started = tokio::time::timeout(OPEN_TIMEOUT, async {
+            ready_rx
+                .await
+                .map_err(|_| mic_failed("capture thread stopped while opening the microphone"))?
+                .map_err(Failure::into_error)?;
+            capture.shared.wait_for_audio().await
+        })
+        .await
+        .map_err(|_| mic_failed("microphone did not produce audio in time"))??;
+        Ok(capture)
     }
 }
 
@@ -276,13 +323,29 @@ impl Failure {
     }
 }
 
-fn blocked_error(diagnostic: &str) -> BoundaryError {
-    BoundaryError::new(BoundaryKind::Capture, diagnostic).with_public_message(MIC_BLOCKED)
+fn mic_failed(diagnostic: &str) -> BoundaryError {
+    BoundaryError::new(BoundaryKind::Capture, diagnostic).with_public_message(MIC_FAILED)
 }
 
 struct Shared {
     pipeline: Mutex<Pipeline>,
     wake: Notify,
+    startup: Arc<CaptureStartup>,
+}
+
+impl Shared {
+    async fn wait_for_audio(&self) -> Result<Instant, BoundaryError> {
+        loop {
+            let woken = self.wake.notified();
+            if let Some(failure) = &self.pipeline.lock().unwrap().failure {
+                return Err(failure.clone().into_error());
+            }
+            if let Some(first_audio) = self.startup.first_audio.get() {
+                return Ok(*first_audio);
+            }
+            woken.await;
+        }
+    }
 }
 
 /// Device samples in, provider chunks and meter readings out. Survives a
@@ -396,18 +459,35 @@ fn run_capture(
     shared: Arc<Shared>,
     control_tx: mpsc::Sender<Control>,
     control_rx: mpsc::Receiver<Control>,
-    ready: mpsc::SyncSender<Result<(), Failure>>,
+    ready: oneshot::Sender<Result<(), Failure>>,
+    cached_input: Option<ResolvedInput>,
 ) {
-    let mut stream = match open_stream(&shared, &control_tx) {
-        Ok(stream) => {
-            let _ = ready.send(Ok(()));
-            stream
-        }
+    if microphone_blocked() {
+        let _ = ready.send(Err(Failure::new(
+            BoundaryKind::Capture,
+            "microphone access is denied in privacy settings".into(),
+            MIC_BLOCKED,
+        )));
+        return;
+    }
+    if ready.is_closed() {
+        return;
+    }
+    let opened = with_fresh_input(
+        cached_input,
+        |input| open_stream(input, &shared, &control_tx, Some(&shared.startup)),
+        || ResolvedInput::resolve(&cpal::default_host()),
+    );
+    let mut stream = match opened {
+        Ok(stream) => stream,
         Err(failure) => {
             let _ = ready.send(Err(failure));
             return;
         }
     };
+    if ready.send(Ok(())).is_err() {
+        return;
+    }
     loop {
         match control_rx.recv() {
             Ok(Control::Stop) | Err(_) => break,
@@ -444,7 +524,9 @@ fn reopen(
 ) -> Reopened {
     let deadline = Instant::now() + REPLACEMENT_WAIT;
     loop {
-        match open_stream(shared, control_tx) {
+        match ResolvedInput::resolve(&cpal::default_host())
+            .and_then(|input| open_stream(input, shared, control_tx, None))
+        {
             Ok(stream) => {
                 tracing::info!("capture moved to the new default microphone");
                 return Reopened::Stream(stream);
@@ -482,21 +564,56 @@ fn fail_pipeline(shared: &Shared, failure: Failure) {
     shared.wake.notify_one();
 }
 
+struct ResolvedInput {
+    device: cpal::Device,
+    config: cpal::SupportedStreamConfig,
+}
+
+impl ResolvedInput {
+    fn resolve(host: &cpal::Host) -> Result<Self, Failure> {
+        let device = host.default_input_device().ok_or_else(|| {
+            Failure::new(
+                BoundaryKind::Capture,
+                "no default input device".into(),
+                NO_MIC,
+            )
+        })?;
+        let config = device
+            .default_input_config()
+            .map_err(|error| classify("default input config unavailable", &error))?;
+        Ok(Self { device, config })
+    }
+}
+
+fn with_fresh_input<I, T, E>(
+    cached: Option<I>,
+    mut open: impl FnMut(I) -> Result<T, E>,
+    resolve: impl FnOnce() -> Result<I, E>,
+) -> Result<T, E> {
+    if let Some(input) = cached
+        && let Ok(stream) = open(input)
+    {
+        return Ok(stream);
+    }
+    open(resolve()?)
+}
+
 fn open_stream(
+    input: ResolvedInput,
     shared: &Arc<Shared>,
     control_tx: &mpsc::Sender<Control>,
+    startup: Option<&CaptureStartup>,
 ) -> Result<cpal::Stream, Failure> {
-    let host = cpal::default_host();
-    let device = host.default_input_device().ok_or_else(|| {
-        Failure::new(
-            BoundaryKind::Capture,
-            "no default input device".into(),
-            NO_MIC,
-        )
-    })?;
-    let supported = device
-        .default_input_config()
-        .map_err(|error| classify("default input config unavailable", &error))?;
+    if let Some(startup) = startup {
+        let mut stream = startup.stream.lock().unwrap();
+        stream.device_resolved = Some(Instant::now());
+        stream.stream_built = None;
+        stream.play_returned = None;
+    }
+    let ResolvedInput {
+        device,
+        config: supported,
+    } = input;
     let format = supported.sample_format();
     let config = cpal::StreamConfig {
         channels: supported.channels(),
@@ -531,9 +648,14 @@ fn open_stream(
         }
     }
     .map_err(|error| classify("input stream unavailable", &error))?;
-    stream
-        .play()
-        .map_err(|error| classify("input stream did not start", &error))?;
+    if let Some(startup) = startup {
+        startup.stream.lock().unwrap().stream_built = Some(Instant::now());
+    }
+    let played = stream.play();
+    if let Some(startup) = startup {
+        startup.stream.lock().unwrap().play_returned = Some(Instant::now());
+    }
+    played.map_err(|error| classify("input stream did not start", &error))?;
     Ok(stream)
 }
 
@@ -555,6 +677,12 @@ where
     device.build_input_stream::<T, _, _>(
         config,
         move |data: &[T], _| {
+            if data.is_empty() {
+                return;
+            }
+            if data_shared.startup.first_audio.get().is_none() {
+                let _ = data_shared.startup.first_audio.set(Instant::now());
+            }
             converted.clear();
             converted.extend(
                 data.iter()
@@ -662,6 +790,27 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    #[test]
+    fn opens_the_current_default_when_the_cached_input_fails() {
+        let opened = with_fresh_input(
+            Some("disconnected mic"),
+            |input| match input {
+                "connected mic" => Ok(input),
+                _ => Err("device unavailable"),
+            },
+            || Ok("connected mic"),
+        );
+        assert_eq!(opened, Ok("connected mic"));
+    }
+
+    #[test]
+    fn opens_the_warm_input_without_resolving_the_default_again() {
+        let opened = with_fresh_input(Some("warm mic"), Ok::<_, &str>, || {
+            panic!("the cached device opened")
+        });
+        assert_eq!(opened, Ok("warm mic"));
+    }
 
     fn pipeline() -> (Pipeline, Arc<AtomicUsize>) {
         let readings = Arc::new(AtomicUsize::new(0));

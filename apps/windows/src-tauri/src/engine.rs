@@ -22,11 +22,11 @@ use voisu_cloud::{
     CleanupSupervisor, CloudHost, DeepgramProvider, GroqProvider, MergeResultValidator,
 };
 use voisu_core::{
-    ActiveCapture, AudioCapture, BoundaryError, BoundaryFuture, BoundaryKind, CancelRegistry,
-    CaptureLimit, Credential, DEFAULT_RENDERING_POLICY, EnglishEligibilityOutcome,
-    PreparedTranscriptDecision, Provider, ProviderCoordinator, ProviderStreams,
-    ResolvedRecordingLanguages, SecretStore, SourceTranscript, Tone, TranscriptProvider,
-    TranscriptValidator, apply_tone, sanitize_source_transcripts,
+    ActiveCapture, BoundaryError, BoundaryFuture, BoundaryKind, CancelRegistry, CaptureLimit,
+    Credential, DEFAULT_RENDERING_POLICY, EnglishEligibilityOutcome, PreparedTranscriptDecision,
+    Provider, ProviderCoordinator, ProviderStreams, ResolvedRecordingLanguages, SecretStore,
+    SourceTranscript, Tone, TranscriptProvider, TranscriptValidator, apply_tone,
+    sanitize_source_transcripts,
 };
 
 use crate::gesture::Action;
@@ -34,7 +34,7 @@ use crate::overlay::{
     self, AUDIO_LEVEL, AudioLevelPayload, RECORDING_STATE, RecordingState as Phase,
     RecordingStatePayload,
 };
-use crate::platform::capture::{CpalCapture, LevelSink};
+use crate::platform::capture::{CaptureStartup, CpalCapture, LevelSink};
 use crate::platform::delivery::{self, DeliveryTarget};
 use crate::platform::secrets::CredentialManagerStore;
 use crate::settings::Settings;
@@ -157,6 +157,7 @@ pub fn start(app: &AppHandle, ended: EndedSink) -> UnboundedSender<Action> {
         host: WindowsCloudHost {
             cleanup: CleanupSupervisor::new(),
         },
+        microphone: CpalCapture::new(),
         ended,
     };
     tauri::async_runtime::spawn(engine.run(rx));
@@ -166,6 +167,7 @@ pub fn start(app: &AppHandle, ended: EndedSink) -> UnboundedSender<Action> {
 struct Engine {
     app: AppHandle,
     host: WindowsCloudHost,
+    microphone: CpalCapture,
     ended: EndedSink,
 }
 
@@ -204,8 +206,8 @@ impl Engine {
         self.emit_state(Phase::Idle, None);
         while let Some(action) = actions.recv().await {
             match action {
-                Action::Start(id) => {
-                    let captured = self.record(id, &mut actions).await;
+                Action::Start { id, hotkey_at } => {
+                    let captured = self.record(id, hotkey_at, &mut actions).await;
                     // The gesture is free as soon as capture ends, so Esc and
                     // the chord are not swallowed while this one processes.
                     (self.ended)(id);
@@ -224,7 +226,12 @@ impl Engine {
 
     /// The capture phase: opens the mic and providers and streams until the
     /// trigger or the capture ends it.
-    async fn record(&self, id: u64, actions: &mut UnboundedReceiver<Action>) -> Captured {
+    async fn record(
+        &self,
+        id: u64,
+        hotkey_at: Instant,
+        actions: &mut UnboundedReceiver<Action>,
+    ) -> Captured {
         // First, before any Voisu window (settings on missing keys) can take
         // focus: the Transcript goes where the user was typing.
         let target = DeliveryTarget::capture();
@@ -237,37 +244,31 @@ impl Engine {
             crate::show_settings(&self.app);
             return Captured::Done;
         }
-        self.emit_state(Phase::Recording, None);
-
-        let levels = self.level_sink();
-        let begun = tokio::task::spawn_blocking(move || CpalCapture::new(levels).begin(id)).await;
-        let mut capture = match begun {
-            Ok(Ok(capture)) => capture,
-            Ok(Err(error)) => {
-                self.fail(id, &error);
-                return Captured::Done;
-            }
-            Err(join) => {
-                let error = BoundaryError::new(
-                    BoundaryKind::Capture,
-                    format!("capture start failed: {join}"),
-                );
-                self.fail(id, &error);
-                return Captured::Done;
-            }
-        };
-        let settings = self.settings();
-        let vocabulary = vocabulary::normalize(&settings.boost_words);
-        let tone = settings.tone;
-        let streams = match self.start_providers(id, &vocabulary) {
-            Ok(streams) => streams,
+        let startup = Arc::new(CaptureStartup::default());
+        let mut providers_started = None;
+        let started = start_recording(
+            self.microphone
+                .begin(id, self.level_sink(), Arc::clone(&startup)),
+            async {
+                let settings = self.settings();
+                let vocabulary = vocabulary::normalize(&settings.boost_words);
+                let streams = self.start_providers(id, &vocabulary)?;
+                let providers =
+                    ProviderCoordinator::start(PROVIDER_DEADLINE, ABORT_DEADLINE, streams);
+                providers_started = Some(Instant::now());
+                Ok((providers, vocabulary, settings.tone))
+            },
+            || self.emit_state(Phase::Recording, None),
+        )
+        .await;
+        startup.log(id, hotkey_at, providers_started);
+        let (mut capture, (mut providers, vocabulary, tone)) = match started {
+            Ok(started) => started,
             Err(error) => {
-                let _ = capture.abort().await;
                 self.fail(id, &error);
                 return Captured::Done;
             }
         };
-        let mut providers = ProviderCoordinator::start(PROVIDER_DEADLINE, ABORT_DEADLINE, streams);
         match self.pump(id, &mut capture, &mut providers, actions).await {
             Outcome::Stop(limit) => Captured::Process {
                 capture,
@@ -475,7 +476,7 @@ impl Engine {
             }
             Some(Action::Stop(current)) if current == id => Some(Outcome::Stop(None)),
             Some(Action::Cancel(current)) if current == id => Some(Outcome::Cancel),
-            Some(Action::Start(other)) => {
+            Some(Action::Start { id: other, .. }) => {
                 // One Recording at a time.
                 (self.ended)(other);
                 None
@@ -584,6 +585,24 @@ impl Engine {
     }
 }
 
+/// Starts provider setup as soon as the capture worker is in flight. The
+/// capture keeps its first chunks queued until the provider streams exist.
+async fn start_recording<C, P>(
+    capture: impl Future<Output = Result<C, BoundaryError>>,
+    providers: impl Future<Output = Result<P, BoundaryError>>,
+    listening: impl FnOnce(),
+) -> Result<(C, P), BoundaryError> {
+    tokio::try_join!(
+        biased;
+        async {
+            let capture = capture.await?;
+            listening();
+            Ok(capture)
+        },
+        providers,
+    )
+}
+
 /// Local formatting, exactly as the Linux daemon delivers it with
 /// `VOISU_ENABLE_DPR` on and no cloud formatter: spoken "new line" and "new
 /// paragraph" become line breaks, and spoken marks, quotes, and first/second
@@ -620,7 +639,7 @@ async fn while_busy<F: Future>(
             biased;
             output = &mut work => return output,
             Some(action) = actions.recv() => {
-                if let Action::Start(id) = action {
+                if let Action::Start { id, .. } = action {
                     tracing::debug!(id, "Recording refused: still processing");
                     ended(id);
                 }
@@ -662,6 +681,55 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn listening_is_reported_only_after_audio_arrives_even_if_providers_start_first() {
+        let (first_audio, audio) = tokio::sync::oneshot::channel();
+        let events = std::cell::RefCell::new(Vec::new());
+        let start = start_recording(
+            async {
+                audio.await.unwrap();
+                Ok("capture")
+            },
+            async {
+                events.borrow_mut().push("providers started");
+                Ok("providers")
+            },
+            || events.borrow_mut().push("recording"),
+        );
+        tokio::pin!(start);
+        poll_fn(|cx| {
+            assert!(start.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(*events.borrow(), ["providers started"]);
+
+        first_audio.send(()).unwrap();
+        assert_eq!(start.await.unwrap(), ("capture", "providers"));
+        assert_eq!(*events.borrow(), ["providers started", "recording"]);
+    }
+
+    #[tokio::test]
+    async fn listening_does_not_wait_for_provider_setup() {
+        let (providers_ready, providers) = tokio::sync::oneshot::channel();
+        let listening = std::cell::Cell::new(false);
+        let start = start_recording(
+            async { Ok("capture") },
+            async { Ok(providers.await.unwrap()) },
+            || listening.set(true),
+        );
+        tokio::pin!(start);
+        poll_fn(|cx| {
+            assert!(start.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert!(listening.get());
+
+        providers_ready.send("providers").unwrap();
+        assert_eq!(start.await.unwrap(), ("capture", "providers"));
+    }
+
     fn both_providers_heard(text: &str) -> Vec<SourceTranscript> {
         [Provider::Groq, Provider::Deepgram]
             .into_iter()
@@ -694,7 +762,14 @@ mod tests {
             let refused = Arc::clone(&refused);
             Arc::new(move |id| refused.lock().unwrap().push(id))
         };
-        for action in [Action::Start(2), Action::HandsFree(2), Action::Stop(2)] {
+        for action in [
+            Action::Start {
+                id: 2,
+                hotkey_at: Instant::now(),
+            },
+            Action::HandsFree(2),
+            Action::Stop(2),
+        ] {
             tx.send(action).unwrap();
         }
         // Busy for four polls: long enough to see every queued action.
