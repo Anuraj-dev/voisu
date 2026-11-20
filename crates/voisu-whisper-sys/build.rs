@@ -23,6 +23,14 @@
 //! for this crate's tests and by `voisu-local-asr/build.rs` for the worker);
 //! packages install the same files beside `voisu-local-asr` in
 //! `/usr/libexec/voisu/`.
+//!
+//! # Windows (MSVC)
+//!
+//! The same build yields `whisper.dll`, `ggml.dll`, `ggml-base.dll` and the
+//! `ggml-cpu-<variant>.dll` modules, all in `bin/`, with import libraries in
+//! `lib/`. Windows has no rpath: the loader searches the exe's own directory
+//! first, so the DLLs are copied there and the installer ships them beside
+//! `voisu-local-asr.exe`.
 
 use std::env;
 use std::fs;
@@ -51,31 +59,42 @@ fn main() {
         config.define("GGML_CPU_ALL_VARIANTS", "ON");
     }
     let out = config.build();
+    let windows = target_os == "windows";
 
     let mut runtime = Vec::new();
     for dir in ["lib", "lib64"] {
         let path: PathBuf = out.join(dir);
         if path.is_dir() {
             println!("cargo:rustc-link-search=native={}", path.display());
-            runtime.extend(LINKED.iter().map(|name| path.join(name)));
+            if !windows {
+                runtime.extend(LINKED.iter().map(|name| path.join(name)));
+            }
         }
     }
-    // Backend modules install to bin/ (ggml's CMAKE_INSTALL_BINDIR default).
-    runtime.extend(modules(&out.join("bin")));
+    // Backend modules install to bin/ (ggml's CMAKE_INSTALL_BINDIR default),
+    // and on Windows so do the linked DLLs.
+    let (prefix, suffix) = if windows {
+        ("", ".dll")
+    } else {
+        ("lib", ".so")
+    };
+    runtime.extend(modules(&out.join("bin"), windows, suffix));
     let runtime: Vec<PathBuf> = runtime.into_iter().filter(|path| path.exists()).collect();
+    let built = |name: &str| runtime.iter().any(|path| file_name(path) == name);
+    if windows {
+        for name in ["whisper.dll", "ggml.dll", "ggml-base.dll"] {
+            assert!(built(name), "{name} was not built");
+        }
+    }
     assert!(
         runtime
             .iter()
-            .any(|path| file_name(path).starts_with("libggml-cpu")),
+            .any(|path| file_name(path).starts_with(&format!("{prefix}ggml-cpu"))),
         "no CPU backend module was built"
     );
     if vulkan {
-        assert!(
-            runtime
-                .iter()
-                .any(|path| file_name(path) == "libggml-vulkan.so"),
-            "the vulkan feature built no libggml-vulkan.so"
-        );
+        let name = format!("{prefix}ggml-vulkan{suffix}");
+        assert!(built(&name), "the vulkan feature built no {name}");
     }
 
     println!("cargo:rustc-link-lib=static=voisu_whisper_shim");
@@ -87,7 +106,9 @@ fn main() {
         (_, "msvc") => {}
         _ => println!("cargo:rustc-link-lib=stdc++"),
     }
-    println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+    if !windows {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+    }
 
     // OUT_DIR is <profile>/build/<crate>-<hash>/out, or
     // <profile>/build/<crate>/<hash>/out under cargo's newer build-dir
@@ -117,7 +138,8 @@ fn main() {
     .expect("write runtime list");
 }
 
-fn modules(dir: &Path) -> Vec<PathBuf> {
+/// The backend modules in `dir`; on Windows every DLL there, linked or not.
+fn modules(dir: &Path, windows: bool, suffix: &str) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -126,7 +148,7 @@ fn modules(dir: &Path) -> Vec<PathBuf> {
         .map(|entry| entry.path())
         .filter(|path| {
             let name = file_name(path);
-            name.starts_with("libggml-") && name.ends_with(".so")
+            name.ends_with(suffix) && (windows || name.starts_with("libggml-"))
         })
         .collect();
     found.sort();

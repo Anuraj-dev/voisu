@@ -1,0 +1,11 @@
+# Offer opt-in Local mode on Windows
+
+Raja decided on 2026-11-21 that Windows gets Local mode. This amends ADR 0013, which shipped Windows cloud-only; the Tauri shell, the Trigger Key, the installer and the updater from that ADR are unchanged. Cloud stays the default, and an existing user sees no change unless they choose Local.
+
+Local on Windows reuses the Linux whisper.cpp path rather than a new engine. The installer carries the same `voisu-local-asr` worker and its whisper.cpp DLLs, built with MSVC and every x86_64 CPU variant, beside the app. The app spawns it per Recording with no console window and speaks worker protocol v1, with a manifest that pins the worker, the model and the health clip by SHA-256. The model is never bundled. After the user consents (download size, English only, runs on the CPU, works offline after download), Settings downloads it into `%LOCALAPPDATA%\Voisu\models`. The download is resumable and cancellable, and the size and SHA-256 are checked before the file is used. DPR local formatting, Tone and Delivery are shared with Cloud.
+
+Windows offers one tier, Fast (`whisper-cpp-small-en-q8-0`, 264 MB), on the CPU. Accurate decodes about three times slower on a CPU and is deferred, and GPU backends are out of scope. Decoding is bounded: if the worker is not done within 30 s plus the length of the audio, it is killed and the user is told. Every Local failure (model missing, a pinned file changed, an unsupported CPU, a load, transcribe or timeout failure) shows one plain message and offers a switch back to Cloud. Voisu never falls back to Cloud on its own, because that would send audio off the machine without the user's choice.
+
+Rejected: bundling the model, which would add 264 MB to every install, and a Windows-only engine such as DirectML or ONNX, which would be a second runtime to pin and maintain. macOS shares the Tauri app but stays cloud-only; Local is compiled in only on Windows.
+
+Consequences: the release was merged without a real-Windows test. Decode speed with MSVC-built ggml is unmeasured, and CPUs without AVX2/FMA/F16C/BMI2 cannot use Local. The second unsigned exe is submitted for Defender review like the app. Plan: `internal/specs/2026-11-21-windows-local-model.md`.

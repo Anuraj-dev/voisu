@@ -7,14 +7,20 @@ on:
       - apps/windows/**
       - crates/voisu-core/**
       - crates/voisu-cloud/**
+      - crates/voisu-local-asr/**
+      - crates/voisu-whisper-sys/**
       - Cargo.toml
+      - Cargo.lock
       - .github/workflows/windows-app.yml
   pull_request:
     paths:
       - apps/windows/**
       - crates/voisu-core/**
       - crates/voisu-cloud/**
+      - crates/voisu-local-asr/**
+      - crates/voisu-whisper-sys/**
       - Cargo.toml
+      - Cargo.lock
       - .github/workflows/windows-app.yml
 
 env:
@@ -24,7 +30,7 @@ jobs:
   installer:
     name: Windows shell + NSIS installer
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
     defaults:
       run:
         working-directory: apps/windows
@@ -42,7 +48,9 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: apps/windows/src-tauri
+          workspaces: |
+            apps/windows/src-tauri
+            .
       - name: Install UI dependencies
         run: npm ci
       # generate_context! embeds ../dist, so the UI must exist before clippy.
@@ -52,8 +60,13 @@ jobs:
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
       - name: Tests
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+      # The Local worker and its whisper.cpp DLLs ship beside the app; the
+      # model does not (ADR 0014).
+      - name: Build and stage the Local worker
+        shell: bash
+        run: ./stage-local-asr.sh
       - name: Build NSIS installer
-        run: npx tauri build --bundles nsis -- --locked
+        run: npx tauri build --bundles nsis --config src-tauri/tauri.local-asr.conf.json -- --locked
       - name: Name the installer
         shell: pwsh
         run: |

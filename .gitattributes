@@ -1,0 +1,2 @@
+# Windows runners check out with core.autocrlf=true; bash scripts must keep LF.
+*.sh text eol=lf

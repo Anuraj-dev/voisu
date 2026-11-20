@@ -182,7 +182,11 @@ mod tests {
     fn every_cpu_variant_is_built_and_one_loads_on_this_host() {
         let dir = backend_dir();
         for variant in ["x64", "sse42", "haswell", "skylakex", "alderlake"] {
-            let module = dir.join(format!("libggml-cpu-{variant}.so"));
+            let module = if cfg!(windows) {
+                dir.join(format!("ggml-cpu-{variant}.dll"))
+            } else {
+                dir.join(format!("libggml-cpu-{variant}.so"))
+            };
             assert!(module.is_file(), "{} missing", module.display());
         }
         assert!(load_backends() >= 1);
