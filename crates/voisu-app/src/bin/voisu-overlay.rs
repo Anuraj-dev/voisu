@@ -22,14 +22,15 @@ use voisu_app::overlay::waveform::{Waveform, poll_target};
 use voisu_app::overlay::{
     LIMIT_APPROACHING_CLASS, LIMIT_WARNING_CLASS, LevelPollAction, LevelPollLatch, LimitWarning,
     LimitWarningLatch, NoSpeechNotifyLatch, ObservedSignal, OverlayPhase, OverlayView,
-    PILL_BAR_COUNT, PILL_BAR_GAP, PILL_HEIGHT, PILL_MAX_LINES, PILL_WIDTH, PositionWatch,
-    PresentationController, PresentationTracker, RecordingNotifyLatch, RungNotification,
-    STATUS_POLL_PERIOD, STATUS_ROUND_TRIP_DEADLINE, StatusCadence, StatusWorker, TickAction,
-    TickObservation, connect_within, edge_falloff_alpha, fetch_status, limit_notification_body,
-    limit_warning_class, limit_warning_from_response, notification_rung_choice, overlay_edges,
-    phase_glyph, pill_text, poll_tick, read_until_eof_within, recording_bar_height,
-    recording_bar_rgb, recording_identity, recording_remaining, resting_floor, sweep_brightness,
-    text_pill_text_width, text_pill_width, write_within,
+    PILL_BAR_COUNT, PILL_BAR_GAP, PILL_BAR_WIDTH, PILL_HEIGHT, PILL_MAX_LINES, PILL_WIDTH,
+    PositionWatch, PresentationController, PresentationTracker, RecordingNotifyLatch,
+    RungNotification, STATUS_POLL_PERIOD, STATUS_ROUND_TRIP_DEADLINE, StatusCadence, StatusWorker,
+    TickAction, TickObservation, connect_within, edge_falloff_alpha, fetch_status,
+    limit_notification_body, limit_warning_class, limit_warning_from_response,
+    notification_rung_choice, overlay_edges, phase_glyph, pill_text, poll_tick,
+    read_until_eof_within, recording_bar_height, recording_bar_rgb, recording_identity,
+    recording_remaining, resting_floor, sweep_brightness, text_pill_text_width, text_pill_width,
+    write_within,
 };
 use voisu_core::{Command, Request, Response, socket_path};
 
@@ -1328,11 +1329,14 @@ fn draw_meter(
     let drawable = f64::from(height) - 2.0;
     let gap = PILL_BAR_GAP;
     let count = PILL_BAR_COUNT;
-    let bar_width = (f64::from(width) - gap * (count - 1) as f64) / count as f64;
+    // Fixed thin bars, the row centred in the meter.
+    let bar_width = PILL_BAR_WIDTH;
+    let row = bar_width * count as f64 + gap * (count - 1) as f64;
+    let left = ((f64::from(width) - row) / 2.0).max(0.0);
     // Corner-fit proof (no explicit clip needed): the 104x24 meter sits inside
     // the 120x32 pill (radius 16) at 8px horizontal / 4px vertical (padding plus
     // border), centred on the window's mid-line (y=16). The tightest point is the
-    // first/last bar's outer edge at window x=8, 8px from the corner arc's
+    // first/last bar's outer edge at window x>=8, <=8px from the corner arc's
     // centre; there the pill's half-height is sqrt(16^2 - 8^2) ~= 13.9px versus
     // a 22px max bar (11px each side). 11 < 13.9, so even a full-height peak bar
     // stays inside the rounded corner.
@@ -1360,7 +1364,7 @@ fn draw_meter(
             // Meter is hidden in every other phase; draw nothing defensively.
             _ => return,
         };
-        let x = index as f64 * (bar_width + gap);
+        let x = left + index as f64 * (bar_width + gap);
         context.set_source_rgba(colour.0, colour.1, colour.2, alpha);
         rounded_rectangle(context, x, centre - bar_height / 2.0, bar_width, bar_height);
         let _ = context.fill();

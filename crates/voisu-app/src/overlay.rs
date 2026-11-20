@@ -466,11 +466,14 @@ impl LevelPollLatch {
 /// history length and sweep tuning were set against.
 pub const VISUAL_BAR_COUNT: usize = 44;
 
-/// Bars the 120x32 pill draws. Each one reads a spaced slot of the same
-/// history, so the row spans as much time as the 44-bar one did.
-pub const PILL_BAR_COUNT: usize = 12;
-/// Gap between pill bars, in pixels.
-pub const PILL_BAR_GAP: f64 = 3.0;
+/// Sound bars the 120x32 pill draws: many thin lines, so the row reads as a
+/// fine waveform. Each one reads a spaced slot of the same history, so the
+/// row spans as much time as the 44-bar one did.
+pub const PILL_BAR_COUNT: usize = 26;
+/// Width of one pill sound bar, in pixels. Thin on purpose.
+pub const PILL_BAR_WIDTH: f64 = 2.0;
+/// Gap between pill sound bars, in pixels.
+pub const PILL_BAR_GAP: f64 = 2.0;
 
 /// The Overlay pill: 120x32 logical px (Windows' Medium), a full-radius capsule.
 pub const PILL_WIDTH: i32 = 120;
@@ -1349,7 +1352,7 @@ mod tests {
             (1.0, 0.706, 0.329)
         );
         let bars = PILL_BAR_COUNT as f64;
-        let row = bars * 5.0 + (bars - 1.0) * PILL_BAR_GAP;
+        let row = bars * PILL_BAR_WIDTH + (bars - 1.0) * PILL_BAR_GAP;
         assert!(row <= f64::from(PILL_WIDTH) - 16.0, "bars fit the pill");
     }
 
