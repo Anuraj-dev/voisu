@@ -373,7 +373,7 @@ pub enum Verdict {
 /// receipt deadline passes.
 pub fn evaluate(watch: Watch) -> Option<DeliveryOutcome> {
     match watch.read {
-        Some(read) if read < NO_READ_TIMEOUT => Some(DeliveryOutcome::Pasted),
+        Some(_) => Some(DeliveryOutcome::Pasted),
         None if watch.ownership_lost => Some(DeliveryOutcome::ClipboardTaken),
         _ if watch.since_chord >= NO_READ_TIMEOUT => Some(DeliveryOutcome::NotConfirmed),
         _ => None,
@@ -1580,7 +1580,15 @@ mod tests {
         );
         assert_eq!(
             evaluate(watch(1501, Some(1500))),
-            Some(DeliveryOutcome::NotConfirmed)
+            Some(DeliveryOutcome::Pasted)
+        );
+    }
+
+    #[test]
+    fn a_read_stamped_just_after_the_deadline_is_confirmed() {
+        assert_eq!(
+            evaluate(watch(1501, Some(1501))),
+            Some(DeliveryOutcome::Pasted)
         );
     }
 
