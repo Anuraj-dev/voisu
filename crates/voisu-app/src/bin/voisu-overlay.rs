@@ -23,7 +23,9 @@ use voisu_app::overlay::move_mode::{
     CancelReason, MoveEnd, MoveKey, MoveListener, MoveMode, MoveReply, MoveRequester, settle_save,
 };
 use voisu_app::overlay::placement::{self, MOVE_PILL, Size};
-use voisu_app::overlay::reveal::{PaintToken, REVEAL_DEADLINE, RevealHold};
+use voisu_app::overlay::reveal::{
+    Entered, MapToken, PaintToken, REVEAL_DEADLINE, RemapToken, RevealHold,
+};
 use voisu_app::overlay::waveform::{Waveform, poll_target};
 use voisu_app::overlay::{
     LIMIT_APPROACHING_CLASS, LIMIT_WARNING_CLASS, LevelPollAction, LevelPollLatch, LimitWarning,
@@ -688,6 +690,10 @@ fn install_surface_feedback(
             }
             window.set_visible(true);
             meter.queue_draw();
+        }
+        // Hidden: the next pill goes wherever the compositor picks again.
+        if view.phase == OverlayPhase::Hidden && window.is_layer_window() && !window.is_visible() {
+            placement.unbind();
         }
         match level_latch.borrow_mut().observe(signal) {
             LevelPollAction::Arm => {
@@ -1699,18 +1705,22 @@ fn render_surface(
 }
 
 /// Places the Recording pill on whichever output the compositor gave it, and
-/// holds each fresh map transparent until it sits right there. The surface is
+/// holds each fresh map transparent until it sits right there. A fresh map is
 /// never bound to an output (that is what lets each Recording show on the
 /// focused one), so the Overlay only learns which output it is on when the
 /// surface enters it, after its first frame is mapped. Until then the pill sits
-/// at [`placement::safe_margins`], on screen on every connected output; once
-/// entered, its margins come from that output's logical geometry, and the saved
+/// at [`placement::safe_margins`], on screen on every connected output; its
+/// right margins come from the entered output's logical geometry, and the saved
 /// position is fractions of whichever output that is.
 ///
-/// [`RevealHold`] decides when a fresh map may be seen: after the enter, once a
-/// transparent frame at that output's margins is painted, or at
-/// [`REVEAL_DEADLINE`] at the best margins known. Only the capsule is hidden,
-/// so status, levels and the meter's animation run on through the hold.
+/// [`RevealHold`] decides what the enter does. If the entered output wants the
+/// margins already applied, the pill shows after one more transparent frame.
+/// Otherwise the probe is unmapped, bound to that output at its margins and
+/// mapped again, still transparent, and shows after that map's first painted
+/// frame, so the visible map never moves (Hyprland would animate the move). At
+/// [`REVEAL_DEADLINE`] it shows anyway at the best margins known. Only the
+/// capsule is hidden, so status, levels and the meter's animation run on
+/// through the hold.
 struct PillPlacement {
     window: gtk::ApplicationWindow,
     /// The drawn pill: transparent while held.
@@ -1723,6 +1733,9 @@ struct PillPlacement {
     /// enter on a remap to the same output either, and then this is the best
     /// guess at the deadline.
     entered: RefCell<Option<gtk::gdk::Monitor>>,
+    /// The output a rebind bound the surface to, for the life of one shown
+    /// pill. It places the pill even if the probe's leave arrives late.
+    bound: RefCell<Option<gtk::gdk::Monitor>>,
     reveal: RefCell<RevealHold>,
     /// The transparent paint the reveal waits for.
     pending: Cell<Option<PaintToken>>,
@@ -1743,6 +1756,7 @@ impl PillPlacement {
             capsule: capsule.clone(),
             holder: holder.clone(),
             entered: RefCell::new(None),
+            bound: RefCell::new(None),
             reveal: RefCell::new(RevealHold::default()),
             pending: Cell::new(None),
             wanted: Cell::new(None),
@@ -1788,34 +1802,60 @@ impl PillPlacement {
             }
         }
         // Hidden (Idle, or move mode) or about to be remapped: every callback
-        // armed for the last map is dead.
+        // armed for the last map is dead. The Overlay's own unmap for a rebind
+        // keeps the pill held for the map that follows.
         window.connect_unmap({
             let placement = Rc::downgrade(&placement);
             move |_| {
                 if let Some(placement) = placement.upgrade() {
-                    placement.reveal.borrow_mut().unmap();
+                    let rebinding = placement.reveal.borrow_mut().unmap();
                     placement.pending.set(None);
-                    placement.show();
+                    trace(format_args!("unmap rebinding={rebinding}"));
+                    if !rebinding {
+                        placement.show();
+                    }
                 }
             }
         });
         placement
     }
 
-    /// Called just before the surface is mapped afresh: holds the pill
-    /// transparent at safe margins, and arms the deadline.
+    /// Called just before the surface is mapped afresh: drops any binding so
+    /// the compositor picks the output, holds the pill transparent at safe
+    /// margins, and arms the deadline.
     fn begin_map(self: &Rc<Self>, position: OverlayPosition, pill: Size) {
+        self.unbind();
         let token = self.reveal.borrow_mut().begin_map();
         self.pending.set(None);
+        self.hold();
+        self.place(position, pill);
+        trace(format_args!("map probe margins={:?}", self.placed.get()));
+        self.arm_deadline(token);
+    }
+
+    /// Drops the binding a rebind made. Called only while the window is
+    /// unmapped: Layer Shell remaps a mapped window whose output changes.
+    fn unbind(&self) {
+        if self.bound.take().is_some() {
+            self.window.set_monitor(None);
+            trace(format_args!("unbind"));
+        }
+    }
+
+    /// The capsule goes transparent and click-through from the next map's
+    /// first frame.
+    fn hold(&self) {
         self.capsule.set_opacity(0.0);
         self.holder.set_visible(true);
         if let Some(surface) = self.window.surface() {
-            // Click-through from this map's first frame. GDK skips a region
-            // equal to the one it has, so clear it first to send it again.
+            // GDK skips a region equal to the one it has, so clear it first
+            // to send it again.
             surface.set_input_region(None);
             surface.set_input_region(Some(&gtk::cairo::Region::create()));
         }
-        self.place(position, pill);
+    }
+
+    fn arm_deadline(self: &Rc<Self>, token: MapToken) {
         let placement = Rc::downgrade(self);
         gtk::glib::timeout_add_local_once(REVEAL_DEADLINE, move || {
             if let Some(placement) = placement.upgrade()
@@ -1824,6 +1864,11 @@ impl PillPlacement {
                 placement.pending.set(None);
                 // Now shown, the output last entered places it, if any.
                 placement.replace();
+                trace(format_args!(
+                    "reveal by=deadline bound={} margins={:?}",
+                    placement.reveal.borrow().bound(),
+                    placement.placed.get()
+                ));
                 placement.show();
             }
         });
@@ -1837,19 +1882,71 @@ impl PillPlacement {
         self.replace();
     }
 
-    fn entered(&self, monitor: &gtk::gdk::Monitor) {
+    fn entered(self: &Rc<Self>, monitor: &gtk::gdk::Monitor) {
         self.entered.replace(Some(monitor.clone()));
-        let paint = self.reveal.borrow_mut().output_known();
-        if let Some(paint) = paint {
-            // A transparent frame at these margins, even if they are
+        let there = self.margins(Some(monitor));
+        let moves = there.is_some() && there != self.placed.get();
+        let action = self.reveal.borrow_mut().output_known(moves);
+        trace(format_args!(
+            "enter output={} size={:?} margins={there:?} action={action:?}",
+            monitor.connector().unwrap_or_default(),
+            monitor_size(monitor)
+        ));
+        match action {
+            // A transparent frame at these margins, even though they are
             // unchanged, before the pill is shown.
-            self.arm(paint);
+            Entered::Paint(paint) => self.arm(paint),
+            // Not from inside the enter signal: the remap unmaps the surface
+            // that is sending it.
+            Entered::Remap(token) => {
+                let placement = Rc::downgrade(self);
+                let monitor = monitor.clone();
+                gtk::glib::idle_add_local_once(move || {
+                    if let Some(placement) = placement.upgrade() {
+                        placement.remap(token, &monitor);
+                    }
+                });
+            }
+            Entered::Ignore => self.replace(),
         }
-        self.replace();
+    }
+
+    /// Maps the probe again, bound to `monitor` at its margins and still
+    /// held, so the pill is never moved while mapped.
+    fn remap(self: &Rc<Self>, token: RemapToken, monitor: &gtk::gdk::Monitor) {
+        let Some(margins) = self.margins(Some(monitor)) else {
+            return;
+        };
+        if !self.reveal.borrow_mut().rebind(token) {
+            return;
+        }
+        self.window.set_visible(false);
+        self.window.set_monitor(Some(monitor));
+        self.bound.replace(Some(monitor.clone()));
+        self.apply(margins);
+        let Some((map, paint)) = self.reveal.borrow_mut().remapped() else {
+            // Unreachable: only a rebind's own unmap ran in between. Never
+            // leave a live pill unmapped, though.
+            self.show();
+            self.window.set_visible(true);
+            return;
+        };
+        self.hold();
+        self.arm(paint);
+        trace(format_args!(
+            "map bound output={} margins={margins:?}",
+            monitor.connector().unwrap_or_default()
+        ));
+        self.window.set_visible(true);
+        self.arm_deadline(map);
     }
 
     fn left(&self, monitor: &gtk::gdk::Monitor) {
         let left = self.entered.borrow().as_ref() == Some(monitor);
+        trace(format_args!(
+            "leave output={} current={left}",
+            monitor.connector().unwrap_or_default()
+        ));
         if left {
             self.entered.replace(None);
             self.reveal.borrow_mut().output_lost();
@@ -1865,6 +1962,11 @@ impl PillPlacement {
         };
         if self.reveal.borrow_mut().painted(paint) {
             self.pending.set(None);
+            trace(format_args!(
+                "reveal by=paint bound={} margins={:?}",
+                self.reveal.borrow().bound(),
+                self.placed.get()
+            ));
             self.show();
         }
     }
@@ -1880,38 +1982,78 @@ impl PillPlacement {
         self.holder.set_visible(false);
     }
 
-    fn replace(&self) {
-        let Some((position, pill)) = self.wanted.get() else {
-            return;
-        };
-        let size = |monitor: &gtk::gdk::Monitor| {
-            let geometry = monitor.geometry();
-            monitor
-                .is_valid()
-                .then_some((geometry.width(), geometry.height()))
-        };
-        let entered = if self.reveal.borrow().trusts_output() {
-            self.entered.borrow().as_ref().and_then(size)
-        } else {
-            None
-        };
+    /// The margins for the wanted pill on `on`, or on no known output.
+    fn margins(&self, on: Option<&gtk::gdk::Monitor>) -> Option<(i32, i32)> {
+        let (position, pill) = self.wanted.get()?;
         let monitors = gtk::prelude::RootExt::display(&self.window).monitors();
         let connected: Vec<Size> = (0..monitors.n_items())
             .filter_map(|index| monitors.item(index)?.downcast::<gtk::gdk::Monitor>().ok())
-            .filter_map(|monitor| size(&monitor))
+            .filter_map(|monitor| monitor_size(&monitor))
             .collect();
-        let margins = placement::output_margins(position, pill, entered, &connected);
+        Some(placement::output_margins(
+            position,
+            pill,
+            on.and_then(monitor_size),
+            &connected,
+        ))
+    }
+
+    fn replace(&self) {
+        let reveal = self.reveal.borrow();
+        if reveal.margins_frozen() {
+            return;
+        }
+        // The bound output places a rebound pill, unless it was unplugged.
+        let bound = self
+            .bound
+            .borrow()
+            .as_ref()
+            .filter(|monitor| reveal.bound() && monitor.is_valid())
+            .cloned();
+        let on = bound.or_else(|| {
+            reveal
+                .trusts_output()
+                .then(|| self.entered.borrow().clone())
+                .flatten()
+        });
+        drop(reveal);
+        let Some(margins) = self.margins(on.as_ref()) else {
+            return;
+        };
         if self.placed.get() == Some(margins) {
             return;
         }
-        self.placed.set(Some(margins));
-        self.window.set_margin(Edge::Left, margins.0);
-        self.window.set_margin(Edge::Top, margins.1);
+        self.apply(margins);
         // A held pill waits for a frame at the new spot instead.
         let paint = self.reveal.borrow_mut().moved();
         if let Some(paint) = paint {
             self.arm(paint);
         }
+    }
+
+    fn apply(&self, margins: (i32, i32)) {
+        self.placed.set(Some(margins));
+        self.window.set_margin(Edge::Left, margins.0);
+        self.window.set_margin(Edge::Top, margins.1);
+        trace(format_args!("margins {margins:?}"));
+    }
+}
+
+/// An output's logical size, while it is still connected.
+fn monitor_size(monitor: &gtk::gdk::Monitor) -> Option<Size> {
+    let geometry = monitor.geometry();
+    monitor
+        .is_valid()
+        .then_some((geometry.width(), geometry.height()))
+}
+
+/// With `VOISU_OVERLAY_TRACE=1`, logs one placement event to stderr (the
+/// journal, under the user unit) with a monotonic timestamp in microseconds.
+/// A dev aid for first-show placement; off by default.
+fn trace(event: std::fmt::Arguments<'_>) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| env::var_os("VOISU_OVERLAY_TRACE").is_some_and(|value| value == "1")) {
+        eprintln!("overlay_trace t_us={} {event}", gtk::glib::monotonic_time());
     }
 }
 
