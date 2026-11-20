@@ -31,6 +31,11 @@
 //! `lib/`. Windows has no rpath: the loader searches the exe's own directory
 //! first, so the DLLs are copied there and the installer ships them beside
 //! `voisu-local-asr.exe`.
+//!
+//! The C runtime follows the Rust target: with `-C target-feature=+crt-static`
+//! (how `apps/windows/stage-local-asr.sh` builds the shipped worker) every
+//! DLL and the shim link the static CRT (`/MT`), so the installed worker
+//! needs no Visual C++ Redistributable. Without it, all of them use `/MD`.
 
 use std::env;
 use std::fs;
@@ -57,6 +62,26 @@ fn main() {
         .define("GGML_VULKAN", if vulkan { "ON" } else { "OFF" });
     if env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64") {
         config.define("GGML_CPU_ALL_VARIANTS", "ON");
+    }
+    if target_env == "msvc" {
+        let crt_static = env::var("CARGO_CFG_TARGET_FEATURE")
+            .unwrap_or_default()
+            .split(',')
+            .any(|feature| feature == "crt-static");
+        // cc passes /MT or /MD in the flags; the policy and the runtime
+        // library make whisper.cpp's and ggml's own CMake files agree,
+        // whatever `cmake_minimum_required` each one declares.
+        config
+            .static_crt(crt_static)
+            .define("CMAKE_POLICY_DEFAULT_CMP0091", "NEW")
+            .define(
+                "CMAKE_MSVC_RUNTIME_LIBRARY",
+                if crt_static {
+                    "MultiThreaded"
+                } else {
+                    "MultiThreadedDLL"
+                },
+            );
     }
     let out = config.build();
     let windows = target_os == "windows";
