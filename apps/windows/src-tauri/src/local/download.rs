@@ -2,14 +2,16 @@
 //! checked against its pinned SHA-256 and size before it is used.
 //!
 //! Each file downloads to `<name>.part`. A later download asks for the rest
-//! with `Range` (206 appends; a server that answers 200 starts it over).
-//! Only a file that matches its pin is renamed into place; a mismatch is
-//! deleted, so the next try starts clean.
+//! with `Range`; a 206 appends only when its `Content-Range` continues the
+//! part exactly, and anything else starts the file over. Only a file that
+//! matches its pin is renamed into place, and only while the download is
+//! not cancelled; a mismatch is deleted, so the next try starts clean.
 
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use super::{PINS, Pin};
@@ -38,11 +40,48 @@ impl DownloadError {
     }
 }
 
+/// For the log: what failed, never any file content.
+impl fmt::Display for DownloadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cancelled => f.write_str("cancelled"),
+            Self::Network(detail) => write!(f, "network: {detail}"),
+            Self::Disk(error) => write!(f, "disk ({:?}): {error}", error.kind()),
+            Self::Damaged => f.write_str("checksum mismatch"),
+        }
+    }
+}
+
+/// One download's cancel switch. Cancelling and moving a verified file into
+/// place take the same lock, so once [`Cancel::cancel`] returns no file of
+/// that download lands.
+#[derive(Debug, Default)]
+pub struct Cancel(Mutex<bool>);
+
+impl Cancel {
+    pub fn cancel(&self) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Renames the verified `part` to `target` unless cancelled first.
+    fn publish(&self, part: &Path, target: &Path) -> Result<(), DownloadError> {
+        let cancelled = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if *cancelled {
+            return Err(DownloadError::Cancelled);
+        }
+        fs::rename(part, target).map_err(DownloadError::Disk)
+    }
+}
+
 /// Downloads every pinned file missing from `dir`. `progress` gets the bytes
 /// of the whole install that are on disk so far.
 pub async fn install(
     dir: &Path,
-    cancel: &AtomicBool,
+    cancel: &Cancel,
     mut progress: impl FnMut(u64),
 ) -> Result<(), DownloadError> {
     fs::create_dir_all(dir).map_err(DownloadError::Disk)?;
@@ -65,10 +104,14 @@ pub async fn install(
     for pin in PINS {
         let target = dir.join(pin.name);
         if !fs::metadata(&target).is_ok_and(|meta| meta.len() == pin.bytes) {
-            fetch(&client, pin, &target, cancel, |bytes| {
-                progress(done + bytes)
-            })
-            .await?;
+            // Cancelling ends the fetch wherever it waits, a stalled
+            // connect or response included.
+            tokio::select! {
+                fetched = fetch(&client, pin, &target, cancel, |bytes| progress(done + bytes)) => {
+                    fetched?;
+                }
+                () = cancelled(cancel) => return Err(DownloadError::Cancelled),
+            }
         }
         done += pin.bytes;
         progress(done);
@@ -87,29 +130,78 @@ fn part_path(target: &Path) -> PathBuf {
     target.with_file_name(name)
 }
 
-/// Where the body of a response to a `Range: bytes=<have>-` request starts.
-fn resume_offset(status: u16, have: u64) -> Option<u64> {
+/// What to do with the response to a request for a `total`-byte file, sent
+/// with `Range: bytes=<have>-` when `have > 0`.
+#[derive(Debug, PartialEq, Eq)]
+enum Start {
+    /// Write the body from this offset.
+    At(u64),
+    /// The server will not continue this part: delete it and ask again.
+    Restart,
+    /// The download failed.
+    Refused,
+}
+
+fn body_start(
+    status: u16,
+    have: u64,
+    content_range: Option<&str>,
+    content_length: Option<u64>,
+    total: u64,
+) -> Start {
     match status {
-        206 if have > 0 => Some(have),
-        200 => Some(0),
-        _ => None,
+        200 if content_length.is_none_or(|length| length == total) => Start::At(0),
+        206 if have > 0 => {
+            let continues =
+                content_range
+                    .and_then(parse_content_range)
+                    .is_some_and(|(first, last, whole)| {
+                        first == have
+                            && Some(last) == total.checked_sub(1)
+                            && whole.is_none_or(|whole| whole == total)
+                    });
+            let length_fits =
+                content_length.is_none_or(|length| Some(length) == total.checked_sub(have));
+            if continues && length_fits {
+                Start::At(have)
+            } else {
+                Start::Restart
+            }
+        }
+        // The part no longer fits the file.
+        416 if have > 0 => Start::Restart,
+        _ => Start::Refused,
     }
+}
+
+/// `bytes <first>-<last>/<total>`, with `*` as an unknown total.
+fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
+    let (span, whole) = value.trim().strip_prefix("bytes ")?.split_once('/')?;
+    let (first, last) = span.split_once('-')?;
+    let first: u64 = first.trim().parse().ok()?;
+    let last: u64 = last.trim().parse().ok()?;
+    let whole = match whole.trim() {
+        "*" => None,
+        whole => Some(whole.parse().ok()?),
+    };
+    (first <= last).then_some((first, last, whole))
 }
 
 async fn fetch(
     client: &reqwest::Client,
     pin: Pin,
     target: &Path,
-    cancel: &AtomicBool,
+    cancel: &Cancel,
     mut progress: impl FnMut(u64),
 ) -> Result<(), DownloadError> {
     let part = part_path(target);
     let mut have = fs::metadata(&part).map_or(0, |meta| meta.len());
     if have > pin.bytes {
-        fs::remove_file(&part).map_err(DownloadError::Disk)?;
+        remove_file(&part).map_err(DownloadError::Disk)?;
         have = 0;
     }
-    if have < pin.bytes {
+    let mut restarted = false;
+    while have < pin.bytes {
         let mut request = client.get(pin.url);
         if have > 0 {
             request = request.header(reqwest::header::RANGE, format!("bytes={have}-"));
@@ -119,12 +211,27 @@ async fn fetch(
             .await
             .map_err(|error| DownloadError::Network(error.to_string()))?;
         let status = response.status().as_u16();
-        let Some(start) = resume_offset(status, have) else {
-            if status == 416 {
-                // The part no longer fits the file; start over next time.
-                let _ = fs::remove_file(&part);
+        let content_range = response
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok());
+        let start = match body_start(
+            status,
+            have,
+            content_range,
+            response.content_length(),
+            pin.bytes,
+        ) {
+            Start::At(start) => start,
+            Start::Restart if !restarted => {
+                restarted = true;
+                remove_file(&part).map_err(DownloadError::Disk)?;
+                have = 0;
+                continue;
             }
-            return Err(DownloadError::Network(format!("HTTP {status}")));
+            Start::Restart | Start::Refused => {
+                return Err(DownloadError::Network(format!("HTTP {status}")));
+            }
         };
         let mut file = if start == 0 {
             File::create(&part)
@@ -134,15 +241,11 @@ async fn fetch(
         .map_err(DownloadError::Disk)?;
         let mut written = start;
         progress(written);
-        loop {
-            let chunk = tokio::select! {
-                chunk = response.chunk() => chunk,
-                () = cancelled(cancel) => return Err(DownloadError::Cancelled),
-            };
-            let Some(chunk) = chunk.map_err(|error| DownloadError::Network(error.to_string()))?
-            else {
-                break;
-            };
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| DownloadError::Network(error.to_string()))?
+        {
             written += chunk.len() as u64;
             if written > pin.bytes {
                 drop(file);
@@ -153,6 +256,14 @@ async fn fetch(
             progress(written);
         }
         file.sync_all().map_err(DownloadError::Disk)?;
+        if written < pin.bytes {
+            // A short body: keep the part, so the next try resumes it.
+            return Err(DownloadError::Network(format!(
+                "body ended at {written} of {} bytes",
+                pin.bytes
+            )));
+        }
+        have = written;
     }
     let checked = part.clone();
     let matches = tokio::task::spawn_blocking(move || matches_pin(&checked, pin))
@@ -163,36 +274,51 @@ async fn fetch(
         let _ = fs::remove_file(&part);
         return Err(DownloadError::Damaged);
     }
-    fs::rename(&part, target).map_err(DownloadError::Disk)
+    // A cancel during the hash still wins.
+    cancel.publish(&part, target)
 }
 
 /// Resolves once `cancel` is set; checked a few times a second so a stalled
 /// connection still cancels promptly.
-async fn cancelled(cancel: &AtomicBool) {
-    while !cancel.load(Ordering::SeqCst) {
+async fn cancelled(cancel: &Cancel) {
+    while !cancel.is_cancelled() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+}
+
+fn remove_file(path: &Path) -> io::Result<()> {
+    fs::remove_file(path).or_else(|error| match error.kind() {
+        io::ErrorKind::NotFound => Ok(()),
+        _ => Err(error),
+    })
 }
 
 fn matches_pin(path: &Path, pin: Pin) -> io::Result<bool> {
     Ok(fs::metadata(path)?.len() == pin.bytes && super::worker::sha256_file(path)? == pin.sha256)
 }
 
-/// Deletes the downloaded files, any partial ones and the manifest.
+/// Deletes the downloaded files, any partial ones and any manifest a
+/// launch left behind. Call it only while no download or Recording runs.
 pub fn remove(dir: &Path) -> io::Result<()> {
-    let mut paths: Vec<PathBuf> = PINS
-        .iter()
-        .flat_map(|pin| {
-            let target = dir.join(pin.name);
-            [part_path(&target), target]
-        })
-        .collect();
-    paths.push(dir.join("manifest.json"));
-    for path in paths {
-        fs::remove_file(&path).or_else(|error| match error.kind() {
-            io::ErrorKind::NotFound => Ok(()),
-            _ => Err(error),
-        })?;
+    for pin in PINS {
+        let target = dir.join(pin.name);
+        remove_file(&part_path(&target))?;
+        remove_file(&target)?;
+    }
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(super::worker::MANIFEST_PREFIX)
+            && (name.ends_with(".json") || name.ends_with(".json.tmp"))
+        {
+            remove_file(&entry.path())?;
+        }
     }
     Ok(())
 }
@@ -202,14 +328,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_partial_file_resumes_only_on_206_and_restarts_on_200() {
-        assert_eq!(resume_offset(206, 1000), Some(1000));
-        assert_eq!(resume_offset(200, 1000), Some(0));
-        assert_eq!(resume_offset(200, 0), Some(0));
-        // 206 to a request that asked for no range, and any error.
-        assert_eq!(resume_offset(206, 0), None);
-        assert_eq!(resume_offset(404, 0), None);
-        assert_eq!(resume_offset(416, 1000), None);
+    fn a_206_resumes_only_when_it_continues_the_part_exactly() {
+        let total = 1000;
+        let resume =
+            |range: &str, length: Option<u64>| body_start(206, 400, Some(range), length, total);
+        assert_eq!(resume("bytes 400-999/1000", Some(600)), Start::At(400));
+        assert_eq!(resume("bytes 400-999/1000", None), Start::At(400));
+        assert_eq!(resume("bytes 400-999/*", None), Start::At(400));
+        // Another offset, end, total or body length starts the file over.
+        assert_eq!(resume("bytes 0-999/1000", None), Start::Restart);
+        assert_eq!(resume("bytes 400-899/1000", None), Start::Restart);
+        assert_eq!(resume("bytes 400-999/2000", None), Start::Restart);
+        assert_eq!(resume("bytes 400-999/1000", Some(599)), Start::Restart);
+        assert_eq!(resume("items 400-999/1000", None), Start::Restart);
+        assert_eq!(resume("bytes 999-400/1000", None), Start::Restart);
+        assert_eq!(body_start(206, 400, None, None, total), Start::Restart);
+        // 206 to a request that asked for no range.
+        assert_eq!(
+            body_start(206, 0, Some("bytes 0-999/1000"), None, total),
+            Start::Refused
+        );
+    }
+
+    #[test]
+    fn a_200_starts_over_and_errors_fail() {
+        assert_eq!(body_start(200, 400, None, Some(1000), 1000), Start::At(0));
+        assert_eq!(body_start(200, 0, None, None, 1000), Start::At(0));
+        assert_eq!(body_start(200, 0, None, Some(999), 1000), Start::Refused);
+        assert_eq!(body_start(416, 400, None, None, 1000), Start::Restart);
+        assert_eq!(body_start(416, 0, None, None, 1000), Start::Refused);
+        assert_eq!(body_start(404, 0, None, None, 1000), Start::Refused);
+    }
+
+    #[test]
+    fn a_cancel_during_the_hash_keeps_the_file_out_of_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let part = dir.path().join("model.part");
+        let target = dir.path().join("model");
+        fs::write(&part, b"verified").unwrap();
+        let cancel = Cancel::default();
+        cancel.cancel();
+        assert!(matches!(
+            cancel.publish(&part, &target),
+            Err(DownloadError::Cancelled)
+        ));
+        assert!(part.exists() && !target.exists());
+
+        Cancel::default().publish(&part, &target).unwrap();
+        assert!(!part.exists() && target.exists());
     }
 
     #[test]
@@ -240,8 +406,15 @@ mod tests {
             fs::write(part_path(&target), b"x").unwrap();
         }
         fs::write(dir.path().join("manifest.json"), b"{}").unwrap();
+        fs::write(dir.path().join("manifest-12-0.json"), b"{}").unwrap();
+        fs::write(dir.path().join("manifest.json.tmp"), b"{}").unwrap();
+        fs::write(dir.path().join("notes.txt"), b"mine").unwrap();
         remove(dir.path()).unwrap();
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+        let left: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["notes.txt"]);
         // Nothing left to remove is not an error.
         remove(dir.path()).unwrap();
     }

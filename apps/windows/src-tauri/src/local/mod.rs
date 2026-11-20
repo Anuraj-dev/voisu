@@ -12,7 +12,6 @@ pub mod download;
 pub mod worker;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -216,12 +215,13 @@ fn without_leading_dialogue_dash(text: &str) -> &str {
 #[derive(Default)]
 pub struct LocalState {
     status: Mutex<Status>,
-    cancel: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
 struct Status {
-    downloading: bool,
+    /// The running download's own cancel switch, so cancelling one never
+    /// touches the next.
+    download: Option<Arc<download::Cancel>>,
     downloaded: u64,
     error: Option<&'static str>,
 }
@@ -250,7 +250,7 @@ pub fn ui(app: &AppHandle) -> Option<LocalUi> {
     Some(LocalUi {
         available: worker_path(app).is_some(),
         installed: installed(&crate::paths::local_model_dir()),
-        downloading: status.downloading,
+        downloading: status.download.is_some(),
         downloaded: status.downloaded,
         total: TOTAL_BYTES,
         error: status.error,
@@ -307,33 +307,43 @@ pub fn set_mode(app: AppHandle, mode: Mode) -> Result<Mode, String> {
     Ok(mode)
 }
 
+/// How a download that did not fail ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DownloadOutcome {
+    Installed,
+    Cancelled,
+}
+
 /// Downloads the clip and the model with progress as `STATE_CHANGED`. A
 /// cancelled download keeps its `.part` file so the next one resumes. An
-/// error is the message to show; cancelling is not an error.
+/// error is the message to show; cancelling is not an error. The page picks
+/// Local itself on `Installed`, and only if the user still wants it.
 #[tauri::command]
-pub async fn download_local_model(app: AppHandle) -> Result<(), String> {
+pub async fn download_local_model(app: AppHandle) -> Result<DownloadOutcome, String> {
     if !cfg!(windows) {
         return Err(LocalError::WorkerMissing.message().into());
     }
     let state = app.state::<LocalState>();
-    {
+    let cancel = {
         let mut status = state.status.lock().unwrap();
-        if status.downloading {
-            return Ok(());
+        if status.download.is_some() {
+            return Err("The Local model is already downloading.".into());
         }
+        let cancel = Arc::new(download::Cancel::default());
         *status = Status {
-            downloading: true,
+            download: Some(Arc::clone(&cancel)),
             ..Status::default()
         };
-    }
-    state.cancel.store(false, Ordering::SeqCst);
+        cancel
+    };
     let _ = app.emit(crate::STATE_CHANGED, ());
     tracing::info!("Local model download started");
     let progress_app = app.clone();
     let mut last = std::time::Instant::now();
     let result = download::install(
         &crate::paths::local_model_dir(),
-        &state.cancel,
+        &cancel,
         move |downloaded| {
             progress_app
                 .state::<LocalState>()
@@ -349,50 +359,55 @@ pub async fn download_local_model(app: AppHandle) -> Result<(), String> {
         },
     )
     .await;
-    let message = match result {
+    let outcome = match result {
         Ok(()) => {
             tracing::info!("Local model installed");
-            None
+            Ok(DownloadOutcome::Installed)
         }
         Err(download::DownloadError::Cancelled) => {
             tracing::info!("Local model download cancelled");
-            None
+            Ok(DownloadOutcome::Cancelled)
         }
         Err(error) => {
-            tracing::warn!(?error, "Local model download failed");
-            Some(error.message())
+            tracing::warn!(%error, "Local model download failed");
+            Err(error.message())
         }
     };
     {
         let mut status = state.status.lock().unwrap();
-        status.downloading = false;
-        status.error = message;
+        status.download = None;
+        status.error = outcome.err();
     }
     let _ = app.emit(crate::STATE_CHANGED, ());
-    match message {
-        Some(message) => Err(message.to_owned()),
-        None => Ok(()),
-    }
+    outcome.map_err(str::to_owned)
 }
 
 #[tauri::command]
 pub fn cancel_local_download(app: AppHandle) {
-    app.state::<LocalState>()
-        .cancel
-        .store(true, Ordering::SeqCst);
+    if let Some(cancel) = &app.state::<LocalState>().status.lock().unwrap().download {
+        cancel.cancel();
+    }
 }
 
 /// Deletes the downloaded model, switching to Cloud first so no Recording
-/// starts against a missing file.
+/// starts against a missing file. The files go while the status lock is
+/// held, so no download can start meanwhile.
 #[tauri::command]
 pub fn remove_local_model(app: AppHandle) -> Result<(), String> {
-    if app.state::<LocalState>().status.lock().unwrap().downloading {
-        return Err("Cancel the download first.".into());
+    const BUSY: &str = "Cancel the download first.";
+    let state = app.state::<LocalState>();
+    if state.status.lock().unwrap().download.is_some() {
+        return Err(BUSY.into());
     }
     crate::try_update_settings(&app, |settings| settings.mode = Mode::Cloud)?;
-    let dir = crate::paths::local_model_dir();
-    let removed = download::remove(&dir);
-    app.state::<LocalState>().status.lock().unwrap().error = None;
+    let removed = {
+        let mut status = state.status.lock().unwrap();
+        if status.download.is_some() {
+            return Err(BUSY.into());
+        }
+        status.error = None;
+        download::remove(&crate::paths::local_model_dir())
+    };
     crate::refresh_tray(&app);
     let _ = app.emit(crate::STATE_CHANGED, ());
     removed.map_err(|error| {

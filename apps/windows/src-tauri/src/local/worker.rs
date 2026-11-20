@@ -3,24 +3,30 @@
 //! The thread writes the manifest, starts the worker and sends `prepare` as
 //! soon as the Recording starts, so loading the model and its health check
 //! overlap the user speaking. At stop the whole Recording goes over in one
-//! `transcribe`, then `shutdown`. Worker protocol v1 (`voisu-local-asr`): a
-//! 4-byte little-endian length, then a JSON object; PCM follows a
-//! `transcribe` frame as raw s16le bytes. Requests go one at a time.
+//! `transcribe`; its result is handed back at once, then the worker gets
+//! `shutdown` and [`SHUTDOWN_GRACE`] to exit before it is killed. Worker
+//! protocol v1 (`voisu-local-asr`): a 4-byte little-endian length, then a
+//! JSON object; PCM follows a `transcribe` frame as raw s16le bytes.
+//! Requests go one at a time, and each reply must answer the request sent.
 //!
-//! Dropping the [`Session`] kills the worker, so a cancelled Recording or a
-//! missed deadline never leaves one running.
+//! Dropping the [`Session`] before its result kills the worker, so a
+//! cancelled Recording or a missed deadline never leaves one running. On
+//! Windows each worker is also in a kill-on-close Job Object, so it dies
+//! with Voisu even when Voisu exits or is killed mid-Recording.
 
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
-use voisu_core::local_wire::{MAX_JSON_FRAME_BYTES, PROTOCOL_VERSION};
+use voisu_core::local_wire::{MAX_JSON_FRAME_BYTES, MAX_TRANSCRIPT_BYTES, PROTOCOL_VERSION};
 
 use super::{HEALTH_CLIP, HEALTH_EXPECTED, LocalError, MODEL, MODEL_ID};
 
@@ -29,7 +35,11 @@ const BEAM_SIZE: u32 = 5;
 const FLASH_ATTN: bool = true;
 /// More threads stop helping whisper.cpp small long before this.
 const MAX_THREADS: usize = 8;
-const MANIFEST: &str = "manifest.json";
+/// How long a worker has to exit after `shutdown` before it is killed.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+/// Manifests are `manifest-<pid>-<n>.json`, one per launch, so a quick retry
+/// never races a cancelled launch still writing its own.
+pub(super) const MANIFEST_PREFIX: &str = "manifest";
 
 /// What a Local Recording starts its worker with.
 pub struct Launch {
@@ -63,11 +73,34 @@ struct Job {
     prompt: Option<String>,
 }
 
+/// A running worker, and on Windows the Job Object that kills it when this
+/// is dropped.
+struct Worker {
+    child: Child,
+    #[cfg(windows)]
+    _job: Option<job::Job>,
+}
+
+impl Worker {
+    /// Kills the worker and waits for it. Blocks briefly: never call it on
+    /// the async executor.
+    fn reap(mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 #[derive(Default)]
 struct Slot {
-    child: Option<Child>,
+    worker: Option<Worker>,
     /// The session ended before the worker started: kill it on arrival.
     killed: bool,
+    /// The result is delivered and the worker thread is shutting it down.
+    closing: bool,
+}
+
+fn lock(slot: &Mutex<Slot>) -> MutexGuard<'_, Slot> {
+    slot.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// The worker for one Recording.
@@ -86,9 +119,7 @@ impl Session {
         let thread_slot = Arc::clone(&slot);
         let spawned = std::thread::Builder::new()
             .name("voisu-local-asr".into())
-            .spawn(move || {
-                let _ = done.send(run(&launch, &thread_slot, &jobs));
-            });
+            .spawn(move || serve(&launch, &thread_slot, &jobs, done));
         if let Err(error) = spawned {
             // `done` went down with the closure, so `transcribe` reports it.
             tracing::warn!(%error, "Local worker thread failed to start");
@@ -120,54 +151,114 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        let child = {
-            let mut slot = self.slot.lock().unwrap();
+        let worker = {
+            let mut slot = lock(&self.slot);
             slot.killed = true;
-            slot.child.take()
+            // Once the result is out, the worker thread shuts it down.
+            if slot.closing {
+                None
+            } else {
+                slot.worker.take()
+            }
         };
-        if let Some(mut child) = child {
-            // Already exited after a clean shutdown, or killed here; either
-            // way the wait is immediate.
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Some(mut worker) = worker {
+            // `kill` only asks Windows to end it; the wait happens off the
+            // async executor. Should the thread not start, dropping the
+            // worker closes its Job Object, which ends it too.
+            let _ = worker.child.kill();
+            let _ = std::thread::Builder::new()
+                .name("voisu-local-asr-reap".into())
+                .spawn(move || worker.reap());
         }
     }
 }
 
-fn run(launch: &Launch, slot: &Mutex<Slot>, jobs: &mpsc::Receiver<Job>) -> Heard {
-    let manifest = write_manifest(launch).map_err(|error| {
-        Failure::new(
-            LocalError::WorkerFailed,
-            format!("manifest write failed: {error}"),
-        )
-    })?;
-    let (mut stdin, mut stdout) = spawn(launch, &manifest, slot)?;
-    match request(&mut stdin, &mut stdout, &control("prepare"), None)? {
+/// The worker thread: one launch, from manifest to exit.
+fn serve(
+    launch: &Launch,
+    slot: &Mutex<Slot>,
+    jobs: &mpsc::Receiver<Job>,
+    done: oneshot::Sender<Heard>,
+) {
+    let manifest = match ManifestFile::write(launch) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            let _ = done.send(Err(Failure::new(
+                LocalError::WorkerFailed,
+                format!("manifest write failed: {error}"),
+            )));
+            return;
+        }
+    };
+    let (mut stdin, mut stdout) = match spawn(launch, &manifest.0, slot) {
+        Ok(pipes) => pipes,
+        Err(failure) => {
+            let _ = done.send(Err(failure));
+            return;
+        }
+    };
+    let heard = converse(&mut stdin, &mut stdout, jobs);
+    lock(slot).closing = true;
+    // The result stands whatever the shutdown below does.
+    let _ = done.send(heard);
+    close(stdin, stdout, slot);
+    drop(manifest);
+}
+
+/// `prepare`, then the Recording's `transcribe`.
+fn converse(stdin: &mut ChildStdin, stdout: &mut ChildStdout, jobs: &mpsc::Receiver<Job>) -> Heard {
+    match request(stdin, stdout, &control(PREPARE), None)? {
         Reply::Ready => {}
-        other => return Err(unexpected("prepare", other)),
+        other => return Err(unexpected(PREPARE, &other)),
     }
     // The Sender is dropped without a job when the Recording is cancelled.
     let Ok(job) = jobs.recv() else {
-        let _ = request(&mut stdin, &mut stdout, &control("shutdown"), None);
         return Ok(None);
     };
     let mut frame = json!({
         "v": PROTOCOL_VERSION,
-        "id": "transcribe",
-        "op": "transcribe",
+        "id": TRANSCRIBE,
+        "op": TRANSCRIBE,
         "pcm_bytes": job.pcm.len(),
     });
     if let Some(prompt) = job.prompt {
         frame["prompt"] = Value::String(prompt);
     }
-    let heard = match request(&mut stdin, &mut stdout, &frame, Some(&job.pcm))? {
-        Reply::Transcript(text) => Some(text),
-        Reply::NoText => None,
-        other => return Err(unexpected("transcribe", other)),
-    };
-    // Best effort: the session's Drop kills a worker that lingers.
-    let _ = request(&mut stdin, &mut stdout, &control("shutdown"), None);
-    Ok(heard)
+    match request(stdin, stdout, &frame, Some(&job.pcm))? {
+        Reply::Transcript(text) => Ok(Some(text)),
+        Reply::NoText => Ok(None),
+        other => Err(unexpected(TRANSCRIBE, &other)),
+    }
+}
+
+/// Asks the worker to exit and gives it [`SHUTDOWN_GRACE`]; kills it after.
+/// The reply is not read: a stalled worker must not hold this thread.
+fn close(mut stdin: ChildStdin, stdout: ChildStdout, slot: &Mutex<Slot>) {
+    let _ = write_frame(&mut stdin, &control(SHUTDOWN));
+    drop(stdin);
+    drop(stdout);
+    let deadline = Instant::now() + SHUTDOWN_GRACE;
+    loop {
+        let mut guard = lock(slot);
+        let Some(worker) = guard.worker.as_mut() else {
+            // The session killed it first.
+            return;
+        };
+        let exited = !matches!(worker.child.try_wait(), Ok(None));
+        if exited || Instant::now() >= deadline {
+            let worker = guard.worker.take();
+            drop(guard);
+            if let Some(worker) = worker {
+                if !exited {
+                    tracing::warn!("Local worker ignored shutdown; killed");
+                }
+                worker.reap();
+            }
+            return;
+        }
+        drop(guard);
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn spawn(
@@ -201,15 +292,88 @@ fn spawn(
         )
     })?;
     let pipes = child.stdin.take().zip(child.stdout.take());
-    let mut slot = slot.lock().unwrap();
-    if slot.killed {
-        let _ = child.kill();
-        let _ = child.wait();
+    let worker = Worker {
+        #[cfg(windows)]
+        _job: job::Job::assign(&child)
+            .inspect_err(|error| {
+                tracing::warn!(%error, "Local worker not in a Job Object; it may outlive Voisu");
+            })
+            .ok(),
+        child,
+    };
+    let mut guard = lock(slot);
+    if guard.killed {
+        drop(guard);
+        worker.reap();
         return Err(Failure::new(LocalError::WorkerFailed, "Recording ended"));
     }
-    slot.child = Some(child);
+    guard.worker = Some(worker);
     pipes.ok_or_else(|| Failure::new(LocalError::WorkerFailed, "worker pipes missing"))
 }
+
+/// Kill-on-close Job Objects: a worker in one ends when the last handle to
+/// the job closes, which Windows does for Voisu however it exits.
+#[cfg(windows)]
+mod job {
+    use std::os::windows::io::AsRawHandle;
+    use std::process::Child;
+
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
+    };
+    use windows::core::PCWSTR;
+
+    pub struct Job(HANDLE);
+
+    // SAFETY: a job handle is a kernel handle, valid from any thread.
+    unsafe impl Send for Job {}
+
+    impl Job {
+        /// A new job holding `child`. The worker starts no processes of its
+        /// own, so assigning it just after spawn leaves nothing outside.
+        pub fn assign(child: &Child) -> windows::core::Result<Self> {
+            // SAFETY: the job handle is owned here (closed on drop), the
+            // limits struct outlives the call, and the child's process
+            // handle is open for as long as `child` lives.
+            unsafe {
+                let job = Self(CreateJobObjectW(None, PCWSTR::null())?);
+                let limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+                    BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION {
+                        LimitFlags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                SetInformationJobObject(
+                    job.0,
+                    JobObjectExtendedLimitInformation,
+                    std::ptr::from_ref(&limits).cast(),
+                    u32::try_from(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+                        .unwrap_or(u32::MAX),
+                )?;
+                AssignProcessToJobObject(job.0, HANDLE(child.as_raw_handle()))?;
+                Ok(job)
+            }
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // SAFETY: the handle came from CreateJobObjectW and closes once.
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+/// Request ids: each op is sent at most once per worker.
+const PREPARE: &str = "prepare";
+const TRANSCRIBE: &str = "transcribe";
+const SHUTDOWN: &str = "shutdown";
 
 fn control(op: &str) -> Value {
     json!({ "v": PROTOCOL_VERSION, "id": op, "op": op })
@@ -224,15 +388,21 @@ fn request(
     frame: &Value,
     pcm: Option<&[u8]>,
 ) -> Result<Reply, Failure> {
+    let id = frame["id"].as_str().unwrap_or_default();
     let sent = write_frame(stdin, frame).and_then(|()| match pcm {
         Some(pcm) => stdin.write_all(pcm).and_then(|()| stdin.flush()),
         None => Ok(()),
     });
     match read_frame(stdout) {
-        Ok(reply) => match parse_reply(&reply) {
-            Reply::Error { code, message } => Err(Failure::new(
+        Ok(reply) => match parse_reply(&reply, id) {
+            // The worker's message is not logged: it can quote input.
+            Reply::Error { code } => Err(Failure::new(
                 LocalError::from_code(&code),
-                format!("worker error {code}: {message}"),
+                format!("worker error {code}"),
+            )),
+            Reply::Invalid(reason) => Err(Failure::new(
+                LocalError::WorkerFailed,
+                format!("invalid reply to {id}: {reason}"),
             )),
             reply => Ok(reply),
         },
@@ -244,13 +414,14 @@ fn request(
 }
 
 /// Names the reply without its text: diagnostics never carry a Transcript.
-fn unexpected(op: &str, reply: Reply) -> Failure {
+fn unexpected(op: &str, reply: &Reply) -> Failure {
     let status = match reply {
         Reply::Ready => "ready",
         Reply::Transcript(_) => "transcript",
         Reply::NoText => "no_text",
         Reply::Shutdown => "shutdown",
         Reply::Error { .. } => "error",
+        Reply::Invalid(_) => "invalid",
     };
     Failure::new(
         LocalError::WorkerFailed,
@@ -265,27 +436,59 @@ pub enum Reply {
     Transcript(String),
     NoText,
     Shutdown,
-    Error { code: String, message: String },
+    /// `code` is a worker error code, or `unrecognized`; never its message.
+    Error {
+        code: String,
+    },
+    /// Not a protocol v1 reply to the request sent.
+    Invalid(&'static str),
 }
 
-pub fn parse_reply(value: &Value) -> Reply {
+/// Checks `value` against the request `id` it must answer. An error may also
+/// carry the empty id: the worker sends that when it refused its manifest or
+/// could not read the request.
+pub fn parse_reply(value: &Value, id: &str) -> Reply {
     let field = |name: &str| value.get(name).and_then(Value::as_str);
-    match field("status") {
+    if value.get("v").and_then(Value::as_u64) != Some(u64::from(PROTOCOL_VERSION)) {
+        return Reply::Invalid("wrong protocol version");
+    }
+    let status = field("status");
+    let answers = match field("id") {
+        Some(reply_id) => reply_id == id || (reply_id.is_empty() && status == Some("error")),
+        None => false,
+    };
+    if !answers {
+        return Reply::Invalid("answers another request");
+    }
+    match status {
         Some("ready") => Reply::Ready,
         Some("transcript") => match field("text") {
-            Some(text) => Reply::Transcript(text.to_owned()),
-            None => Reply::NoText,
+            Some(text) if !text.is_empty() && text.len() <= MAX_TRANSCRIPT_BYTES => {
+                Reply::Transcript(text.to_owned())
+            }
+            _ => Reply::Invalid("transcript text missing or too long"),
         },
         Some("no_text") => Reply::NoText,
         Some("shutdown") => Reply::Shutdown,
         Some("error") => Reply::Error {
-            code: field("code").unwrap_or("unknown").to_owned(),
-            message: field("message").unwrap_or_default().to_owned(),
+            code: error_code(field("code")),
         },
-        _ => Reply::Error {
-            code: "invalid_reply".to_owned(),
-            message: "reply has no known status".to_owned(),
-        },
+        _ => Reply::Invalid("unknown status"),
+    }
+}
+
+/// A worker error code as it is safe to log: a short snake_case token.
+fn error_code(code: Option<&str>) -> String {
+    match code {
+        Some(code)
+            if (1..=40).contains(&code.len())
+                && code.bytes().all(|byte| {
+                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
+                }) =>
+        {
+            code.to_owned()
+        }
+        _ => "unrecognized".to_owned(),
     }
 }
 
@@ -312,29 +515,43 @@ pub fn read_frame(reader: &mut impl Read) -> io::Result<Value> {
     serde_json::from_slice(&payload).map_err(io::Error::other)
 }
 
-/// Writes `models\manifest.json`, pinning the worker, the model and the
-/// health clip. The worker refuses to start (`manifest_error`) if any pinned
-/// file has changed since.
-fn write_manifest(launch: &Launch) -> io::Result<PathBuf> {
-    let model = launch.models.join(MODEL.name);
-    let clip = launch.models.join(HEALTH_CLIP.name);
-    let worker_bytes = fs::metadata(&launch.worker)?.len();
-    let cores = std::thread::available_parallelism()
-        .map_or(4, usize::from)
-        .min(MAX_THREADS);
-    let document = manifest(
-        &launch.worker,
-        &sha256_file(&launch.worker)?,
-        worker_bytes,
-        &model,
-        &clip,
-        cores,
-    );
-    let path = launch.models.join(MANIFEST);
-    let temp = path.with_extension("json.tmp");
-    fs::write(&temp, serde_json::to_vec_pretty(&document)?)?;
-    fs::rename(&temp, &path)?;
-    Ok(path)
+/// This launch's manifest in `models\`, pinning the worker, the model and
+/// the health clip. The worker refuses to start (`manifest_error`) if any
+/// pinned file has changed since. Deleted with the launch.
+struct ManifestFile(PathBuf);
+
+impl ManifestFile {
+    fn write(launch: &Launch) -> io::Result<Self> {
+        static LAUNCHES: AtomicU64 = AtomicU64::new(0);
+        let model = launch.models.join(MODEL.name);
+        let clip = launch.models.join(HEALTH_CLIP.name);
+        let worker_bytes = fs::metadata(&launch.worker)?.len();
+        let cores = std::thread::available_parallelism()
+            .map_or(4, usize::from)
+            .min(MAX_THREADS);
+        let document = manifest(
+            &launch.worker,
+            &sha256_file(&launch.worker)?,
+            worker_bytes,
+            &model,
+            &clip,
+            cores,
+        );
+        let launch_number = LAUNCHES.fetch_add(1, Ordering::Relaxed);
+        let path = launch.models.join(format!(
+            "{MANIFEST_PREFIX}-{}-{launch_number}.json",
+            std::process::id()
+        ));
+        // Written whole before the worker is started, so no temp file.
+        fs::write(&path, serde_json::to_vec_pretty(&document)?)?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for ManifestFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
 }
 
 fn manifest(
@@ -396,45 +613,110 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn reply(id: &str, rest: Value) -> Value {
+        let mut value = json!({"v": PROTOCOL_VERSION, "id": id});
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(rest.as_object().unwrap().clone());
+        value
+    }
+
     #[test]
     fn replies_parse_into_what_the_session_acts_on() {
         let cases = [
-            (json!({"status": "ready", "model_id": "m"}), Reply::Ready),
             (
-                json!({"status": "transcript", "text": "hi"}),
+                reply("prepare", json!({"status": "ready", "model_id": "m"})),
+                Reply::Ready,
+            ),
+            (
+                reply("prepare", json!({"status": "transcript", "text": "hi"})),
                 Reply::Transcript("hi".into()),
             ),
-            (json!({"status": "no_text"}), Reply::NoText),
-            (json!({"status": "shutdown"}), Reply::Shutdown),
             (
-                json!({"id": "", "status": "error", "code": "manifest_error", "message": "pinned artifact changed"}),
+                reply("prepare", json!({"status": "no_text"})),
+                Reply::NoText,
+            ),
+            (
+                reply("prepare", json!({"status": "shutdown"})),
+                Reply::Shutdown,
+            ),
+            (
+                reply(
+                    "",
+                    json!({"status": "error", "code": "manifest_error", "message": "pinned artifact changed"}),
+                ),
                 Reply::Error {
                     code: "manifest_error".into(),
-                    message: "pinned artifact changed".into(),
+                },
+            ),
+            (
+                reply(
+                    "prepare",
+                    json!({"status": "error", "code": "Bad code: see text"}),
+                ),
+                Reply::Error {
+                    code: "unrecognized".into(),
                 },
             ),
         ];
-        for (value, reply) in cases {
-            assert_eq!(parse_reply(&value), reply, "{value}");
+        for (value, expected) in cases {
+            assert_eq!(parse_reply(&value, "prepare"), expected, "{value}");
         }
-        assert!(matches!(
-            parse_reply(&json!({"status": "warming"})),
-            Reply::Error { code, .. } if code == "invalid_reply"
+    }
+
+    #[test]
+    fn a_reply_must_answer_the_request_sent() {
+        let invalid = |value: Value| matches!(parse_reply(&value, "transcribe"), Reply::Invalid(_));
+        // Another request's id, or the empty id on anything but an error.
+        assert!(invalid(reply("prepare", json!({"status": "no_text"}))));
+        assert!(invalid(reply("", json!({"status": "no_text"}))));
+        assert!(invalid(json!({"v": PROTOCOL_VERSION, "status": "no_text"})));
+        // Another protocol version, or none.
+        assert!(invalid(
+            json!({"v": 2, "id": "transcribe", "status": "no_text"})
         ));
+        assert!(invalid(json!({"id": "transcribe", "status": "no_text"})));
+        // A Transcript that is empty, missing or past the protocol's bound.
+        assert!(invalid(reply(
+            "transcribe",
+            json!({"status": "transcript", "text": ""})
+        )));
+        assert!(invalid(reply(
+            "transcribe",
+            json!({"status": "transcript"})
+        )));
+        let long = "a".repeat(MAX_TRANSCRIPT_BYTES + 1);
+        assert!(invalid(reply(
+            "transcribe",
+            json!({"status": "transcript", "text": long})
+        )));
+        let longest = "a".repeat(MAX_TRANSCRIPT_BYTES);
+        assert_eq!(
+            parse_reply(
+                &reply(
+                    "transcribe",
+                    json!({"status": "transcript", "text": longest.clone()})
+                ),
+                "transcribe"
+            ),
+            Reply::Transcript(longest)
+        );
+        assert!(invalid(reply("transcribe", json!({"status": "warming"}))));
     }
 
     #[test]
     fn a_request_round_trips_and_a_refused_manifest_reads_as_damaged() {
         let mut sent = Vec::new();
-        let mut reply = Vec::new();
+        let mut answer = Vec::new();
         write_frame(
-            &mut reply,
-            &json!({"status": "transcript", "text": "hello"}),
+            &mut answer,
+            &reply("x", json!({"status": "transcript", "text": "hello"})),
         )
         .unwrap();
         let heard = request(
             &mut sent,
-            &mut reply.as_slice(),
+            &mut answer.as_slice(),
             &control("x"),
             Some(&[1, 2]),
         )
@@ -447,22 +729,46 @@ mod tests {
         let mut refusal = Vec::new();
         write_frame(
             &mut refusal,
-            &json!({"id": "", "status": "error", "code": "manifest_error", "message": "m"}),
+            &reply(
+                "",
+                json!({"status": "error", "code": "manifest_error", "message": "m"}),
+            ),
         )
         .unwrap();
         let failure = request(
             &mut Vec::new(),
             &mut refusal.as_slice(),
-            &control("prepare"),
+            &control(PREPARE),
             None,
         )
         .unwrap_err();
         assert_eq!(failure.error, LocalError::Damaged);
+        // The worker's message stays out of the log.
+        assert_eq!(failure.diagnostic, "worker error manifest_error");
         // A worker that died without a reply.
         let mut nothing: &[u8] = &[];
-        let failure =
-            request(&mut Vec::new(), &mut nothing, &control("prepare"), None).unwrap_err();
+        let failure = request(&mut Vec::new(), &mut nothing, &control(PREPARE), None).unwrap_err();
         assert_eq!(failure.error, LocalError::WorkerFailed);
+    }
+
+    #[test]
+    fn each_launch_writes_its_own_manifest_and_deletes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker = dir.path().join("voisu-local-asr.exe");
+        fs::write(&worker, b"worker").unwrap();
+        let launch = Launch {
+            worker,
+            models: dir.path().to_owned(),
+            log: dir.path().join("worker.log"),
+        };
+        let first = ManifestFile::write(&launch).unwrap();
+        let second = ManifestFile::write(&launch).unwrap();
+        assert_ne!(first.0, second.0);
+        assert!(first.0.exists() && second.0.exists());
+        let kept = second.0.clone();
+        drop(second);
+        assert!(!kept.exists());
+        assert!(first.0.exists());
     }
 
     #[test]
