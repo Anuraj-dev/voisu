@@ -2,7 +2,8 @@ name: Release
 
 # Ticket 14 (GH issue #46). On a strict v<major>.<minor>.<patch> tag push:
 #
-#   validate -> build -> smoke (fedora/ubuntu/arch) -> publish
+#   validate -> smoke-source (fedora/arch, from source)  \
+#            -> build -> smoke (ubuntu/arch-bin, built artifacts) -> publish
 #
 # The Windows installer builds in parallel (build-windows) and is attached to the
 # Release after it exists (publish-windows); it never gates the Linux jobs.
@@ -164,6 +165,50 @@ jobs:
           retention-days: 7
 
   # --- install-smoke gate: publishing blocks on this ------------------------
+  # Two jobs so neither waits on work it does not use. The source legs (fedora,
+  # arch) build from the checkout and the live tag tarball, so they start right
+  # after validate and overlap the build job. The binary legs (ubuntu, arch-bin)
+  # install the built .deb and release tarball, so they wait for build. Every
+  # publish job needs BOTH, so publishing still waits for all four legs.
+  smoke-source:
+    name: Install-smoke (${{ matrix.distro }})
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: fedora
+            image: fedora:latest
+          # The Arch source PKGBUILD (voisu) and the prebuilt one (voisu-bin)
+          # declare a mutual conflict, so they get SEPARATE containers.
+          - distro: arch
+            image: archlinux
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - name: Bootstrap git for checkout
+        run: |
+          set -eu
+          case "${{ matrix.distro }}" in
+            fedora) dnf -y install git ca-certificates ;;
+            arch)   pacman -Sy --noconfirm git ca-certificates ;;
+          esac
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Run the distro install-smoke
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          case "${{ matrix.distro }}" in
+            fedora) bash packaging/ci/smoke-fedora.sh ;;
+            arch)   bash packaging/ci/smoke-arch.sh "$VERSION" ;;
+          esac
+
   smoke:
     name: Install-smoke (${{ matrix.distro }})
     needs: [validate, build]
@@ -175,12 +220,6 @@ jobs:
         include:
           - distro: ubuntu
             image: ubuntu:26.04
-          - distro: fedora
-            image: fedora:latest
-          # Arch source PKGBUILD (voisu) and the prebuilt PKGBUILD (voisu-bin)
-          # declare a mutual conflict, so they get SEPARATE containers.
-          - distro: arch
-            image: archlinux
           - distro: arch-bin
             image: archlinux
     container:
@@ -190,9 +229,8 @@ jobs:
         run: |
           set -eu
           case "${{ matrix.distro }}" in
-            ubuntu)        apt-get update && apt-get install -y --no-install-recommends git ca-certificates ;;
-            fedora)        dnf -y install git ca-certificates ;;
-            arch|arch-bin) pacman -Sy --noconfirm git ca-certificates ;;
+            ubuntu)   apt-get update && apt-get install -y --no-install-recommends git ca-certificates ;;
+            arch-bin) pacman -Sy --noconfirm git ca-certificates ;;
           esac
       - uses: actions/checkout@v4
         with:
@@ -209,15 +247,13 @@ jobs:
           set -euo pipefail
           case "${{ matrix.distro }}" in
             ubuntu)   bash packaging/ci/smoke-ubuntu.sh "$(ls dist/release/voisu_*_amd64.deb)" ;;
-            fedora)   bash packaging/ci/smoke-fedora.sh ;;
-            arch)     bash packaging/ci/smoke-arch.sh "$VERSION" ;;
             arch-bin) bash packaging/ci/smoke-arch-bin.sh "$VERSION" "$(ls dist/release/voisu-*-x86_64.tar.gz)" ;;
           esac
 
   # --- publish: apt repo -> gh-pages ----------------------------------------
   publish-apt:
     name: Publish apt repo (gh-pages)
-    needs: [validate, smoke]
+    needs: [validate, smoke-source, smoke]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -276,7 +312,7 @@ jobs:
   # --- publish: GitHub Release with assets -----------------------------------
   publish-release:
     name: Publish GitHub Release
-    needs: [validate, smoke]
+    needs: [validate, smoke-source, smoke]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -311,7 +347,7 @@ jobs:
   # anyone who installs immediately.
   publish-aur:
     name: Publish AUR packages
-    needs: [validate, smoke, publish-release]
+    needs: [validate, smoke-source, smoke, publish-release]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # Serialize AUR pushes so two release runs can't interleave. The downgrade

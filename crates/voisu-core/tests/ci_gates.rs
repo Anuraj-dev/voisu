@@ -103,7 +103,7 @@ fn every_release_attaches_the_linux_version_file() {
         .lines()
         .find(|line| line.trim_start().starts_with("needs:"))
         .expect("publish-release has needs");
-    assert_eq!(needs.trim(), "needs: [validate, smoke]");
+    assert_eq!(needs.trim(), "needs: [validate, smoke-source, smoke]");
     assert!(
         job.contains("VERSION: ${{ needs.validate.outputs.version }}"),
         "the version comes from the validated tag"
