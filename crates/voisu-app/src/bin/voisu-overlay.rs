@@ -451,6 +451,9 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
          .move-button { min-width: 24px; min-height: 24px; padding: 0; margin: 0; border-radius: 12px; background: transparent; background-image: none; border: 0; box-shadow: none; outline: none; color: #F4F5F7; font-size: 11pt; font-weight: 700; }
          .move-button:hover { background: rgba(244, 245, 247, 0.14); }
          .move-button:active { background: rgba(244, 245, 247, 0.22); }
+         .move-button.cancel { color: #FF8A8A; }
+         .move-button.cancel:hover { background: rgba(255, 138, 138, 0.22); }
+         .move-button.confirm { color: #65D6A0; }
          .move-button.confirm:hover { background: rgba(101, 214, 160, 0.28); }",
     );
     capsule.add_css_class("capsule");
