@@ -305,8 +305,9 @@ pub const fn needs_fresh_map(before: OverlayPhase, next: OverlayPhase) -> bool {
 pub const LIMIT_APPROACHING_CLASS: &str = "limitsoon";
 
 /// The words the pill shows. Text states (Loading, Unavailable, Failure,
-/// Copied) carry their own; silence and the last minute of a Recording are text
-/// states too, so they widen the pill like the rest. The final ten seconds keep
+/// Copied) carry their own; the last minute of a Recording is a text state
+/// too, so it widens the pill like the rest. Silence stays graphics-first: its
+/// amber dotted floor says "no speech" without words. The final ten seconds keep
 /// the amber bars and red border: a countdown in words would lag its own
 /// second. Empty means the pill shows bars or a glyph instead.
 pub fn pill_text(
@@ -316,7 +317,6 @@ pub fn pill_text(
 ) -> std::borrow::Cow<'static, str> {
     use std::borrow::Cow;
     match (view.phase, warning) {
-        (OverlayPhase::NoSpeech, _) => Cow::Borrowed(view.visible_label),
         (OverlayPhase::Recording, Some(LimitWarning::Approaching)) => remaining
             .and_then(|left| limit_notification_body(LimitWarning::Approaching, left))
             .map_or(
@@ -2695,12 +2695,10 @@ mod tests {
     }
 
     #[test]
-    fn silence_and_the_last_minute_are_text_states_in_the_pill() {
+    fn silence_shows_its_amber_floor_and_the_last_minute_is_text() {
         let at = |secs| Some(Duration::from_secs(secs));
-        assert_eq!(
-            pill_text(OverlayView::no_speech(), None, None),
-            "Didn't catch any speech"
-        );
+        // Silence keeps the bare pill and its amber dotted floor, no words.
+        assert_eq!(pill_text(OverlayView::no_speech(), None, None), "");
         let phase_view = |phase| OverlayView {
             phase,
             visible_label: "",

@@ -436,7 +436,7 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
     css.load_from_data(
         "window.background { background: transparent; }
          .capsule { background: rgba(23, 25, 29, 0.96); border-radius: 20px; border: 1px solid rgba(244, 245, 247, 0.28); padding: 5px 7px; }
-         .capsule.failure, .capsule.loading, .capsule.unavailable, .capsule.copied, .capsule.nospeech, .capsule.limitsoon { padding: 4px 14px; }
+         .capsule.failure, .capsule.loading, .capsule.unavailable, .capsule.copied, .capsule.limitsoon { padding: 4px 14px; }
          .capsule .state-label, .capsule .meter { color: #F4F5F7; font-size: 10pt; font-weight: 600; }
          .capsule.processing .state-label, .capsule.processing .meter { color: #8FB4FF; }
          .capsule.success .state-label, .capsule.success .meter { color: #65D6A0; font-size: 13pt; }
