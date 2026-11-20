@@ -144,8 +144,10 @@ SOFTWARE.
   `crates/voisu-whisper-sys/vendor.sh`), built into `libwhisper.so.1`,
   `libggml.so.0`, `libggml-base.so.0` and the `libggml-cpu-*.so` and
   `libggml-vulkan.so` backend modules that ship beside the
-  `voisu-local-asr` worker in `/usr/libexec/voisu/`. ggml is part of the same
-  tree and carries the same license.
+  `voisu-local-asr` worker in `/usr/libexec/voisu/`. On Windows the same
+  tree builds `whisper.dll`, `ggml.dll`, `ggml-base.dll` and the
+  `ggml-cpu-*.dll` backend modules, installed under `local-asr\` beside the
+  app. ggml is part of the same tree and carries the same license.
 - Source: <https://github.com/ggml-org/whisper.cpp>, release tarball
   `v1.9.5` (sha256
   `ff1a9053feb509ff9d7729703355541ae9690073a6b1c40eb692c962e0dc1720`)
