@@ -7,6 +7,7 @@
 // frames.
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { createDrag } from './drag.js';
 import { startsDrag } from './press.js';
 
 // Motion from the Linux overlay (voisu-overlay.rs), on the pill's thin
@@ -304,60 +305,38 @@ window.addEventListener('resize', () => {
 // Text widens the pill and the size changes with it: re-centre on the anchor.
 new ResizeObserver(place).observe(capsule);
 
-// In move mode the window follows the pointer while the pill is held. The
-// native side reads the pointer itself, so this only says "pressed" and
-// "moved", one call in flight at a time. Not the OS move loop: that can hand
-// this window the keyboard, and on the Mac it needs the press event.
-let dragging = false;
-let dragBusy = false;
-let dragAgain = false;
-
-function sendDrag(start) {
-  if (dragBusy) {
-    dragAgain = true;
-    return;
-  }
-  dragBusy = true;
-  invoke('drag_overlay', { start })
-    .catch((error) => console.warn('overlay drag failed', error))
-    .finally(() => {
-      dragBusy = false;
-      if (dragAgain && dragging) {
-        dragAgain = false;
-        sendDrag(false);
-      }
-    });
-}
+// In move mode the window follows the pointer while the pill is held (see
+// drag.js). Not the OS move loop: that can hand this window the keyboard,
+// and on the Mac it needs the press event.
+const drag = createDrag((start, id) => invoke('drag_overlay', { moveId: id, start }));
 
 capsule.addEventListener('pointerdown', (event) => {
-  if (!startsDrag(event, moving)) return;
+  if (!startsDrag(event, moving) || moveId == null) return;
   event.preventDefault();
   capsule.setPointerCapture(event.pointerId);
-  dragging = true;
-  dragAgain = false;
-  sendDrag(true);
+  drag.press(moveId);
 });
-capsule.addEventListener('pointermove', () => {
-  if (dragging && moving) sendDrag(false);
-});
-const endDrag = () => {
-  dragging = false;
-};
-capsule.addEventListener('pointerup', endDrag);
-capsule.addEventListener('lostpointercapture', endDrag);
+capsule.addEventListener('pointermove', () => drag.move());
+capsule.addEventListener('pointerup', () => drag.release());
+capsule.addEventListener('lostpointercapture', () => drag.release());
 
 // ✓ keeps the spot the pill was dropped at, ✗ puts it back. The native side
 // ends move mode and hides the pill either way, and Settings shows any
 // error. One call at a time, so a click and a key together finish once.
+// The drop's last move lands first, so ✓ saves where the pill was let go.
 let finishing = false;
-function finishMove(save) {
+async function finishMove(save) {
   if (!moving || moveId == null || finishing) return;
   finishing = true;
-  invoke('finish_overlay_move', { moveId, save })
-    .catch((error) => console.warn('overlay move finish failed', error))
-    .finally(() => {
-      finishing = false;
-    });
+  const id = moveId;
+  try {
+    await drag.idle();
+    await invoke('finish_overlay_move', { moveId: id, save });
+  } catch (error) {
+    console.warn('overlay move finish failed', error);
+  } finally {
+    finishing = false;
+  }
 }
 document.getElementById('move-save').addEventListener('click', () => finishMove(true));
 document.getElementById('move-cancel').addEventListener('click', () => finishMove(false));
@@ -394,7 +373,7 @@ function applyLayout(payload) {
   // The move look first, so the pill is placed at the width it is drawn.
   setMoving(Boolean(payload.moving));
   place();
-  if (!moving) endDrag();
+  if (!moving) drag.cancel();
   invoke('overlay_layout_drawn', { seq: payload.seq }).catch(() => {});
 }
 listen('overlay-layout', ({ payload }) => applyLayout(payload)).then(() =>

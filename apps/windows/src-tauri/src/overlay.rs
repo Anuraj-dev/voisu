@@ -241,6 +241,11 @@ impl Presenter {
         self.moving.then_some(self.move_id)
     }
 
+    /// The latest move mode's id, on or not; 0 before the first.
+    pub fn last_move_id(&self) -> u64 {
+        self.move_id
+    }
+
     /// Visible for a Recording in progress, not just a check mark or error
     /// waiting out its timer.
     pub fn is_live(&self) -> bool {
@@ -501,6 +506,65 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
+
+/// Where the pointer holds the window in a drag, as a fraction of the
+/// window's size. Crossing to a monitor with another DPI resizes the window
+/// mid-drag; a fraction keeps the pointer on the same spot of the pill,
+/// where a pixel offset taken at the press would make it jump.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+struct Grab {
+    x: f64,
+    y: f64,
+}
+
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+impl Grab {
+    /// A press at `cursor` on a window at `origin` of `size`; `None` for an
+    /// empty window.
+    fn at(cursor: (f64, f64), origin: (f64, f64), size: (f64, f64)) -> Option<Self> {
+        (size.0 > 0.0 && size.1 > 0.0).then(|| Self {
+            x: (cursor.0 - origin.0) / size.0,
+            y: (cursor.1 - origin.1) / size.1,
+        })
+    }
+
+    /// The origin that puts the grabbed spot of a window of `size`, its size
+    /// now, under `cursor`.
+    fn origin(self, cursor: (f64, f64), size: (f64, f64)) -> (f64, f64) {
+        (cursor.0 - self.x * size.0, cursor.1 - self.y * size.1)
+    }
+}
+
+/// The running drag's grab and the move mode it was pressed in.
+#[derive(Debug)]
+struct DragGrab(Option<(u64, Grab)>);
+
+impl DragGrab {
+    const fn new() -> Self {
+        Self(None)
+    }
+
+    /// A press in move `id`; `None` if the window could not be read.
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+    fn press(&mut self, id: u64, grab: Option<Grab>) {
+        self.0 = grab.map(|grab| (id, grab));
+    }
+
+    /// The grab a pointer move in move `id` follows: none without a press
+    /// in that same move.
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+    fn hold(&self, id: u64) -> Option<Grab> {
+        self.0.and_then(|(of, grab)| (of == id).then_some(grab))
+    }
+
+    fn release(&mut self) {
+        self.0 = None;
+    }
+}
+
+/// Main thread only. Released when a move ends, so no grab outlives it.
+static DRAG: Mutex<DragGrab> = Mutex::new(DragGrab::new());
 
 /// The saved position the next show places the pill at. Read on the main
 /// thread at each hidden → visible edge, so a change applies from the next
@@ -931,14 +995,16 @@ pub fn cancel_move(app: &AppHandle) {
 /// While moving, the page reports a press (`start`) and each pointer move
 /// on the pill; the window follows the pointer. Doing it here, not with the
 /// OS move loop, keeps the overlay from taking focus and works without the
-/// press event the Mac's window drag needs.
-pub async fn drag(app: &AppHandle, start: bool) -> Result<(), String> {
+/// press event the Mac's window drag needs. Each report names its move
+/// mode: one still queued when that move ended (✓, Esc, a Recording) moves
+/// nothing, even if another move has started since.
+pub async fn drag(app: &AppHandle, move_id: u64, start: bool) -> Result<(), String> {
     on_main(app, move |app| {
-        if !presenter(app).is_moving() {
+        if presenter(app).move_id() != Some(move_id) {
             return;
         }
         if let Some(window) = app.get_webview_window(OVERLAY_WINDOW) {
-            native::drag(&window, start);
+            native::drag(&window, move_id, start);
         }
     })
     .await
@@ -947,6 +1013,7 @@ pub async fn drag(app: &AppHandle, start: bool) -> Result<(), String> {
 /// Hidden and click-through again; Settings and the page are told. Focus
 /// goes back to Settings if the overlay had it.
 fn leave_move(app: &AppHandle) {
+    lock(&DRAG).release();
     if let Some(window) = app.get_webview_window(OVERLAY_WINDOW) {
         let settings = app
             .get_webview_window(crate::SETTINGS_WINDOW)
@@ -960,9 +1027,15 @@ fn leave_move(app: &AppHandle) {
     let _ = app.emit(crate::STATE_CHANGED, ());
 }
 
-pub fn is_moving(app: &AppHandle) -> bool {
+/// The latest move mode's id (0 before the first) and whether it is still
+/// on, read together, so Settings can tell a start answer that lands after
+/// its move ended.
+pub fn last_move(app: &AppHandle) -> (u64, bool) {
     app.try_state::<OverlayPresenter>()
-        .is_some_and(|state| lock(&state.inner().0).is_moving())
+        .map_or((0, false), |state| {
+            let presenter = lock(&state.inner().0);
+            (presenter.last_move_id(), presenter.is_moving())
+        })
 }
 
 /// Generation of the running tray preview. A real Recording bumps it, and
@@ -1134,9 +1207,7 @@ mod native {
         WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
     };
 
-    use std::sync::Mutex;
-
-    use super::{Anchor, Rect, Source, dropped_position, lock, placement, position};
+    use super::{Anchor, DRAG, Grab, Rect, Source, dropped_position, lock, placement, position};
     use crate::settings::OverlayPosition;
 
     pub type Frame = Rect;
@@ -1177,30 +1248,31 @@ mod native {
         }
     }
 
-    /// The pointer's offset from the window corner, taken at the press.
-    static DRAG: Mutex<Option<(i32, i32)>> = Mutex::new(None);
-
-    /// `start` notes where on the window the pointer pressed; after that the
-    /// window follows the pointer. `SWP_NOACTIVATE`: no OS move loop, so
-    /// nothing hands the overlay focus.
-    pub fn drag(window: &WebviewWindow, start: bool) {
+    /// `start` notes where on the window the pointer pressed in move `id`;
+    /// after that the window follows the pointer. The window's size is read
+    /// at each move: a DPI change since the press resized it, and the grab,
+    /// a fraction, keeps the pointer on the same spot of the pill.
+    /// `SWP_NOACTIVATE`: no OS move loop, so nothing hands the overlay focus.
+    pub fn drag(window: &WebviewWindow, id: u64, start: bool) {
         let Ok(hwnd) = window.hwnd() else { return };
         let mut cursor = POINT::default();
+        let mut r = RECT::default();
         // SAFETY: read-only queries with valid out-pointers, then a move of
         // our own window on its thread.
         unsafe {
-            if GetCursorPos(&mut cursor).is_err() {
+            if GetCursorPos(&mut cursor).is_err() || GetWindowRect(hwnd, &mut r).is_err() {
                 return;
             }
+            let cursor = (f64::from(cursor.x), f64::from(cursor.y));
+            let size = (f64::from(r.right - r.left), f64::from(r.bottom - r.top));
             let mut drag = lock(&DRAG);
             if start {
-                let mut r = RECT::default();
-                *drag = GetWindowRect(hwnd, &mut r)
-                    .is_ok()
-                    .then(|| (cursor.x - r.left, cursor.y - r.top));
-            } else if let Some((dx, dy)) = *drag {
+                let origin = (f64::from(r.left), f64::from(r.top));
+                drag.press(id, Grab::at(cursor, origin, size));
+            } else if let Some(grab) = drag.hold(id) {
+                let (x, y) = grab.origin(cursor, size);
                 let flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE;
-                let _ = SetWindowPos(hwnd, None, cursor.x - dx, cursor.y - dy, 0, 0, flags);
+                let _ = SetWindowPos(hwnd, None, x.round() as i32, y.round() as i32, 0, 0, flags);
             }
         }
     }
@@ -1371,11 +1443,12 @@ mod native {
         NSEvent, NSScreen, NSStatusWindowLevel, NSWindow, NSWindowCollectionBehavior,
     };
     use objc2_foundation::{NSPoint, NSRect, NSSize};
-    use std::sync::Mutex;
 
     use tauri::WebviewWindow;
 
-    use super::{Anchor, MacFrame, Source, lock, mac_dropped_position, mac_placement, position};
+    use super::{
+        Anchor, DRAG, Grab, MacFrame, Source, lock, mac_dropped_position, mac_placement, position,
+    };
     use crate::settings::OverlayPosition;
 
     fn ns_window(window: &WebviewWindow) -> Option<&NSWindow> {
@@ -1415,23 +1488,25 @@ mod native {
         ns.orderFrontRegardless();
     }
 
-    /// The pointer's offset from the frame origin, taken at the press.
-    static DRAG: Mutex<Option<(f64, f64)>> = Mutex::new(None);
-
-    /// `start` notes where on the frame the pointer pressed; after that the
-    /// frame follows the pointer. Read from `NSEvent::mouseLocation`, so it
-    /// needs no current event (which `performWindowDrag` does).
-    pub fn drag(window: &WebviewWindow, start: bool) {
+    /// `start` notes where on the frame the pointer pressed in move `id`;
+    /// after that the frame follows the pointer. Read from
+    /// `NSEvent::mouseLocation`, so it needs no current event (which
+    /// `performWindowDrag` does). Points do not change with the display's
+    /// scale; the grab is a fraction all the same, like Windows'.
+    pub fn drag(window: &WebviewWindow, id: u64, start: bool) {
         let Some(ns) = ns_window(window) else {
             return;
         };
         let mouse = NSEvent::mouseLocation();
+        let frame = ns.frame();
+        let cursor = (mouse.x, mouse.y);
+        let size = (frame.size.width, frame.size.height);
         let mut drag = lock(&DRAG);
         if start {
-            let origin = ns.frame().origin;
-            *drag = Some((mouse.x - origin.x, mouse.y - origin.y));
-        } else if let Some((dx, dy)) = *drag {
-            ns.setFrameOrigin(NSPoint::new(mouse.x - dx, mouse.y - dy));
+            drag.press(id, Grab::at(cursor, (frame.origin.x, frame.origin.y), size));
+        } else if let Some(grab) = drag.hold(id) {
+            let (x, y) = grab.origin(cursor, size);
+            ns.setFrameOrigin(NSPoint::new(x, y));
         }
     }
 
@@ -1526,7 +1601,7 @@ mod native {
         let _ = window.show();
     }
 
-    pub fn drag(_window: &WebviewWindow, _start: bool) {}
+    pub fn drag(_window: &WebviewWindow, _id: u64, _start: bool) {}
 
     pub fn release_focus(_window: &WebviewWindow, _to: Option<&WebviewWindow>) {}
 
@@ -2284,6 +2359,96 @@ mod tests {
         presenter.begin_move();
         assert_ne!(presenter.move_id(), Some(c));
         assert_eq!(stored, [spot]);
+    }
+
+    #[test]
+    fn the_last_move_id_tells_settings_a_move_has_ended() {
+        let mut presenter = Presenter::default();
+        assert_eq!(
+            (presenter.last_move_id(), presenter.is_moving()),
+            (0, false)
+        );
+        presenter.begin_move();
+        let a = presenter.move_id().unwrap();
+        assert_eq!((presenter.last_move_id(), presenter.is_moving()), (a, true));
+        // A Recording ends the move before Settings has its start answer.
+        presenter.on_state(RecordingState::Recording);
+        assert_eq!(
+            (presenter.last_move_id(), presenter.is_moving()),
+            (a, false)
+        );
+    }
+
+    #[test]
+    fn a_drag_keeps_the_pointer_on_the_same_spot_of_the_pill_across_a_dpi_change() {
+        let close = |a: (f64, f64), b: (f64, f64)| {
+            assert!(
+                (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9,
+                "{a:?} != {b:?}"
+            );
+        };
+        // Pressed near the right end of the 336x64 window at 100 %.
+        let grab = Grab::at((400.0, 232.0), (100.0, 200.0), (336.0, 64.0)).unwrap();
+        close(grab.origin((400.0, 232.0), (336.0, 64.0)), (100.0, 200.0));
+        close(grab.origin((500.0, 300.0), (336.0, 64.0)), (200.0, 268.0));
+        // Dragged onto a 150 % monitor, the window is now 504x96: the pointer
+        // stays 300/336 of the way along and halfway down, where a 300 px
+        // offset would put it 150 px left of that spot.
+        close(grab.origin((2300.0, 500.0), (504.0, 96.0)), (1850.0, 452.0));
+        // Back at 100 %, the same offset as at the press.
+        close(grab.origin((400.0, 232.0), (336.0, 64.0)), (100.0, 200.0));
+        assert_eq!(Grab::at((1.0, 1.0), (0.0, 0.0), (0.0, 64.0)), None);
+    }
+
+    #[test]
+    fn a_grab_moves_the_pill_only_in_the_move_it_was_pressed_in() {
+        let grab = Grab::at((10.0, 10.0), (0.0, 0.0), (100.0, 100.0));
+        let mut presenter = Presenter::default();
+        let mut drag = DragGrab::new();
+        presenter.begin_move();
+        let a = presenter.move_id().unwrap();
+        assert_eq!(drag.hold(a), None, "no press yet");
+        drag.press(a, grab);
+        assert_eq!(drag.hold(a), grab);
+
+        // ✓ ends move A, which releases the grab, and Settings starts B.
+        assert!(presenter.end_move_for(a));
+        drag.release();
+        presenter.begin_move();
+        let b = presenter.move_id().unwrap();
+        // A report still queued for A is turned away before it reaches the
+        // native drag, and the grab A pressed is gone.
+        assert_ne!(presenter.move_id(), Some(a));
+        assert_eq!(drag.hold(a), None);
+        // B's moves follow nothing until B's own press.
+        assert_eq!(drag.hold(b), None);
+        drag.press(b, grab);
+        assert_eq!(drag.hold(b), grab);
+        assert_eq!(drag.hold(a), None, "a stale report never follows B's grab");
+        // A window that could not be read leaves no grab.
+        drag.press(b, None);
+        assert_eq!(drag.hold(b), None);
+    }
+
+    #[test]
+    fn on_a_short_work_area_the_shared_bottom_line_saves_the_default() {
+        // At 100 % on a work area under about 889 px tall, the default line
+        // (0.964 down) clamps onto the bottom margin line. A drop there
+        // keeps the default, so ✓ without a drag leaves Reset off; on a
+        // taller display the default sits a few px above the margin.
+        let short = Rect {
+            left: 0,
+            top: 0,
+            right: 1366,
+            bottom: 728,
+        };
+        let shown = placement(short, 1.0, None, Pill::Plain);
+        let at_margin = placement(short, 1.0, at(0.5, 1.0), Pill::Plain);
+        assert_eq!(shown, at_margin, "the two lines coincide");
+        assert_eq!(
+            dropped_position(short, 1.0, shown.window, shown.anchor),
+            None
+        );
     }
 
     #[test]

@@ -49,7 +49,7 @@ const state = {
   autoPaste: true,
   overlayPosition: null,
   overlayMoving: false,
-  moveId: 0,
+  lastOverlayMove: 0,
   boostWords: ['Voisu', 'Deepgram'],
   tone: 'formal',
   trigger: { key: DEFAULT_KEY, label: mac ? 'Ctrl+Option' : 'Ctrl+Win', warnings: [], isDefault: true },
@@ -119,10 +119,10 @@ const COMMANDS = {
     if (!state.overlayMoving) {
       console.info('mock: overlay shown in move mode');
       state.overlayMoving = true;
-      state.moveId += 1;
+      state.lastOverlayMove += 1;
       emit('state-changed', null);
     }
-    return state.moveId;
+    return state.lastOverlayMove;
   },
   // The overlay page: its layout comes from the `?state=` driver.
   overlay_layout: () => null,
@@ -131,7 +131,7 @@ const COMMANDS = {
   // ✓ saves a spot left of centre, as if the pill were dragged there. A
   // finish for an earlier move changes nothing.
   finish_overlay_move: ({ moveId, save }) => {
-    if (!state.overlayMoving || moveId !== state.moveId) return state.overlayPosition;
+    if (!state.overlayMoving || moveId !== state.lastOverlayMove) return state.overlayPosition;
     if (save) state.overlayPosition = { x: 0.3, y: 0.0 };
     state.overlayMoving = false;
     emit('state-changed', null);

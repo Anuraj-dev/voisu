@@ -77,10 +77,17 @@
   // one that lands after the pill's ✓ or ✗ cannot end a later move.
   let moveId = null;
 
+  // A start answer can land after its move already ended (a Recording, the
+  // pill's ✗) and the state refresh said so: it must not bring the move
+  // look back.
+  const ended = (id) =>
+    ui.app.lastOverlayMove > id || (ui.app.lastOverlayMove === id && !ui.app.overlayMoving);
+
   const startMove = () =>
     positionAction(async () => {
       moveRequest = invoke('start_overlay_move');
-      moveId = (await moveRequest) ?? null;
+      const id = (await moveRequest) ?? null;
+      moveId = id != null && !ended(id) ? id : null;
       ui.app.overlayMoving = moveId != null;
     }, 'Could not show the overlay.');
 

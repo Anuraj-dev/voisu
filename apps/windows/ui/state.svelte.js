@@ -17,6 +17,8 @@ export const ui = $state({
     overlayPosition: null,
     // Settings' "Move overlay" is under way.
     overlayMoving: false,
+    // The latest move's id, on or ended; 0 before the first.
+    lastOverlayMove: 0,
     boostWords: [],
     tone: 'formal',
     // Blank until get_state names this platform's Trigger Key; the presets
@@ -128,11 +130,19 @@ export function missingPermissions() {
   ].filter(Boolean);
 }
 
+// Refreshes can overlap; one answered after a newer one has applied is
+// older news and is dropped.
+let refreshes = 0;
+let applied = 0;
+
 export async function refresh() {
+  const seq = ++refreshes;
   try {
     const stored = ui.app.boostWords.join('\n');
     const wasReady = keysReady();
     const next = await invoke('get_state');
+    if (seq < applied) return;
+    applied = seq;
     // Never overwrite boost words the user is editing, including any typed
     // while this call was in flight.
     if (ui.wordsDraft === stored) ui.wordsDraft = next.boostWords.join('\n');

@@ -118,6 +118,9 @@ struct UiState {
     overlay_position: Option<OverlayPosition>,
     /// The overlay is showing for the user to drag it.
     overlay_moving: bool,
+    /// The latest move mode's id, on or ended (0 before the first), so a
+    /// start answer that lands after its move ended is ignored.
+    last_overlay_move: u64,
     boost_words: Vec<String>,
     tone: Tone,
     trigger: UiTrigger,
@@ -237,6 +240,7 @@ const PLATFORM: &str = if cfg!(target_os = "macos") {
 fn get_state(app: AppHandle) -> UiState {
     let mut store = CredentialManagerStore;
     let settings = app.state::<AppState>().settings.lock().unwrap().clone();
+    let (last_overlay_move, overlay_moving) = overlay::last_move(&app);
     UiState {
         groq_saved: store.has_key(Provider::Groq),
         deepgram_saved: store.has_key(Provider::Deepgram),
@@ -244,7 +248,8 @@ fn get_state(app: AppHandle) -> UiState {
         version: app.package_info().version.to_string(),
         auto_paste: settings.auto_paste,
         overlay_position: settings.overlay_position,
-        overlay_moving: overlay::is_moving(&app),
+        overlay_moving,
+        last_overlay_move,
         boost_words: settings.boost_words,
         tone: settings.tone,
         trigger: UiTrigger::of(settings.hotkey),
@@ -378,10 +383,10 @@ fn overlay_layout_drawn(app: AppHandle, seq: u64) {
     overlay::layout_drawn(&app, seq);
 }
 
-/// A press (`start`) or a pointer move on the pill in move mode.
+/// A press (`start`) or a pointer move on the pill in move mode `move_id`.
 #[tauri::command]
-async fn drag_overlay(app: AppHandle, start: bool) -> Result<(), String> {
-    overlay::drag(&app, start).await
+async fn drag_overlay(app: AppHandle, move_id: u64, start: bool) -> Result<(), String> {
+    overlay::drag(&app, move_id, start).await
 }
 
 /// Back to the default bottom-centre spot, shown in a preview.
