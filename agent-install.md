@@ -63,7 +63,7 @@ Primary target: Fedora KDE Plasma on Wayland. GNOME also works.
 ```sh
 sudo dnf copr enable anuraj-dev/voisu
 sudo dnf install voisu
-# optional on-screen overlay (the capsule):
+# optional on-screen overlay (the pill):
 sudo dnf install voisu-overlay
 ```
 
@@ -115,7 +115,7 @@ echo 'deb [signed-by=/etc/apt/keyrings/voisu-archive-keyring.asc arch=amd64] htt
 sudo apt-get update && sudo apt-get install -y voisu
 ```
 
-**HUMAN: run setup.** Ask the user to run `voisu setup` in their own terminal. It asks for the API keys, enables the daemon and the native GNOME capsule, and sets Ctrl+Space as the Trigger Key by default. If setup says so, the user must log out and back in, or reboot. Wait for them to come back before you verify.
+**HUMAN: run setup.** Ask the user to run `voisu setup` in their own terminal. It asks for the API keys, enables the daemon and the native GNOME overlay, and sets Ctrl+Space as the Trigger Key by default. If setup says so, the user must log out and back in, or reboot. Wait for them to come back before you verify.
 
 Then go to **Verify on Linux**.
 
@@ -201,6 +201,8 @@ Tell the user:
 - **Gestures:** on Windows, hold Ctrl+Win to dictate and double-tap for hands-free. On a Mac, the same with Control+Option. On Linux, press the Trigger Key to start and press it again to stop. Esc cancels on Windows and Mac.
 - **Keys:** they can be changed later with `voisu auth set groq` / `voisu auth set deepgram` on Linux (these read the key from standard input), or in the settings window on Windows and Mac.
 - **Updates:** Windows and Mac update themselves. On Linux, Voisu updates through the package manager.
+- **Local transcription (Linux only for now):** to keep speech on the computer, the user picks Engine → Local in `voisu` (or you run `voisu engine local` once the model is installed). Setup asks before downloading the model; don't download it for them without asking.
+- **Overlay position:** the pill can be moved. On Windows and Mac, Settings → Dictation → Move overlay. On Linux (KDE Plasma or Hyprland), `voisu overlay-position move` or `reset`.
 - **Docs:** https://anuraj-dev.github.io/voisu/docs/
 
 ## Links

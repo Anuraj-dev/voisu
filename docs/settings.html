@@ -77,40 +77,45 @@
 
   <main id="main" class="doc">
 <h1>Settings &amp; commands</h1>
-<p class="lead">Voisu keeps settings to a minimum. On Windows they live in a small settings window and the tray menu. On Linux everything is a <code>voisu</code> command.</p>
+<p class="lead">Voisu keeps settings to a minimum. On Windows and Mac they live in the settings window and the tray or menu bar menu. On Linux they live in the <code>voisu</code> interface, and every one is also a <code>voisu</code> command.</p>
 
 <nav class="toc" aria-label="On this page">
-  <a href="#windows">Windows settings window</a>
-  <a href="#tray">Windows tray menu</a>
+  <a href="#windows">Windows and Mac settings window</a>
+  <a href="#tray">Tray and menu bar menu</a>
+  <a href="#linux-interface">Linux interface</a>
+  <a href="#local">Linux Local model</a>
   <a href="#linux">Linux commands</a>
   <a href="#files">Where files live</a>
 </nav>
 
-<h2 id="windows">Windows settings window</h2>
-<p>Open it from the tray icon with <strong>Settings…</strong>. The first time you run Voisu it shows a setup screen for your two keys (see the <a href="windows-setup.html">Windows setup guide</a>). After that it has two tabs: <strong>Overview</strong> shows whether Voisu is ready and your last Transcript; <strong>Settings</strong> holds the options below.</p>
+<h2 id="windows">Windows and Mac settings window</h2>
+<p>Open it from the tray icon (the menu bar icon on a Mac) with <strong>Settings…</strong>. The first time you run Voisu it shows a setup screen for your two keys (see the <a href="windows-setup.html">Windows</a> or <a href="macos-setup.html">Mac</a> setup guide). After that a sidebar holds these pages:</p>
 <div class="table-scroll">
 <table>
-  <thead><tr><th>Setting</th><th>What it does</th></tr></thead>
+  <thead><tr><th>Page</th><th>Setting</th><th>What it does</th></tr></thead>
   <tbody>
-    <tr><td data-label="Setting">Trigger Key</td><td data-label="What it does">The key you hold to dictate. <kbd>Ctrl</kbd>&nbsp;<kbd>Win</kbd> by default.</td></tr>
-    <tr><td data-label="Setting">Paste automatically</td><td data-label="What it does">On by default. Turn it off and Voisu only puts the Transcript on your clipboard; you paste it yourself with <kbd>Ctrl</kbd>&nbsp;<kbd>V</kbd>.</td></tr>
-    <tr><td data-label="Setting">Overlay size</td><td data-label="What it does">Small, Medium or Large. The capsule previews at the new size when you pick one.</td></tr>
-    <tr><td data-label="Setting">Informal tone</td><td data-label="What it does">Off by default. On swaps phrases for chat abbreviations like btw and drops the final full stop. Sentence starts and “I” keep their capitals.</td></tr>
-    <tr><td data-label="Setting">Boost words</td><td data-label="What it does">Names and terms Voisu should favour, one per entry. Blanks and duplicates are dropped. They're sent to Deepgram and Groq with each Recording.</td></tr>
-    <tr><td data-label="Setting">Start at login</td><td data-label="What it does">Starts Voisu in the tray when you sign in to Windows. Turned on after your first successful setup.</td></tr>
-    <tr><td data-label="Setting">API keys</td><td data-label="What it does">Shows whether each key is saved. <strong>Replace</strong> pastes a new one, checked with the provider before it's saved. Saved keys are never shown.</td></tr>
+    <tr><td data-label="Page">Home</td><td data-label="Setting">Last Transcript</td><td data-label="What it does">Shows whether Voisu is ready, your Trigger Key, and your last Transcript with <strong>Copy</strong>. The Transcript is held in memory only.</td></tr>
+    <tr><td data-label="Page">Dictation</td><td data-label="Setting">Trigger Key</td><td data-label="What it does">The key you hold to dictate. <kbd>Ctrl</kbd>&nbsp;<kbd>Win</kbd> on Windows and <kbd>Control</kbd>&nbsp;<kbd>Option</kbd> on a Mac by default.</td></tr>
+    <tr><td data-label="Page">Dictation</td><td data-label="Setting">Paste automatically</td><td data-label="What it does">On by default. Turn it off and Voisu only puts the Transcript on your clipboard; you paste it yourself.</td></tr>
+    <tr><td data-label="Page">Dictation</td><td data-label="Setting">Informal tone</td><td data-label="What it does">Off by default. On swaps phrases for chat abbreviations like btw and drops the final full stop. Sentence starts and “I” keep their capitals.</td></tr>
+    <tr><td data-label="Page">Dictation</td><td data-label="Setting">Overlay position</td><td data-label="What it does">Where the overlay pill sits, bottom centre by default. <strong>Move overlay</strong> lets you drag the pill anywhere; click ✓ on it or press <kbd>Enter</kbd> to save, ✗ or <kbd>Esc</kbd> to cancel. <strong>Reset position</strong> puts it back.</td></tr>
+    <tr><td data-label="Page">Words</td><td data-label="Setting">Boost words</td><td data-label="What it does">Names and terms Voisu should favour, one per line. Blanks and duplicates are dropped. They're sent to Deepgram and Groq with each Recording.</td></tr>
+    <tr><td data-label="Page">API keys</td><td data-label="Setting">Groq, Deepgram</td><td data-label="What it does">Shows whether each key is saved. <strong>Replace</strong> pastes a new one, checked with the provider before it's saved. Saved keys are never shown.</td></tr>
+    <tr><td data-label="Page">General</td><td data-label="Setting">Start at login</td><td data-label="What it does">Starts Voisu when you sign in. Turned on after your first successful setup.</td></tr>
+    <tr><td data-label="Page">General</td><td data-label="Setting">Star prompt</td><td data-label="What it does">After steady use, Voisu may ask for a GitHub star. Turn this off and it never asks. <strong>Star on GitHub</strong> is always there.</td></tr>
+    <tr><td data-label="Page">What's new</td><td data-label="Setting">Releases</td><td data-label="What it does">Lists what changed in every release, and what a downloaded update brings before you restart. After an update, Voisu shows what changed once.</td></tr>
   </tbody>
 </table>
 </div>
-<p><strong>About</strong> shows the installed version, whether an update is waiting, and opens the logs folder. Your last Transcript, with <strong>Copy</strong>, is on the Overview tab and held in memory only.</p>
+<p><strong>General</strong> also opens the logs folder and the setup guide. When an update has downloaded, a banner at the top of the window offers <strong>Restart to update</strong>.</p>
 
-<h2 id="tray">Windows tray menu</h2>
+<h2 id="tray">Tray and menu bar menu</h2>
 <div class="table-scroll">
 <table>
   <thead><tr><th>Item</th><th>What it does</th></tr></thead>
   <tbody>
     <tr><td data-label="Item">Settings…</td><td data-label="What it does">Opens the settings window.</td></tr>
-    <tr><td data-label="Item">Preview overlay</td><td data-label="What it does">Shows the capsule so you can see where it appears, without recording.</td></tr>
+    <tr><td data-label="Item">Preview overlay</td><td data-label="What it does">Shows the overlay pill so you can see where it appears, without recording.</td></tr>
     <tr><td data-label="Item">Test paste (in 3 s)</td><td data-label="What it does">Waits three seconds so you can click into an app, then pastes a sample text there. A quick way to check Delivery into a particular app.</td></tr>
     <tr><td data-label="Item">Start at login</td><td data-label="What it does">Same switch as in the settings window.</td></tr>
     <tr><td data-label="Item">Update to v…</td><td data-label="What it does">Appears when a new version has downloaded. Installs it and relaunches Voisu.</td></tr>
@@ -120,14 +125,48 @@
 </div>
 
 <h2 id="linux-interface">Linux: the <code>voisu</code> interface</h2>
-<p>Run <code>voisu</code> in a terminal to open Voisu's interface. It works with the keyboard: <kbd>←</kbd>&nbsp;<kbd>→</kbd> switch tabs, <kbd>↑</kbd>&nbsp;<kbd>↓</kbd> move, <kbd>Enter</kbd> acts, <kbd>?</kbd> lists every key, <kbd>q</kbd> quits.</p>
+<p>Run <code>voisu</code> in a terminal to open Voisu's interface. It works with the keyboard: <kbd>←</kbd>&nbsp;<kbd>→</kbd> or <kbd>1</kbd>–<kbd>4</kbd> switch tabs, <kbd>↑</kbd>&nbsp;<kbd>↓</kbd> move, <kbd>Enter</kbd> acts, <kbd>?</kbd> lists every key, <kbd>q</kbd> quits.</p>
 <ul>
-  <li><strong>Home</strong> shows whether Voisu is ready to dictate. If something is wrong, it names the problem and the one key that fixes it. <kbd>d</kbd> shows every check.</li>
-  <li><strong>Settings</strong> changes Engine, Delivery, Writing, Layout, Deepgram and your keys, with a short guide to each choice. When a change needs Voisu to restart, it offers the restart.</li>
+  <li><strong>Home</strong> shows whether Voisu is ready to dictate, the Local model in use, and <em>Update available</em> when a new version is out. If something is wrong, it names the problem and the one key that fixes it. <kbd>d</kbd> shows every check.</li>
+  <li><strong>Settings</strong> holds the rows below, each with a short guide to its choices. When a change needs Voisu to restart, the row says so and <kbd>r</kbd> restarts it.</li>
   <li><strong>Dictionary</strong> holds names and terms Voisu should spell your way.</li>
   <li><strong>History</strong> lists recent Recordings. <kbd>c</kbd> copies one.</li>
 </ul>
+<div class="table-scroll">
+<table>
+  <thead><tr><th>Row</th><th>Choices</th><th>Command</th></tr></thead>
+  <tbody>
+    <tr><td data-label="Row">Engine</td><td data-label="Choices">Cloud (needs internet) or Local (stays on this computer)</td><td data-label="Command"><code>voisu engine</code></td></tr>
+    <tr><td data-label="Row">Delivery</td><td data-label="Choices">Paste, or Copy (you press <kbd>Ctrl</kbd>&nbsp;<kbd>V</kbd>)</td><td data-label="Command"><code>voisu delivery</code></td></tr>
+    <tr><td data-label="Row">Writing</td><td data-label="Choices">Clean or Exact</td><td data-label="Command"><code>voisu writing</code></td></tr>
+    <tr><td data-label="Row">Layout</td><td data-label="Choices">Plain, Auto or Sections</td><td data-label="Command"><code>voisu layout</code></td></tr>
+    <tr><td data-label="Row">Tone</td><td data-label="Choices">Formal, or Informal (btw, no final full stop)</td><td data-label="Command"><code>voisu tone</code></td></tr>
+    <tr><td data-label="Row">Deepgram</td><td data-label="Choices">On or off. Off uses Groq alone</td><td data-label="Command"><code>voisu deepgram</code></td></tr>
+    <tr><td data-label="Row">Groq key, Deepgram key</td><td data-label="Choices"><kbd>Enter</kbd> enters a new key, checked before it's saved</td><td data-label="Command"><code>voisu key set</code></td></tr>
+    <tr><td data-label="Row">Trigger Key</td><td data-label="Choices">Shown only; your desktop sets it</td><td data-label="Command"><code>voisu shortcut</code></td></tr>
+    <tr><td data-label="Row">Local unload</td><td data-label="Choices">Never (default), After 30 min, After 1 hour</td><td data-label="Command"><code>voisu local-unload</code></td></tr>
+    <tr><td data-label="Row">Local device</td><td data-label="Choices">Auto, GPU or CPU</td><td data-label="Command"><code>voisu local-device</code></td></tr>
+    <tr><td data-label="Row">Local model</td><td data-label="Choices">Auto, Accurate or Fast</td><td data-label="Command"><code>voisu local-model</code></td></tr>
+    <tr><td data-label="Row">Overlay</td><td data-label="Choices">Move (drag the pill, ✓ saves, ✗ cancels) or Reset (bottom centre)</td><td data-label="Command"><code>voisu overlay-position</code></td></tr>
+    <tr><td data-label="Row">Update check</td><td data-label="Choices">On or off</td><td data-label="Command"><code>voisu update-check</code></td></tr>
+    <tr><td data-label="Row">Star prompt</td><td data-label="Choices">On or off</td><td data-label="Command"><code>voisu star-prompt</code></td></tr>
+    <tr><td data-label="Row">Run setup</td><td data-label="Choices">Walks through keys, Engine and Trigger Key again</td><td data-label="Command"><code>voisu setup</code></td></tr>
+    <tr><td data-label="Row">Star on GitHub</td><td data-label="Choices">Opens Voisu's GitHub page</td><td data-label="Command"><code>voisu star</code></td></tr>
+  </tbody>
+</table>
+</div>
 <p>If Voisu isn't set up yet, <code>voisu</code> opens straight on setup. <code>voisu setup</code> opens the same screens any time.</p>
+
+<h2 id="local">Linux: switch to a Local model</h2>
+<p>Local transcription runs on Linux only, on your own GPU or CPU, with no internet once it's installed. The Windows and Mac apps use Cloud.</p>
+<ol>
+  <li>Run <code>voisu</code> and open <strong>Settings</strong> (<kbd>2</kbd>). If Local is already installed, pick <strong>Engine → Local</strong> and you're done.</li>
+  <li>Otherwise pick <strong>Run setup</strong>, and on <em>Where should your speech become text?</em> choose <strong>Local</strong>.</li>
+  <li><em>Install Local?</em> shows how much Voisu downloads, once. Without a GPU it adds <em>No GPU found, so it runs on the CPU, more slowly.</em> Choose <strong>Install</strong>, or <strong>Not now</strong> to keep using Cloud. Nothing downloads until you choose Install.</li>
+  <li>Keep the window open while it downloads and checks the model. If the download stops, <kbd>Enter</kbd> tries again and carries on where it stopped.</li>
+</ol>
+<p>Setup installs <strong>Accurate</strong> (distil-large-v3.5, about 780 MB) when it finds a GPU and <strong>Fast</strong> (small.en, about 265 MB) when it doesn't. To change it later, pick <strong>Local model</strong>: Auto runs Accurate on a GPU and Fast on the CPU. A model that isn't installed asks before it downloads, for example <em>Download Fast (small.en), 252.6 MiB? y/n</em>, and replaces the installed one at your next Recording.</p>
+<p><strong>Local device</strong> picks where it runs: Auto uses your best GPU through Vulkan (NVIDIA, AMD or Intel), GPU never uses the CPU, and CPU works anywhere but is several times slower. Voisu never switches to the CPU or to Cloud on its own. The model stays loaded by default, so every Recording starts at once; <strong>Local unload</strong> frees its 1 to 2 GB of memory after an idle spell, and the next Recording then waits about 15 seconds.</p>
 
 <h2 id="linux">Linux commands</h2>
 <p>Every setting is also a command, for scripts and agents. Run <code>voisu setup</code> again any time to redo the guided setup. Individual settings:</p>
@@ -141,6 +180,14 @@
     <tr><td data-label="Command"><code>voisu layout [plain|auto|sections]</code></td><td data-label="What it does">How much layout Voisu adds. <code>plain</code> adds punctuation only; <code>auto</code> organizes your text when you speak in parts; <code>sections</code> adds headings.</td></tr>
     <tr><td data-label="Command"><code>voisu deepgram [on|off]</code></td><td data-label="What it does">Turns Deepgram streaming on or off.</td></tr>
     <tr><td data-label="Command"><code>voisu engine [cloud|local]</code></td><td data-label="What it does">Transcribe online with Cloud, or on this computer with a Local model you've installed.</td></tr>
+    <tr><td data-label="Command"><code>voisu tone [formal|informal]</code></td><td data-label="What it does"><code>informal</code> uses chat abbreviations like btw and drops the final full stop.</td></tr>
+    <tr><td data-label="Command"><code>voisu local-model [auto|accurate|fast]</code></td><td data-label="What it does">Which Local model runs. A model that isn't installed downloads only after you agree. See <a href="#local">Local model</a>.</td></tr>
+    <tr><td data-label="Command"><code>voisu local-device [auto|gpu|cpu]</code></td><td data-label="What it does">Where the Local model runs.</td></tr>
+    <tr><td data-label="Command"><code>voisu local-unload [off|SECONDS]</code></td><td data-label="What it does">Frees an idle Local model's memory after this long (30 to 86400 seconds). <code>off</code>, the default, keeps it loaded.</td></tr>
+    <tr><td data-label="Command"><code>voisu local remove [--yes]</code></td><td data-label="What it does">Deletes the installed Local model.</td></tr>
+    <tr><td data-label="Command"><code>voisu overlay-position [move|reset|&lt;x,y&gt;]</code></td><td data-label="What it does">Prints, moves or resets where the overlay pill sits. <code>&lt;x,y&gt;</code> sets it as fractions of the screen, such as <code>0.500,0.964</code> (the default, bottom centre). Needs KDE Plasma or Hyprland.</td></tr>
+    <tr><td data-label="Command"><code>voisu update-check [on|off]</code></td><td data-label="What it does">Turns the daily update check on or off.</td></tr>
+    <tr><td data-label="Command"><code>voisu star</code> / <code>star-prompt [on|off]</code></td><td data-label="What it does">Opens Voisu's GitHub page to star it, or turns the star request on or off.</td></tr>
     <tr><td data-label="Command"><code>voisu dictionary add &lt;term&gt;</code></td><td data-label="What it does">Adds a name or term to your personal dictionary. <code>remove</code> and <code>list</code> manage it.</td></tr>
     <tr><td data-label="Command"><code>voisu key set &lt;groq|deepgram&gt;</code></td><td data-label="What it does">Saves a provider key, read from standard input. <code>key check</code> checks it.</td></tr>
   </tbody>
@@ -157,6 +204,7 @@
     <tr><td data-label="Command"><code>voisu doctor [--verbose]</code></td><td data-label="What it does">Checks that this computer is ready: portals, Delivery, clipboard, keys.</td></tr>
     <tr><td data-label="Command"><code>voisu history [--json]</code></td><td data-label="What it does">Lists recent Recordings from local history.</td></tr>
     <tr><td data-label="Command"><code>voisu export &lt;id&gt;</code></td><td data-label="What it does">Writes a redacted diagnostic export of one Recording, for a bug report.</td></tr>
+    <tr><td data-label="Command"><code>voisu update [--check|--dry-run]</code></td><td data-label="What it does">Updates Voisu through the package manager that installed it. See <a href="updating.html">Updating</a>.</td></tr>
   </tbody>
 </table>
 </div>

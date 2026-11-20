@@ -86,7 +86,9 @@
   <tbody>
     <tr><td data-label="Sent to">Deepgram</td><td data-label="What">Your audio, streamed</td><td data-label="When">While a Recording runs, unless you've turned Deepgram off (Linux)</td></tr>
     <tr><td data-label="Sent to">Groq</td><td data-label="What">Your audio, then the Source Transcript text for reconciliation and formatting</td><td data-label="When">When you stop a Recording</td></tr>
-    <tr><td data-label="Sent to">GitHub</td><td data-label="What">An update check (Windows)</td><td data-label="When">At start and every 6 hours</td></tr>
+    <tr><td data-label="Sent to">GitHub</td><td data-label="What">An update check (Windows and Mac)</td><td data-label="When">At start and every 6 hours</td></tr>
+    <tr><td data-label="Sent to">GitHub</td><td data-label="What">A small version file, with no identifier, settings or usage (Linux)</td><td data-label="When">Once a day, unless you turn off <code>voisu update-check</code></td></tr>
+    <tr><td data-label="Sent to">Hugging Face</td><td data-label="What">A download request for the Local model (Linux)</td><td data-label="When">Only when you agree to install one</td></tr>
   </tbody>
 </table>
 </div>
@@ -95,7 +97,7 @@
 
 <h2 id="stays">What stays on your computer</h2>
 <ul>
-  <li><strong>API keys</strong> live in your OS keyring: Windows Credential Manager, or the Secret Service keyring on Linux.</li>
+  <li><strong>API keys</strong> live in your OS keyring: Windows Credential Manager, the macOS Keychain, or the Secret Service keyring on Linux.</li>
   <li><strong>Logs</strong> are written locally and never uploaded. On Windows they're in <code>%LOCALAPPDATA%\Voisu\logs</code>.</li>
   <li><strong>Last transcript</strong> on Windows is held in memory only. It is never written to disk and is gone when Voisu quits.</li>
   <li><strong>Local history</strong> on Linux keeps up to the last 200 Recordings or 7 days, whichever comes first, so <code>voisu history</code> and <code>voisu export</code> can help you diagnose problems. Saved text is capped at 8 KB per entry.</li>

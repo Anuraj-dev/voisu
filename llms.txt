@@ -14,13 +14,13 @@ Agents installing Voisu for a user: follow the agent install guide below. Never 
 - [Getting started](https://anuraj-dev.github.io/voisu/docs/getting-started.html): install on Windows, macOS, Fedora, Arch or Debian/Ubuntu, add keys, make the first Recording
 - [Set up on Mac](https://anuraj-dev.github.io/voisu/docs/macos-setup.html): Gatekeeper Open Anyway, the Microphone, Accessibility and Input Monitoring permissions, keys in the Keychain
 - [Install with an agent](https://anuraj-dev.github.io/voisu/docs/agents.html): copyable prompts for Claude Code, Codex and other terminal agents
-- [Dictating](https://anuraj-dev.github.io/voisu/docs/using.html): gestures, the capsule's states, where text goes, recovering a Transcript
-- [Providers & API keys](https://anuraj-dev.github.io/voisu/docs/providers.html): what Deepgram and Groq do, getting and storing keys, local transcription on Linux
-- [Settings & commands](https://anuraj-dev.github.io/voisu/docs/settings.html): the Windows settings window and tray, every Linux `voisu` command, file locations
+- [Dictating](https://anuraj-dev.github.io/voisu/docs/using.html): gestures, the overlay pill's states, where text goes, recovering a Transcript
+- [Providers & API keys](https://anuraj-dev.github.io/voisu/docs/providers.html): what Deepgram and Groq do, getting and storing keys, Local transcription (Linux only for now)
+- [Settings & commands](https://anuraj-dev.github.io/voisu/docs/settings.html): the Windows and Mac settings window and tray, the Linux interface's Settings rows, switching to Local, every Linux `voisu` command, file locations
 - [Troubleshooting](https://anuraj-dev.github.io/voisu/docs/troubleshooting.html): Trigger Key, portals, keys, microphone, failed pastes, SmartScreen, bug reports
 
 ## Optional
 
 - [Privacy](https://anuraj-dev.github.io/voisu/docs/privacy.html): what leaves the computer and what stays on it
-- [Updating & uninstalling](https://anuraj-dev.github.io/voisu/docs/updating.html): updates on each platform and clean removal
+- [Updating & uninstalling](https://anuraj-dev.github.io/voisu/docs/updating.html): updates on each platform, What's new, and clean removal
 - [Source on GitHub](https://github.com/Anuraj-dev/voisu)

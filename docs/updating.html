@@ -80,7 +80,7 @@
 <p class="lead">Windows and Mac update themselves. On Linux, Voisu updates with the rest of your system through the package manager you installed it from.</p>
 
 <h2 id="windows">Updating on Windows</h2>
-<p>Voisu checks GitHub for a new release when it starts and every 6 hours after that. When it finds one, it downloads the installer in the background and checks its signature. Then the tray icon gets a dot and the menu shows <strong>Update to v…</strong>.</p>
+<p>Voisu checks GitHub for a new release when it starts and every 6 hours after that. When it finds one, it downloads the installer in the background and checks its signature. Then the tray icon gets a dot, the menu shows <strong>Update to v…</strong>, and a banner at the top of the window offers <strong>Restart to update</strong>. After the update, Voisu shows what changed, and the <strong>What's new</strong> page lists every release.</p>
 <ul>
   <li>Choose <strong>Update to v…</strong> to install now. Voisu relaunches on the new version.</li>
   <li>Or carry on and choose <strong>Quit Voisu</strong> later. The update installs as Voisu quits.</li>
@@ -91,6 +91,7 @@
 <p>Voisu checks for a new release the same way. When one is ready, its window shows <strong>Update available</strong>; choose <strong>Restart to update</strong> and Voisu replaces itself and opens again. Your permissions carry over. You can also download the latest <a href="https://github.com/Anuraj-dev/voisu/releases/latest/download/Voisu-macOS-arm64.dmg">Voisu-macOS-arm64.dmg</a> and drag it over the old copy in Applications.</p>
 
 <h2 id="linux">Updating on Linux</h2>
+<p><code>voisu update</code> runs the right package manager for you and restarts Voisu. <code>voisu update --check</code> only compares versions. Once a day Voisu also checks for a new release and shows <strong>Update available</strong> on the interface's Home screen; <code>voisu update-check off</code> turns that off. To update by hand:</p>
 <h3 id="update-fedora">Fedora</h3>
 <div class="code"><pre><span class="p">$ </span>sudo dnf upgrade voisu voisu-overlay</pre></div>
 <h3 id="update-debian">Debian / Ubuntu</h3>

@@ -116,12 +116,13 @@
 </div>
 
 <h2 id="local">Local transcription on Linux</h2>
-<p>On Linux, <code>voisu setup</code> also offers <strong>Local</strong>: a model downloaded once, with your consent, that then runs offline with no provider keys. It's English only.</p>
+<p>On Linux, setup also offers <strong>Local</strong>: a whisper.cpp model (MIT licence) downloaded once, with your consent, that then runs offline with no provider keys. It's English only, and Linux only for now; the Windows and Mac apps use Cloud.</p>
 <ul>
-  <li>With an NVIDIA GPU that has at least 3.5 GB of memory: <code>distil-large-v3.5-int8</code> (about 2.98 GB download, MIT licence).</li>
-  <li>Any other computer: <code>parakeet-tdt-0.6b-v3</code> on the CPU (about 770 MB download, CC-BY-4.0 licence).</li>
+  <li><strong>Accurate</strong>: distil-large-v3.5, about 780 MB. The most accurate, best on a GPU.</li>
+  <li><strong>Fast</strong>: small.en, about 265 MB. Made for computers without a GPU, a little less accurate.</li>
 </ul>
-<p>Nothing downloads until you agree to the size and licence. Local never falls back to the cloud: if the model isn't ready, the Recording fails instead. Switch with <code>voisu mode local</code> or <code>voisu mode cloud</code>, and remove the model with <code>voisu local remove</code>.</p>
+<p>It runs on your GPU through Vulkan (NVIDIA, AMD or Intel), or on the CPU, more slowly. Setup checks for a GPU and installs Accurate when it finds one and Fast when it doesn't. The model stays loaded, so every Recording starts at once.</p>
+<p>Nothing downloads until you agree to the size. A download that stops picks up where it left off. Local never falls back to the cloud or switches to the CPU on its own: if the model isn't ready, the Recording fails instead. Switch with <code>voisu engine local</code> or <code>voisu engine cloud</code>, pick a model with <code>voisu local-model</code>, and remove it with <code>voisu local remove</code>. The <a href="settings.html#local">step-by-step guide</a> walks through it in the <code>voisu</code> interface.</p>
 
     <nav class="pager" aria-label="Docs pages">
       <a class="prev" href="using.html"><small>Previous</small>Dictating</a><a class="next" href="updating.html"><small>Next</small>Updating &amp; uninstalling</a>
