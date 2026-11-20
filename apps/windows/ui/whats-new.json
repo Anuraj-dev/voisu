@@ -1,5 +1,15 @@
 [
   {
+    "version": "1.0.0",
+    "date": "2026-11-20",
+    "items": [
+      { "kind": "new", "text": "A new, smaller overlay pill with thin sound bars, at the bottom centre by default." },
+      { "kind": "new", "text": "Move the overlay anywhere: Dictation, then Overlay position, then Move overlay. Drag it, then ✓ saves and ✗ cancels. Reset position puts it back." },
+      { "kind": "improved", "text": "The first Recording starts faster, and Stop or Esc now work while the microphone is starting.", "platforms": ["windows"] },
+      { "kind": "improved", "text": "The Overlay size setting is gone: there is one pill size on every screen." }
+    ]
+  },
+  {
     "version": "0.79.0",
     "date": "2026-11-13",
     "items": [
