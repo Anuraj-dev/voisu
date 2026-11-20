@@ -63,6 +63,9 @@ export const ui = $state({
   wordsDraft: '',
   // The sidebar page: home | dictation | words | keys | general | whats-new
   page: 'home',
+  // Setup was left for Local mode (Windows), which needs no keys. Until
+  // Local is chosen, this launch shows the pages anyway.
+  skipSetup: false,
   // "Restart to update" sits on the banner and on What's new; both share
   // one run and its error.
   updating: false,

@@ -60,7 +60,12 @@
   const mb = (bytes) => Math.round(bytes / 1_000_000);
   let modeBusy = $state(false);
 
+  // Set by Download, cleared by choosing Cloud: a download that finishes
+  // after the user picked Cloud leaves Cloud on.
+  let wantLocal = false;
+
   async function chooseMode(mode) {
+    if (mode === 'cloud') wantLocal = false;
     if (modeBusy) return;
     modeBusy = true;
     errors.mode = '';
@@ -74,16 +79,19 @@
   }
 
   // Consent is this click: nothing downloads until the user asks. A
-  // finished download switches to Local, which is what it was for. A
-  // failure lands in local.error through the state refresh.
+  // finished download switches to Local, which is what it was for, unless
+  // the user chose Cloud meanwhile. A failure lands in local.error through
+  // the state refresh.
   async function download() {
     errors.mode = '';
+    wantLocal = true;
+    let outcome;
     try {
-      await invoke('download_local_model');
+      outcome = await invoke('download_local_model');
     } catch (e) {
       return;
     }
-    if (ui.app.local?.installed) await chooseMode('local');
+    if (outcome === 'installed' && wantLocal) await chooseMode('local');
   }
 
   async function cancelDownload() {

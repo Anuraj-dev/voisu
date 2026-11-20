@@ -144,13 +144,13 @@ const COMMANDS = {
       downloadTimer = setInterval(() => {
         if (!local.downloading) {
           clearInterval(downloadTimer);
-          return resolve();
+          return resolve('cancelled');
         }
         local.downloaded = Math.min(local.total, local.downloaded + local.total / 20);
         if (local.downloaded >= local.total) {
           Object.assign(local, { downloading: false, installed: true });
           clearInterval(downloadTimer);
-          resolve();
+          resolve('installed');
         }
         emit('state-changed', null);
       }, 250);
