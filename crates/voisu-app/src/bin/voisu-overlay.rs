@@ -409,10 +409,13 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
     window.set_child(Some(&capsule));
     window.set_visible(false);
 
+    // The capsule's 1 px outline is the logo's green (#65d6a0), faint enough to
+    // read as an edge, not a glow, so the dark pill stays visible over dark
+    // windows. Failure and limit states swap in their own red border.
     let css = gtk::CssProvider::new();
     css.load_from_data(
         "window.background { background: transparent; }
-         .capsule { background: rgba(23, 25, 29, 0.96); border-radius: 16px; border: 1px solid transparent; padding: 3px 7px; }
+         .capsule { background: rgba(23, 25, 29, 0.96); border-radius: 16px; border: 1px solid rgba(101, 214, 160, 0.4); padding: 3px 7px; }
          .capsule.failure, .capsule.loading, .capsule.unavailable, .capsule.copied, .capsule.nospeech, .capsule.limitsoon { padding: 4px 14px; }
          .capsule .state-label, .capsule .meter { color: #F4F5F7; font-size: 10pt; font-weight: 600; }
          .capsule.processing .state-label, .capsule.processing .meter { color: #8FB4FF; }
@@ -425,7 +428,7 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
          .capsule.copied .state-label { color: #FFB454; }
          .capsule.limitsoon .state-label { color: #FFB454; }
          .capsule.limitwarn { border: 1px solid rgba(255, 138, 138, 0.9); box-shadow: 0 0 8px rgba(255, 138, 138, 0.35); }
-         .capsule.moving { border: 1px dashed rgba(244, 245, 247, 0.55); padding: 0 3px; }
+         .capsule.moving { border: 1px dashed rgba(101, 214, 160, 0.6); padding: 0 3px; }
          .move-button { min-width: 24px; min-height: 24px; padding: 0; margin: 0; border-radius: 12px; background: transparent; background-image: none; border: 0; box-shadow: none; outline: none; color: #F4F5F7; font-size: 11pt; font-weight: 700; }
          .move-button:hover { background: rgba(244, 245, 247, 0.14); }
          .move-button:active { background: rgba(244, 245, 247, 0.22); }
