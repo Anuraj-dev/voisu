@@ -114,14 +114,23 @@ where
     D: Deserializer<'de>,
     T: DeserializeOwned + Default,
 {
-    let value = serde_json::Value::deserialize(deserializer)?;
+    let value = value(deserializer)?;
     Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
+/// One field's JSON, or `null` when it is valid JSON that still does not
+/// parse as a value: a number out of range like `1e400` fails while it is
+/// read, before any fallback could see it. Taken raw first, so only this
+/// field drops back to its default. Malformed JSON still fails the file.
+fn value<'de, D: Deserializer<'de>>(deserializer: D) -> Result<serde_json::Value, D::Error> {
+    let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+    Ok(serde_json::from_str(raw.get()).unwrap_or_default())
 }
 
 /// [`lenient`] for a word list: a stray non-string entry is dropped on its
 /// own, so it cannot erase the rest of the list on the next save.
 fn lenient_terms<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
-    let value = serde_json::Value::deserialize(deserializer)?;
+    let value = value(deserializer)?;
     let terms = value.as_array().map(|items| {
         items
             .iter()
@@ -136,7 +145,7 @@ fn lenient_terms<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Strin
 fn lenient_trigger_key<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<TriggerChord, D::Error> {
-    let value = serde_json::Value::deserialize(deserializer)?;
+    let value = value(deserializer)?;
     Ok(
         serde_json::from_value(value.clone()).unwrap_or_else(|error| {
             tracing::warn!(%value, %error, "Trigger Key setting not usable; using Ctrl+Win");
@@ -147,7 +156,7 @@ fn lenient_trigger_key<'de, D: Deserializer<'de>>(
 
 /// [`lenient`] for a toggle whose default is on.
 fn lenient_on<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
-    let value = serde_json::Value::deserialize(deserializer)?;
+    let value = value(deserializer)?;
     Ok(value.as_bool().unwrap_or(true))
 }
 
@@ -451,6 +460,9 @@ mod tests {
             r#", "overlay_position": {"x": "0.5", "y": 0.5}"#,
             r#", "overlay_position": {"x": 1.5, "y": 0.5}"#,
             r#", "overlay_position": {"x": 0.5, "y": -0.1}"#,
+            // Out of f64 range: serde_json refuses it while reading.
+            r#", "overlay_position": {"x": 1e400}"#,
+            r#", "overlay_position": {"x": 1e400, "y": 0.5}"#,
         ] {
             let json = format!(r#"{{"auto_paste": false{value}}}"#);
             fs::write(&path, &json).unwrap();

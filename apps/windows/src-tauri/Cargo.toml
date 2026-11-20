@@ -29,7 +29,7 @@ dirs = "6"
 # its mock store; Linux builds exist only for local checks.
 keyring = "3.6"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 tauri = { version = "2.12", features = ["tray-icon"] }
 tauri-plugin-autostart = "2.7"
 # The one-time star prompt notification, sent from Rust only.
