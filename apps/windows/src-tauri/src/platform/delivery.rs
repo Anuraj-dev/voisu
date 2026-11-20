@@ -9,18 +9,22 @@
 //!
 //! 1. Preflight the target: gone, one of Voisu's own windows, or elevated
 //!    (UIPI drops synthetic input into a higher-integrity window without an
-//!    error, so this is checked up front and reported instead).
+//!    error, so this is checked up front and reported instead). The
+//!    Transcript is still copied to the clipboard.
 //! 2. Publish `CF_UNICODETEXT` with delayed rendering from a message-only
-//!    owner window, plus the formats that keep it out of clipboard history,
+//!    owner window, after the formats that keep it out of clipboard history,
 //!    cloud clipboard and clipboard monitors. From here on the Transcript is
 //!    on the clipboard, whatever happens next.
 //! 3. Bring the target back to the front if the user clicked away.
-//! 4. Release held modifiers, then send the paste chord.
+//! 4. Check Voisu still owns the clipboard and the target is in front, then
+//!    release held modifiers and send the paste chord.
 //! 5. The target's `WM_RENDERFORMAT` is the receipt that it pasted; reads by
 //!    any other app do not count. Report Delivery on the receipt. With no
 //!    receipt the paste is reported as delivered (the chord reached the
 //!    window in front; apps that read through another process never send a
 //!    receipt).
+//! 6. Before the owner window goes, write the text out for real if nobody
+//!    has read it yet, so it stays on the clipboard.
 //!
 //! The receipt design (delayed render as proof of read, the history/cloud
 //! exclusion formats) follows Handy's Windows paste path (MIT,
@@ -351,6 +355,52 @@ pub fn evaluate(watch: Watch) -> Option<DeliveryOutcome> {
     }
 }
 
+/// The last check before the chord. Another app may have replaced the
+/// clipboard, or come to the front, while the target was brought forward;
+/// the chord would then paste that app's content, or land in its window.
+pub fn before_chord(still_owner: bool, target_in_front: bool) -> Option<DeliveryOutcome> {
+    if !still_owner {
+        Some(DeliveryOutcome::ClipboardTaken)
+    } else if !target_in_front {
+        Some(DeliveryOutcome::FocusLost)
+    } else {
+        None
+    }
+}
+
+// ---- Teardown ----
+
+/// How long teardown keeps trying to open a busy clipboard to write out a
+/// Transcript nobody has read yet.
+pub const MATERIALIZE_BUDGET: Duration = Duration::from_millis(500);
+
+/// Teardown's next move before the clipboard owner window goes. Windows
+/// renders a still-delayed format once, at destroy, and drops it if another
+/// app has the clipboard open just then, so Voisu writes it out first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Settle {
+    /// Nothing is delayed: the text was rendered, or another app owns the
+    /// clipboard now.
+    Done,
+    /// The clipboard is open: write the text now.
+    Write,
+    /// Another app has the clipboard open: answer messages and try again.
+    Retry,
+    /// Out of time; the destroy-time render is the last chance.
+    GiveUp,
+}
+
+/// `delayed`: Voisu still owns the clipboard and its text is unrendered.
+/// `opened`: Voisu got the clipboard open on this try.
+pub fn settle(delayed: bool, opened: bool, elapsed: Duration) -> Settle {
+    match (delayed, opened) {
+        (false, _) => Settle::Done,
+        (true, true) => Settle::Write,
+        (true, false) if elapsed < MATERIALIZE_BUDGET => Settle::Retry,
+        (true, false) => Settle::GiveUp,
+    }
+}
+
 /// Who had the clipboard open when the text was rendered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reader {
@@ -583,8 +633,8 @@ mod native {
 
     use super::{
         CHORD_HOLD, DeliveryError, DeliveryOutcome, Integrity, Key, MODIFIERS, PasteChord, Probe,
-        Reader, VK_MASK, Watch, chord_phases, clipboard_text, evaluate, paste_chord, preflight,
-        read_by_target, release_held,
+        Reader, Settle, VK_MASK, Watch, before_chord, chord_phases, clipboard_text, evaluate,
+        paste_chord, preflight, read_by_target, release_held, settle,
     };
 
     const CF_UNICODETEXT: u32 = 13;
@@ -612,6 +662,9 @@ mod native {
         target_pids: Vec<u32>,
         /// The target's read, the receipt that it pasted.
         read: Option<Instant>,
+        /// The text was written out (for any reader, or at teardown), so it
+        /// is no longer a delayed render.
+        rendered: bool,
         lost: bool,
     }
 
@@ -640,6 +693,13 @@ mod native {
         let target = HWND(hwnd as *mut c_void);
         let probe = probe(target);
         if let Some(outcome) = preflight(probe) {
+            // Nothing is pasted, but the Transcript still goes on the
+            // clipboard for the user to paste.
+            if !text.is_empty()
+                && let Err(error) = copy_held(text)
+            {
+                tracing::warn!(%error, "could not copy the transcript");
+            }
             return Ok(outcome);
         }
         if text.is_empty() {
@@ -648,8 +708,9 @@ mod native {
         let chord = paste_chord(&class_name(target), &exe_path(probe.pid));
         let owner = owner_window()?;
         let result = paste(owner, target, probe.pid, text, chord);
-        // Destroying the owner renders any still-delayed text, so it stays on
-        // the clipboard; state goes only after it.
+        materialize(owner);
+        // Destroying the owner renders anything still delayed, the fallback
+        // if `materialize` ran out of time; state goes only after it.
         unsafe {
             let _ = DestroyWindow(owner);
         }
@@ -661,6 +722,11 @@ mod native {
         let _serial = ONE_AT_A_TIME
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        copy_held(text)
+    }
+
+    /// `copy` for a caller that already holds `ONE_AT_A_TIME`.
+    fn copy_held(text: &str) -> Result<(), DeliveryError> {
         let owner = owner_window()?;
         let result = open(owner).and_then(|()| {
             let result = copy_open(text);
@@ -678,17 +744,18 @@ mod native {
     fn copy_open(text: &str) -> Result<(), DeliveryError> {
         unsafe { EmptyClipboard() }
             .map_err(|_| DeliveryError::Clipboard("could not clear the clipboard"))?;
+        // Markers first: text without them would reach Win+V history.
+        if !mark_private() {
+            return Err(DeliveryError::Clipboard(
+                "could not hide the text from history",
+            ));
+        }
         let bytes: Vec<u8> = clipboard_text(text)
             .iter()
             .flat_map(|unit| unit.to_ne_bytes())
             .collect();
         if !set(CF_UNICODETEXT, &bytes) {
             return Err(DeliveryError::Clipboard("could not copy the text"));
-        }
-        if !mark_private() {
-            return Err(DeliveryError::Clipboard(
-                "could not hide the text from history",
-            ));
         }
         Ok(())
     }
@@ -706,6 +773,7 @@ mod native {
                 target,
                 target_pids: target_pids(target, target_pid),
                 read: None,
+                rendered: false,
                 lost: false,
             });
         });
@@ -719,6 +787,12 @@ mod native {
         // to the publish) before the chord, so it is timed before the chord
         // and an anonymous reader is not mistaken for the target's receipt.
         pump();
+        let still_owner =
+            owns_clipboard(owner) && !with_published(|state| state.lost).unwrap_or(true);
+        let in_front = unsafe { GetForegroundWindow() } == target;
+        if let Some(outcome) = before_chord(still_owner, in_front) {
+            return Ok(outcome);
+        }
         send_chord(chord)?;
         Ok(watch(Instant::now()))
     }
@@ -1034,6 +1108,13 @@ mod native {
     fn publish_open() -> Result<(), DeliveryError> {
         unsafe { EmptyClipboard() }
             .map_err(|_| DeliveryError::Clipboard("could not clear the clipboard"))?;
+        // Markers first, and no text without all of them: rendered later,
+        // unmarked text would reach Win+V history and cloud clipboard.
+        if !mark_private() {
+            return Err(DeliveryError::Clipboard(
+                "could not hide the text from history",
+            ));
+        }
         // A NULL handle registers a delayed render; the call's return value
         // is NULL on success too, so check availability instead.
         unsafe {
@@ -1042,12 +1123,45 @@ mod native {
         if unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT) }.is_err() {
             return Err(DeliveryError::Clipboard("could not offer the text"));
         }
-        if !mark_private() {
-            return Err(DeliveryError::Clipboard(
-                "could not hide the text from history",
-            ));
-        }
         Ok(())
+    }
+
+    /// Writes the text out for real if nobody has read it yet, before the
+    /// owner window goes (see `Settle`). Opens the clipboard only while the
+    /// text is still delayed, so a target reading late is not locked out,
+    /// and answers render requests between tries.
+    fn materialize(owner: HWND) {
+        let started = Instant::now();
+        loop {
+            pump();
+            let opened = still_delayed(owner) && unsafe { OpenClipboard(Some(owner)) }.is_ok();
+            // Checked again with the clipboard open: writing after another
+            // app emptied it would add the text to that app's content.
+            let step = settle(still_delayed(owner), opened, started.elapsed());
+            if step == Settle::Write {
+                render(None);
+            }
+            if opened {
+                close();
+            }
+            match step {
+                Settle::Retry => unsafe {
+                    MsgWaitForMultipleObjects(None, false, 10, QS_ALLINPUT);
+                },
+                Settle::GiveUp => {
+                    tracing::warn!("clipboard stayed busy; the transcript may not stay on it");
+                    return;
+                }
+                Settle::Done | Settle::Write => return,
+            }
+        }
+    }
+
+    /// Voisu still owns the clipboard and offers text nobody has rendered.
+    fn still_delayed(owner: HWND) -> bool {
+        owns_clipboard(owner)
+            && unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT) }.is_ok()
+            && with_published(|state| !state.rendered).unwrap_or(false)
     }
 
     // ---- Owner window ----
@@ -1117,7 +1231,7 @@ mod native {
             return;
         };
         let bytes: Vec<u8> = text.iter().flat_map(|unit| unit.to_ne_bytes()).collect();
-        set(CF_UNICODETEXT, &bytes);
+        let rendered = set(CF_UNICODETEXT, &bytes);
         let by_target = reader.is_some_and(|reader| read_by_target(reader, &target_pids));
         if reader.is_some() && !by_target {
             // Its read used up the delayed render, so the target's paste
@@ -1126,6 +1240,7 @@ mod native {
             tracing::info!(?reader, "another app read the transcript first");
         }
         with_published(|state| {
+            state.rendered |= rendered;
             if by_target && state.read.is_none() {
                 state.read = Some(Instant::now());
             }
@@ -1362,6 +1477,35 @@ mod tests {
         let mut lost = watch(1500, None);
         lost.ownership_lost = true;
         assert_eq!(evaluate(lost), Some(DeliveryOutcome::ClipboardTaken));
+    }
+
+    #[test]
+    fn the_chord_waits_for_the_clipboard_and_the_target() {
+        assert_eq!(before_chord(true, true), None);
+        assert_eq!(
+            before_chord(false, true),
+            Some(DeliveryOutcome::ClipboardTaken)
+        );
+        assert_eq!(
+            before_chord(false, false),
+            Some(DeliveryOutcome::ClipboardTaken)
+        );
+        assert_eq!(before_chord(true, false), Some(DeliveryOutcome::FocusLost));
+    }
+
+    #[test]
+    fn teardown_writes_unread_text_and_retries_a_busy_clipboard_within_budget() {
+        let late = MATERIALIZE_BUDGET + ms(1);
+        assert_eq!(settle(false, false, ms(0)), Settle::Done);
+        assert_eq!(settle(false, true, late), Settle::Done);
+        assert_eq!(settle(true, true, ms(0)), Settle::Write);
+        assert_eq!(settle(true, true, late), Settle::Write);
+        assert_eq!(settle(true, false, ms(0)), Settle::Retry);
+        assert_eq!(
+            settle(true, false, MATERIALIZE_BUDGET - ms(1)),
+            Settle::Retry
+        );
+        assert_eq!(settle(true, false, MATERIALIZE_BUDGET), Settle::GiveUp);
     }
 
     #[test]
