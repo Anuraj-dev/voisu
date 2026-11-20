@@ -34,15 +34,13 @@ impl InputCache {
                 // Invalidate immediately, even if a press arrives before the
                 // worker has finished resolving the new default.
                 let changes = Arc::clone(&worker_cache);
-                let _watch = watch_default(move || {
+                let watch = watch_default(move || {
                     changes.revision.fetch_add(1, Ordering::Release);
                     let _ = worker_events.send(Event::Refresh);
                 });
-                // CoreAudio's default input is a concrete device. If watching
-                // fails, resolve it per press so a still-connected old mic
-                // cannot be used after the user picks a different one.
-                #[cfg(target_os = "macos")]
-                if _watch.is_none() {
+                // Without notifications we can't keep the cached config
+                // current, including after a switch away and back.
+                if watch.is_none() {
                     return;
                 }
                 let host = cpal::default_host();

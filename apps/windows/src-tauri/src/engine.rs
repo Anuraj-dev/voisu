@@ -23,10 +23,10 @@ use voisu_cloud::{
 };
 use voisu_core::{
     ActiveCapture, BoundaryError, BoundaryFuture, BoundaryKind, CancelRegistry, CaptureLimit,
-    Credential, DEFAULT_RENDERING_POLICY, EnglishEligibilityOutcome, PreparedTranscriptDecision,
-    Provider, ProviderCoordinator, ProviderStreams, ResolvedRecordingLanguages, SecretStore,
-    SourceTranscript, Tone, TranscriptProvider, TranscriptValidator, apply_tone,
-    sanitize_source_transcripts,
+    CapturedAudio, Credential, DEFAULT_RENDERING_POLICY, EnglishEligibilityOutcome,
+    PreparedTranscriptDecision, Provider, ProviderCoordinator, ProviderStreams,
+    ResolvedRecordingLanguages, SecretStore, SourceTranscript, Tone, TranscriptProvider,
+    TranscriptValidator, apply_tone, sanitize_source_transcripts,
 };
 
 use crate::gesture::Action;
@@ -58,6 +58,23 @@ pub type EndedSink = Arc<dyn Fn(u64) + Send + Sync>;
 #[derive(Clone)]
 pub struct WindowsCloudHost {
     cleanup: CleanupSupervisor,
+    recording_keys: Option<RecordingKeys>,
+}
+
+#[derive(Clone)]
+struct RecordingKeys {
+    deepgram: Credential,
+    groq: Credential,
+}
+
+impl RecordingKeys {
+    fn load() -> Result<Self, BoundaryError> {
+        let mut store = CredentialManagerStore;
+        Ok(Self {
+            groq: store.load(Provider::Groq)?,
+            deepgram: store.load(Provider::Deepgram)?,
+        })
+    }
 }
 
 impl CloudHost for WindowsCloudHost {
@@ -66,7 +83,11 @@ impl CloudHost for WindowsCloudHost {
     }
 
     fn load_credential(&self, provider: Provider) -> Result<Credential, BoundaryError> {
-        CredentialManagerStore.load(provider)
+        match (&self.recording_keys, provider) {
+            (Some(keys), Provider::Deepgram) => Ok(keys.deepgram.clone()),
+            (Some(keys), Provider::Groq) => Ok(keys.groq.clone()),
+            (None, provider) => CredentialManagerStore.load(provider),
+        }
     }
 
     fn prepare_intent_credential(
@@ -156,6 +177,7 @@ pub fn start(app: &AppHandle, ended: EndedSink) -> UnboundedSender<Action> {
         app: app.clone(),
         host: WindowsCloudHost {
             cleanup: CleanupSupervisor::new(),
+            recording_keys: None,
         },
         microphone: CpalCapture::new(),
         ended,
@@ -178,12 +200,17 @@ enum Outcome {
     Failed(BoundaryError),
 }
 
+enum RecordingAudio {
+    Live(Box<dyn ActiveCapture>),
+    Stopped(CapturedAudio),
+}
+
 /// What the capture phase leaves for the processing phase.
 enum Captured {
     /// Nothing left to do; the state is already reported.
     Done,
     Process {
-        capture: Box<dyn ActiveCapture>,
+        audio: RecordingAudio,
         providers: ProviderCoordinator,
         limit: Option<CaptureLimit>,
         target: DeliveryTarget,
@@ -238,40 +265,72 @@ impl Engine {
         // A tray preview still playing must not hide or feed this session's
         // capsule.
         overlay::end_preview();
-        if !crate::keys_ready() {
-            tracing::info!(id, "Recording refused: keys missing");
-            self.emit_state(Phase::Error, Some(KEYS_MISSING.to_owned()));
-            crate::show_settings(&self.app);
-            return Captured::Done;
-        }
         let startup = Arc::new(CaptureStartup::default());
         let mut providers_started = None;
+        let mut trigger = StartupTrigger::new(id, actions, &self.ended);
+        let keys = tokio::select! {
+            biased;
+            () = trigger.until_end() => None,
+            result = load_recording_keys() => Some(result),
+        };
+        let keys = match keys {
+            Some(Some(keys)) => keys,
+            Some(None) => {
+                tracing::info!(id, "Recording refused: keys missing");
+                self.emit_state(Phase::Error, Some(KEYS_MISSING.to_owned()));
+                crate::show_settings(&self.app);
+                startup.log(id, hotkey_at, None);
+                return Captured::Done;
+            }
+            None => {
+                startup.log(id, hotkey_at, None);
+                return Captured::Done;
+            }
+        };
         let started = start_recording(
             self.microphone
                 .begin(id, self.level_sink(), Arc::clone(&startup)),
             async {
                 let settings = self.settings();
                 let vocabulary = vocabulary::normalize(&settings.boost_words);
-                let streams = self.start_providers(id, &vocabulary)?;
+                let streams = self.start_providers(id, &vocabulary, keys)?;
                 let providers =
                     ProviderCoordinator::start(PROVIDER_DEADLINE, ABORT_DEADLINE, streams);
                 providers_started = Some(Instant::now());
                 Ok((providers, vocabulary, settings.tone))
             },
-            || self.emit_state(Phase::Recording, None),
+            |phase| self.emit_state(phase, None),
+            &mut trigger,
         )
         .await;
         startup.log(id, hotkey_at, providers_started);
-        let (mut capture, (mut providers, vocabulary, tone)) = match started {
-            Ok(started) => started,
+        let (audio, (mut providers, vocabulary, tone)) = match started {
+            Ok(Some(started)) => started,
+            Ok(None) => {
+                self.emit_state(Phase::Idle, None);
+                return Captured::Done;
+            }
             Err(error) => {
                 self.fail(id, &error);
                 return Captured::Done;
             }
         };
+        let mut capture = match audio {
+            RecordingAudio::Live(capture) => capture,
+            RecordingAudio::Stopped(_) => {
+                return Captured::Process {
+                    audio,
+                    providers,
+                    limit: None,
+                    target,
+                    vocabulary,
+                    tone,
+                };
+            }
+        };
         match self.pump(id, &mut capture, &mut providers, actions).await {
             Outcome::Stop(limit) => Captured::Process {
-                capture,
+                audio: RecordingAudio::Live(capture),
                 providers,
                 limit,
                 target,
@@ -297,7 +356,7 @@ impl Engine {
     /// The processing phase: a Transcript from a stopped Recording, or the
     /// teardown of a cancelled or failed one.
     async fn settle(&self, id: u64, captured: Captured) {
-        let (mut capture, providers, limit, target, vocabulary, tone) = match captured {
+        let (audio, providers, limit, target, vocabulary, tone) = match captured {
             Captured::Done => return,
             Captured::Abort {
                 capture,
@@ -311,21 +370,26 @@ impl Engine {
                 };
             }
             Captured::Process {
-                capture,
+                audio,
                 providers,
                 limit,
                 target,
                 vocabulary,
                 tone,
-            } => (capture, providers, limit, target, vocabulary, tone),
+            } => (audio, providers, limit, target, vocabulary, tone),
         };
-        self.emit_state(Phase::Processing, None);
-        let audio = match capture.finish().await {
-            Ok(audio) => audio,
-            Err(error) => {
-                abort(capture, providers).await;
-                return self.fail(id, &error);
+        let audio = match audio {
+            RecordingAudio::Live(mut capture) => {
+                self.emit_state(Phase::Processing, None);
+                match capture.finish().await {
+                    Ok(audio) => audio,
+                    Err(error) => {
+                        abort(capture, providers).await;
+                        return self.fail(id, &error);
+                    }
+                }
             }
+            RecordingAudio::Stopped(audio) => audio,
         };
         let audio = match limit {
             Some(limit) => audio.with_truncation(limit),
@@ -467,24 +531,13 @@ impl Engine {
     /// Applies a trigger action during Recording `id`. Returns how the
     /// capture phase ends, if this action ends it.
     fn on_action(&self, id: u64, action: Option<Action>) -> Option<Outcome> {
-        match action {
-            // The trigger is gone: nothing can stop this Recording.
-            None => Some(Outcome::Cancel),
-            Some(Action::HandsFree(current)) if current == id => {
+        match recording_action(id, action, &self.ended)? {
+            TriggerAction::HandsFree => {
                 self.emit_state(Phase::HandsFree, None);
                 None
             }
-            Some(Action::Stop(current)) if current == id => Some(Outcome::Stop(None)),
-            Some(Action::Cancel(current)) if current == id => Some(Outcome::Cancel),
-            Some(Action::Start { id: other, .. }) => {
-                // One Recording at a time.
-                (self.ended)(other);
-                None
-            }
-            Some(stale) => {
-                tracing::debug!(?stale, id, "stale trigger action");
-                None
-            }
+            TriggerAction::Stop => Some(Outcome::Stop(None)),
+            TriggerAction::Cancel => Some(Outcome::Cancel),
         }
     }
 
@@ -494,25 +547,26 @@ impl Engine {
         &self,
         id: u64,
         vocabulary: &[String],
+        keys: RecordingKeys,
     ) -> Result<ProviderStreams, BoundaryError> {
+        let host = WindowsCloudHost {
+            cleanup: self.host.cleanup.clone(),
+            recording_keys: Some(keys),
+        };
         let mut deepgram = DeepgramProvider::with_keyterms_and_language(
-            self.host.clone(),
+            host.clone(),
             vocabulary::deepgram_keyterms(vocabulary),
             LANGUAGE.to_owned(),
         );
         let mut groq = GroqProvider::with_prompt_and_language(
-            self.host.clone(),
+            host,
             vocabulary::whisper_prompt(vocabulary),
             LANGUAGE.to_owned(),
         );
         let deepgram = deepgram.start(id)?;
-        let groq = match groq.start(id) {
-            Ok(groq) => groq,
-            Err(error) => {
-                tauri::async_runtime::spawn(deepgram.abort());
-                return Err(error);
-            }
-        };
+        // On partial failure, Deepgram's Drop cancels synchronously and
+        // hands its WebSocket task to the engine's cleanup supervisor.
+        let groq = groq.start(id)?;
         Ok(ProviderStreams { deepgram, groq })
     }
 
@@ -585,22 +639,116 @@ impl Engine {
     }
 }
 
-/// Starts provider setup as soon as the capture worker is in flight. The
-/// capture keeps its first chunks queued until the provider streams exist.
-async fn start_recording<C, P>(
-    capture: impl Future<Output = Result<C, BoundaryError>>,
+async fn load_recording_keys() -> Option<RecordingKeys> {
+    tokio::task::spawn_blocking(RecordingKeys::load)
+        .await
+        .ok()?
+        .ok()
+}
+
+enum TriggerAction {
+    Stop,
+    Cancel,
+    HandsFree,
+}
+
+fn recording_action(id: u64, action: Option<Action>, ended: &EndedSink) -> Option<TriggerAction> {
+    match action {
+        None => Some(TriggerAction::Cancel),
+        Some(Action::HandsFree(current)) if current == id => Some(TriggerAction::HandsFree),
+        Some(Action::Stop(current)) if current == id => Some(TriggerAction::Stop),
+        Some(Action::Cancel(current)) if current == id => Some(TriggerAction::Cancel),
+        Some(Action::Start { id: other, .. }) => {
+            ended(other);
+            None
+        }
+        Some(stale) => {
+            tracing::debug!(?stale, id, "stale trigger action");
+            None
+        }
+    }
+}
+
+struct StartupTrigger<'a> {
+    id: u64,
+    actions: &'a mut UnboundedReceiver<Action>,
+    ended: &'a EndedSink,
+    hands_free: bool,
+}
+
+impl<'a> StartupTrigger<'a> {
+    fn new(id: u64, actions: &'a mut UnboundedReceiver<Action>, ended: &'a EndedSink) -> Self {
+        Self {
+            id,
+            actions,
+            ended,
+            hands_free: false,
+        }
+    }
+
+    async fn next(&mut self) -> TriggerAction {
+        loop {
+            if let Some(action) = recording_action(self.id, self.actions.recv().await, self.ended) {
+                if matches!(action, TriggerAction::HandsFree) {
+                    self.hands_free = true;
+                }
+                return action;
+            }
+        }
+    }
+
+    async fn until_end(&mut self) {
+        while matches!(self.next().await, TriggerAction::HandsFree) {}
+    }
+}
+
+/// Provider setup starts as soon as the capture worker is in flight. Keep
+/// polling the Trigger Key while either branch is pending.
+async fn start_recording<P>(
+    capture: impl Future<Output = Result<Box<dyn ActiveCapture>, BoundaryError>>,
     providers: impl Future<Output = Result<P, BoundaryError>>,
-    listening: impl FnOnce(),
-) -> Result<(C, P), BoundaryError> {
-    tokio::try_join!(
-        biased;
-        async {
-            let capture = capture.await?;
-            listening();
-            Ok(capture)
-        },
-        providers,
-    )
+    mut emit: impl FnMut(Phase),
+    trigger: &mut StartupTrigger<'_>,
+) -> Result<Option<(RecordingAudio, P)>, BoundaryError> {
+    tokio::pin!(capture, providers);
+    let mut opened: Option<Box<dyn ActiveCapture>> = None;
+    let mut ready_providers = None;
+    loop {
+        tokio::select! {
+            biased;
+            action = trigger.next() => match action {
+                TriggerAction::Cancel => return Ok(None),
+                TriggerAction::Stop => {
+                    let Some(mut capture) = opened else { return Ok(None) };
+                    // Stop the mic before waiting for providers. Their completion
+                    // path sends the full PCM when no chunks were streamed live.
+                    let finish = async {
+                        let audio = capture.finish().await?;
+                        emit(Phase::Processing);
+                        let providers = match ready_providers {
+                            Some(providers) => providers,
+                            None => providers.await?,
+                        };
+                        Ok(Some((RecordingAudio::Stopped(audio), providers)))
+                    };
+                    return while_busy(finish, trigger.actions, trigger.ended).await;
+                }
+                TriggerAction::HandsFree if opened.is_some() => emit(Phase::HandsFree),
+                TriggerAction::HandsFree => {}
+            },
+            result = &mut capture, if opened.is_none() => {
+                opened = Some(result?);
+                emit(Phase::Recording);
+                if trigger.hands_free {
+                    emit(Phase::HandsFree);
+                }
+            },
+            result = &mut providers, if ready_providers.is_none() => ready_providers = Some(result?),
+        }
+        if opened.is_some() && ready_providers.is_some() {
+            return Ok(opened.map(RecordingAudio::Live).zip(ready_providers));
+        }
+    }
 }
 
 /// Local formatting, exactly as the Linux daemon delivers it with
@@ -683,18 +831,25 @@ mod tests {
 
     #[tokio::test]
     async fn listening_is_reported_only_after_audio_arrives_even_if_providers_start_first() {
+        let (_send, mut actions) = mpsc::unbounded_channel();
+        let ended: EndedSink = Arc::new(|_| {});
+        let mut trigger = StartupTrigger::new(1, &mut actions, &ended);
         let (first_audio, audio) = tokio::sync::oneshot::channel();
         let events = std::cell::RefCell::new(Vec::new());
         let start = start_recording(
             async {
                 audio.await.unwrap();
-                Ok("capture")
+                Ok(startup_mic(None))
             },
             async {
                 events.borrow_mut().push("providers started");
                 Ok("providers")
             },
-            || events.borrow_mut().push("recording"),
+            |phase| {
+                assert_eq!(phase, Phase::Recording);
+                events.borrow_mut().push("recording");
+            },
+            &mut trigger,
         );
         tokio::pin!(start);
         poll_fn(|cx| {
@@ -705,18 +860,28 @@ mod tests {
         assert_eq!(*events.borrow(), ["providers started"]);
 
         first_audio.send(()).unwrap();
-        assert_eq!(start.await.unwrap(), ("capture", "providers"));
+        assert!(matches!(
+            start.await.unwrap(),
+            Some((RecordingAudio::Live(_), "providers"))
+        ));
         assert_eq!(*events.borrow(), ["providers started", "recording"]);
     }
 
     #[tokio::test]
     async fn listening_does_not_wait_for_provider_setup() {
+        let (_send, mut actions) = mpsc::unbounded_channel();
+        let ended: EndedSink = Arc::new(|_| {});
+        let mut trigger = StartupTrigger::new(1, &mut actions, &ended);
         let (providers_ready, providers) = tokio::sync::oneshot::channel();
         let listening = std::cell::Cell::new(false);
         let start = start_recording(
-            async { Ok("capture") },
+            async { Ok(startup_mic(None)) },
             async { Ok(providers.await.unwrap()) },
-            || listening.set(true),
+            |phase| {
+                assert_eq!(phase, Phase::Recording);
+                listening.set(true);
+            },
+            &mut trigger,
         );
         tokio::pin!(start);
         poll_fn(|cx| {
@@ -727,7 +892,108 @@ mod tests {
         assert!(listening.get());
 
         providers_ready.send("providers").unwrap();
-        assert_eq!(start.await.unwrap(), ("capture", "providers"));
+        assert!(matches!(
+            start.await.unwrap(),
+            Some((RecordingAudio::Live(_), "providers"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn stop_or_cancel_during_startup_ends_quietly() {
+        for action in [Action::Stop(1), Action::Cancel(1)] {
+            let (send, mut actions) = mpsc::unbounded_channel();
+            let ended: EndedSink = Arc::new(|_| {});
+            let mut trigger = StartupTrigger::new(1, &mut actions, &ended);
+            let (callback, audio) = tokio::sync::oneshot::channel();
+            let start = start_recording(
+                async {
+                    audio.await.unwrap();
+                    Ok(startup_mic(None))
+                },
+                std::future::pending::<Result<(), BoundaryError>>(),
+                |_| panic!("bars shown for {action:?}"),
+                &mut trigger,
+            );
+            let mut start = Box::pin(start);
+            poll_fn(|cx| {
+                assert!(start.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            send.send(action).unwrap();
+            // Both the action and audio can be ready before the next poll.
+            callback.send(()).unwrap();
+            poll_fn(|cx| {
+                assert!(matches!(start.as_mut().poll(cx), Poll::Ready(Ok(None))));
+                Poll::Ready(())
+            })
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_after_first_audio_finishes_the_mic_before_providers_are_ready() {
+        let (send, mut actions) = mpsc::unbounded_channel();
+        let ended: EndedSink = Arc::new(|_| {});
+        let mut trigger = StartupTrigger::new(1, &mut actions, &ended);
+        let (providers_ready, providers) = tokio::sync::oneshot::channel();
+        let (finished, mut stopped) = tokio::sync::oneshot::channel();
+        let phases = std::cell::RefCell::new(Vec::new());
+        let start = start_recording(
+            async { Ok(startup_mic(Some(finished))) },
+            async {
+                providers.await.unwrap();
+                Ok(())
+            },
+            |phase| phases.borrow_mut().push(phase),
+            &mut trigger,
+        );
+        tokio::pin!(start);
+        poll_fn(|cx| {
+            assert!(start.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        send.send(Action::Stop(1)).unwrap();
+        poll_fn(|cx| {
+            assert!(start.as_mut().poll(cx).is_pending());
+            assert_eq!(stopped.try_recv(), Ok(()));
+            assert_eq!(*phases.borrow(), [Phase::Recording, Phase::Processing]);
+            Poll::Ready(())
+        })
+        .await;
+        providers_ready.send(()).unwrap();
+        let Some((RecordingAudio::Stopped(audio), ())) = start.await.unwrap() else {
+            panic!("expected buffered audio from the stopped mic");
+        };
+        assert_eq!(audio.pcm_s16le_mono_16khz(), [1, 2]);
+    }
+
+    fn startup_mic(finished: Option<tokio::sync::oneshot::Sender<()>>) -> Box<dyn ActiveCapture> {
+        struct StartupMic(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl ActiveCapture for StartupMic {
+            fn deadline_clock(&self) -> voisu_core::DeadlineClock {
+                unreachable!("the capture pump has not started")
+            }
+
+            fn next_chunk(&mut self) -> BoundaryFuture<'_, Option<voisu_core::AudioChunk>> {
+                unreachable!("the capture pump has not started")
+            }
+
+            fn finish(&mut self) -> BoundaryFuture<'_, CapturedAudio> {
+                Box::pin(async move {
+                    self.0.take().unwrap().send(()).unwrap();
+                    Ok(CapturedAudio::new(vec![1, 2]))
+                })
+            }
+
+            fn abort(self: Box<Self>) -> BoundaryFuture<'static, ()> {
+                unreachable!("startup drops the capture guard")
+            }
+        }
+
+        Box::new(StartupMic(finished))
     }
 
     fn both_providers_heard(text: &str) -> Vec<SourceTranscript> {
