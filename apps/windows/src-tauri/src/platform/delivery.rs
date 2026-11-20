@@ -15,11 +15,11 @@
 //!    cloud clipboard and clipboard monitors.
 //! 4. Release held modifiers, then send the paste chord.
 //! 5. The target's `WM_RENDERFORMAT` is the receipt that it pasted; reads by
-//!    any other app do not count. Restore shortly after the receipt, but only
-//!    while Voisu still owns the clipboard and nothing else has written to it
-//!    since (`GetClipboardSequenceNumber`). With no receipt the paste is
-//!    reported as delivered (the chord reached the window in front; apps
-//!    that read through a clipboard manager or another process never send a
+//!    any other app do not count. Report Delivery on the receipt and restore
+//!    shortly afterwards, while Voisu still owns the clipboard and its
+//!    sequence number (`GetClipboardSequenceNumber`) is unchanged. With no
+//!    receipt the paste is reported as delivered (the chord reached the
+//!    window in front; apps that read through another process never send a
 //!    receipt), and the Transcript stays on the clipboard for a bounded grace
 //!    period so a late paste still gets it, then the user's clipboard comes
 //!    back.
@@ -363,50 +363,35 @@ pub struct Watch {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
-    Wait,
-    /// The target pasted: put the user's clipboard back.
+    /// Put the user's clipboard back if it still matches what Voisu left.
     Restore,
-    /// No read yet: report the paste, then watch `evaluate_grace` with the
-    /// Transcript still on the clipboard for a late paste.
-    Keep,
     /// Leave the clipboard alone: it is no longer Voisu's.
-    Abandon {
-        pasted: bool,
-    },
+    Abandon,
 }
 
-pub fn evaluate(watch: Watch) -> Verdict {
-    if watch.ownership_lost {
-        return Verdict::Abandon {
-            pasted: watch.read.is_some(),
-        };
-    }
+/// Decide what to report as soon as there is a receipt, a failure, or the
+/// receipt deadline passes.
+pub fn evaluate(watch: Watch) -> Option<DeliveryOutcome> {
     match watch.read {
-        Some(read) if watch.since_chord.saturating_sub(read) >= QUIET_AFTER_READ => {
-            Verdict::Restore
-        }
-        None if watch.since_chord >= NO_READ_TIMEOUT => Verdict::Keep,
-        _ => Verdict::Wait,
+        Some(_) => Some(DeliveryOutcome::Pasted),
+        None if watch.ownership_lost => Some(DeliveryOutcome::ClipboardTaken),
+        _ if watch.since_chord >= NO_READ_TIMEOUT => Some(DeliveryOutcome::NotConfirmed),
+        _ => None,
     }
 }
 
-/// After `Keep`: the user's clipboard comes back a quiet period after a late
-/// read, at `NOT_CONFIRMED_GRACE`, or as soon as another delivery is
-/// `queued` behind this one. Never `Keep`.
-pub fn evaluate_grace(watch: Watch, queued: bool) -> Verdict {
+/// After reporting Delivery, wait a quiet period after a read. If there is
+/// still no read, wait out the grace period or until another delivery queues.
+pub fn evaluate_restore(watch: Watch, queued: bool) -> Option<Verdict> {
     if watch.ownership_lost {
-        return Verdict::Abandon {
-            pasted: watch.read.is_some(),
-        };
+        return Some(Verdict::Abandon);
     }
     match watch.read {
         Some(read) if watch.since_chord.saturating_sub(read) >= QUIET_AFTER_READ => {
-            Verdict::Restore
+            Some(Verdict::Restore)
         }
-        // A late read still gets its quiet period, bounded by it.
-        Some(_) => Verdict::Wait,
-        None if queued || watch.since_chord >= NOT_CONFIRMED_GRACE => Verdict::Restore,
-        None => Verdict::Wait,
+        None if queued || watch.since_chord >= NOT_CONFIRMED_GRACE => Some(Verdict::Restore),
+        _ => None,
     }
 }
 
@@ -651,7 +636,7 @@ mod native {
     use super::{
         CF_ENHMETAFILE, CHORD_HOLD, DeliveryError, DeliveryOutcome, Integrity, Key, MODIFIERS,
         PasteChord, Probe, Reader, SNAPSHOT_BUDGET, VK_MASK, Verdict, Watch, chord_phases,
-        clipboard_text, evaluate, evaluate_grace, may_restore, paste_chord, preflight,
+        clipboard_text, evaluate, evaluate_restore, may_restore, paste_chord, preflight,
         read_by_target, release_held, snapshot_format,
     };
 
@@ -813,32 +798,26 @@ mod native {
         }
 
         let chord_at = Instant::now();
-        Ok(match watch(chord_at, evaluate) {
-            Verdict::Restore => {
-                restore_guarded(owner, &saved);
-                DeliveryOutcome::Pasted
-            }
-            Verdict::Keep => {
-                // Reported now, so the Overlay shows success without waiting
-                // out the grace period; the user's clipboard comes back after.
-                early(Ok(DeliveryOutcome::NotConfirmed));
-                let late = watch(chord_at, |state| {
-                    evaluate_grace(state, QUEUED.load(Ordering::SeqCst) > 0)
-                });
-                if late == Verdict::Restore {
-                    restore_guarded(owner, &saved);
-                }
-                tracing::debug!(?late, "unconfirmed paste settled");
-                DeliveryOutcome::NotConfirmed
-            }
-            Verdict::Abandon { pasted: true } => DeliveryOutcome::Pasted,
-            Verdict::Abandon { pasted: false } => DeliveryOutcome::ClipboardTaken,
-            Verdict::Wait => unreachable!(),
-        })
+        let outcome = watch(chord_at, evaluate);
+        if outcome == DeliveryOutcome::ClipboardTaken {
+            return Ok(outcome);
+        }
+
+        early(Ok(outcome));
+        let verdict = watch(chord_at, |state| {
+            evaluate_restore(state, QUEUED.load(Ordering::SeqCst) > 0)
+        });
+        if verdict == Verdict::Restore {
+            restore_guarded(owner, &saved);
+        }
+        if outcome == DeliveryOutcome::NotConfirmed {
+            tracing::debug!(?verdict, "unconfirmed paste settled");
+        }
+        Ok(outcome)
     }
 
-    /// Pumps messages until `decide` returns anything but `Wait`.
-    fn watch(chord_at: Instant, decide: impl Fn(Watch) -> Verdict) -> Verdict {
+    /// Pumps messages until `decide` has a result.
+    fn watch<T>(chord_at: Instant, decide: impl Fn(Watch) -> Option<T>) -> T {
         loop {
             pump();
             let (read, lost) = with_published(|state| {
@@ -849,15 +828,15 @@ mod native {
                 (read, state.lost)
             })
             .unwrap_or((None, true));
-            match decide(Watch {
+            if let Some(result) = decide(Watch {
                 since_chord: chord_at.elapsed(),
                 read,
                 ownership_lost: lost,
             }) {
-                Verdict::Wait => unsafe {
-                    MsgWaitForMultipleObjects(None, false, 25, QS_ALLINPUT);
-                },
-                verdict => return verdict,
+                return result;
+            }
+            unsafe {
+                MsgWaitForMultipleObjects(None, false, 25, QS_ALLINPUT);
             }
         }
     }
@@ -1569,67 +1548,100 @@ mod tests {
     }
 
     #[test]
-    fn restores_a_quiet_period_after_the_read() {
-        assert_eq!(evaluate(watch(50, None)), Verdict::Wait);
-        assert_eq!(evaluate(watch(150, Some(100))), Verdict::Wait);
-        assert_eq!(evaluate(watch(300, Some(100))), Verdict::Restore);
+    fn reports_the_receipt_before_the_clipboard_can_be_restored() {
+        assert_eq!(evaluate(watch(99, None)), None);
+        let receipt = watch(100, Some(100));
+        assert_eq!(evaluate(receipt), Some(DeliveryOutcome::Pasted));
+        assert_eq!(evaluate_restore(receipt, true), None);
+        assert_eq!(evaluate_restore(watch(299, Some(100)), true), None);
+        assert_eq!(
+            evaluate_restore(watch(300, Some(100)), true),
+            Some(Verdict::Restore)
+        );
     }
 
     #[test]
-    fn a_read_just_before_the_timeout_still_restores() {
-        assert_eq!(evaluate(watch(1600, Some(1450))), Verdict::Wait);
-        assert_eq!(evaluate(watch(1650, Some(1450))), Verdict::Restore);
+    fn a_read_just_before_the_timeout_is_confirmed_even_if_observed_after_it() {
+        let receipt = watch(1600, Some(1499));
+        assert_eq!(evaluate(receipt), Some(DeliveryOutcome::Pasted));
+        assert_eq!(evaluate_restore(receipt, false), None);
+        assert_eq!(
+            evaluate_restore(watch(1699, Some(1499)), false),
+            Some(Verdict::Restore)
+        );
     }
 
     #[test]
-    fn no_read_keeps_the_transcript_on_the_clipboard() {
-        assert_eq!(evaluate(watch(1499, None)), Verdict::Wait);
-        assert_eq!(evaluate(watch(1500, None)), Verdict::Keep);
+    fn no_read_before_the_deadline_is_unconfirmed() {
+        assert_eq!(evaluate(watch(1499, None)), None);
+        assert_eq!(
+            evaluate(watch(1500, None)),
+            Some(DeliveryOutcome::NotConfirmed)
+        );
+        assert_eq!(
+            evaluate(watch(1501, Some(1500))),
+            Some(DeliveryOutcome::Pasted)
+        );
+    }
+
+    #[test]
+    fn a_read_stamped_just_after_the_deadline_is_confirmed() {
+        assert_eq!(
+            evaluate(watch(1501, Some(1501))),
+            Some(DeliveryOutcome::Pasted)
+        );
     }
 
     #[test]
     fn an_unconfirmed_paste_restores_after_the_grace_period() {
-        assert_eq!(evaluate_grace(watch(1500, None), false), Verdict::Wait);
-        assert_eq!(evaluate_grace(watch(4999, None), false), Verdict::Wait);
-        assert_eq!(evaluate_grace(watch(5000, None), false), Verdict::Restore);
+        assert_eq!(evaluate_restore(watch(1500, None), false), None);
+        assert_eq!(evaluate_restore(watch(4999, None), false), None);
+        assert_eq!(
+            evaluate_restore(watch(5000, None), false),
+            Some(Verdict::Restore)
+        );
     }
 
     #[test]
     fn a_late_read_restores_after_its_quiet_period() {
+        assert_eq!(evaluate_restore(watch(2100, Some(2000)), false), None);
         assert_eq!(
-            evaluate_grace(watch(2100, Some(2000)), false),
-            Verdict::Wait
-        );
-        assert_eq!(
-            evaluate_grace(watch(2200, Some(2000)), false),
-            Verdict::Restore
+            evaluate_restore(watch(2200, Some(2000)), false),
+            Some(Verdict::Restore)
         );
         // Even past the grace period, the read finishes first.
-        assert_eq!(evaluate_grace(watch(5050, Some(4950)), true), Verdict::Wait);
+        assert_eq!(evaluate_restore(watch(5050, Some(4950)), true), None);
     }
 
     #[test]
     fn a_queued_delivery_ends_the_grace_period() {
-        assert_eq!(evaluate_grace(watch(1600, None), true), Verdict::Restore);
+        assert_eq!(
+            evaluate_restore(watch(1600, None), true),
+            Some(Verdict::Restore)
+        );
     }
 
     #[test]
     fn losing_the_clipboard_during_the_grace_period_leaves_it() {
         let mut lost = watch(2000, None);
         lost.ownership_lost = true;
-        assert_eq!(
-            evaluate_grace(lost, false),
-            Verdict::Abandon { pasted: false }
-        );
+        assert_eq!(evaluate_restore(lost, false), Some(Verdict::Abandon));
     }
 
     #[test]
-    fn losing_the_clipboard_abandons_the_restore() {
+    fn losing_the_clipboard_after_a_read_preserves_the_receipt_and_skips_restore() {
         let mut lost = watch(100, Some(50));
         lost.ownership_lost = true;
-        assert_eq!(evaluate(lost), Verdict::Abandon { pasted: true });
-        lost.read = None;
-        assert_eq!(evaluate(lost), Verdict::Abandon { pasted: false });
+        assert_eq!(evaluate(lost), Some(DeliveryOutcome::Pasted));
+        assert_eq!(evaluate_restore(lost, false), Some(Verdict::Abandon));
+    }
+
+    #[test]
+    fn losing_the_clipboard_before_a_read_is_a_delivery_failure() {
+        let mut lost = watch(1500, None);
+        lost.ownership_lost = true;
+        assert_eq!(evaluate(lost), Some(DeliveryOutcome::ClipboardTaken));
+        assert_eq!(evaluate_restore(lost, false), Some(Verdict::Abandon));
     }
 
     #[test]

@@ -409,7 +409,9 @@ impl Engine {
                     .unwrap() = Some(text.clone());
                 let _ = self.app.emit(crate::STATE_CHANGED, ());
                 if self.deliver(id, target, text).await {
-                    // After the Delivery has finished, never during one.
+                    // The Delivery result can arrive before clipboard restore.
+                    // This hook counts toward the star prompt and may send a
+                    // notification. It leaves the clipboard and focus alone.
                     crate::dictation_delivered(&self.app);
                 }
             }
