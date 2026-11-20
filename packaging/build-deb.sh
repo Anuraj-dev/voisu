@@ -165,6 +165,10 @@ while read -r lib; do
     install -m 0644 "$root/target/worker/release/$lib" "$worker_stage/runtime/$lib"
 done < "$root/target/worker/release/voisu-whisper-runtime.txt"
 install -m 0644 "$root/target/worker/release/voisu-whisper-runtime.txt" "$worker_stage/runtime/"
+# cargo-deb strips only the binaries cargo builds for the package, not these
+# staged assets; lintian rejects unstripped ones. --strip-unneeded keeps the
+# dynamic symbols the worker loads the libraries by.
+strip --strip-unneeded "$worker_stage/voisu-local-asr" "$worker_stage/runtime/"*.so*
 # Checked as installed: the worker and its runtime share one directory.
 check_dir=$(mktemp -d)
 cp -p "$worker_stage/voisu-local-asr" "$worker_stage/runtime/"* "$check_dir/"

@@ -26,11 +26,14 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd "$script_dir/../.." && pwd)
 
 echo "== provision Fedora build + test toolchain =="
+# Keep in step with voisu.spec BuildRequires; the last line builds the
+# whisper.cpp worker (Vulkan) for Local transcription.
 dnf -y install \
     rust cargo gcc make pkgconf-pkg-config \
     rpm-build systemd-rpm-macros systemd git \
     dbus-daemon python3 curl \
-    gtk4-devel gtk4-layer-shell-devel libxkbcommon-devel
+    gtk4-devel gtk4-layer-shell-devel libxkbcommon-devel \
+    cmake gcc-c++ vulkan-loader-devel glslc spirv-headers-devel
 
 # makepkg-style hygiene: build the RPM as a non-root user.
 useradd -m builder 2>/dev/null || true
