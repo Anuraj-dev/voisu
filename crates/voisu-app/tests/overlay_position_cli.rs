@@ -211,8 +211,6 @@ fn move_saves_where_the_overlay_says_the_pill_was_dropped() {
 
 #[test]
 fn a_cancelled_move_keeps_the_saved_spot() {
-    let sandbox = Sandbox::new();
-    let socket = sandbox.overlay_socket();
     for (reason, message) in [
         (
             CancelReason::User,
@@ -232,8 +230,13 @@ fn a_cancelled_move_keeps_the_saved_spot() {
              The Overlay stays where it was.\n",
         ),
     ] {
+        // A fresh runtime dir per round: rebinding one socket path can find
+        // the previous round's `overlay.lock` still held, because a `voisu`
+        // child that another test thread is spawning inherits every open fd
+        // until its exec closes them (CLOEXEC), flock included.
+        let sandbox = Sandbox::new();
         let overlay = fake_overlay(
-            &socket,
+            &sandbox.overlay_socket(),
             None,
             vec![MoveReply::Moving, MoveReply::Cancel(reason)],
         );

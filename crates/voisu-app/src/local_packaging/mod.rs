@@ -202,7 +202,7 @@ pub fn baseline_defects() -> &'static [BaselineDefect] {
 #[must_use]
 pub fn required_ci_needles() -> &'static [&'static str] {
     &[
-        "cargo test --workspace --locked",
+        "cargo nextest run --workspace --locked",
         "cargo test --manifest-path tools/transcript-quality/Cargo.toml --locked",
         "cargo clippy --all-targets --workspace --locked -- -D warnings",
         "cargo clippy --workspace --all-targets --features overlay --locked -- -D warnings",
