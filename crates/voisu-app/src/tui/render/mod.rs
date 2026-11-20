@@ -598,6 +598,32 @@ mod tests {
     }
 
     #[test]
+    fn a_scrolled_list_never_shows_a_heading_without_its_rows() {
+        let mut app = app_on('2');
+        select(&mut app, SettingsRow::StarPrompt);
+        let lines = screen(&mut app, &UNICODE, (90, 24));
+        let list: Vec<&str> = lines[5..]
+            .iter()
+            .filter_map(|line| line.split_once('│').map(|(list, _)| list.trim_end()))
+            .collect();
+        // Overlay, the last Dictation row, would top the list; the list
+        // starts at the next section instead of naming an empty Dictation.
+        assert_eq!(list[0], " Transcript");
+        assert_eq!(list[1], "   Writing       Clean");
+        assert!(!list.contains(&" Dictation"), "{list:#?}");
+        assert!(list.contains(&" ▌ Star prompt   On"), "{list:#?}");
+        for (index, line) in list.iter().enumerate() {
+            if !line.starts_with("   ") && !line.starts_with(" ▌") && !line.is_empty() {
+                let next = list.get(index + 1).copied().unwrap_or("");
+                assert!(
+                    next.starts_with("   ") || next.starts_with(" ▌"),
+                    "heading {line:?} has no row under it: {list:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn the_local_model_row_says_what_runs_and_asks_before_a_download() {
         let mut app = app_on('2');
         app.settings_selected = SettingsRow::ALL
@@ -757,18 +783,25 @@ mod tests {
                 let body = joined(&lines);
                 assert!(!body.contains('…'), "{size:?} {index}: cut\n{body}");
                 // 120x40 holds every section; 90x24 scrolls them, but the
-                // selected row always shows.
-                let shown: &[SettingsRow] = if size.1 >= 40 {
-                    &SettingsRow::ALL
-                } else {
-                    std::slice::from_ref(&row)
-                };
-                for other in shown {
-                    assert!(
-                        body.contains(other.label()),
-                        "{size:?} lost {}",
-                        other.label()
-                    );
+                // list itself always shows the selected row, marked.
+                let list: Vec<&str> = lines
+                    .iter()
+                    .filter_map(|line| line.split_once('│').map(|(list, _)| list))
+                    .collect();
+                let marked = format!(" ▌ {}", row.label());
+                assert!(
+                    list.iter().any(|line| line.starts_with(&marked)),
+                    "{size:?} lost the selected {}\n{body}",
+                    row.label()
+                );
+                if size.1 >= 40 {
+                    for other in SettingsRow::ALL {
+                        assert!(
+                            list.iter().any(|line| line.contains(other.label())),
+                            "{size:?} lost {}",
+                            other.label()
+                        );
+                    }
                 }
                 let panel: Vec<&str> = lines
                     .iter()

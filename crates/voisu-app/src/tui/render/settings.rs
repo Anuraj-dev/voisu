@@ -143,7 +143,13 @@ fn list_lines(app: &App, look: &Look, width: usize, height: usize) -> Vec<Line<'
         .iter()
         .position(|item| matches!(item, Item::Row(index) if SettingsRow::ALL[*index] == selected))
         .unwrap_or(0);
-    let start = text::window_start(at, height);
+    let mut start = text::window_start(at, height);
+    // A top row that ends its section would give way to a heading with no
+    // rows under it: start on the next section's heading instead, which keeps
+    // the selection in view since it sits further down.
+    if start > 0 && start < at && matches!(items.get(start + 1), Some(Item::Heading(_))) {
+        start += 1;
+    }
     let mut shown: Vec<Item> = items.iter().copied().skip(start).take(height).collect();
     // Scrolled into the middle of a section: its heading takes the top line,
     // which is never the selected row's.
