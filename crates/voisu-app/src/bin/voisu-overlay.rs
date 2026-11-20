@@ -2141,9 +2141,10 @@ fn watch_config(reread: &Rc<Cell<bool>>) -> Option<gtk::gio::FileMonitor> {
 }
 
 /// Sizes the pill for what it shows: 120x40 for bars and the check mark, and
-/// for text widened to fit, up to `PILL_MAX_WIDTH`, wrapping to two lines.
-/// The label's own width request is the text width, so the capsule is exactly
-/// the pill. The surface around it keeps its fixed size.
+/// for text widened to fit, up to `PILL_MAX_WIDTH`, wrapping to two lines
+/// (one, if two would not fit the surface's fixed box). The label's own
+/// width request is the text width, so the capsule is exactly the pill. The
+/// surface around it keeps its fixed size.
 fn size_pill(capsule: &gtk::Box, label: &gtk::Label, glyph: &gtk::Label) -> Size {
     if !label.is_visible() {
         // Back to the bare pill, so a wide text state never leaves it wider
@@ -2168,14 +2169,23 @@ fn size_pill(capsule: &gtk::Box, label: &gtk::Label, glyph: &gtk::Label) -> Size
     // label's natural width then is the request, not its unwrapped length.
     label.set_wrap(true);
     label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-    label.set_lines(PILL_MAX_LINES);
     label.set_ellipsize(gtk::pango::EllipsizeMode::End);
     label.set_max_width_chars(1);
     label.set_width_chars(1);
-    let height = label
-        .measure(gtk::Orientation::Vertical, text_width)
-        .1
-        .max(0);
+    // As many lines as fit the fixed surface box: a large text scale gets
+    // fewer, so the pill never grows the surface (which would move it).
+    let mut lines = PILL_MAX_LINES;
+    let height = loop {
+        label.set_lines(lines);
+        let height = label
+            .measure(gtk::Orientation::Vertical, text_width)
+            .1
+            .max(0);
+        if lines <= 1 || height + TEXT_PILL_PAD_Y <= PILL_BOX.1 {
+            break height;
+        }
+        lines -= 1;
+    };
     label.set_size_request(text_width, height);
     // Never shorter than the bar pill: one line of text sits centred in it.
     capsule.set_size_request(width, PILL_HEIGHT);
