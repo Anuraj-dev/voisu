@@ -161,6 +161,58 @@ impl OverlayView {
     }
 }
 
+/// The saved position the pill is placed by. [`PositionWatch`]'s answers are
+/// its only source ([`SavedPosition::apply`]). A fresh map reads the config
+/// itself before it is mapped and places that map by its read
+/// ([`SavedPosition::pin`]), but only until the watch applies something:
+/// a read never overrides a newer answer from the watch, nor stays once the
+/// watch has caught up.
+#[derive(Clone, Copy, Debug)]
+pub struct SavedPosition {
+    applied: crate::config::OverlayPosition,
+    version: u64,
+    pinned: Option<(crate::config::OverlayPosition, u64)>,
+}
+
+impl SavedPosition {
+    #[must_use]
+    pub fn new(applied: crate::config::OverlayPosition) -> Self {
+        Self {
+            applied,
+            version: 0,
+            pinned: None,
+        }
+    }
+
+    /// Where the pill goes now.
+    #[must_use]
+    pub fn current(self) -> crate::config::OverlayPosition {
+        match self.pinned {
+            Some((read, version)) if version == self.version => read,
+            _ => self.applied,
+        }
+    }
+
+    /// Which of the watch's answers is current; a fresh map's read notes it
+    /// when it starts.
+    #[must_use]
+    pub fn version(self) -> u64 {
+        self.version
+    }
+
+    /// The watch's answer.
+    pub fn apply(&mut self, position: crate::config::OverlayPosition) {
+        self.applied = position;
+        self.version += 1;
+    }
+
+    /// A fresh map's own read, started at `version`: places that map unless
+    /// the watch has applied an answer since.
+    pub fn pin(&mut self, read: crate::config::OverlayPosition, version: u64) {
+        self.pinned = (version == self.version).then_some((read, version));
+    }
+}
+
 /// Re-reads the Overlay position off the GTK thread, so showing the pill never
 /// waits on the config file. `refresh` starts a read when a Recording begins
 /// or the config file changes; the next ticks `take` the answer and re-place
@@ -2554,6 +2606,31 @@ mod tests {
                 notify_limit: None,
             },
         );
+    }
+
+    #[test]
+    fn a_maps_own_read_never_overrides_a_newer_answer_from_the_watch() {
+        let spot = |x: f64, y: f64| crate::config::OverlayPosition::from_fractions(x, y).unwrap();
+        let (a, b, c) = (spot(0.5, 0.964), spot(0.25, 0.1), spot(0.75, 0.5));
+        let mut saved = SavedPosition::new(a);
+        assert_eq!(saved.current(), a);
+
+        // The map's read lands first: that map is placed by it.
+        let asked = saved.version();
+        saved.pin(b, asked);
+        assert_eq!(saved.current(), b);
+        // The watch catches up, then moves on: its answers win from then on.
+        saved.apply(b);
+        assert_eq!(saved.current(), b);
+        saved.apply(c);
+        assert_eq!(saved.current(), c);
+
+        // The watch applies a newer spot while the map's read is out: the
+        // read (of the older file) is dropped.
+        let asked = saved.version();
+        saved.apply(a);
+        saved.pin(b, asked);
+        assert_eq!(saved.current(), a);
     }
 
     #[test]

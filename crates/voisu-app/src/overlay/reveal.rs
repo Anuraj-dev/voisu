@@ -3,7 +3,7 @@
 //! tested without one.
 //!
 //! A fresh map first asks the compositor which output is focused, with the
-//! window still unmapped ([`RevealHold::begin_resolve`]); an answer that
+//! window still unmapped ([`RevealHold::request_resolve`]); an answer that
 //! comes after a newer map or a hide is dropped. Where it says (Hyprland,
 //! KWin), the Overlay binds the surface there at its final margins before
 //! mapping it, and the pill shows at once ([`RevealHold::show_bound`]). Elsewhere the surface is
@@ -49,11 +49,14 @@ pub struct RemapToken(u64);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Entered {
     /// The applied margins are right for it: paint one more transparent
-    /// frame and show the pill once [`RevealHold::painted`] says so.
-    Paint(PaintToken),
+    /// frame and show the pill once [`RevealHold::painted`] says so. Arm a
+    /// deadline with the map token too: the map's first one may already have
+    /// fired, ignored while a remap was queued.
+    Paint(PaintToken, MapToken),
     /// That output wants other margins: unmap, bind to it at its margins and
-    /// map again. Start with [`RevealHold::rebind`].
-    Remap(RemapToken),
+    /// map again. Start with [`RevealHold::rebind`]. Arm a deadline with the
+    /// map token too, in case a later enter cancels the remap.
+    Remap(RemapToken, MapToken),
     /// An unbound pill already shown by the deadline: place it by this
     /// output where it is.
     Place,
@@ -100,19 +103,22 @@ impl Default for RevealHold {
 }
 
 impl RevealHold {
+    /// A map is wanted while the pill is not mapped. `fresh` is whether it
+    /// is for a new pill (a new Recording, a replaced surface) rather than
+    /// the same one asked again on the next tick. Returns the token to ask
+    /// for the focused output with: a new one, superseding any answer still
+    /// out, unless that answer is for this same pill (`None`).
+    pub fn request_resolve(&mut self, fresh: bool) -> Option<ResolveToken> {
+        (fresh || self.phase != Phase::Resolving).then(|| self.begin_resolve())
+    }
+
     /// A fresh map is wanted. Ask for the focused output with the token, and
     /// map once [`RevealHold::resolved`] accepts the answer.
-    pub fn begin_resolve(&mut self) -> ResolveToken {
+    fn begin_resolve(&mut self) -> ResolveToken {
         self.supersede();
         self.phase = Phase::Resolving;
         self.bound = false;
         ResolveToken(self.map)
-    }
-
-    /// Whether a fresh map is waiting on its answer.
-    #[must_use]
-    pub fn resolving(&self) -> bool {
-        self.phase == Phase::Resolving
     }
 
     /// The answer for `token` is in (or its budget ran out). `true` when it
@@ -171,10 +177,10 @@ impl RevealHold {
             Phase::Probing | Phase::Painting | Phase::Rebinding => {
                 if moves {
                     self.phase = Phase::Rebinding;
-                    Entered::Remap(RemapToken(self.next_paint().0))
+                    Entered::Remap(RemapToken(self.next_paint().0), MapToken(self.map))
                 } else {
                     self.phase = Phase::Painting;
-                    Entered::Paint(self.next_paint())
+                    Entered::Paint(self.next_paint(), MapToken(self.map))
                 }
             }
             Phase::Shown => Entered::Place,
@@ -283,14 +289,14 @@ mod tests {
 
     fn paint_of(entered: Entered) -> PaintToken {
         match entered {
-            Entered::Paint(paint) => paint,
+            Entered::Paint(paint, _) => paint,
             other => panic!("expected a paint, got {other:?}"),
         }
     }
 
     fn remap_of(entered: Entered) -> RemapToken {
         match entered {
-            Entered::Remap(remap) => remap,
+            Entered::Remap(remap, _) => remap,
             other => panic!("expected a remap, got {other:?}"),
         }
     }
@@ -299,14 +305,13 @@ mod tests {
     fn an_answer_for_a_superseded_or_hidden_map_is_dropped() {
         let mut hold = RevealHold::default();
         let first = hold.begin_resolve();
-        assert!(hold.resolving());
+        assert_eq!(hold.request_resolve(false), None, "already out");
         assert!(!hold.held(), "nothing is mapped yet");
         assert_eq!(hold.output_known(true), Entered::Ignore);
         let second = hold.begin_resolve();
         assert!(!hold.resolved(first), "a newer map superseded it");
         assert!(hold.resolved(second));
         hold.cancel_resolve();
-        assert!(!hold.resolving());
         assert!(hold.unmapped());
         assert!(!hold.resolved(second), "hidden before the answer came");
 
@@ -321,6 +326,44 @@ mod tests {
         hold.begin_map();
         assert!(!hold.resolved(token));
         assert!(hold.held());
+    }
+
+    #[test]
+    fn a_fresh_pill_never_inherits_the_answer_still_out_for_the_last_one() {
+        let mut hold = RevealHold::default();
+        let first = hold.request_resolve(false).expect("nothing was out");
+        // The same pill, asked again on the next tick, keeps its question.
+        assert_eq!(hold.request_resolve(false), None);
+        assert!(hold.resolved(first));
+        // A new Recording while it is still out asks again.
+        let second = hold.request_resolve(true).expect("a fresh pill asks anew");
+        assert!(!hold.resolved(first), "the earlier answer is dropped");
+        assert!(hold.resolved(second));
+        // Once mapped, the next request is a new question either way.
+        hold.show_bound();
+        assert!(hold.request_resolve(false).is_some());
+    }
+
+    #[test]
+    fn a_second_enter_after_an_ignored_deadline_still_has_one() {
+        let mut hold = RevealHold::default();
+        let probe = hold.begin_map();
+        let Entered::Remap(_, after_remap) = hold.output_known(true) else {
+            panic!("expected a remap");
+        };
+        // The probe's own deadline fires while the remap is queued: ignored.
+        assert!(!hold.deadline(probe));
+        // Then a second enter finds the margins right after all, which drops
+        // the queued remap: the pill must still be shown by a deadline.
+        let Entered::Paint(_, after_paint) = hold.output_known(false) else {
+            panic!("expected a paint");
+        };
+        assert!(hold.held());
+        assert!(
+            hold.deadline(after_paint) || hold.deadline(after_remap),
+            "a deadline armed by an enter still shows the pill"
+        );
+        assert!(!hold.held());
     }
 
     #[test]

@@ -6,16 +6,14 @@
 //! Other compositors (and a Hyprland whose socket doesn't answer in time)
 //! get `None`, and the Overlay falls back to an unbound map.
 
-use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// The longest the Overlay waits on Hyprland before mapping without it.
 pub const IPC_DEADLINE: Duration = Duration::from_millis(50);
 
 /// A `j/monitors` reply is a few KiB per output; past this it is not one.
-const MAX_REPLY_BYTES: u64 = 1024 * 1024;
+pub const MAX_REPLY_BYTES: usize = 1024 * 1024;
 
 /// The connector name (`HDMI-A-1`) of the focused output in a Hyprland
 /// `j/monitors` reply, or `None` if the reply isn't one or names none.
@@ -32,37 +30,19 @@ pub fn focused_monitor(reply: &[u8]) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Asks the running Hyprland, if this session is one, for its focused
-/// output, within [`IPC_DEADLINE`].
+/// The running Hyprland's request socket, if this session is one. The
+/// Overlay asks it `j/monitors` asynchronously, within [`IPC_DEADLINE`], and
+/// reads the reply with [`focused_monitor`].
 #[must_use]
-pub fn focused_output() -> Option<String> {
+pub fn socket_path() -> Option<PathBuf> {
     let instance = std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE")?;
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")?;
-    let socket = PathBuf::from(runtime)
-        .join("hypr")
-        .join(instance)
-        .join(".socket.sock");
-    let deadline = Instant::now() + IPC_DEADLINE;
-    let mut stream = UnixStream::connect(socket).ok()?;
-    stream.set_write_timeout(Some(IPC_DEADLINE)).ok()?;
-    stream.write_all(b"j/monitors").ok()?;
-    let mut reply = Vec::new();
-    let mut chunk = [0_u8; 8192];
-    loop {
-        let left = deadline.checked_duration_since(Instant::now())?;
-        if left.is_zero() {
-            return None;
-        }
-        stream.set_read_timeout(Some(left)).ok()?;
-        match stream.read(&mut chunk).ok()? {
-            0 => break,
-            read => reply.extend_from_slice(&chunk[..read]),
-        }
-        if reply.len() as u64 > MAX_REPLY_BYTES {
-            return None;
-        }
-    }
-    focused_monitor(&reply)
+    Some(
+        PathBuf::from(runtime)
+            .join("hypr")
+            .join(instance)
+            .join(".socket.sock"),
+    )
 }
 
 #[cfg(test)]

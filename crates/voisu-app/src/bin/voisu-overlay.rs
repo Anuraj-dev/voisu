@@ -33,8 +33,8 @@ use voisu_app::overlay::{
     LimitWarningLatch, NoSpeechNotifyLatch, ObservedSignal, OverlayPhase, OverlayView,
     PILL_BAR_COUNT, PILL_BAR_GAP, PILL_BAR_WIDTH, PILL_HEIGHT, PILL_MAX_LINES, PILL_WIDTH,
     PositionWatch, PresentationController, PresentationTracker, RecordingNotifyLatch,
-    RungNotification, STATUS_POLL_PERIOD, STATUS_ROUND_TRIP_DEADLINE, StatusCadence, StatusWorker,
-    TickAction, TickObservation, connect_within, edge_falloff_alpha, fetch_status,
+    RungNotification, STATUS_POLL_PERIOD, STATUS_ROUND_TRIP_DEADLINE, SavedPosition, StatusCadence,
+    StatusWorker, TickAction, TickObservation, connect_within, edge_falloff_alpha, fetch_status,
     limit_notification_body, limit_warning_class, limit_warning_from_response, needs_fresh_map,
     notification_rung_choice, phase_glyph, pill_text, poll_tick, read_until_eof_within,
     recording_bar_height, recording_bar_rgb, recording_identity, recording_remaining,
@@ -561,7 +561,9 @@ fn install_surface_feedback(
     let tick_cadence = Rc::clone(&cadence);
     let mut position_watch = PositionWatch::default();
     // Where the pill goes, and where it sits on the output it was given.
-    let position = Rc::new(Cell::new(voisu_app::config::overlay_position()));
+    let position = Rc::new(RefCell::new(SavedPosition::new(
+        voisu_app::config::overlay_position(),
+    )));
     let placement = PillPlacement::install(
         &window,
         &frame,
@@ -677,7 +679,7 @@ fn install_surface_feedback(
             position_watch.refresh();
         }
         if let Some(saved) = position_watch.take() {
-            position.set(saved);
+            position.borrow_mut().apply(saved);
         }
         // While the pill is being moved, the move window stands in for it.
         let moving = moves
@@ -698,9 +700,10 @@ fn install_surface_feedback(
                 remaining,
             )
         {
-            // A new Recording over a pill still up is mapped afresh, so the
-            // compositor puts it on the output it picks now.
-            if needs_fresh_map(before, view.phase) && window.is_visible() {
+            // A new Recording over a pill still up, or still waiting on its
+            // map, is mapped afresh, so it goes on the output focused now.
+            let fresh = needs_fresh_map(before, view.phase);
+            if fresh && window.is_visible() {
                 window.set_visible(false);
             }
             // Placed before it is shown. A fresh map is mapped by the
@@ -712,7 +715,7 @@ fn install_surface_feedback(
             } else if window.is_visible() {
                 placement.place(pill);
             } else {
-                placement.request_map(pill);
+                placement.request_map(pill, fresh);
             }
             meter.queue_draw();
         }
@@ -908,7 +911,7 @@ struct MoveController {
     /// Where the pill goes, as last read from the config. A move starts from
     /// it; a save reaches it only through the config, once the client has
     /// written it.
-    position: Rc<Cell<OverlayPosition>>,
+    position: Rc<RefCell<SavedPosition>>,
     /// Asks the status tick to re-read the saved position.
     reread: Rc<Cell<bool>>,
     /// A Recording or its processing is on screen.
@@ -988,7 +991,7 @@ impl MoveController {
     }
 
     fn start(&mut self, mut requester: MoveRequester, now: Instant) {
-        let original = self.position.get();
+        let original = self.position.borrow().current();
         let state = Rc::new(RefCell::new(MoveState {
             mode: MoveMode::start(original, now),
             end: None,
@@ -1793,11 +1796,15 @@ struct PillPlacement {
     capsule: gtk::Widget,
     /// Drawn only while held, so a held frame is still committed.
     holder: gtk::DrawingArea,
-    /// The saved position, shared with the status tick. A fresh map reads
-    /// it afresh before it is mapped.
-    position: Rc<Cell<OverlayPosition>>,
+    /// The saved position, shared with the status tick, which alone applies
+    /// the watch's answers. A fresh map reads it afresh before it is mapped
+    /// and pins its read for that map.
+    position: Rc<RefCell<SavedPosition>>,
     /// Who names the focused output before a map, if anyone.
     source: Option<FocusSource>,
+    /// The lookup for the map being resolved. Dropped (which cancels its I/O)
+    /// when that map is superseded or hidden, so at most one is out.
+    lookup: RefCell<Option<gtk::glib::JoinHandle<()>>>,
     /// The output this map is placed by: the one it was bound to, or the
     /// one it entered. `None` until known, and from each fresh map.
     on: RefCell<Option<gtk::gdk::Monitor>>,
@@ -1825,19 +1832,12 @@ impl PillPlacement {
         layers: &gtk::Overlay,
         capsule: &gtk::Widget,
         holder: &gtk::DrawingArea,
-        position: &Rc<Cell<OverlayPosition>>,
+        position: &Rc<RefCell<SavedPosition>>,
     ) -> Rc<Self> {
         let source = focus::focus_source(
             env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some(),
             env::var("XDG_CURRENT_DESKTOP").ok().as_deref(),
         );
-        if source == Some(FocusSource::KWin) {
-            // Connect now, so the first map's budget is spent on the call,
-            // not on the bus handshake. The connection is shared and kept.
-            gtk::glib::MainContext::default().spawn_local(async {
-                session_bus().await;
-            });
-        }
         let placement = Rc::new(Self {
             window: window.clone(),
             frame: frame.clone(),
@@ -1846,6 +1846,7 @@ impl PillPlacement {
             holder: holder.clone(),
             position: Rc::clone(position),
             source,
+            lookup: RefCell::new(None),
             on: RefCell::new(None),
             bound: Cell::new(false),
             reveal: RefCell::new(RevealHold::default()),
@@ -1912,34 +1913,55 @@ impl PillPlacement {
     }
 
     /// Called on each tick while a pill should be up and the window is not
-    /// mapped. The first call asks, off the GTK thread or asynchronously,
-    /// for the saved position and the focused output; the window is mapped
-    /// once both are in (see [`Self::resolved`]). Later calls only update the
-    /// pill to place.
-    fn request_map(self: &Rc<Self>, pill: Size) {
-        self.wanted.set(Some((self.position.get(), pill)));
-        if self.reveal.borrow().resolving() {
+    /// mapped. The first call for a pill asks, off the GTK thread or
+    /// asynchronously, for the saved position and the focused output; the
+    /// window is mapped once both are in or out of time (see
+    /// [`Self::resolved`]). Later calls for the same pill only update the
+    /// pill to place; a `fresh` pill (a new Recording) asks again, dropping
+    /// the earlier lookup, so it never maps on an output looked up for the
+    /// last pill.
+    fn request_map(self: &Rc<Self>, pill: Size, fresh: bool) {
+        self.wanted
+            .set(Some((self.position.borrow().current(), pill)));
+        let Some(token) = self.reveal.borrow_mut().request_resolve(fresh) else {
             return;
-        }
-        let token = self.reveal.borrow_mut().begin_resolve();
+        };
         self.pending.set(None);
-        let source = self.source;
+        let asked_at = self.position.borrow().version();
         // Started now, so it runs alongside the output lookup.
         let saved = gtk::gio::spawn_blocking(voisu_app::config::overlay_position);
-        let placement = Rc::downgrade(self);
-        gtk::glib::MainContext::default().spawn_local(async move {
-            let answer = match source {
-                Some(source) => focused_output(source).await,
-                None => None,
-            };
-            let saved = gtk::glib::future_with_timeout(POSITION_READ_DEADLINE, saved)
+        let saved = async move {
+            gtk::glib::future_with_timeout(POSITION_READ_DEADLINE, saved)
                 .await
                 .ok()
-                .and_then(Result::ok);
+                .and_then(Result::ok)
+        };
+        let answer = focused_output(self.source, self.session_bus());
+        let placement = Rc::downgrade(self);
+        let lookup = gtk::glib::MainContext::default().spawn_local(async move {
+            // Each within its own budget, waited on together.
+            let (answer, saved) = futures_util::future::join(answer, saved).await;
             if let Some(placement) = placement.upgrade() {
-                placement.resolved(token, saved, answer.as_deref());
+                placement.resolved(token, saved.map(|read| (read, asked_at)), answer.as_deref());
             }
         });
+        if let Some(earlier) = self.lookup.replace(Some(lookup)) {
+            earlier.abort();
+        }
+    }
+
+    /// The application's own session bus connection, the KWin lookup's. It
+    /// is never opened here: on the GTK thread that could block on finding
+    /// the bus. GTK's registration made it, and a closed one ends the
+    /// process (GIO's exit-on-close), so there is nothing to reopen.
+    fn session_bus(&self) -> Option<gtk::gio::DBusConnection> {
+        if self.source != Some(FocusSource::KWin) {
+            return None;
+        }
+        self.window
+            .application()
+            .and_then(|application| application.dbus_connection())
+            .filter(|bus| !bus.is_closed())
     }
 
     /// The answers for the map asked for by `token` are in: binds the window
@@ -1950,18 +1972,20 @@ impl PillPlacement {
     fn resolved(
         self: &Rc<Self>,
         token: ResolveToken,
-        saved: Option<OverlayPosition>,
+        saved: Option<(OverlayPosition, u64)>,
         answer: Option<&str>,
     ) {
         if !self.reveal.borrow().resolved(token) {
             trace(format_args!("resolve dropped answer={answer:?}"));
             return;
         }
-        if let Some(saved) = saved {
-            self.position.set(saved);
+        // This map's own read, unless the watch has applied a newer one.
+        if let Some((read, asked_at)) = saved {
+            self.position.borrow_mut().pin(read, asked_at);
         }
         if let Some((_, pill)) = self.wanted.get() {
-            self.wanted.set(Some((self.position.get(), pill)));
+            self.wanted
+                .set(Some((self.position.borrow().current(), pill)));
         }
         let monitor = answer.and_then(|name| self.monitor_named(name));
         if let (Some(source), Some(monitor)) = (self.source, monitor) {
@@ -2007,6 +2031,9 @@ impl PillPlacement {
     /// unmapped.
     fn hidden(&self) {
         self.reveal.borrow_mut().cancel_resolve();
+        if let Some(lookup) = self.lookup.take() {
+            lookup.abort();
+        }
         self.unbind();
     }
 
@@ -2028,7 +2055,7 @@ impl PillPlacement {
             }
             window.set_visible(false);
             if let Some((_, pill)) = placement.wanted.get() {
-                placement.request_map(pill);
+                placement.request_map(pill, true);
             }
         });
     }
@@ -2104,7 +2131,8 @@ impl PillPlacement {
     /// and the surface is only touched when the box's margins change (a new
     /// position or output geometry).
     fn place(&self, pill: Size) {
-        self.wanted.set(Some((self.position.get(), pill)));
+        self.wanted
+            .set(Some((self.position.borrow().current(), pill)));
         self.replace();
     }
 
@@ -2120,16 +2148,20 @@ impl PillPlacement {
         match action {
             // A transparent frame at these margins, even though they are
             // unchanged, before the pill is shown.
-            Entered::Paint(paint) => {
+            // A deadline of its own too: the map's may have fired already,
+            // ignored while a remap was queued.
+            Entered::Paint(paint, map) => {
                 self.on.replace(Some(monitor.clone()));
                 self.replace();
                 self.arm(paint);
+                self.arm_deadline(map);
             }
             // Not from inside the enter signal: the remap unmaps the surface
             // that is sending it. The output is kept now, so nothing that
             // runs first loses it.
-            Entered::Remap(token) => {
+            Entered::Remap(token, map) => {
                 self.on.replace(Some(monitor.clone()));
+                self.arm_deadline(map);
                 let placement = Rc::downgrade(self);
                 let monitor = monitor.clone();
                 gtk::glib::idle_add_local_once(move || {
@@ -2151,6 +2183,20 @@ impl PillPlacement {
     /// held, so the pill is never moved while mapped.
     fn remap(self: &Rc<Self>, token: RemapToken, monitor: &gtk::gdk::Monitor) {
         if !self.reveal.borrow_mut().rebind(token) {
+            return;
+        }
+        // Unplugged since its enter: never bind a gone output (KWin would
+        // close the surface). Resolve afresh instead, still held.
+        if monitor_size(monitor).is_none() {
+            trace(format_args!(
+                "remap output={} gone",
+                monitor.connector().unwrap_or_default()
+            ));
+            self.window.set_visible(false);
+            self.on.replace(None);
+            if let Some((_, pill)) = self.wanted.get() {
+                self.request_map(pill, true);
+            }
             return;
         }
         let layout = self.layout(Some(monitor));
@@ -2254,43 +2300,23 @@ impl PillPlacement {
     }
 }
 
-thread_local! {
-    /// The session bus connection the KWin lookup reuses. GIO keeps its
-    /// shared one only while someone holds it.
-    static SESSION_BUS: RefCell<Option<gtk::gio::DBusConnection>> = const { RefCell::new(None) };
-}
-
-/// The session bus connection, made once and kept; `None` while there is no
-/// session bus.
-async fn session_bus() -> Option<gtk::gio::DBusConnection> {
-    if let Some(bus) = SESSION_BUS.with_borrow(Clone::clone) {
-        return Some(bus);
-    }
-    match gtk::gio::bus_get_future(gtk::gio::BusType::Session).await {
-        Ok(bus) => {
-            SESSION_BUS.set(Some(bus.clone()));
-            Some(bus)
-        }
-        Err(error) => {
-            trace(format_args!("session bus unavailable error={error}"));
-            None
-        }
-    }
-}
-
 /// Asks `source` for its focused output's connector name, within its budget.
-async fn focused_output(source: FocusSource) -> Option<String> {
-    match source {
+/// Nothing here blocks or holds a worker thread: dropping the future (on
+/// timeout, or when its map is superseded) cancels the I/O.
+async fn focused_output(
+    source: Option<FocusSource>,
+    bus: Option<gtk::gio::DBusConnection>,
+) -> Option<String> {
+    match source? {
         FocusSource::Hyprland => gtk::glib::future_with_timeout(
             voisu_app::overlay::hyprland::IPC_DEADLINE,
-            gtk::gio::spawn_blocking(voisu_app::overlay::hyprland::focused_output),
+            hyprland_focused_output(),
         )
         .await
-        .ok()?
-        .ok()?,
+        .ok()
+        .flatten(),
         FocusSource::KWin => gtk::glib::future_with_timeout(focus::KWIN_DEADLINE, async {
-            let bus = session_bus().await?;
-            let reply = bus
+            let reply = bus?
                 .call_future(
                     Some(focus::KWIN_BUS),
                     focus::KWIN_PATH,
@@ -2311,11 +2337,48 @@ async fn focused_output(source: FocusSource) -> Option<String> {
     }
 }
 
+/// Asks Hyprland's request socket `j/monitors` on the GTK main context, with
+/// a nonblocking connect (a full backlog fails at once rather than waiting).
+async fn hyprland_focused_output() -> Option<String> {
+    use voisu_app::overlay::hyprland;
+    let path = hyprland::socket_path()?;
+    let client = gtk::gio::SocketClient::new();
+    // A Unix socket needs no proxy lookup, which would use a thread.
+    client.set_enable_proxy(false);
+    let connection = client
+        .connect_future(&gtk::gio::UnixSocketAddress::new(&path))
+        .await
+        .ok()?;
+    let (_, _, partial) = connection
+        .output_stream()
+        .write_all_future(b"j/monitors", gtk::glib::Priority::DEFAULT)
+        .await
+        .ok()?;
+    if partial.is_some() {
+        return None;
+    }
+    let input = connection.input_stream();
+    let mut reply = Vec::new();
+    loop {
+        let chunk = input
+            .read_bytes_future(64 * 1024, gtk::glib::Priority::DEFAULT)
+            .await
+            .ok()?;
+        if chunk.is_empty() {
+            break;
+        }
+        if reply.len() + chunk.len() > hyprland::MAX_REPLY_BYTES {
+            return None;
+        }
+        reply.extend_from_slice(&chunk);
+    }
+    hyprland::focused_monitor(&reply)
+}
+
 /// An output's logical size, while it is still connected.
 fn monitor_size(monitor: &gtk::gdk::Monitor) -> Option<Size> {
     let geometry = monitor.geometry();
-    monitor
-        .is_valid()
+    (monitor.is_valid() && geometry.width() > 0 && geometry.height() > 0)
         .then_some((geometry.width(), geometry.height()))
 }
 
