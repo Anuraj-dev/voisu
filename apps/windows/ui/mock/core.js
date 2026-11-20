@@ -34,6 +34,8 @@ const SCREENS = [
   // What's new with the pending update's notes under "Ready to install".
   'whats-new-pending',
   'replace-key',
+  // Dictation with the overlay in move mode.
+  'overlay-moving',
 ];
 if (!SCREENS.includes(screen)) console.warn(`unknown ?screen=${asked}; try ${SCREENS.join(', ')}`);
 const pending = screen === 'update' || screen === 'whats-new-pending';
@@ -46,6 +48,8 @@ const state = {
   version: '0.79.0',
   autoPaste: true,
   overlaySize: 'medium',
+  overlayPosition: null,
+  overlayMoving: false,
   boostWords: ['Voisu', 'Deepgram'],
   tone: 'formal',
   trigger: { key: DEFAULT_KEY, label: mac ? 'Ctrl+Option' : 'Ctrl+Win', warnings: [], isDefault: true },
@@ -112,6 +116,19 @@ const COMMANDS = {
   set_auto_paste: ({ enabled }) => (state.autoPaste = enabled),
   set_tone: ({ tone }) => (state.tone = tone),
   set_overlay_size: ({ size }) => (state.overlaySize = size),
+  start_overlay_move: () => {
+    console.info('mock: overlay shown in move mode');
+    state.overlayMoving = true;
+    emit('state-changed', null);
+  },
+  // Done saves a spot left of centre, as if the pill were dragged there.
+  finish_overlay_move: ({ save }) => {
+    if (save && state.overlayMoving) state.overlayPosition = { x: 0.3, y: 0.0 };
+    state.overlayMoving = false;
+    emit('state-changed', null);
+    return state.overlayPosition;
+  },
+  reset_overlay_position: () => (state.overlayPosition = null),
   set_autostart: ({ enabled }) => (state.autostart = enabled),
   set_boost_words: ({ words }) => (state.boostWords = [...new Set(words.map((w) => w.trim()).filter(Boolean))]),
   save_keys: async ({ groq, deepgram }) => {
@@ -200,6 +217,9 @@ async function drive() {
     await open(screen);
   } else if (screen === 'whats-new-pending') {
     await open('whats-new');
+  } else if (screen === 'overlay-moving') {
+    await open('dictation');
+    (await until(() => $('#move-overlay'))).click();
   } else if (screen === 'replace-key') {
     await open('keys');
     (await until(() => $('button[aria-label="Replace Groq key"]'))).click();

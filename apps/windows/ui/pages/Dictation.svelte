@@ -71,7 +71,57 @@
       if (current) current.checked = true;
     }
   }
+
+  let positionBusy = $state(false);
+  const moving = $derived(app.overlayMoving);
+
+  async function positionAction(run, failure) {
+    if (positionBusy) return;
+    positionBusy = true;
+    errors.position = '';
+    try {
+      await run();
+    } catch (e) {
+      errors.position = typeof e === 'string' ? e : failure;
+    } finally {
+      positionBusy = false;
+    }
+  }
+
+  const startMove = () =>
+    positionAction(async () => {
+      await invoke('start_overlay_move');
+      ui.app.overlayMoving = true;
+    }, 'Could not show the overlay.');
+
+  // Done (`save`) or Cancel.
+  const finishMove = (save) =>
+    positionAction(async () => {
+      ui.app.overlayPosition = await invoke('finish_overlay_move', { save });
+      ui.app.overlayMoving = false;
+    }, 'Could not save the overlay position.');
+
+  const resetPosition = () =>
+    positionAction(async () => {
+      ui.app.overlayPosition = await invoke('reset_overlay_position');
+    }, 'Could not reset the overlay position.');
+
+  // The overlay never takes focus, so Esc is heard here.
+  function onKeydown(event) {
+    if (moving && event.key === 'Escape' && !event.defaultPrevented) {
+      event.preventDefault();
+      finishMove(false);
+    }
+  }
+
+  // Leaving the page while moving cancels, so the pill never stays grabbable
+  // with no Done in sight.
+  $effect(() => () => {
+    if (ui.app.overlayMoving) invoke('finish_overlay_move', { save: false }).catch(() => {});
+  });
 </script>
+
+<svelte:window onkeydown={onKeydown} />
 
 <header class="page-head">
   <h1>Dictation</h1>
@@ -134,9 +184,9 @@
   <div class="row">
     <span class="row-text">
       <span id="size-label">Overlay size</span>
-      <span class="hint">The capsule that shows while you dictate.</span>
+      <span class="hint">The pill that shows while you dictate.</span>
     </span>
-    <div class="segmented" role="radiogroup" aria-labelledby="size-label">
+    <div class="segmented" class:off={moving} role="radiogroup" aria-labelledby="size-label">
       {#each SIZES as size (size.id)}
         <label class:on={app.overlaySize === size.id}>
           <input
@@ -144,6 +194,7 @@
             name="overlay-size"
             value={size.id}
             checked={app.overlaySize === size.id}
+            disabled={moving}
             onchange={() => chooseSize(size.id)}
           />
           {size.name}
@@ -152,6 +203,31 @@
     </div>
   </div>
   <ErrorLine message={errors.appearance} />
+  <div class="row" role="group" aria-labelledby="position-label">
+    <span class="row-text" aria-live="polite">
+      {#if moving}
+        <span id="position-label">Drag the overlay where you want it</span>
+        <span class="hint">Esc cancels.</span>
+      {:else}
+        <span id="position-label">Overlay position</span>
+        <span class="hint">{app.overlayPosition ? 'Where you put it.' : 'Top centre.'}</span>
+      {/if}
+    </span>
+    <div class="actions">
+      {#if moving}
+        <button type="button" class="pill" disabled={positionBusy} onclick={() => finishMove(false)}>Cancel</button>
+        <button type="button" class="primary small" disabled={positionBusy} onclick={() => finishMove(true)}>Done</button>
+      {:else}
+        <button type="button" class="pill" id="move-overlay" disabled={positionBusy} onclick={startMove}>
+          Move overlay
+        </button>
+        <button type="button" class="pill" disabled={positionBusy || !app.overlayPosition} onclick={resetPosition}>
+          Reset position
+        </button>
+      {/if}
+    </div>
+  </div>
+  <ErrorLine message={errors.position} />
 </div>
 
 <style>
@@ -166,5 +242,20 @@
   }
   .link {
     align-self: flex-start;
+  }
+  .actions {
+    display: flex;
+    flex: none;
+    align-items: center;
+    gap: 6px;
+  }
+  .primary.small {
+    padding: 3px 14px;
+  }
+  .segmented.off {
+    opacity: 0.5;
+  }
+  .segmented.off input {
+    cursor: not-allowed;
   }
 </style>

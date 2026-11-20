@@ -13,6 +13,11 @@ export const ui = $state({
     version: '',
     autoPaste: true,
     overlaySize: 'medium',
+    // { x, y }: the pill centre as fractions of the work area; null is the
+    // default spot, top centre.
+    overlayPosition: null,
+    // Settings' "Move overlay" is under way.
+    overlayMoving: false,
     boostWords: [],
     tone: 'formal',
     // Blank until get_state names this platform's Trigger Key; the presets
