@@ -70,7 +70,8 @@ Do not edit the version by hand — the next auto-bump overwrites it.
 
 CI is the oracle (there is no local clippy/lint tooling assumed). A PR must pass:
 
-- **Tests + flake gate** — `cargo test --workspace`, including the flake guard.
+- **Tests + flake gate** — `cargo nextest run --workspace`, then two more
+  voisu-app passes as the flake guard.
 - **Clippy** — `cargo clippy` with `-D warnings` (warnings fail the build).
 - **cargo-audit** — no known-vulnerable dependencies.
 

@@ -25,8 +25,8 @@ fn uses_line_contains(ci: &str, needle: &str) -> bool {
 fn workspace_test_gate_uses_committed_lockfile() {
     let ci = ci_workflow();
     assert!(
-        ci.contains("cargo test --workspace --locked"),
-        "default CI test gate must consume Cargo.lock: cargo test --workspace --locked"
+        ci.contains("cargo nextest run --workspace --locked"),
+        "default CI test gate must consume Cargo.lock: cargo nextest run --workspace --locked"
     );
     assert!(
         ci.contains("cargo test --manifest-path tools/transcript-quality/Cargo.toml --locked"),
