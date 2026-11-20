@@ -122,12 +122,27 @@ jobs:
       # vulnerabilities. zvariant, zvariant_derive and zbus_names were folded
       # into zbus 6. They come in only through zbus 5 (voisu-app's portal and
       # session code); drop these ignores when that code moves to zbus 6.
+      # RUSTSEC-2026-0574..0582: heapless 0.8.0, pulled only by flacenc 0.5.1
+      # (voisu-cloud's FLAC upload encoder; 0.5.1 is the latest flacenc). They
+      # cover IndexMap, Deque, SortedLinkedList, Spsc, the treiber pool and
+      # panicking element Drop. flacenc uses only heapless::Vec of plain
+      # integers, so none of them is reachable. Drop these when flacenc moves
+      # to heapless >= 0.9.4.
       - name: cargo audit
         run: >-
           cargo audit --deny warnings
           --ignore RUSTSEC-2026-0370
           --ignore RUSTSEC-2026-0371
           --ignore RUSTSEC-2026-0372
+          --ignore RUSTSEC-2026-0574
+          --ignore RUSTSEC-2026-0575
+          --ignore RUSTSEC-2026-0576
+          --ignore RUSTSEC-2026-0577
+          --ignore RUSTSEC-2026-0578
+          --ignore RUSTSEC-2026-0579
+          --ignore RUSTSEC-2026-0580
+          --ignore RUSTSEC-2026-0581
+          --ignore RUSTSEC-2026-0582
       # tools/transcript-quality keeps its own Cargo.lock (excluded from the
       # root workspace), so its dependency set needs its own audit pass.
       - name: cargo audit (tools/transcript-quality lockfile)
