@@ -2,9 +2,11 @@
 //! mapped again first. Pure state, so the order of compositor events is
 //! tested without one.
 //!
-//! Where the compositor says which output is focused (Hyprland), the Overlay
-//! binds the surface there at its final margins before mapping it, and the
-//! pill shows at once ([`RevealHold::show_bound`]). Elsewhere the surface is
+//! A fresh map first asks the compositor which output is focused, with the
+//! window still unmapped ([`RevealHold::begin_resolve`]); an answer that
+//! comes after a newer map or a hide is dropped. Where it says (Hyprland,
+//! KWin), the Overlay binds the surface there at its final margins before
+//! mapping it, and the pill shows at once ([`RevealHold::show_bound`]). Elsewhere the surface is
 //! mapped unbound and learns its output only after its first buffer (the
 //! compositor's `wl_surface.enter`), so that map is a held probe: the pill
 //! draws transparent frames at margins safe on every output until the output
@@ -35,6 +37,10 @@ pub struct MapToken(u64);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PaintToken(u64);
 
+/// Names one question to the compositor about the focused output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResolveToken(u64);
+
 /// Names one remap the probe asked for, run later off the enter signal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RemapToken(u64);
@@ -59,6 +65,8 @@ pub enum Entered {
 enum Phase {
     /// Not on screen.
     Unmapped,
+    /// Not on screen yet: waiting to learn the focused output.
+    Resolving,
     /// An unbound probe, held, output not yet known this map.
     Probing,
     /// Held, at the right margins: waiting for a frame there to be painted.
@@ -92,6 +100,37 @@ impl Default for RevealHold {
 }
 
 impl RevealHold {
+    /// A fresh map is wanted. Ask for the focused output with the token, and
+    /// map once [`RevealHold::resolved`] accepts the answer.
+    pub fn begin_resolve(&mut self) -> ResolveToken {
+        self.supersede();
+        self.phase = Phase::Resolving;
+        self.bound = false;
+        ResolveToken(self.map)
+    }
+
+    /// Whether a fresh map is waiting on its answer.
+    #[must_use]
+    pub fn resolving(&self) -> bool {
+        self.phase == Phase::Resolving
+    }
+
+    /// The answer for `token` is in (or its budget ran out). `true` when it
+    /// still stands: map now, with [`RevealHold::show_bound`] or
+    /// [`RevealHold::begin_map`].
+    #[must_use]
+    pub fn resolved(&self, token: ResolveToken) -> bool {
+        self.phase == Phase::Resolving && token.0 == self.map
+    }
+
+    /// The pill was hidden before its answer came: drop the answer.
+    pub fn cancel_resolve(&mut self) {
+        if self.phase == Phase::Resolving {
+            self.supersede();
+            self.phase = Phase::Unmapped;
+        }
+    }
+
     /// A fresh map bound to the focused output before it is mapped, at its
     /// final margins: nothing to wait for, so it is seen at once.
     pub fn show_bound(&mut self) {
@@ -139,7 +178,7 @@ impl RevealHold {
                 }
             }
             Phase::Shown => Entered::Place,
-            Phase::Unmapped | Phase::Remapping => Entered::Ignore,
+            Phase::Unmapped | Phase::Resolving | Phase::Remapping => Entered::Ignore,
         }
     }
 
@@ -180,10 +219,13 @@ impl RevealHold {
     }
 
     /// The deadline armed by `token` fired. `true` when that map is still
-    /// held: show the pill now, where it is. A probe waiting on its remap
-    /// shows unbound.
+    /// held: show the pill now, where it is. A probe whose output is known
+    /// and whose remap is already queued waits for that remap instead, which
+    /// arms a deadline of its own.
     pub fn deadline(&mut self, token: MapToken) -> bool {
-        self.reveal_if(self.held() && token.0 == self.map)
+        self.reveal_if(
+            matches!(self.phase, Phase::Probing | Phase::Painting) && token.0 == self.map,
+        )
     }
 
     /// Mapped (or between the two maps of a rebind) and not yet shown: the
@@ -194,6 +236,12 @@ impl RevealHold {
             self.phase,
             Phase::Probing | Phase::Painting | Phase::Rebinding | Phase::Remapping
         )
+    }
+
+    /// Off screen, with no map under way or asked for.
+    #[must_use]
+    pub fn unmapped(&self) -> bool {
+        self.phase == Phase::Unmapped
     }
 
     /// Whether the surface is bound to an output.
@@ -245,6 +293,34 @@ mod tests {
             Entered::Remap(remap) => remap,
             other => panic!("expected a remap, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_answer_for_a_superseded_or_hidden_map_is_dropped() {
+        let mut hold = RevealHold::default();
+        let first = hold.begin_resolve();
+        assert!(hold.resolving());
+        assert!(!hold.held(), "nothing is mapped yet");
+        assert_eq!(hold.output_known(true), Entered::Ignore);
+        let second = hold.begin_resolve();
+        assert!(!hold.resolved(first), "a newer map superseded it");
+        assert!(hold.resolved(second));
+        hold.cancel_resolve();
+        assert!(!hold.resolving());
+        assert!(hold.unmapped());
+        assert!(!hold.resolved(second), "hidden before the answer came");
+
+        // An accepted answer maps, and the token is spent with it.
+        let token = hold.begin_resolve();
+        assert!(hold.resolved(token));
+        hold.show_bound();
+        assert!(!hold.resolved(token));
+        hold.cancel_resolve();
+        assert!(hold.bound(), "cancelling only touches a pending answer");
+        let token = hold.begin_resolve();
+        hold.begin_map();
+        assert!(!hold.resolved(token));
+        assert!(hold.held());
     }
 
     #[test]
@@ -330,16 +406,36 @@ mod tests {
     }
 
     #[test]
+    fn a_deadline_waits_for_a_remap_already_queued() {
+        let mut hold = RevealHold::default();
+        let probe = hold.begin_map();
+        let remap = remap_of(hold.output_known(true));
+        // The timer fires before the idle remap runs.
+        assert!(
+            !hold.deadline(probe),
+            "the known output must not be dropped"
+        );
+        assert!(hold.held());
+        assert!(hold.rebind(remap));
+        assert!(hold.unmap());
+        let (map, paint) = hold.remapped().unwrap();
+        assert!(hold.bound());
+        // The remap's own deadline still bounds the hold.
+        assert!(hold.deadline(map));
+        assert!(!hold.held());
+        assert!(!hold.painted(paint));
+    }
+
+    #[test]
     fn the_deadline_shows_the_probe_where_it_is_and_a_late_enter_places_it() {
         let mut hold = RevealHold::default();
         let map = hold.begin_map();
-        let remap = remap_of(hold.output_known(true));
+        let paint = paint_of(hold.output_known(false));
         assert!(hold.deadline(map));
         assert!(!hold.held());
         assert!(!hold.bound());
         assert!(!hold.margins_frozen());
-        assert!(!hold.rebind(remap), "the remap died with the deadline");
-        assert_eq!(hold.remapped(), None);
+        assert!(!hold.painted(paint), "the paint died with the deadline");
 
         // With no enter at all, the deadline shows it the same way, and an
         // enter that comes after only places it, with no hold.

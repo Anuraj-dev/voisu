@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+pub mod focus;
 pub mod hyprland;
 pub mod move_mode;
 pub mod placement;

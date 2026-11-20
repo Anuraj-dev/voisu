@@ -19,12 +19,13 @@ use voisu_app::feedback::{
     select_feedback_backend,
 };
 use voisu_app::local_overlay::TriggerRepeatLatch;
+use voisu_app::overlay::focus::{self, FocusSource};
 use voisu_app::overlay::move_mode::{
     CancelReason, MoveEnd, MoveKey, MoveListener, MoveMode, MoveReply, MoveRequester, settle_save,
 };
 use voisu_app::overlay::placement::{self, MOVE_PILL, PILL_BOX, Size};
 use voisu_app::overlay::reveal::{
-    Entered, MapToken, PaintToken, REVEAL_DEADLINE, RemapToken, RevealHold,
+    Entered, MapToken, PaintToken, REVEAL_DEADLINE, RemapToken, ResolveToken, RevealHold,
 };
 use voisu_app::overlay::waveform::{Waveform, poll_target};
 use voisu_app::overlay::{
@@ -561,7 +562,14 @@ fn install_surface_feedback(
     let mut position_watch = PositionWatch::default();
     // Where the pill goes, and where it sits on the output it was given.
     let position = Rc::new(Cell::new(voisu_app::config::overlay_position()));
-    let placement = PillPlacement::install(&window, &frame, &layers, capsule.upcast_ref(), &holder);
+    let placement = PillPlacement::install(
+        &window,
+        &frame,
+        &layers,
+        capsule.upcast_ref(),
+        &holder,
+        &position,
+    );
     // Set when the config file changes or a move is saved: re-read the
     // position, so a change lands even while a result pill is on screen.
     let reread = Rc::new(Cell::new(false));
@@ -572,6 +580,7 @@ fn install_surface_feedback(
         let moves = Rc::new(RefCell::new(MoveController {
             application: application.clone(),
             main_window: window.clone(),
+            placement: Rc::clone(&placement),
             listener,
             position: Rc::clone(&position),
             reread: Rc::clone(&reread),
@@ -694,22 +703,27 @@ fn install_surface_feedback(
             if needs_fresh_map(before, view.phase) && window.is_visible() {
                 window.set_visible(false);
             }
-            // Placed before it is shown. A fresh map is held transparent
-            // until it is placed by the output it landed on, so it never
-            // appears at a stale spot or jumps once the output is known.
-            if window.is_layer_window() {
-                if window.is_visible() {
-                    placement.place(position.get(), pill);
-                } else {
-                    placement.begin_map(position.get(), pill);
-                }
+            // Placed before it is shown. A fresh map is mapped by the
+            // placement once it knows the saved position and, where the
+            // compositor says, the focused output; it never appears at a
+            // stale spot or jumps once the output is known.
+            if !window.is_layer_window() {
+                window.set_visible(true);
+            } else if window.is_visible() {
+                placement.place(pill);
+            } else {
+                placement.request_map(pill);
             }
-            window.set_visible(true);
             meter.queue_draw();
         }
-        // Hidden: the next pill goes wherever the compositor picks again.
-        if view.phase == OverlayPhase::Hidden && window.is_layer_window() && !window.is_visible() {
-            placement.unbind();
+        // Hidden, or standing aside for move mode: a map still waiting on its
+        // answer is dropped, and the next pill goes wherever the compositor
+        // picks again.
+        if (moving || view.phase == OverlayPhase::Hidden)
+            && window.is_layer_window()
+            && !window.is_visible()
+        {
+            placement.hidden();
         }
         match level_latch.borrow_mut().observe(signal) {
             LevelPollAction::Arm => {
@@ -888,6 +902,8 @@ fn refuse_moves(reason: &str) -> Option<MoveListener> {
 struct MoveController {
     application: gtk::Application,
     main_window: gtk::ApplicationWindow,
+    /// The main pill's placement, so a move drops a map still resolving.
+    placement: Rc<PillPlacement>,
     listener: Rc<MoveListener>,
     /// Where the pill goes, as last read from the config. A move starts from
     /// it; a save reaches it only through the config, once the client has
@@ -983,6 +999,11 @@ impl MoveController {
             return;
         }
         self.main_window.set_visible(false);
+        // A fresh map still waiting on its answer must not map the pill
+        // under the move window.
+        if self.main_window.is_layer_window() {
+            self.placement.hidden();
+        }
         window.present();
         eprintln!("overlay_move start position={original}");
         self.session = Some(MoveSession {
@@ -1746,10 +1767,12 @@ fn render_surface(
 /// Hyprland, which animates a mapped layer's margin changes, has nothing to
 /// slide.
 ///
-/// Which output, before the map: on Hyprland its IPC names the focused
-/// output, and the surface is bound there at that output's margins before it
-/// is mapped, so the pill shows at once and in place. Elsewhere (KDE, or a
-/// Hyprland whose IPC didn't answer) a fresh map is unbound and the Overlay
+/// Which output, before the map: a fresh map waits, unmapped, for the saved
+/// position (read afresh) and for the compositor to name its focused output
+/// (Hyprland's IPC, or KWin's D-Bus), each within a short budget. The surface
+/// is then bound to that output at its margins before it is mapped, so the
+/// pill shows at once and in place. With no answer (another compositor, or
+/// one that didn't answer in time) a fresh map is unbound and the Overlay
 /// only learns its output when the surface enters it, after its first frame.
 /// Each such map gets a new `wl_surface` (the window is unrealized first),
 /// since hiding and showing the same one brings no new enter. Until the enter
@@ -1770,6 +1793,11 @@ struct PillPlacement {
     capsule: gtk::Widget,
     /// Drawn only while held, so a held frame is still committed.
     holder: gtk::DrawingArea,
+    /// The saved position, shared with the status tick. A fresh map reads
+    /// it afresh before it is mapped.
+    position: Rc<Cell<OverlayPosition>>,
+    /// Who names the focused output before a map, if anyone.
+    source: Option<FocusSource>,
     /// The output this map is placed by: the one it was bound to, or the
     /// one it entered. `None` until known, and from each fresh map.
     on: RefCell<Option<gtk::gdk::Monitor>>,
@@ -1786,6 +1814,10 @@ struct PillPlacement {
     offset: Cell<Option<(i32, i32)>>,
 }
 
+/// The longest a fresh map waits on the saved position before it is mapped
+/// with the one last read.
+const POSITION_READ_DEADLINE: Duration = Duration::from_millis(50);
+
 impl PillPlacement {
     fn install(
         window: &gtk::ApplicationWindow,
@@ -1793,13 +1825,27 @@ impl PillPlacement {
         layers: &gtk::Overlay,
         capsule: &gtk::Widget,
         holder: &gtk::DrawingArea,
+        position: &Rc<Cell<OverlayPosition>>,
     ) -> Rc<Self> {
+        let source = focus::focus_source(
+            env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some(),
+            env::var("XDG_CURRENT_DESKTOP").ok().as_deref(),
+        );
+        if source == Some(FocusSource::KWin) {
+            // Connect now, so the first map's budget is spent on the call,
+            // not on the bus handshake. The connection is shared and kept.
+            gtk::glib::MainContext::default().spawn_local(async {
+                session_bus().await;
+            });
+        }
         let placement = Rc::new(Self {
             window: window.clone(),
             frame: frame.clone(),
             layers: layers.clone(),
             capsule: capsule.clone(),
             holder: holder.clone(),
+            position: Rc::clone(position),
+            source,
             on: RefCell::new(None),
             bound: Cell::new(false),
             reveal: RefCell::new(RevealHold::default()),
@@ -1844,12 +1890,19 @@ impl PillPlacement {
         // keeps the pill held for the map that follows.
         window.connect_unmap({
             let placement = Rc::downgrade(&placement);
-            move |_| {
+            move |window| {
                 if let Some(placement) = placement.upgrade() {
                     let rebinding = placement.reveal.borrow_mut().unmap();
                     placement.pending.set(None);
-                    trace(format_args!("unmap rebinding={rebinding}"));
-                    if !rebinding {
+                    // Unmapped while still meant to be up: gtk4-layer-shell
+                    // remapping it itself, as when its bound output goes.
+                    let remapped = !rebinding && window.is_visible();
+                    trace(format_args!(
+                        "unmap rebinding={rebinding} remapped={remapped}"
+                    ));
+                    if remapped {
+                        placement.replaced_by_compositor();
+                    } else if !rebinding {
                         placement.show();
                     }
                 }
@@ -1858,30 +1911,81 @@ impl PillPlacement {
         placement
     }
 
-    /// Called just before the surface is mapped afresh. Binds it to the
-    /// output Hyprland has focused, at its margins, and shows it; or, with no
-    /// such answer, maps it unbound on a new surface, held at safe margins,
-    /// with the deadline armed.
-    fn begin_map(self: &Rc<Self>, position: OverlayPosition, pill: Size) {
-        self.wanted.set(Some((position, pill)));
+    /// Called on each tick while a pill should be up and the window is not
+    /// mapped. The first call asks, off the GTK thread or asynchronously,
+    /// for the saved position and the focused output; the window is mapped
+    /// once both are in (see [`Self::resolved`]). Later calls only update the
+    /// pill to place.
+    fn request_map(self: &Rc<Self>, pill: Size) {
+        self.wanted.set(Some((self.position.get(), pill)));
+        if self.reveal.borrow().resolving() {
+            return;
+        }
+        let token = self.reveal.borrow_mut().begin_resolve();
         self.pending.set(None);
-        let focused = voisu_app::overlay::hyprland::focused_output();
-        let monitor = focused.as_deref().and_then(|name| self.monitor_named(name));
-        if let Some(monitor) = monitor {
+        let source = self.source;
+        // Started now, so it runs alongside the output lookup.
+        let saved = gtk::gio::spawn_blocking(voisu_app::config::overlay_position);
+        let placement = Rc::downgrade(self);
+        gtk::glib::MainContext::default().spawn_local(async move {
+            let answer = match source {
+                Some(source) => focused_output(source).await,
+                None => None,
+            };
+            let saved = gtk::glib::future_with_timeout(POSITION_READ_DEADLINE, saved)
+                .await
+                .ok()
+                .and_then(Result::ok);
+            if let Some(placement) = placement.upgrade() {
+                placement.resolved(token, saved, answer.as_deref());
+            }
+        });
+    }
+
+    /// The answers for the map asked for by `token` are in: binds the window
+    /// to the named output at its margins and shows it; or, with no such
+    /// answer, maps it unbound on a new surface, held at safe margins, with
+    /// the deadline armed. An answer for a map since hidden or superseded is
+    /// dropped.
+    fn resolved(
+        self: &Rc<Self>,
+        token: ResolveToken,
+        saved: Option<OverlayPosition>,
+        answer: Option<&str>,
+    ) {
+        if !self.reveal.borrow().resolved(token) {
+            trace(format_args!("resolve dropped answer={answer:?}"));
+            return;
+        }
+        if let Some(saved) = saved {
+            self.position.set(saved);
+        }
+        if let Some((_, pill)) = self.wanted.get() {
+            self.wanted.set(Some((self.position.get(), pill)));
+        }
+        let monitor = answer.and_then(|name| self.monitor_named(name));
+        if let (Some(source), Some(monitor)) = (self.source, monitor) {
             self.bind(&monitor);
             self.reveal.borrow_mut().show_bound();
             self.show();
             self.replace();
             trace(format_args!(
-                "resolved output via hyprland ipc={} margins={:?}",
+                "resolved output via {} {}={} margins={:?}",
+                source.name(),
+                match source {
+                    FocusSource::Hyprland => "ipc",
+                    FocusSource::KWin => "dbus",
+                },
                 monitor.connector().unwrap_or_default(),
                 self.placed.get()
             ));
+            self.window.set_visible(true);
             return;
         }
         trace(format_args!(
-            "resolved output via fallback ipc={}",
-            focused.as_deref().unwrap_or("none")
+            "resolved output via fallback source={} answer={}",
+            self.source.map_or("none", FocusSource::name),
+            answer.unwrap_or("none")
         ));
         self.unbind();
         self.on.replace(None);
@@ -1894,14 +1998,56 @@ impl PillPlacement {
         self.replace();
         trace(format_args!("map probe margins={:?}", self.placed.get()));
         self.arm_deadline(token);
+        self.window.set_visible(true);
+    }
+
+    /// The pill is off screen (or move mode stands in for it): drops a map
+    /// still waiting on its answers, and the binding, so the compositor
+    /// picks the next map's output. Called only while the window is
+    /// unmapped.
+    fn hidden(&self) {
+        self.reveal.borrow_mut().cancel_resolve();
+        self.unbind();
+    }
+
+    /// gtk4-layer-shell unmapped a pill still meant to be up and maps it
+    /// again itself (its bound output went away). That map is unbound and
+    /// outside the reveal, so it is held transparent and, once it is up,
+    /// replaced by a fresh map of the Overlay's own.
+    fn replaced_by_compositor(self: &Rc<Self>) {
+        self.hold();
+        let placement = Rc::downgrade(self);
+        gtk::glib::idle_add_local_once(move || {
+            let Some(placement) = placement.upgrade() else {
+                return;
+            };
+            let window = &placement.window;
+            // A hide, or a map of the Overlay's own, came first.
+            if !window.is_visible() || !placement.reveal.borrow().unmapped() {
+                return;
+            }
+            window.set_visible(false);
+            if let Some((_, pill)) = placement.wanted.get() {
+                placement.request_map(pill);
+            }
+        });
     }
 
     /// The connected output with this connector name.
     fn monitor_named(&self, name: &str) -> Option<gtk::gdk::Monitor> {
         let monitors = gtk::prelude::RootExt::display(&self.window).monitors();
-        (0..monitors.n_items())
+        let monitors: Vec<gtk::gdk::Monitor> = (0..monitors.n_items())
             .filter_map(|index| monitors.item(index)?.downcast::<gtk::gdk::Monitor>().ok())
-            .find(|monitor| monitor.is_valid() && monitor.connector().as_deref() == Some(name))
+            .collect();
+        let connectors: Vec<_> = monitors
+            .iter()
+            .map(|monitor| (monitor.connector(), monitor_size(monitor)))
+            .collect();
+        let outputs: Vec<_> = connectors
+            .iter()
+            .map(|(connector, size)| (connector.as_deref(), *size))
+            .collect();
+        focus::output_named(name, &outputs).map(|index| monitors[index].clone())
     }
 
     /// Binds the window to `monitor`, which then places it. Called only
@@ -1953,12 +2099,12 @@ impl PillPlacement {
         });
     }
 
-    /// Puts a pill of `pill` size at `position`. Called on every visible
-    /// tick; a new pill size only moves the capsule inside the box, and the
-    /// surface is only touched when the box's margins change (a new position
-    /// or output geometry).
-    fn place(&self, position: OverlayPosition, pill: Size) {
-        self.wanted.set(Some((position, pill)));
+    /// Puts a pill of `pill` size at the saved position. Called on every
+    /// visible tick; a new pill size only moves the capsule inside the box,
+    /// and the surface is only touched when the box's margins change (a new
+    /// position or output geometry).
+    fn place(&self, pill: Size) {
+        self.wanted.set(Some((self.position.get(), pill)));
         self.replace();
     }
 
@@ -1980,8 +2126,10 @@ impl PillPlacement {
                 self.arm(paint);
             }
             // Not from inside the enter signal: the remap unmaps the surface
-            // that is sending it.
+            // that is sending it. The output is kept now, so nothing that
+            // runs first loses it.
             Entered::Remap(token) => {
+                self.on.replace(Some(monitor.clone()));
                 let placement = Rc::downgrade(self);
                 let monitor = monitor.clone();
                 gtk::glib::idle_add_local_once(move || {
@@ -2002,15 +2150,15 @@ impl PillPlacement {
     /// Maps the probe again, bound to `monitor` at its margins and still
     /// held, so the pill is never moved while mapped.
     fn remap(self: &Rc<Self>, token: RemapToken, monitor: &gtk::gdk::Monitor) {
-        let Some((margins, offset)) = self.layout(Some(monitor)) else {
-            return;
-        };
         if !self.reveal.borrow_mut().rebind(token) {
             return;
         }
+        let layout = self.layout(Some(monitor));
         self.window.set_visible(false);
         self.bind(monitor);
-        self.apply(margins, offset);
+        if let Some((margins, offset)) = layout {
+            self.apply(margins, offset);
+        }
         let Some((map, paint)) = self.reveal.borrow_mut().remapped() else {
             // Unreachable: only a rebind's own unmap ran in between. Never
             // leave a live pill unmapped, though.
@@ -2021,8 +2169,9 @@ impl PillPlacement {
         self.hold();
         self.arm(paint);
         trace(format_args!(
-            "map bound output={} margins={margins:?}",
-            monitor.connector().unwrap_or_default()
+            "map bound output={} margins={:?}",
+            monitor.connector().unwrap_or_default(),
+            self.placed.get()
         ));
         self.window.set_visible(true);
         self.arm_deadline(map);
@@ -2102,6 +2251,63 @@ impl PillPlacement {
                 .move_(&self.layers, f64::from(offset.0), f64::from(offset.1));
             trace(format_args!("offset {offset:?}"));
         }
+    }
+}
+
+thread_local! {
+    /// The session bus connection the KWin lookup reuses. GIO keeps its
+    /// shared one only while someone holds it.
+    static SESSION_BUS: RefCell<Option<gtk::gio::DBusConnection>> = const { RefCell::new(None) };
+}
+
+/// The session bus connection, made once and kept; `None` while there is no
+/// session bus.
+async fn session_bus() -> Option<gtk::gio::DBusConnection> {
+    if let Some(bus) = SESSION_BUS.with_borrow(Clone::clone) {
+        return Some(bus);
+    }
+    match gtk::gio::bus_get_future(gtk::gio::BusType::Session).await {
+        Ok(bus) => {
+            SESSION_BUS.set(Some(bus.clone()));
+            Some(bus)
+        }
+        Err(error) => {
+            trace(format_args!("session bus unavailable error={error}"));
+            None
+        }
+    }
+}
+
+/// Asks `source` for its focused output's connector name, within its budget.
+async fn focused_output(source: FocusSource) -> Option<String> {
+    match source {
+        FocusSource::Hyprland => gtk::glib::future_with_timeout(
+            voisu_app::overlay::hyprland::IPC_DEADLINE,
+            gtk::gio::spawn_blocking(voisu_app::overlay::hyprland::focused_output),
+        )
+        .await
+        .ok()?
+        .ok()?,
+        FocusSource::KWin => gtk::glib::future_with_timeout(focus::KWIN_DEADLINE, async {
+            let bus = session_bus().await?;
+            let reply = bus
+                .call_future(
+                    Some(focus::KWIN_BUS),
+                    focus::KWIN_PATH,
+                    focus::KWIN_INTERFACE,
+                    focus::KWIN_ACTIVE_OUTPUT,
+                    None,
+                    Some(gtk::glib::VariantTy::new("(s)").ok()?),
+                    gtk::gio::DBusCallFlags::NO_AUTO_START,
+                    i32::try_from(focus::KWIN_DEADLINE.as_millis()).unwrap_or(i32::MAX),
+                )
+                .await
+                .ok()?;
+            reply.get::<(String,)>().map(|(name,)| name)
+        })
+        .await
+        .ok()
+        .flatten(),
     }
 }
 
