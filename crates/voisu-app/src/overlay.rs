@@ -10,6 +10,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+pub mod focus;
+pub mod hyprland;
+pub mod move_mode;
+pub mod placement;
+pub mod reveal;
 pub mod waveform;
 
 use voisu_core::{
@@ -153,6 +158,172 @@ impl OverlayView {
 
     pub const fn is_visible(self) -> bool {
         !matches!(self.phase, OverlayPhase::Hidden)
+    }
+}
+
+/// The saved position the pill is placed by. [`PositionWatch`]'s answers are
+/// its only source ([`SavedPosition::apply`]). A fresh map reads the config
+/// itself before it is mapped and places that map by its read
+/// ([`SavedPosition::pin`]), but only until the watch applies something:
+/// a read never overrides a newer answer from the watch, nor stays once the
+/// watch has caught up.
+#[derive(Clone, Copy, Debug)]
+pub struct SavedPosition {
+    applied: crate::config::OverlayPosition,
+    version: u64,
+    pinned: Option<(crate::config::OverlayPosition, u64)>,
+}
+
+impl SavedPosition {
+    #[must_use]
+    pub fn new(applied: crate::config::OverlayPosition) -> Self {
+        Self {
+            applied,
+            version: 0,
+            pinned: None,
+        }
+    }
+
+    /// Where the pill goes now.
+    #[must_use]
+    pub fn current(self) -> crate::config::OverlayPosition {
+        match self.pinned {
+            Some((read, version)) if version == self.version => read,
+            _ => self.applied,
+        }
+    }
+
+    /// Which of the watch's answers is current; a fresh map's read notes it
+    /// when it starts.
+    #[must_use]
+    pub fn version(self) -> u64 {
+        self.version
+    }
+
+    /// The watch's answer.
+    pub fn apply(&mut self, position: crate::config::OverlayPosition) {
+        self.applied = position;
+        self.version += 1;
+    }
+
+    /// A fresh map's own read, started at `version`: places that map unless
+    /// the watch has applied an answer since.
+    pub fn pin(&mut self, read: crate::config::OverlayPosition, version: u64) {
+        self.pinned = (version == self.version).then_some((read, version));
+    }
+}
+
+/// Re-reads the Overlay position off the GTK thread, so showing the pill never
+/// waits on the config file. `refresh` starts a read when a Recording begins
+/// or the config file changes; the next ticks `take` the answer and re-place
+/// the surface only if it differs from what was last applied. The pill
+/// therefore appears at the last known spot and moves at most once, within a
+/// tick or two. A `refresh` while a read is out queues one more read after it,
+/// so a change that lands mid-read is never missed.
+pub struct PositionWatch {
+    applied: Option<crate::config::OverlayPosition>,
+    pending: Option<std::sync::mpsc::Receiver<crate::config::OverlayPosition>>,
+    again: bool,
+    read: std::sync::Arc<dyn Fn() -> crate::config::OverlayPosition + Send + Sync>,
+}
+
+impl Default for PositionWatch {
+    fn default() -> Self {
+        Self::with_reader(crate::config::overlay_position)
+    }
+}
+
+impl PositionWatch {
+    fn with_reader(
+        read: impl Fn() -> crate::config::OverlayPosition + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            applied: None,
+            pending: None,
+            again: false,
+            read: std::sync::Arc::new(read),
+        }
+    }
+
+    /// Starts a read, or queues one if a read is already out.
+    pub fn refresh(&mut self) {
+        if self.pending.is_some() {
+            self.again = true;
+            return;
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let read = std::sync::Arc::clone(&self.read);
+        // A thread that cannot start drops the sender; `take` then clears it.
+        let _ = thread::Builder::new()
+            .name("overlay-position".to_owned())
+            .spawn(move || {
+                let _ = sender.send(read());
+            });
+        self.pending = Some(receiver);
+    }
+
+    /// The position to apply now, if a finished read differs from the one last
+    /// applied. Never blocks.
+    pub fn take(&mut self) -> Option<crate::config::OverlayPosition> {
+        use std::sync::mpsc::TryRecvError;
+        let answer = match self.pending.as_ref()?.try_recv() {
+            Ok(position) => Some(position),
+            Err(TryRecvError::Empty) => return None,
+            Err(TryRecvError::Disconnected) => None,
+        };
+        self.pending = None;
+        if std::mem::take(&mut self.again) {
+            self.refresh();
+        }
+        let position = answer?;
+        (self.applied != Some(position)).then(|| {
+            self.applied = Some(position);
+            position
+        })
+    }
+}
+
+/// Whether a status round trip shows Voisu idle as of when it was sent: only a
+/// reply that says so. A failed or timed-out poll (`None`) is no evidence
+/// either way, since a Recording may be underway behind it.
+pub fn shows_idle(response: Option<&Response>) -> bool {
+    response.is_some_and(|response| response.state == Some(DaemonState::Idle))
+}
+
+/// Whether showing `next` after `before` maps the pill surface afresh, when it
+/// is already up. The pill is never bound to an output: the compositor puts
+/// each new map on the output it picks (the focused one) and the pill stays
+/// there while mapped. A Recording that starts while anything else is still
+/// on the pill (the last result, its processing, a notice) is a new request,
+/// so it gets a fresh map and follows focus like one shown from hidden.
+pub const fn needs_fresh_map(before: OverlayPhase, next: OverlayPhase) -> bool {
+    matches!(next, OverlayPhase::Recording)
+        && !matches!(before, OverlayPhase::Hidden | OverlayPhase::Recording)
+}
+
+/// The CSS class that turns the pill's text amber while the limit approaches.
+pub const LIMIT_APPROACHING_CLASS: &str = "limitsoon";
+
+/// The words the pill shows. Text states (Loading, Unavailable, Failure,
+/// Copied) carry their own; the last minute of a Recording is a text state
+/// too, so it widens the pill like the rest. Silence stays graphics-first: its
+/// amber dotted floor says "no speech" without words. The final ten seconds keep
+/// the amber bars and red border: a countdown in words would lag its own
+/// second. Empty means the pill shows bars or a glyph instead.
+pub fn pill_text(
+    view: OverlayView,
+    warning: Option<LimitWarning>,
+    remaining: Option<Duration>,
+) -> std::borrow::Cow<'static, str> {
+    use std::borrow::Cow;
+    match (view.phase, warning) {
+        (OverlayPhase::Recording, Some(LimitWarning::Approaching)) => remaining
+            .and_then(|left| limit_notification_body(LimitWarning::Approaching, left))
+            .map_or(
+                Cow::Borrowed(limit_warning_body(LimitWarning::Approaching)),
+                Cow::Owned,
+            ),
+        _ => Cow::Borrowed(view.capsule_text()),
     }
 }
 
@@ -379,19 +550,56 @@ impl LevelPollLatch {
 
 // ---- Waveform drawing math (pure; the cairo adapter in the bin consumes it) ----
 
-/// Number of bars drawn in the meter row: 22 slots of level history mirrored
-/// about the centre (see `waveform`), as on the Windows overlay.
+/// Bars in the older, wider meter row: 22 slots of level history mirrored
+/// about the centre (see `waveform`), as on the Windows overlay. The pill
+/// draws [`PILL_BAR_COUNT`] of them; this stays the reference density the
+/// history length and sweep tuning were set against.
 pub const VISUAL_BAR_COUNT: usize = 44;
+
+/// Sound bars the 120x40 pill draws: many thin lines, so the row reads as a
+/// fine waveform. Each one reads a spaced slot of the same history, so the
+/// row spans as much time as the 44-bar one did.
+pub const PILL_BAR_COUNT: usize = 26;
+/// Width of one pill sound bar, in pixels. Thin on purpose.
+pub const PILL_BAR_WIDTH: f64 = 2.0;
+/// Gap between pill sound bars, in pixels.
+pub const PILL_BAR_GAP: f64 = 2.0;
+
+/// The Overlay pill: 120x40 logical px, a full-radius capsule. Text pills are
+/// never shorter.
+pub const PILL_WIDTH: i32 = 120;
+pub const PILL_HEIGHT: i32 = 40;
+/// A pill that carries text widens up to here, then wraps to a second line.
+pub const PILL_MAX_WIDTH: i32 = 320;
+/// Text pills show at most this many lines.
+pub const PILL_MAX_LINES: i32 = 2;
+/// Horizontal CSS padding plus border inside a text pill, per side.
+pub const PILL_TEXT_PAD_X: i32 = 15;
+/// Space between the text and a glyph beside it.
+pub const PILL_CONTENT_GAP: i32 = 10;
+
+/// The width a text pill takes: the unwrapped text and any glyph beside it,
+/// plus padding, never narrower than the bar pill nor wider than
+/// [`PILL_MAX_WIDTH`]. Text that does not fit wraps to [`PILL_MAX_LINES`].
+pub fn text_pill_width(text_width: i32, glyph_width: i32) -> i32 {
+    let gap = if glyph_width > 0 { PILL_CONTENT_GAP } else { 0 };
+    (text_width + gap + glyph_width + 2 * PILL_TEXT_PAD_X).clamp(PILL_WIDTH, PILL_MAX_WIDTH)
+}
+
+/// The width left for the text inside a pill of `pill_width`.
+pub fn text_pill_text_width(pill_width: i32, glyph_width: i32) -> i32 {
+    let gap = if glyph_width > 0 { PILL_CONTENT_GAP } else { 0 };
+    (pill_width - 2 * PILL_TEXT_PAD_X - gap - glyph_width).max(1)
+}
 
 /// Spec floor for the edge-falloff ramp: outermost bars sit at ~45% opacity.
 const EDGE_FALLOFF_MIN: f64 = 0.45;
 /// One full left→right pass of the Processing light sweep.
 const SWEEP_PERIOD_SECS: f64 = 1.2;
-/// Sweep bump width in bar units (gaussian sigma). Chosen relative to the
-/// 44-bar visual row: at 2.2× the density of the old 20-bar row (44/20), the
-/// sigma is scaled by the same factor (2.0 × 44/20 = 4.4) so the light-sweep
-/// bump keeps the same VISUAL width on screen.
-const SWEEP_SIGMA_BARS: f64 = 4.4;
+/// Sweep bump width as a fraction of the row (gaussian sigma / bar count), so
+/// the light-sweep bump keeps the same VISUAL width whatever the density. Set
+/// from the 44-bar row's 4.4-bar sigma.
+const SWEEP_SIGMA_FRACTION: f64 = 0.1;
 /// Resting-bar brightness away from the sweep bump, and the uniform
 /// reduced-motion brightness. Chosen so the sweep reads as light passing
 /// through visible bars, not bars blinking on from black.
@@ -431,11 +639,12 @@ pub fn sweep_brightness(
     if reduced_motion {
         return SWEEP_REDUCED_MOTION_BRIGHTNESS;
     }
+    let sigma = count as f64 * SWEEP_SIGMA_FRACTION;
     let progress = (elapsed_secs.rem_euclid(SWEEP_PERIOD_SECS)) / SWEEP_PERIOD_SECS;
-    let travel = count as f64 + 6.0 * SWEEP_SIGMA_BARS;
-    let position = progress * travel - 3.0 * SWEEP_SIGMA_BARS;
+    let travel = count as f64 + 6.0 * sigma;
+    let position = progress * travel - 3.0 * sigma;
     let distance = index as f64 + 0.5 - position;
-    let bump = (-distance * distance / (2.0 * SWEEP_SIGMA_BARS * SWEEP_SIGMA_BARS)).exp();
+    let bump = (-distance * distance / (2.0 * sigma * sigma)).exp();
     SWEEP_BASE_BRIGHTNESS + (1.0 - SWEEP_BASE_BRIGHTNESS) * bump
 }
 
@@ -1076,6 +1285,9 @@ pub fn read_until_eof_within(
 #[derive(Debug)]
 pub struct StatusObservation {
     pub response: Option<Response>,
+    /// When this round trip was sent: the reply shows the daemon as it was
+    /// at or after this instant.
+    pub requested_at: Instant,
     /// The cadence the worker chose after this round trip; the GTK tick that
     /// consumes observations follows it so it never lags the worker.
     pub period: Duration,
@@ -1110,9 +1322,14 @@ impl StatusWorker {
         thread::spawn(move || {
             let mut cadence = StatusCadence::default();
             while !thread_stop.load(Ordering::Relaxed) {
+                let requested_at = Instant::now();
                 let response = fetch();
                 let period = cadence.next(response.as_ref(), Instant::now());
-                *thread_latest.lock().unwrap() = Some(StatusObservation { response, period });
+                *thread_latest.lock().unwrap() = Some(StatusObservation {
+                    response,
+                    requested_at,
+                    period,
+                });
                 thread::sleep(period);
             }
         });
@@ -1144,6 +1361,79 @@ mod tests {
         FeedbackBackend, FeedbackCapabilities, SessionKind, select_feedback_backend,
     };
     use voisu_core::{DaemonState, OverlayEvent, OverlayOutcome, Response, VersionEnvelope};
+
+    #[test]
+    fn only_a_reply_saying_idle_shows_voisu_idle() {
+        assert!(shows_idle(Some(&overlay_status(DaemonState::Idle, None))));
+        assert!(!shows_idle(Some(&overlay_status(
+            DaemonState::Recording,
+            None
+        ))));
+        assert!(!shows_idle(Some(&overlay_status(
+            DaemonState::Processing,
+            None
+        ))));
+        // A failed poll could be hiding a Recording.
+        assert!(!shows_idle(None));
+    }
+
+    #[test]
+    fn a_recording_over_anything_still_shown_maps_the_pill_afresh() {
+        use OverlayPhase::*;
+        for before in [
+            Processing,
+            Success,
+            Failure,
+            Loading,
+            Unavailable,
+            NoSpeech,
+            Copied,
+        ] {
+            assert!(needs_fresh_map(before, Recording), "{before:?}");
+        }
+        // From hidden it is mapped afresh anyway; a Recording already shown
+        // stays put, as does everything that isn't a new Recording.
+        assert!(!needs_fresh_map(Hidden, Recording));
+        assert!(!needs_fresh_map(Recording, Recording));
+        for next in [Hidden, Processing, Success, Failure, NoSpeech, Copied] {
+            assert!(!needs_fresh_map(Recording, next), "{next:?}");
+            assert!(!needs_fresh_map(Success, next), "{next:?}");
+        }
+    }
+
+    #[test]
+    fn text_pills_widen_from_the_pill_to_320_and_never_past_it() {
+        // Short text keeps the 120 px pill; longer text widens it.
+        assert_eq!(text_pill_width(30, 0), PILL_WIDTH);
+        assert_eq!(text_pill_width(150, 0), 150 + 2 * PILL_TEXT_PAD_X);
+        assert_eq!(
+            text_pill_width(150, 14),
+            150 + PILL_CONTENT_GAP + 14 + 2 * PILL_TEXT_PAD_X
+        );
+        assert_eq!(text_pill_width(900, 0), PILL_MAX_WIDTH);
+        assert_eq!(text_pill_width(900, 14), PILL_MAX_WIDTH);
+        // The text gets what the padding and glyph leave.
+        assert_eq!(
+            text_pill_text_width(PILL_MAX_WIDTH, 0),
+            PILL_MAX_WIDTH - 2 * PILL_TEXT_PAD_X
+        );
+        assert_eq!(
+            text_pill_text_width(PILL_MAX_WIDTH, 14),
+            PILL_MAX_WIDTH - 2 * PILL_TEXT_PAD_X - PILL_CONTENT_GAP - 14
+        );
+    }
+
+    #[test]
+    fn the_pill_bars_keep_the_recording_and_state_colours() {
+        assert_eq!(recording_bar_rgb(None), (0.949, 0.949, 0.949));
+        assert_eq!(
+            recording_bar_rgb(Some(LimitWarning::Approaching)),
+            (1.0, 0.706, 0.329)
+        );
+        let bars = PILL_BAR_COUNT as f64;
+        let row = bars * PILL_BAR_WIDTH + (bars - 1.0) * PILL_BAR_GAP;
+        assert!(row <= f64::from(PILL_WIDTH) - 16.0, "bars fit the pill");
+    }
 
     #[test]
     fn red_level_poll_timer_uses_observed_recording_edges() {
@@ -1356,10 +1646,12 @@ mod tests {
         // rendered.
         *worker.latest.lock().unwrap() = Some(StatusObservation {
             response: Some(overlay_status(DaemonState::Idle, None)),
+            requested_at: Instant::now(),
             period: STATUS_POLL_PERIOD,
         });
         *worker.latest.lock().unwrap() = Some(StatusObservation {
             response: Some(overlay_status(DaemonState::Recording, None)),
+            requested_at: Instant::now(),
             period: STATUS_POLL_PERIOD,
         });
         let taken = worker.take_latest().unwrap();
@@ -2313,6 +2605,135 @@ mod tests {
                 notify_no_speech: false,
                 notify_limit: None,
             },
+        );
+    }
+
+    #[test]
+    fn a_maps_own_read_never_overrides_a_newer_answer_from_the_watch() {
+        let spot = |x: f64, y: f64| crate::config::OverlayPosition::from_fractions(x, y).unwrap();
+        let (a, b, c) = (spot(0.5, 0.964), spot(0.25, 0.1), spot(0.75, 0.5));
+        let mut saved = SavedPosition::new(a);
+        assert_eq!(saved.current(), a);
+
+        // The map's read lands first: that map is placed by it.
+        let asked = saved.version();
+        saved.pin(b, asked);
+        assert_eq!(saved.current(), b);
+        // The watch catches up, then moves on: its answers win from then on.
+        saved.apply(b);
+        assert_eq!(saved.current(), b);
+        saved.apply(c);
+        assert_eq!(saved.current(), c);
+
+        // The watch applies a newer spot while the map's read is out: the
+        // read (of the older file) is dropped.
+        let asked = saved.version();
+        saved.apply(a);
+        saved.pin(b, asked);
+        assert_eq!(saved.current(), a);
+    }
+
+    #[test]
+    fn the_position_watch_reports_only_changes_never_blocks_and_never_misses_one() {
+        use crate::config::OverlayPosition;
+        use std::sync::{Arc, Mutex, mpsc};
+        let at = |x, y| OverlayPosition::from_fractions(x, y).unwrap();
+        let file = Arc::new(Mutex::new(OverlayPosition::DEFAULT));
+        // A gated read reports that it has read the file, then waits for its
+        // release, so the test changes the file only after that read.
+        type Gate = (mpsc::Sender<()>, mpsc::Receiver<()>);
+        let gate: Arc<Mutex<Option<Gate>>> = Arc::default();
+        let mut watch = PositionWatch::with_reader({
+            let (file, gate) = (Arc::clone(&file), Arc::clone(&gate));
+            move || {
+                let position = *file.lock().unwrap();
+                if let Some((read, release)) = gate.lock().unwrap().take() {
+                    read.send(()).unwrap();
+                    let _ = release.recv();
+                }
+                position
+            }
+        });
+        // The last change reported once every read (queued ones too) is done.
+        let settle = |watch: &mut PositionWatch| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut last = None;
+            loop {
+                if let Some(position) = watch.take() {
+                    last = Some(position);
+                }
+                if watch.pending.is_none() || Instant::now() > deadline {
+                    return last;
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+        };
+        assert_eq!(watch.take(), None, "nothing asked, nothing taken");
+        watch.refresh();
+        assert_eq!(settle(&mut watch), Some(OverlayPosition::DEFAULT));
+        watch.refresh();
+        assert_eq!(settle(&mut watch), None, "unchanged means no re-place");
+        *file.lock().unwrap() = at(0.25, 0.1);
+        watch.refresh();
+        assert_eq!(settle(&mut watch), Some(at(0.25, 0.1)));
+        // A slow read never blocks a tick, and a change saved while it is out
+        // is read after it rather than dropped.
+        let (release, held) = mpsc::channel::<()>();
+        let (read, was_read) = mpsc::channel::<()>();
+        *gate.lock().unwrap() = Some((read, held));
+        *file.lock().unwrap() = at(0.7, 0.2);
+        watch.refresh();
+        was_read
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the gated read never ran");
+        assert_eq!(watch.take(), None, "the read is still out");
+        // Saved after the out read took 0.7: only the queued read sees it.
+        *file.lock().unwrap() = at(0.9, 0.9);
+        watch.refresh();
+        release.send(()).unwrap();
+        assert_eq!(settle(&mut watch), Some(at(0.9, 0.9)));
+    }
+
+    #[test]
+    fn silence_shows_its_amber_floor_and_the_last_minute_is_text() {
+        let at = |secs| Some(Duration::from_secs(secs));
+        // Silence keeps the bare pill and its amber dotted floor, no words.
+        assert_eq!(pill_text(OverlayView::no_speech(), None, None), "");
+        let phase_view = |phase| OverlayView {
+            phase,
+            visible_label: "",
+            accessible_label: "",
+        };
+        let recording = phase_view(OverlayPhase::Recording);
+        assert_eq!(pill_text(recording, None, at(120)), "");
+        // The first tick of the warning says exactly what the notification does.
+        assert_eq!(
+            pill_text(recording, Some(LimitWarning::Approaching), at(60)),
+            limit_warning_body(LimitWarning::Approaching)
+        );
+        assert_eq!(
+            pill_text(recording, Some(LimitWarning::Approaching), at(42)),
+            "Approaching the recording limit — about 42 seconds left"
+        );
+        // Without a reading, the nominal wording stands in.
+        assert_eq!(
+            pill_text(recording, Some(LimitWarning::Approaching), None),
+            limit_warning_body(LimitWarning::Approaching)
+        );
+        // The final ten seconds stay as bars with the red border.
+        assert_eq!(pill_text(recording, Some(LimitWarning::Final), at(8)), "");
+        // A warning only speaks for a Recording that is still on screen.
+        assert_eq!(
+            pill_text(
+                phase_view(OverlayPhase::Processing),
+                Some(LimitWarning::Approaching),
+                at(40)
+            ),
+            ""
+        );
+        assert_eq!(
+            pill_text(OverlayView::copied(), None, None),
+            OverlayView::copied().visible_label
         );
     }
 

@@ -65,7 +65,7 @@ Run `voisu` with no arguments in a terminal. It is a full-screen, keyboard-only 
 | `q` | Quit |
 
 - **Home** shows what matters now: ready to dictate, or the one problem and the single key that fixes it. `d` runs every `voisu doctor` check.
-- **Settings** covers Engine, Delivery, Writing, Layout, Tone, Deepgram, your keys and Local unload. Each choice is explained beside it, and Settings offers a restart when the service needs one.
+- **Settings** covers Engine, Delivery, Writing, Layout, Tone, Deepgram, your keys, Local unload and Overlay (Move drags the pill anywhere on screen, with ✓ to save and ✗ to cancel; Reset puts it back at the bottom centre). Each choice is explained beside it, and Settings offers a restart when the service needs one.
 - **Dictionary** holds the words Voisu should spell your way. `a` adds, `d` removes. Local mode on the Whisper-based model also hands your words to the model as a hint before it transcribes, and corrects by sound: a name it wrote as it heard it ("voice you") becomes your entry ("Voisu") when the entry has two or more syllables. Cloud mode corrects exact spellings only.
 - **History** lists recent Recordings. `c` copies one.
 
@@ -174,7 +174,7 @@ By default the Local model stays loaded, so every Recording starts at once. A lo
 
 - **Voisu is not running after login.** The daemon waits up to 20 seconds for GNOME to export `WAYLAND_DISPLAY` and `DISPLAY`. If `voisu service status` still shows inactive or failed, run `voisu service restart` once the desktop is up, and check `journalctl --user -u voisu.service`.
 - **Paste goes to whichever window has focus.** On GNOME, Voisu cannot check which window has focus. To paste by hand, run `voisu delivery copy`.
-- **The Overlay is the GNOME Shell extension `overlay@voisu.app`.** `voisu-overlay.service` (the GTK observer) being inactive is expected there.
+- **The Overlay is the GNOME Shell extension `overlay@voisu.app`.** `voisu-overlay.service` (the GTK observer) being inactive is expected there. The extension's pill can't be moved: `voisu overlay-position move` and Settings' Move say so instead.
 - **Paste uses the RemoteDesktop portal and libei.** Unless the compositor's input seat offers text input, Voisu sends a Ctrl+V keystroke. A window that pastes with a different shortcut (a terminal using Ctrl+Shift+V) receives nothing. In that case, paste manually. The Transcript is on the clipboard.
 - **Reset Voisu's RemoteDesktop grant.** This clears only the grant Voisu saved itself. GNOME may ask again when the daemon restarts or at the next Delivery. A permission GNOME remembers on its own is not cleared by this.
 

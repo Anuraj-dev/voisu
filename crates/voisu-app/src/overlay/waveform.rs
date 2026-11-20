@@ -124,13 +124,22 @@ impl Waveform {
 
     /// The level for bar `index` of a `count`-bar row mirrored about its
     /// centre: the two middle bars show the head, the outer bars the oldest
-    /// history.
+    /// history. A row narrower than the history steps over slots so it still
+    /// spans the whole history instead of only its newest few samples.
     pub fn bar_level(&self, index: usize, count: usize) -> f64 {
         let half = count / 2;
         let slot = if index < half {
             half - 1 - index
         } else {
             index - half
+        };
+        // Spread the row's slots evenly over 0..HISTORY-1, so the outermost bar
+        // shows the oldest sample whatever the row's width. A full-width row
+        // (half == HISTORY) maps each bar to its own slot.
+        let slot = if half > 1 {
+            slot * (HISTORY - 1) / (half - 1)
+        } else {
+            0
         };
         self.slot_level(slot)
     }
@@ -284,6 +293,42 @@ mod tests {
             (waveform.bar_level(0, count) - waveform.slot_level(HISTORY - 1)).abs() < EPS,
             "the outermost bar shows the oldest history"
         );
+    }
+
+    #[test]
+    fn a_narrow_row_is_mirrored_and_still_spans_the_history() {
+        let mut waveform = Waveform::default();
+        // More samples than the history holds, so every slot is filled and
+        // differs from its neighbours.
+        for step in 0..(HISTORY + 8) {
+            waveform.set_target(if step % 3 == 0 {
+                0.9
+            } else {
+                0.2 + 0.02 * step as f64
+            });
+            waveform.advance(super::SAMPLE_PERIOD_SECS);
+        }
+        let count = super::super::PILL_BAR_COUNT;
+        for index in 0..count {
+            let mirrored = waveform.bar_level(count - 1 - index, count);
+            assert!((waveform.bar_level(index, count) - mirrored).abs() < EPS);
+        }
+        assert!((waveform.bar_level(count / 2, count) - waveform.slot_level(0)).abs() < EPS);
+        // Both outermost bars show the oldest slot, not one a few samples in.
+        let oldest = waveform.slot_level(HISTORY - 1);
+        assert!((waveform.bar_level(0, count) - oldest).abs() < EPS);
+        assert!((waveform.bar_level(count - 1, count) - oldest).abs() < EPS);
+        // The newest bar is not just the oldest one repeated.
+        assert!(
+            (waveform.slot_level(HISTORY - 1) - waveform.slot_level(HISTORY * 2 / 3)).abs() > EPS
+        );
+        // A full-width row still maps one bar to one slot.
+        let full = super::super::VISUAL_BAR_COUNT;
+        for slot in 0..HISTORY {
+            assert!(
+                (waveform.bar_level(full / 2 + slot, full) - waveform.slot_level(slot)).abs() < EPS
+            );
+        }
     }
 
     #[test]
