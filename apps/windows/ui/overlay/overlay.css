@@ -13,6 +13,7 @@
   --notice: #ffb454;
   --text: #f4f5f7;
   --ring: rgba(244, 245, 247, 0.7);
+  --outline: rgba(244, 245, 247, 0.28);
 }
 
 *,
@@ -40,15 +41,18 @@ body {
 }
 
 /* overlay.js sets --x/--y (the pill's top-left corner) so the pill's centre
-   lands on the anchor the native side placed the window around. */
+   lands on the anchor the native side placed the window around. 120x40 at
+   the medium size (overlay.rs PILL_WIDTH/PILL_HEIGHT), with the Linux pill's
+   faint white outline; the error state's red border overrides it. */
 .capsule {
   position: absolute;
   left: var(--x, 50%);
   top: var(--y, 50%);
   min-width: calc(120px * var(--s));
-  height: calc(32px * var(--s));
-  border-radius: 999px;
-  border: 1px solid transparent;
+  height: calc(40px * var(--s));
+  border-radius: calc(20px * var(--s));
+  border: 1px solid var(--outline);
+  padding: calc(5px * var(--s)) calc(7px * var(--s));
   background: var(--surface);
   display: grid;
   place-items: center;
@@ -61,13 +65,14 @@ body {
   width: max-content;
   max-width: calc(320px * var(--s));
   height: auto;
-  min-height: calc(32px * var(--s));
-  padding: calc(5px * var(--s)) calc(14px * var(--s));
+  min-height: calc(40px * var(--s));
+  padding: calc(4px * var(--s)) calc(14px * var(--s));
 }
 
+/* Room for the full 26-bar row (2 px bars, 2 px gaps: 102 px). */
 .meter {
-  width: calc(88px * var(--s));
-  height: calc(18px * var(--s));
+  width: calc(104px * var(--s));
+  height: calc(28px * var(--s));
   display: block;
 }
 
@@ -89,7 +94,7 @@ body {
   color: var(--failure);
 }
 
-/* Copied: calm amber text, no border or glow (the Linux Copied phase). The
+/* Copied: calm amber text, no red border or glow (the Linux Copied phase). The
    Transcript is safe on the clipboard; the user only has to paste it. */
 .copied-text {
   color: var(--notice);
@@ -159,7 +164,8 @@ body {
 }
 
 /* Move mode puts ✗ (cancel) and ✓ (save) either side of the idle bars:
-   24 px round targets at the medium size, white glyphs on the pill. */
+   24 px round targets at the medium size, a red ✗ and a green ✓ as on
+   Linux. */
 .move-button {
   display: none;
 }
@@ -173,6 +179,11 @@ body {
   width: calc(158px * var(--s));
   gap: calc(5px * var(--s));
   padding: 0 calc(4px * var(--s));
+}
+
+/* What is left between ✗ and ✓; overlay.js draws the bars that fit. */
+.capsule.moving .meter {
+  width: calc(88px * var(--s));
 }
 
 .capsule.moving .move-button {
@@ -202,8 +213,16 @@ body {
   stroke-linejoin: round;
 }
 
-.move-button:hover {
-  background: rgba(244, 245, 247, 0.14);
+#move-cancel {
+  color: var(--failure);
+}
+
+#move-cancel:hover {
+  background: rgba(255, 138, 138, 0.22);
+}
+
+#move-save {
+  color: var(--accent);
 }
 
 #move-save:hover {

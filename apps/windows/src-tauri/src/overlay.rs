@@ -1,5 +1,5 @@
 //! The recording Overlay: a small pill with live level bars, by default at
-//! the top centre of the active monitor, while Voisu records. The user can
+//! the bottom centre of the active monitor, while Voisu records. The user can
 //! move it from Settings; the spot is kept as fractions of the work area.
 //!
 //! The window is created once at startup and never takes focus, never appears
@@ -32,7 +32,7 @@ const OVERLAY_LAYOUT: &str = "overlay-layout";
 /// The pill at the medium size, in logical pixels. The page scales itself
 /// from the window width it is given (overlay.js `BASE_WIDTH`).
 const PILL_WIDTH: f64 = 120.0;
-const PILL_HEIGHT: f64 = 32.0;
+const PILL_HEIGHT: f64 = 40.0;
 /// The pill in move mode, ✗ and ✓ either side of the bars (overlay.css
 /// `.capsule.moving` width). Move mode places by this width, so the page
 /// never has to shift the wider pill off its anchor near an edge, and the
@@ -63,14 +63,15 @@ const TEXT_WIDTH: f64 = 320.0;
 const TEXT_HEIGHT: f64 = 48.0;
 /// Transparent room around the pill for the error state's 8 px glow.
 const GLOW_PAD: f64 = 8.0;
-/// Least gap between the pill and any work-area edge; the default spot is
-/// this far below the top. Not scaled by the Overlay size.
+/// Least gap between the pill and any work-area edge. Not scaled by the
+/// Overlay size.
 const EDGE_MARGIN: f64 = 12.0;
-/// Saving (the pill's ✓) snaps the pill to the centre line, or to the
-/// default top or bottom margin, when it is dropped this close to it.
+/// Saving (the pill's ✓) snaps the pill to the centre line, the default
+/// spot's line, or the top or bottom margin, when it is dropped this close.
 const SNAP_DISTANCE: f64 = 24.0;
-/// What `None` means: centred, at the top margin.
-const DEFAULT_POSITION: OverlayPosition = OverlayPosition { x: 0.5, y: 0.0 };
+/// What `None` means: centred near the bottom (SuperWhisper's spot, as on
+/// Linux), the pill clear of a bottom taskbar or Dock.
+const DEFAULT_POSITION: OverlayPosition = OverlayPosition { x: 0.5, y: 0.964 };
 /// Long enough to read a one-line error, then the capsule hides.
 const ERROR_DISPLAY: Duration = Duration::from_secs(3);
 /// The Delivered check mark, as brief as the Linux overlay's: the Transcript
@@ -348,7 +349,7 @@ impl Area {
 }
 
 /// Where the overlay window goes on a monitor for the saved `position` (the
-/// default top-centre for `None`). The pill centre is the saved fraction of
+/// default bottom-centre for `None`). The pill centre is the saved fraction of
 /// this work area, clamped so the pill stays inside it on any monitor size,
 /// DPI or taskbar position. The window, sized for the widest text, is
 /// centred on the pill and pushed back inside the work area only where it
@@ -393,8 +394,9 @@ pub fn placement(
 
 /// The position to save after the user dragged the window to `window` on a
 /// monitor with this work area, the pill drawn at `anchor` in it. The pill
-/// centre snaps to the centre line, and to the default top or bottom margin,
-/// within 24 px. `None` is the default spot, so Reset has nothing to undo.
+/// centre snaps to the centre line, and to the nearest of the top margin,
+/// the default spot's line and the bottom margin, within 24 px. `None` is
+/// the default spot, so Reset has nothing to undo.
 /// The clamp is the plain pill's, the one later shows place: the move
 /// pill's wider clamp would push a drop near an edge further in than it
 /// was shown.
@@ -411,20 +413,20 @@ pub fn dropped_position(
         f64::from(window.top) + anchor.y * f64::from(window.bottom - window.top),
     );
     let near = |a: f64, b: f64| (a - b).abs() <= area.snap;
-    let (_, top_line) = area.clamp(x, area.top);
-    let (_, bottom_line) = area.clamp(x, area.top + area.height);
+    // Each line the pill centre may snap to, with the fraction it saves.
+    let line = |fy: f64| (area.clamp(x, area.top + fy * area.height).1, fy);
     let fx = if near(x, area.left + area.width / 2.0) {
         0.5
     } else {
         (x - area.left) / area.width
     };
-    let fy = if near(y, top_line) {
-        0.0
-    } else if near(y, bottom_line) {
-        1.0
-    } else {
-        (y - area.top) / area.height
-    };
+    // The default line sits a few px above the bottom margin, so the nearer
+    // of the two wins.
+    let fy = [line(0.0), line(DEFAULT_POSITION.y), line(1.0)]
+        .into_iter()
+        .filter(|&(at, _)| near(y, at))
+        .min_by(|a, b| (a.0 - y).abs().total_cmp(&(b.0 - y).abs()))
+        .map_or((y - area.top) / area.height, |(_, fy)| fy);
     OverlayPosition::new(fx.clamp(0.0, 1.0), fy.clamp(0.0, 1.0))
         .filter(|position| *position != DEFAULT_POSITION)
 }
@@ -1717,8 +1719,9 @@ mod tests {
     }
 
     #[test]
-    fn the_default_pill_sits_top_centre_twelve_px_down_at_any_scale() {
-        // 1920x1040 work area at 100%: a 336x64 window, the pill 120x32.
+    fn the_default_pill_sits_bottom_centre_clear_of_the_taskbar_at_any_scale() {
+        // 1920x1040 work area at 100%: a 336x64 window, the pill 120x40, its
+        // centre 96.4 % of the way down, above the 12 px bottom margin.
         let p = placement(FULL_HD, 1.0, OverlaySize::Medium, None, Pill::Plain);
         assert_eq!(
             (
@@ -1727,14 +1730,11 @@ mod tests {
             ),
             (336, 64)
         );
-        assert_eq!(
-            pill(p, 1.0, OverlaySize::Medium),
-            (900.0, 12.0, 1020.0, 44.0)
-        );
-        // The window cannot centre on a pill this near the top, so it stops
-        // at the work area and the pill sits above its middle.
-        assert_eq!(p.window.top, 0);
-        assert!(p.anchor.y < 0.5);
+        let (l, t, r, b) = pill(p, 1.0, OverlaySize::Medium);
+        assert_eq!((l, r, b - t), (900.0, 1020.0, 40.0));
+        assert!(((t + b) / 2.0 - 0.964 * 1040.0).abs() < 1e-6);
+        assert!(1040.0 - b > 12.0, "clear of the bottom margin: {b}");
+        assert!(inside(p.window, FULL_HD));
 
         // A second monitor left of the primary at 150%, with a top taskbar.
         let left_monitor = Rect {
@@ -1745,20 +1745,24 @@ mod tests {
         };
         let p = placement(left_monitor, 1.5, OverlaySize::Medium, None, Pill::Plain);
         let (l, t, r, b) = pill(p, 1.5, OverlaySize::Medium);
-        assert_eq!((r - l, b - t), (180.0, 48.0));
-        assert_eq!(t - 60.0, 18.0, "12 logical px at 150%");
+        assert_eq!((r - l, b - t), (180.0, 60.0));
+        assert!(((t + b) / 2.0 - (60.0 + 0.964 * 1380.0)).abs() < 1e-6);
         assert_eq!(l - -2560.0, 0.0 - r, "centred");
 
         for (size, (w, h)) in [
-            (OverlaySize::Small, (96.0, 25.6)),
-            (OverlaySize::Large, (150.0, 40.0)),
+            (OverlaySize::Small, (96.0, 32.0)),
+            (OverlaySize::Large, (150.0, 50.0)),
         ] {
             let (l, t, r, b) = pill(placement(FULL_HD, 1.0, size, None, Pill::Plain), 1.0, size);
             assert!(
                 (r - l - w).abs() < 1e-9 && (b - t - h).abs() < 1e-9,
                 "{size:?}"
             );
-            assert!((t - 12.0).abs() < 1e-9, "{size:?} keeps the 12 px margin");
+            assert!(
+                ((t + b) / 2.0 - 0.964 * 1040.0).abs() < 1e-6,
+                "{size:?} keeps the default line"
+            );
+            assert!(1040.0 - b >= 12.0, "{size:?} keeps the 12 px margin");
             assert!(
                 ((l + r) / 2.0 - 960.0).abs() < 1e-9,
                 "{size:?} stays centred"
@@ -1796,19 +1800,14 @@ mod tests {
 
     #[test]
     fn placing_then_dropping_where_it_was_gives_the_same_position() {
+        let left_monitor = Rect {
+            left: -1280,
+            top: 40,
+            right: 0,
+            bottom: 1024,
+        };
         for position in [at(0.25, 0.5), at(0.8, 0.3), at(0.1, 0.9), at(0.62, 0.71)] {
-            for (work, dpi) in [
-                (FULL_HD, 1.0),
-                (
-                    Rect {
-                        left: -1280,
-                        top: 40,
-                        right: 0,
-                        bottom: 1024,
-                    },
-                    1.25,
-                ),
-            ] {
+            for (work, dpi) in [(FULL_HD, 1.0), (left_monitor, 1.25)] {
                 for size in [OverlaySize::Small, OverlaySize::Medium, OverlaySize::Large] {
                     let p = placement(work, dpi, size, position, Pill::Plain);
                     let back = dropped_position(work, dpi, size, p.window, p.anchor).unwrap();
@@ -1820,12 +1819,18 @@ mod tests {
                 }
             }
         }
-        // The default spot comes back as the default: nothing to reset.
-        let p = placement(FULL_HD, 1.0, OverlaySize::Medium, None, Pill::Plain);
-        assert_eq!(
-            dropped_position(FULL_HD, 1.0, OverlaySize::Medium, p.window, p.anchor),
-            None
-        );
+        // The default spot comes back as the default, though it is within
+        // snap distance of the bottom margin: nothing to reset.
+        for (work, dpi) in [(FULL_HD, 1.0), (left_monitor, 1.25)] {
+            for size in [OverlaySize::Small, OverlaySize::Medium, OverlaySize::Large] {
+                let p = placement(work, dpi, size, None, Pill::Plain);
+                assert_eq!(
+                    dropped_position(work, dpi, size, p.window, p.anchor),
+                    None,
+                    "{work:?} {dpi} {size:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2018,7 +2023,7 @@ mod tests {
     }
 
     #[test]
-    fn dropping_near_the_centre_line_or_a_default_margin_snaps_to_it() {
+    fn dropping_near_the_centre_line_the_default_line_or_a_margin_snaps_to_it() {
         let size = OverlaySize::Medium;
         // Builds the dragged window around a pill centred at (x, y).
         let drop = |work: Rect, dpi: f64, x: f64, y: f64| {
@@ -2031,20 +2036,25 @@ mod tests {
             };
             dropped_position(work, dpi, size, window, Anchor { x: 0.5, y: 0.5 })
         };
-        // 20 px off the centre line, 23 px below the default top: default.
-        assert_eq!(drop(FULL_HD, 1.0, 980.0, 28.0 + 23.0), None);
-        // 30 px off the centre line stays there.
-        let p = drop(FULL_HD, 1.0, 990.0, 28.0).unwrap();
+        // The default line is 0.964 of the way down; the margin lines are
+        // the clamp limits, the pill's 12 px from the work area edges.
+        let default_y = 0.964 * 1040.0;
+        let (top_line, bottom_line) = (12.0 + 20.0, 1040.0 - 12.0 - 20.0);
+        // 20 px off the centre line, 20 px above the default line: default.
+        assert_eq!(drop(FULL_HD, 1.0, 980.0, default_y - 20.0), None);
+        // 30 px off the centre line stays there; the top margin snaps.
+        let p = drop(FULL_HD, 1.0, 990.0, top_line + 10.0).unwrap();
         assert!((p.x - 990.0 / 1920.0).abs() < 1e-9 && p.y == 0.0);
-        // Near the bottom margin line (pill bottom 12 px above the work area).
-        let p = drop(FULL_HD, 1.0, 400.0, 1040.0 - 28.0 - 20.0).unwrap();
+        // Dragged down past the bottom margin: clamped onto it, nearer it
+        // than the default line, so the bottom margin is kept.
+        let p = drop(FULL_HD, 1.0, 400.0, bottom_line + 20.0).unwrap();
         assert_eq!(p.y, 1.0);
         assert!((p.x - 400.0 / 1920.0).abs() < 1e-9);
         // Mid-screen is kept as is.
         let p = drop(FULL_HD, 1.0, 1500.0, 700.0).unwrap();
         assert!((p.y - 700.0 / 1040.0).abs() < 1e-9);
-        // Dragged partly off screen: clamped, then snapped to the top margin.
-        assert_eq!(drop(FULL_HD, 1.0, 960.0, -40.0), None);
+        // Dragged partly off the top: clamped, then snapped to the top margin.
+        assert_eq!(drop(FULL_HD, 1.0, 960.0, -40.0), at(0.5, 0.0));
         // The snap distance is logical: 24 px at 200% is 48 physical px.
         let hi = Rect {
             left: 0,
@@ -2052,8 +2062,10 @@ mod tests {
             right: 3840,
             bottom: 2080,
         };
-        assert_eq!(drop(hi, 2.0, 1920.0 + 46.0, 56.0 + 40.0), None);
-        assert!(drop(hi, 2.0, 1920.0 + 50.0, 56.0).is_some());
+        let hi_default = 0.964 * 2080.0;
+        assert_eq!(drop(hi, 2.0, 1920.0 + 46.0, hi_default - 40.0), None);
+        assert_eq!(drop(hi, 2.0, 1920.0 + 46.0, 64.0 + 40.0), at(0.5, 0.0));
+        assert!(drop(hi, 2.0, 1920.0 + 50.0, hi_default).is_some());
     }
 
     #[test]

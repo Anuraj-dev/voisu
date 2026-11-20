@@ -11,7 +11,7 @@ use voisu_core::Tone;
 
 use crate::trigger_key::TriggerChord;
 
-/// How large the recording Overlay draws. Medium is the 120x32 pill.
+/// How large the recording Overlay draws. Medium is the 120x40 pill.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OverlaySize {
@@ -35,7 +35,7 @@ impl OverlaySize {
 /// Where the user put the recording Overlay: the pill centre as fractions
 /// (0.0–1.0) of the work area of whichever monitor it shows on. A value out
 /// of range, not a number or missing a coordinate does not deserialize, so
-/// the setting reads as `None`: the default top-centre.
+/// the setting reads as `None`: the default bottom-centre.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "RawPosition")]
 pub struct OverlayPosition {
@@ -83,7 +83,7 @@ pub struct Settings {
     pub auto_paste: bool,
     #[serde(deserialize_with = "lenient")]
     pub overlay_size: OverlaySize,
-    /// None is the default rule: top-centre, 12 px below the work area top.
+    /// None is the default spot: centred, 96.4 % of the way down.
     /// Junk reads as None.
     #[serde(deserialize_with = "lenient")]
     pub overlay_position: Option<OverlayPosition>,

@@ -252,7 +252,7 @@
         <span class="hint">Use ✓ / ✗ on the overlay. Enter saves, Esc cancels.</span>
       {:else}
         <span id="position-label">Overlay position</span>
-        <span class="hint">{app.overlayPosition ? 'Where you put it.' : 'Top centre.'}</span>
+        <span class="hint">{app.overlayPosition ? 'Where you put it.' : 'Bottom centre.'}</span>
       {/if}
     </span>
     <div class="actions">

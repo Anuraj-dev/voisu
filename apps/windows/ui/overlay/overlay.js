@@ -10,10 +10,10 @@ import { listen } from '@tauri-apps/api/event';
 import { startsDrag } from './press.js';
 
 // Motion from the Linux overlay (voisu-overlay.rs), on the pill's thin
-// sound bars: many 2 px lines so the row reads as a fine waveform.
-const BARS = 21;
-const CENTRE = (BARS - 1) / 2;
-const HISTORY = CENTRE + 1; // newest level at the centre, oldest at the edges
+// sound bars: 26 white 2 px lines, 2 px apart, so the row reads as a fine
+// waveform. The move pill's narrower meter draws as many as fit.
+const BARS = 26;
+const HISTORY = Math.ceil(BARS / 2); // newest level at the centre, oldest at the edges
 const GAP = 2;
 const BAR_WIDTH = 2;
 const BAR_RGB = '242, 242, 242';
@@ -116,18 +116,20 @@ function fitCanvas() {
   return box;
 }
 
-// Half-sine falloff: 0.45 at the ends, 1.0 at the centre.
-function edgeAlpha(i) {
-  return 0.45 + 0.55 * Math.sin((Math.PI * (i + 0.5)) / BARS);
+// Half-sine falloff over a row of `count` bars: 0.45 at the ends, 1.0 at the
+// centre.
+function edgeAlpha(i, count) {
+  return 0.45 + 0.55 * Math.sin((Math.PI * (i + 0.5)) / count);
 }
 
-function barLevel(i) {
-  return history[Math.abs(i - CENTRE)];
+// An even row has two centre bars; both show the newest level.
+function barLevel(i, count) {
+  return history[Math.floor(Math.abs(i - (count - 1) / 2))];
 }
 
-function sweepBrightness(i, now) {
+function sweepBrightness(i, count, now) {
   if (reducedMotion.matches) return REDUCED_BRIGHTNESS;
-  const travel = BARS + 6 * SWEEP_SIGMA;
+  const travel = count + 6 * SWEEP_SIGMA;
   const progress = ((now - sweepStart) % SWEEP_PERIOD_MS) / SWEEP_PERIOD_MS;
   const position = progress * travel - 3 * SWEEP_SIGMA;
   const d = i + 0.5 - position;
@@ -141,8 +143,10 @@ function draw(now) {
 
   const gap = GAP * scale;
   const barWidth = BAR_WIDTH * scale;
-  // Fixed thin bars, the row centred in the meter.
-  const left = Math.max(0, (width - (barWidth * BARS + gap * (BARS - 1))) / 2);
+  // Fixed thin bars, as many as fit (all 26 in the plain pill), the row
+  // centred in the meter.
+  const count = Math.min(BARS, Math.floor((width + gap) / (barWidth + gap) + 1e-6));
+  const left = Math.max(0, (width - (barWidth * count + gap * (count - 1))) / 2);
   const drawable = height - 2;
   const floor = Math.max(0.15 * drawable, 1.5);
   const first = state === 'handsFree' ? HANDS_FREE_SLOTS : 0;
@@ -155,13 +159,13 @@ function draw(now) {
     ctx.fill();
   }
 
-  for (let i = first; i < BARS; i += 1) {
+  for (let i = first; i < count; i += 1) {
     let barHeight = floor;
-    let alpha = edgeAlpha(i);
+    let alpha = edgeAlpha(i, count);
     if (state === 'processing') {
-      alpha *= sweepBrightness(i, now);
+      alpha *= sweepBrightness(i, count, now);
     } else {
-      barHeight = floor + barLevel(i) * (drawable - floor);
+      barHeight = floor + barLevel(i, count) * (drawable - floor);
     }
     const x = left + i * (barWidth + gap);
     const y = (height - barHeight) / 2;

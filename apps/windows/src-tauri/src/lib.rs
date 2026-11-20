@@ -115,7 +115,7 @@ struct UiState {
     version: String,
     auto_paste: bool,
     overlay_size: OverlaySize,
-    /// `None` is the default top-centre spot.
+    /// `None` is the default bottom-centre spot.
     overlay_position: Option<OverlayPosition>,
     /// The overlay is showing for the user to drag it.
     overlay_moving: bool,
@@ -395,7 +395,7 @@ async fn drag_overlay(app: AppHandle, start: bool) -> Result<(), String> {
     overlay::drag(&app, start).await
 }
 
-/// Back to the default top-centre spot, shown in a preview.
+/// Back to the default bottom-centre spot, shown in a preview.
 #[tauri::command]
 fn reset_overlay_position(app: AppHandle) -> Result<Option<OverlayPosition>, String> {
     tracing::info!("overlay position reset");
