@@ -22,7 +22,7 @@ use voisu_app::local_overlay::TriggerRepeatLatch;
 use voisu_app::overlay::move_mode::{
     CancelReason, MoveEnd, MoveKey, MoveListener, MoveMode, MoveReply, MoveRequester, settle_save,
 };
-use voisu_app::overlay::placement::{self, MOVE_PILL, Size};
+use voisu_app::overlay::placement::{self, MOVE_PILL, PILL_BOX, Size};
 use voisu_app::overlay::reveal::{
     Entered, MapToken, PaintToken, REVEAL_DEADLINE, RemapToken, RevealHold,
 };
@@ -271,8 +271,8 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
 
     let window = gtk::ApplicationWindow::builder()
         .application(application)
-        .default_width(PILL_WIDTH)
-        .default_height(PILL_HEIGHT)
+        .default_width(PILL_BOX.0)
+        .default_height(PILL_BOX.1)
         .resizable(false)
         .decorated(false)
         .focusable(false)
@@ -283,7 +283,7 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
         window.init_layer_shell();
         window.set_layer(Layer::Overlay);
         // Anchored to the top-left corner only and pushed into place with
-        // margins (see `place_pill`), so the pill can sit anywhere.
+        // margins (see `PillPlacement`), so the pill can sit anywhere.
         for (edge, anchored) in [
             (Edge::Top, true),
             (Edge::Left, true),
@@ -399,15 +399,13 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
         }
     });
     let capsule = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-    // The capsule must BE the 120x40 pill, not a smaller box floated inside it.
-    // GTK widget margins sit OUTSIDE the styled background, so set_margin_* would
-    // shrink the drawn pill and let peak bars bleed past its rounded corners.
-    // Fill the whole window instead and push the interior spacing inward with CSS
-    // `padding` (which GTK paints INSIDE the background) — see the CSS below.
-    // Result: capsule 120x40 (radius 20), meter interior 104x28. A text state
-    // widens it (see `size_pill`).
-    capsule.set_hexpand(true);
-    capsule.set_vexpand(true);
+    // The capsule must BE the 120x40 pill: its size request is the pill's
+    // (see `size_pill`), and the fixed box below gives it exactly that. GTK
+    // widget margins sit OUTSIDE the styled background, so set_margin_* would
+    // shrink the drawn pill and let peak bars bleed past its rounded corners;
+    // the interior spacing is CSS `padding` (which GTK paints INSIDE the
+    // background) instead — see the CSS below. Result: capsule 120x40 (radius
+    // 20), meter interior 104x28. A text state widens it.
     capsule.append(&label);
     capsule.append(&meter);
     capsule.append(&glyph);
@@ -423,7 +421,14 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
     let layers = gtk::Overlay::new();
     layers.set_child(Some(&capsule));
     layers.add_overlay(&holder);
-    window.set_child(Some(&layers));
+    // The surface is one fixed, transparent box big enough for every pill
+    // state (and click-through, see the realize handler above); the capsule
+    // sits inside it at its own size, put where `PillPlacement` says. A state
+    // change then never resizes the surface or moves its margins.
+    let frame = gtk::Fixed::new();
+    frame.set_size_request(PILL_BOX.0, PILL_BOX.1);
+    frame.put(&layers, 0.0, 0.0);
+    window.set_child(Some(&frame));
     window.set_visible(false);
 
     let css = gtk::CssProvider::new();
@@ -470,6 +475,8 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
             meter,
             glyph,
             capsule,
+            frame,
+            layers,
             holder,
             waveform,
             rendered,
@@ -493,6 +500,10 @@ struct CapsuleFeedback {
     meter: gtk::DrawingArea,
     glyph: gtk::Label,
     capsule: gtk::Box,
+    /// The fixed box the surface is, and the layers moved inside it; see
+    /// `PillPlacement`.
+    frame: gtk::Fixed,
+    layers: gtk::Overlay,
     /// Draws the held frames of a fresh map; see `PillPlacement`.
     holder: gtk::DrawingArea,
     waveform: Rc<RefCell<Waveform>>,
@@ -517,6 +528,8 @@ fn install_surface_feedback(
         meter,
         glyph,
         capsule,
+        frame,
+        layers,
         holder,
         waveform,
         rendered,
@@ -545,7 +558,7 @@ fn install_surface_feedback(
     let mut position_watch = PositionWatch::default();
     // Where the pill goes, and where it sits on the output it was given.
     let position = Rc::new(Cell::new(voisu_app::config::overlay_position()));
-    let placement = PillPlacement::install(&window, capsule.upcast_ref(), &holder);
+    let placement = PillPlacement::install(&window, &frame, &layers, capsule.upcast_ref(), &holder);
     // Set when the config file changes or a move is saved: re-read the
     // position, so a change lands even while a result pill is on screen.
     let reread = Rc::new(Cell::new(false));
@@ -1701,66 +1714,78 @@ fn render_surface(
     let glyph_text = phase_glyph(view.phase);
     glyph.set_label(glyph_text);
     glyph.set_visible(!glyph_text.is_empty());
-    Some(size_pill(window, capsule, label, glyph))
+    Some(size_pill(capsule, label, glyph))
 }
 
-/// Places the Recording pill on whichever output the compositor gave it, and
-/// holds each fresh map transparent until it sits right there. A fresh map is
-/// never bound to an output (that is what lets each Recording show on the
-/// focused one), so the Overlay only learns which output it is on when the
-/// surface enters it, after its first frame is mapped. Until then the pill sits
-/// at [`placement::safe_margins`], on screen on every connected output; its
-/// right margins come from the entered output's logical geometry, and the saved
-/// position is fractions of whichever output that is.
+/// Places the pill on the output it shows on, without ever moving the mapped
+/// surface in normal use. The surface is one fixed, transparent,
+/// click-through [`placement::PILL_BOX`], placed once per map by margins that
+/// never depend on the pill's size; a state change only moves the capsule
+/// inside it (`frame`), so a wider text pill never shifts the surface and
+/// Hyprland, which animates a mapped layer's margin changes, has nothing to
+/// slide.
 ///
-/// [`RevealHold`] decides what the enter does. If the entered output wants the
-/// margins already applied, the pill shows after one more transparent frame.
-/// Otherwise the probe is unmapped, bound to that output at its margins and
-/// mapped again, still transparent, and shows after that map's first painted
-/// frame, so the visible map never moves (Hyprland would animate the move). At
-/// [`REVEAL_DEADLINE`] it shows anyway at the best margins known. Only the
-/// capsule is hidden, so status, levels and the meter's animation run on
-/// through the hold.
+/// Which output, before the map: on Hyprland its IPC names the focused
+/// output, and the surface is bound there at that output's margins before it
+/// is mapped, so the pill shows at once and in place. Elsewhere (KDE, or a
+/// Hyprland whose IPC didn't answer) a fresh map is unbound and the Overlay
+/// only learns its output when the surface enters it, after its first frame.
+/// Each such map gets a new `wl_surface` (the window is unrealized first),
+/// since hiding and showing the same one brings no new enter. Until the enter
+/// the pill is held transparent at [`placement::safe_margins`], and
+/// [`RevealHold`] decides what the enter does: show after one more frame if
+/// the margins are right, or unmap, bind to that output at its margins and
+/// map again, still held. At [`REVEAL_DEADLINE`] it shows anyway, where it
+/// is; an enter after that re-places it (a snap, on a compositor that doesn't
+/// animate layers). Only the capsule is hidden, so status, levels and the
+/// meter's animation run on through the hold.
 struct PillPlacement {
     window: gtk::ApplicationWindow,
+    /// The fixed box's content, where the capsule is put.
+    frame: gtk::Fixed,
+    /// The capsule and its holder, moved inside `frame`.
+    layers: gtk::Overlay,
     /// The drawn pill: transparent while held.
     capsule: gtk::Widget,
     /// Drawn only while held, so a held frame is still committed.
     holder: gtk::DrawingArea,
-    /// The output the surface last entered and has not left. Kept over a
-    /// remap, though [`RevealHold::trusts_output`] ignores it until the new
-    /// map's enter: a compositor that sends no leave on unmap may send no
-    /// enter on a remap to the same output either, and then this is the best
-    /// guess at the deadline.
-    entered: RefCell<Option<gtk::gdk::Monitor>>,
-    /// The output a rebind bound the surface to, for the life of one shown
-    /// pill. It places the pill even if the probe's leave arrives late.
-    bound: RefCell<Option<gtk::gdk::Monitor>>,
+    /// The output this map is placed by: the one it was bound to, or the
+    /// one it entered. `None` until known, and from each fresh map.
+    on: RefCell<Option<gtk::gdk::Monitor>>,
+    /// Whether the window is bound to an output (`set_monitor`).
+    bound: Cell<bool>,
     reveal: RefCell<RevealHold>,
     /// The transparent paint the reveal waits for.
     pending: Cell<Option<PaintToken>>,
     /// The position and pill size last placed, to re-place on enter.
     wanted: Cell<Option<(OverlayPosition, Size)>>,
-    /// The margins last applied.
+    /// The box margins last applied.
     placed: Cell<Option<(i32, i32)>>,
+    /// The capsule's offset inside the box last applied.
+    offset: Cell<Option<(i32, i32)>>,
 }
 
 impl PillPlacement {
     fn install(
         window: &gtk::ApplicationWindow,
+        frame: &gtk::Fixed,
+        layers: &gtk::Overlay,
         capsule: &gtk::Widget,
         holder: &gtk::DrawingArea,
     ) -> Rc<Self> {
         let placement = Rc::new(Self {
             window: window.clone(),
+            frame: frame.clone(),
+            layers: layers.clone(),
             capsule: capsule.clone(),
             holder: holder.clone(),
-            entered: RefCell::new(None),
-            bound: RefCell::new(None),
+            on: RefCell::new(None),
+            bound: Cell::new(false),
             reveal: RefCell::new(RevealHold::default()),
             pending: Cell::new(None),
             wanted: Cell::new(None),
             placed: Cell::new(None),
+            offset: Cell::new(None),
         });
         let watch = {
             let placement = Rc::downgrade(&placement);
@@ -1770,14 +1795,6 @@ impl PillPlacement {
                     move |_, monitor| {
                         if let Some(placement) = placement.upgrade() {
                             placement.entered(monitor);
-                        }
-                    }
-                });
-                surface.connect_leave_monitor({
-                    let placement = placement.clone();
-                    move |_, monitor| {
-                        if let Some(placement) = placement.upgrade() {
-                            placement.left(monitor);
                         }
                     }
                 });
@@ -1791,16 +1808,16 @@ impl PillPlacement {
                 });
             }
         };
-        match window.surface() {
-            Some(surface) => watch(&surface),
-            None => {
-                window.connect_realize(move |window| {
-                    if let Some(surface) = window.surface() {
-                        watch(&surface);
-                    }
-                });
-            }
+        if let Some(surface) = window.surface() {
+            watch(&surface);
         }
+        // Every realize brings a new surface (a fresh unbound map unrealizes
+        // the window), whose signals are watched afresh.
+        window.connect_realize(move |window| {
+            if let Some(surface) = window.surface() {
+                watch(&surface);
+            }
+        });
         // Hidden (Idle, or move mode) or about to be remapped: every callback
         // armed for the last map is dead. The Overlay's own unmap for a rebind
         // keeps the pill held for the map that follows.
@@ -1820,23 +1837,65 @@ impl PillPlacement {
         placement
     }
 
-    /// Called just before the surface is mapped afresh: drops any binding so
-    /// the compositor picks the output, holds the pill transparent at safe
-    /// margins, and arms the deadline.
+    /// Called just before the surface is mapped afresh. Binds it to the
+    /// output Hyprland has focused, at its margins, and shows it; or, with no
+    /// such answer, maps it unbound on a new surface, held at safe margins,
+    /// with the deadline armed.
     fn begin_map(self: &Rc<Self>, position: OverlayPosition, pill: Size) {
-        self.unbind();
-        let token = self.reveal.borrow_mut().begin_map();
+        self.wanted.set(Some((position, pill)));
         self.pending.set(None);
+        let focused = voisu_app::overlay::hyprland::focused_output();
+        let monitor = focused.as_deref().and_then(|name| self.monitor_named(name));
+        if let Some(monitor) = monitor {
+            self.bind(&monitor);
+            self.reveal.borrow_mut().show_bound();
+            self.show();
+            self.replace();
+            trace(format_args!(
+                "resolved output via hyprland ipc={} margins={:?}",
+                monitor.connector().unwrap_or_default(),
+                self.placed.get()
+            ));
+            return;
+        }
+        trace(format_args!(
+            "resolved output via fallback ipc={}",
+            focused.as_deref().unwrap_or("none")
+        ));
+        self.unbind();
+        self.on.replace(None);
+        // A new wl_surface, so the compositor sends this map its enter.
+        if self.window.is_realized() {
+            WidgetExt::unrealize(&self.window);
+        }
+        let token = self.reveal.borrow_mut().begin_map();
         self.hold();
-        self.place(position, pill);
+        self.replace();
         trace(format_args!("map probe margins={:?}", self.placed.get()));
         self.arm_deadline(token);
     }
 
-    /// Drops the binding a rebind made. Called only while the window is
-    /// unmapped: Layer Shell remaps a mapped window whose output changes.
+    /// The connected output with this connector name.
+    fn monitor_named(&self, name: &str) -> Option<gtk::gdk::Monitor> {
+        let monitors = gtk::prelude::RootExt::display(&self.window).monitors();
+        (0..monitors.n_items())
+            .filter_map(|index| monitors.item(index)?.downcast::<gtk::gdk::Monitor>().ok())
+            .find(|monitor| monitor.is_valid() && monitor.connector().as_deref() == Some(name))
+    }
+
+    /// Binds the window to `monitor`, which then places it. Called only
+    /// while the window is unmapped: Layer Shell remaps a mapped window whose
+    /// output changes.
+    fn bind(&self, monitor: &gtk::gdk::Monitor) {
+        self.window.set_monitor(Some(monitor));
+        self.bound.set(true);
+        self.on.replace(Some(monitor.clone()));
+    }
+
+    /// Drops the binding, so the compositor picks the next map's output.
+    /// Called only while the window is unmapped.
     fn unbind(&self) {
-        if self.bound.take().is_some() {
+        if self.bound.replace(false) {
             self.window.set_monitor(None);
             trace(format_args!("unbind"));
         }
@@ -1862,8 +1921,7 @@ impl PillPlacement {
                 && placement.reveal.borrow_mut().deadline(token)
             {
                 placement.pending.set(None);
-                // Now shown, the output last entered places it, if any.
-                placement.replace();
+                // Where it is: moving it now would slide it on Hyprland.
                 trace(format_args!(
                     "reveal by=deadline bound={} margins={:?}",
                     placement.reveal.borrow().bound(),
@@ -1875,16 +1933,16 @@ impl PillPlacement {
     }
 
     /// Puts a pill of `pill` size at `position`. Called on every visible
-    /// tick, so a new pill size, position or output geometry lands within one
-    /// tick; the surface is only touched when the margins change.
+    /// tick; a new pill size only moves the capsule inside the box, and the
+    /// surface is only touched when the box's margins change (a new position
+    /// or output geometry).
     fn place(&self, position: OverlayPosition, pill: Size) {
         self.wanted.set(Some((position, pill)));
         self.replace();
     }
 
     fn entered(self: &Rc<Self>, monitor: &gtk::gdk::Monitor) {
-        self.entered.replace(Some(monitor.clone()));
-        let there = self.margins(Some(monitor));
+        let there = self.layout(Some(monitor)).map(|(margins, _)| margins);
         let moves = there.is_some() && there != self.placed.get();
         let action = self.reveal.borrow_mut().output_known(moves);
         trace(format_args!(
@@ -1895,7 +1953,11 @@ impl PillPlacement {
         match action {
             // A transparent frame at these margins, even though they are
             // unchanged, before the pill is shown.
-            Entered::Paint(paint) => self.arm(paint),
+            Entered::Paint(paint) => {
+                self.on.replace(Some(monitor.clone()));
+                self.replace();
+                self.arm(paint);
+            }
             // Not from inside the enter signal: the remap unmaps the surface
             // that is sending it.
             Entered::Remap(token) => {
@@ -1907,23 +1969,27 @@ impl PillPlacement {
                     }
                 });
             }
-            Entered::Ignore => self.replace(),
+            // Shown unbound before its output was known: placed by it now.
+            Entered::Place => {
+                self.on.replace(Some(monitor.clone()));
+                self.replace();
+            }
+            Entered::Ignore => {}
         }
     }
 
     /// Maps the probe again, bound to `monitor` at its margins and still
     /// held, so the pill is never moved while mapped.
     fn remap(self: &Rc<Self>, token: RemapToken, monitor: &gtk::gdk::Monitor) {
-        let Some(margins) = self.margins(Some(monitor)) else {
+        let Some((margins, offset)) = self.layout(Some(monitor)) else {
             return;
         };
         if !self.reveal.borrow_mut().rebind(token) {
             return;
         }
         self.window.set_visible(false);
-        self.window.set_monitor(Some(monitor));
-        self.bound.replace(Some(monitor.clone()));
-        self.apply(margins);
+        self.bind(monitor);
+        self.apply(margins, offset);
         let Some((map, paint)) = self.reveal.borrow_mut().remapped() else {
             // Unreachable: only a rebind's own unmap ran in between. Never
             // leave a live pill unmapped, though.
@@ -1939,19 +2005,6 @@ impl PillPlacement {
         ));
         self.window.set_visible(true);
         self.arm_deadline(map);
-    }
-
-    fn left(&self, monitor: &gtk::gdk::Monitor) {
-        let left = self.entered.borrow().as_ref() == Some(monitor);
-        trace(format_args!(
-            "leave output={} current={left}",
-            monitor.connector().unwrap_or_default()
-        ));
-        if left {
-            self.entered.replace(None);
-            self.reveal.borrow_mut().output_lost();
-            self.replace();
-        }
     }
 
     /// After each frame: shows a held pill once the frame it waited for is
@@ -1982,15 +2035,16 @@ impl PillPlacement {
         self.holder.set_visible(false);
     }
 
-    /// The margins for the wanted pill on `on`, or on no known output.
-    fn margins(&self, on: Option<&gtk::gdk::Monitor>) -> Option<(i32, i32)> {
+    /// The box margins and capsule offset for the wanted pill on `on`, or on
+    /// no known output.
+    fn layout(&self, on: Option<&gtk::gdk::Monitor>) -> Option<((i32, i32), (i32, i32))> {
         let (position, pill) = self.wanted.get()?;
         let monitors = gtk::prelude::RootExt::display(&self.window).monitors();
         let connected: Vec<Size> = (0..monitors.n_items())
             .filter_map(|index| monitors.item(index)?.downcast::<gtk::gdk::Monitor>().ok())
             .filter_map(|monitor| monitor_size(&monitor))
             .collect();
-        Some(placement::output_margins(
+        Some(placement::box_placement(
             position,
             pill,
             on.and_then(monitor_size),
@@ -1999,43 +2053,34 @@ impl PillPlacement {
     }
 
     fn replace(&self) {
-        let reveal = self.reveal.borrow();
-        if reveal.margins_frozen() {
+        if self.reveal.borrow().margins_frozen() {
             return;
         }
-        // The bound output places a rebound pill, unless it was unplugged.
-        let bound = self
-            .bound
-            .borrow()
-            .as_ref()
-            .filter(|monitor| reveal.bound() && monitor.is_valid())
-            .cloned();
-        let on = bound.or_else(|| {
-            reveal
-                .trusts_output()
-                .then(|| self.entered.borrow().clone())
-                .flatten()
-        });
-        drop(reveal);
-        let Some(margins) = self.margins(on.as_ref()) else {
+        let on = self.on.borrow().clone();
+        let Some((margins, offset)) = self.layout(on.as_ref()) else {
             return;
         };
-        if self.placed.get() == Some(margins) {
-            return;
-        }
-        self.apply(margins);
+        let moved = self.placed.get() != Some(margins);
+        self.apply(margins, offset);
         // A held pill waits for a frame at the new spot instead.
-        let paint = self.reveal.borrow_mut().moved();
-        if let Some(paint) = paint {
+        if moved && let Some(paint) = self.reveal.borrow_mut().moved() {
             self.arm(paint);
         }
     }
 
-    fn apply(&self, margins: (i32, i32)) {
-        self.placed.set(Some(margins));
-        self.window.set_margin(Edge::Left, margins.0);
-        self.window.set_margin(Edge::Top, margins.1);
-        trace(format_args!("margins {margins:?}"));
+    /// Applies what changed: the box's margins on the surface, the capsule's
+    /// offset inside it.
+    fn apply(&self, margins: (i32, i32), offset: (i32, i32)) {
+        if self.placed.replace(Some(margins)) != Some(margins) {
+            self.window.set_margin(Edge::Left, margins.0);
+            self.window.set_margin(Edge::Top, margins.1);
+            trace(format_args!("margins {margins:?}"));
+        }
+        if self.offset.replace(Some(offset)) != Some(offset) {
+            self.frame
+                .move_(&self.layers, f64::from(offset.0), f64::from(offset.1));
+            trace(format_args!("offset {offset:?}"));
+        }
     }
 }
 
@@ -2077,20 +2122,13 @@ fn watch_config(reread: &Rc<Cell<bool>>) -> Option<gtk::gio::FileMonitor> {
 /// Sizes the pill for what it shows: 120x40 for bars and the check mark, and
 /// for text widened to fit, up to `PILL_MAX_WIDTH`, wrapping to two lines.
 /// The label's own width request is the text width, so the capsule is exactly
-/// the pill and the window follows it.
-fn size_pill(
-    window: &gtk::ApplicationWindow,
-    capsule: &gtk::Box,
-    label: &gtk::Label,
-    glyph: &gtk::Label,
-) -> Size {
+/// the pill. The surface around it keeps its fixed size.
+fn size_pill(capsule: &gtk::Box, label: &gtk::Label, glyph: &gtk::Label) -> Size {
     if !label.is_visible() {
-        // Back to the bare pill: reset the window's size explicitly, so a wide
-        // text state never leaves the surface wider than the bars.
+        // Back to the bare pill, so a wide text state never leaves it wider
+        // than the bars.
         label.set_size_request(-1, -1);
         capsule.set_size_request(PILL_WIDTH, PILL_HEIGHT);
-        window.set_default_size(PILL_WIDTH, PILL_HEIGHT);
-        window.queue_resize();
         return (PILL_WIDTH, PILL_HEIGHT);
     }
     // Measure the text on one line to know how wide it wants to be.
@@ -2120,8 +2158,6 @@ fn size_pill(
     label.set_size_request(text_width, height);
     // Never shorter than the bar pill: one line of text sits centred in it.
     capsule.set_size_request(width, PILL_HEIGHT);
-    window.set_default_size(width, -1);
-    window.queue_resize();
     // A text state's CSS padding (4 px) and border (1 px) above and below.
     (width, (height + TEXT_PILL_PAD_Y).max(PILL_HEIGHT))
 }

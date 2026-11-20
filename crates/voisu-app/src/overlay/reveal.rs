@@ -2,22 +2,21 @@
 //! mapped again first. Pure state, so the order of compositor events is
 //! tested without one.
 //!
-//! An unbound Layer Shell surface learns its output only after its first
-//! buffer is mapped (the compositor's `wl_surface.enter`). Until then the
-//! pill sits at margins safe on every output, which on a bigger output are
-//! the wrong spot. Moving a mapped layer surface is not an option: Hyprland
-//! animates a layer's box from the old margins to the new ones, so the pill
-//! would slide in. So each fresh map is a held probe: the pill draws
-//! transparent frames until its output is known. If that output wants the
-//! margins already applied, the pill shows after one more painted frame.
-//! Otherwise the probe is unmapped, bound to that output at its margins and
-//! mapped again, still held, and shows after that map's first painted frame.
-//! The visible map's margins never change. If the output never says, the
-//! pill shows anyway at [`REVEAL_DEADLINE`], unbound, at the best margins
-//! known.
+//! Where the compositor says which output is focused (Hyprland), the Overlay
+//! binds the surface there at its final margins before mapping it, and the
+//! pill shows at once ([`RevealHold::show_bound`]). Elsewhere the surface is
+//! mapped unbound and learns its output only after its first buffer (the
+//! compositor's `wl_surface.enter`), so that map is a held probe: the pill
+//! draws transparent frames at margins safe on every output until the output
+//! is known. If that output wants the margins already applied, the pill shows
+//! after one more painted frame. Otherwise the probe is unmapped, bound to
+//! that output at its margins and mapped again, still held, and shows after
+//! that map's first painted frame; a compositor that animates a mapped
+//! layer's margins (Hyprland) never sees them change. If the output never
+//! says, the pill shows anyway at [`REVEAL_DEADLINE`], unbound, where it is,
+//! and an enter that comes later re-places it.
 //!
-//! The binding lasts one shown pill: a hide, or the next fresh map, drops it
-//! so the compositor picks the focused output again.
+//! The binding lasts one shown pill: a hide, or the next fresh map, drops it.
 //!
 //! Every callback the Overlay arms carries a token. Unmapping, a new map, or
 //! a later change (a new output, a move) supersedes it, so a stale timer,
@@ -25,7 +24,7 @@
 
 use std::time::Duration;
 
-/// The longest a fresh map stays transparent while it waits for its output.
+/// The longest a fresh probe stays transparent while it waits for its output.
 pub const REVEAL_DEADLINE: Duration = Duration::from_millis(150);
 
 /// Names one map, for its [`REVEAL_DEADLINE`] timer.
@@ -49,7 +48,10 @@ pub enum Entered {
     /// That output wants other margins: unmap, bind to it at its margins and
     /// map again. Start with [`RevealHold::rebind`].
     Remap(RemapToken),
-    /// Nothing to hold or remap for; at most re-place a shown pill.
+    /// An unbound pill already shown by the deadline: place it by this
+    /// output where it is.
+    Place,
+    /// A bound or unmapped surface: the enter changes nothing.
     Ignore,
 }
 
@@ -90,8 +92,16 @@ impl Default for RevealHold {
 }
 
 impl RevealHold {
-    /// A fresh map starts as an unbound, held probe. Arm the deadline with
-    /// the token.
+    /// A fresh map bound to the focused output before it is mapped, at its
+    /// final margins: nothing to wait for, so it is seen at once.
+    pub fn show_bound(&mut self) {
+        self.supersede();
+        self.phase = Phase::Shown;
+        self.bound = true;
+    }
+
+    /// A fresh unbound map starts as a held probe. Arm the deadline with the
+    /// token.
     pub fn begin_map(&mut self) -> MapToken {
         self.supersede();
         self.phase = Phase::Probing;
@@ -114,12 +124,12 @@ impl RevealHold {
     }
 
     /// The surface entered an output. `moves` is whether that output wants
-    /// margins other than those applied. Only an unbound held probe acts on
-    /// it; once rebound, or shown, an enter (a late one from the probe
-    /// included) holds and remaps nothing.
+    /// margins other than those applied. A bound surface ignores it, so a
+    /// late enter from a probe never touches its rebound map.
     pub fn output_known(&mut self, moves: bool) -> Entered {
         match self.phase {
-            Phase::Probing | Phase::Painting | Phase::Rebinding if !self.bound => {
+            _ if self.bound => Entered::Ignore,
+            Phase::Probing | Phase::Painting | Phase::Rebinding => {
                 if moves {
                     self.phase = Phase::Rebinding;
                     Entered::Remap(RemapToken(self.next_paint().0))
@@ -128,16 +138,8 @@ impl RevealHold {
                     Entered::Paint(self.next_paint())
                 }
             }
-            _ => Entered::Ignore,
-        }
-    }
-
-    /// The surface left the output it was placed by. A held probe waits for
-    /// the next one again; a bound map stays bound.
-    pub fn output_lost(&mut self) {
-        if !self.bound && matches!(self.phase, Phase::Painting | Phase::Rebinding) {
-            self.paint += 1;
-            self.phase = Phase::Probing;
+            Phase::Shown => Entered::Place,
+            Phase::Unmapped | Phase::Remapping => Entered::Ignore,
         }
     }
 
@@ -178,8 +180,8 @@ impl RevealHold {
     }
 
     /// The deadline armed by `token` fired. `true` when that map is still
-    /// held: show the pill now, at the best margins known. A probe waiting
-    /// on its remap shows unbound.
+    /// held: show the pill now, where it is. A probe waiting on its remap
+    /// shows unbound.
     pub fn deadline(&mut self, token: MapToken) -> bool {
         self.reveal_if(self.held() && token.0 == self.map)
     }
@@ -194,23 +196,15 @@ impl RevealHold {
         )
     }
 
-    /// Whether the surface is bound to the output its probe entered.
+    /// Whether the surface is bound to an output.
     #[must_use]
     pub fn bound(&self) -> bool {
         self.bound
     }
 
-    /// Whether the output the surface was last known on may place the pill.
-    /// Not while a fresh probe waits for its output, since that output may
-    /// be from the last map.
-    #[must_use]
-    pub fn trusts_output(&self) -> bool {
-        self.phase != Phase::Probing
-    }
-
     /// Whether the margins must be left as they are: a probe waiting on its
-    /// remap would otherwise move while mapped, which Hyprland animates.
-    /// The remap applies the right ones.
+    /// remap would otherwise move while mapped. The remap applies the right
+    /// ones.
     #[must_use]
     pub fn margins_frozen(&self) -> bool {
         matches!(self.phase, Phase::Rebinding | Phase::Remapping)
@@ -254,15 +248,24 @@ mod tests {
     }
 
     #[test]
+    fn a_map_bound_before_it_is_mapped_shows_at_once_and_ignores_enters() {
+        let mut hold = RevealHold::default();
+        hold.show_bound();
+        assert!(!hold.held());
+        assert!(hold.bound());
+        assert_eq!(hold.output_known(true), Entered::Ignore);
+        assert_eq!(hold.moved(), None);
+        assert!(!hold.unmap());
+        assert!(!hold.bound());
+    }
+
+    #[test]
     fn an_enter_at_the_applied_margins_shows_after_a_paint_without_a_remap() {
         let mut hold = RevealHold::default();
         assert!(!hold.held());
         let map = hold.begin_map();
         assert!(hold.held());
-        // The last map's output can't place it yet.
-        assert!(!hold.trusts_output());
         let paint = paint_of(hold.output_known(false));
-        assert!(hold.trusts_output());
         assert!(!hold.margins_frozen());
         assert!(hold.held(), "still transparent until that frame is painted");
         assert!(hold.painted(paint));
@@ -313,7 +316,9 @@ mod tests {
         assert!(!hold.held());
 
         // A fresh map over a bound pill still up starts unbound too.
+        hold.show_bound();
         hold.begin_map();
+        assert!(!hold.bound());
         let remap = remap_of(hold.output_known(true));
         assert!(hold.rebind(remap));
         hold.unmap();
@@ -325,23 +330,22 @@ mod tests {
     }
 
     #[test]
-    fn the_deadline_during_the_probe_shows_it_unbound_and_cancels_the_remap() {
+    fn the_deadline_shows_the_probe_where_it_is_and_a_late_enter_places_it() {
         let mut hold = RevealHold::default();
         let map = hold.begin_map();
         let remap = remap_of(hold.output_known(true));
         assert!(hold.deadline(map));
         assert!(!hold.held());
         assert!(!hold.bound());
-        assert!(!hold.margins_frozen(), "shown: re-placed in place now");
-        assert!(!hold.rebind(remap));
+        assert!(!hold.margins_frozen());
+        assert!(!hold.rebind(remap), "the remap died with the deadline");
         assert_eq!(hold.remapped(), None);
 
-        // With no enter at all, the deadline shows it the same way, and a
-        // late enter only re-places it.
+        // With no enter at all, the deadline shows it the same way, and an
+        // enter that comes after only places it, with no hold.
         let map = hold.begin_map();
         assert!(hold.deadline(map));
-        assert!(hold.trusts_output());
-        assert_eq!(hold.output_known(true), Entered::Ignore);
+        assert_eq!(hold.output_known(true), Entered::Place);
         assert_eq!(hold.moved(), None);
         assert!(!hold.held());
     }
@@ -355,41 +359,28 @@ mod tests {
         assert!(!hold.painted(early), "that frame was at the old margins");
         assert!(hold.rebind(remap));
         hold.unmap();
-        // An enter or leave the probe sends late, once unmapped.
+        // An enter the probe sends late, once unmapped.
         assert_eq!(hold.output_known(true), Entered::Ignore);
-        hold.output_lost();
         let (_, paint) = hold.remapped().unwrap();
         // And once the bound map is up.
         assert_eq!(hold.output_known(true), Entered::Ignore);
-        hold.output_lost();
         assert!(hold.bound());
         assert!(hold.held());
         assert!(hold.painted(paint));
+        assert_eq!(hold.output_known(true), Entered::Ignore);
     }
 
     #[test]
-    fn leaving_the_output_or_moving_before_the_paint_waits_for_a_new_one() {
+    fn a_move_before_the_paint_waits_for_a_new_one() {
         let mut hold = RevealHold::default();
         hold.begin_map();
-        let first = paint_of(hold.output_known(false));
-        hold.output_lost();
-        assert!(!hold.painted(first), "that frame was for the output left");
-        assert!(hold.held());
-        assert!(!hold.trusts_output());
-        // A move while waiting arms nothing: no output to paint for yet.
+        // A move while probing arms nothing: no output to paint for yet.
         assert_eq!(hold.moved(), None);
-        let second = paint_of(hold.output_known(false));
+        let first = paint_of(hold.output_known(false));
         let moved = hold.moved().unwrap();
-        assert!(!hold.painted(second), "that frame was of the old margins");
+        assert!(!hold.painted(first), "that frame was of the old margins");
         assert!(hold.painted(moved));
         assert!(!hold.held());
-
-        // Leaving while a remap is pending cancels it.
-        hold.begin_map();
-        let remap = remap_of(hold.output_known(true));
-        hold.output_lost();
-        assert!(!hold.rebind(remap));
-        assert!(!hold.margins_frozen());
     }
 
     #[test]
@@ -411,12 +402,8 @@ mod tests {
 
         // A remap's callbacks belong to it alone.
         let old = hold.begin_map();
-        let stale = match hold.output_known(false) {
-            Entered::Paint(paint) => paint,
-            other => panic!("expected a paint, got {other:?}"),
-        };
+        let stale = paint_of(hold.output_known(false));
         let new = hold.begin_map();
-        assert!(!hold.trusts_output());
         assert!(!hold.painted(stale));
         assert!(!hold.deadline(old));
         assert!(hold.held());

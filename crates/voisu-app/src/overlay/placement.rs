@@ -3,17 +3,23 @@
 //!
 //! The saved [`OverlayPosition`] is the pill's centre as fractions of the
 //! output. The Layer Shell surface is anchored to the top and left edges and
-//! pushed into place with margins, recomputed whenever the output, the pill's
-//! size or the position changes. Every function clamps so the whole pill stays
-//! on the output, whatever the output's size.
+//! pushed into place with margins. Every function clamps so the whole pill
+//! stays on the output, whatever the output's size.
 //!
-//! The Recording pill is never bound to an output: the compositor puts each
-//! fresh map on the output it chooses (the focused one), and the Overlay only
-//! learns which once the surface enters it. Until then [`safe_margins`] keep
-//! the pill on screen on every connected output; [`output_margins`] picks
-//! between the two.
+//! The pill's surface is a fixed, transparent [`PILL_BOX`], big enough for
+//! every pill state, and the drawn pill sits inside it ([`box_placement`]).
+//! So a state change that resizes the pill only re-lays it out inside the
+//! surface; the margins, which a compositor such as Hyprland animates when
+//! they change on a mapped surface, depend on the position and the output
+//! alone.
+//!
+//! When the Overlay can't ask which output is focused, it maps the surface
+//! unbound and learns the output once the surface enters it. Until then
+//! [`safe_margins`] keep the pill on screen on every connected output;
+//! [`output_margins`] picks between the two.
 
 use crate::config::OverlayPosition;
+use crate::overlay::PILL_MAX_WIDTH;
 
 /// A width and height in logical pixels.
 pub type Size = (i32, i32);
@@ -82,6 +88,35 @@ pub fn output_margins(
         Some(output) => pill_margins(position, output, pill),
         None => safe_margins(position, connected, pill),
     }
+}
+
+/// The pill's surface: as wide as the widest text pill and tall enough for
+/// two lines of text, so no pill state resizes it.
+pub const PILL_BOX: Size = (PILL_MAX_WIDTH, 64);
+
+/// Where the [`PILL_BOX`] surface goes and where a pill of `pill` size sits
+/// inside it, for `position` on `output` (or, unknown, on every one of
+/// `connected`): the box's margins, and the pill's offset from the box's
+/// top-left corner. The box is centred on the saved point and clamped to the
+/// output like a pill; the offset puts the pill exactly where
+/// [`output_margins`] would put a surface of the pill's own size. The margins
+/// never depend on `pill`.
+#[must_use]
+pub fn box_placement(
+    position: OverlayPosition,
+    pill: Size,
+    output: Option<Size>,
+    connected: &[Size],
+) -> ((i32, i32), (i32, i32)) {
+    let margins = output_margins(position, PILL_BOX, output, connected);
+    let wanted = output_margins(position, pill, output, connected);
+    // Only an output smaller than the box could put the pill outside it.
+    let inside = |at: i32, from: i32, room: i32| (at - from).clamp(0, room.max(0));
+    let offset = (
+        inside(wanted.0, margins.0, PILL_BOX.0 - pill.0),
+        inside(wanted.1, margins.1, PILL_BOX.1 - pill.1),
+    );
+    (margins, offset)
 }
 
 /// `centre` (in output pixels) moved just enough that the pill around it
@@ -284,5 +319,95 @@ mod tests {
             pill_margins(saved, LAPTOP, PILL)
         );
         assert_eq!(pill_margins(saved, LAPTOP, PILL), (324, 76));
+    }
+
+    /// Every pill state the box must hold: the bars, the move pill's
+    /// footprint, and one- and two-line text pills up to the widest.
+    const STATES: [Size; 5] = [PILL, (180, 40), (320, 40), (320, 48), (256, 58)];
+
+    #[test]
+    fn the_pill_sits_inside_the_box_where_its_own_margins_would_put_it() {
+        let connected = [HDMI, LAPTOP];
+        for output in [Some(HDMI), Some(LAPTOP), Some((3840, 2160)), None] {
+            for position in [
+                OverlayPosition::DEFAULT,
+                at(0.5, 0.5),
+                at(0.0, 0.0),
+                at(1.0, 1.0),
+                at(0.02, 0.98),
+                at(0.99, 0.01),
+            ] {
+                for pill in STATES {
+                    let (margins, offset) = box_placement(position, pill, output, &connected);
+                    let wanted = output_margins(position, pill, output, &connected);
+                    assert_eq!(
+                        (margins.0 + offset.0, margins.1 + offset.1),
+                        wanted,
+                        "{position} {pill:?} on {output:?}"
+                    );
+                    assert!(offset.0 >= 0 && offset.0 + pill.0 <= PILL_BOX.0);
+                    assert!(offset.1 >= 0 && offset.1 + pill.1 <= PILL_BOX.1);
+                    let on = output.unwrap_or(LAPTOP);
+                    assert!(on_output(margins, on, PILL_BOX), "box off {on:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_box_is_centred_on_the_point_and_clamped_at_the_edges() {
+        // Centred: the pill in the middle of the box.
+        assert_eq!(
+            box_placement(at(0.5, 0.5), PILL, Some(HDMI), &[HDMI]),
+            ((800, 508), (100, 12))
+        );
+        // The default on HDMI: the pill where it always was, (900,1021).
+        assert_eq!(
+            box_placement(OverlayPosition::DEFAULT, PILL, Some(HDMI), &[HDMI]),
+            ((800, 1009), (100, 12))
+        );
+        // At the corners the box stops at the edge and the pill shifts
+        // inside it to reach the edge too.
+        assert_eq!(
+            box_placement(at(0.0, 0.0), PILL, Some(HDMI), &[HDMI]),
+            ((0, 0), (0, 0))
+        );
+        assert_eq!(
+            box_placement(at(1.0, 1.0), PILL, Some(HDMI), &[HDMI]),
+            ((1600, 1016), (200, 24))
+        );
+        // Unknown output on mixed outputs: placed on the smallest, the laptop.
+        assert_eq!(
+            box_placement(OverlayPosition::DEFAULT, PILL, None, &[HDMI, LAPTOP]),
+            ((608, 893), (100, 12))
+        );
+        // An output smaller than the box: the box at its corner, the pill
+        // still on the output.
+        let tiny = (200, 50);
+        let (margins, offset) = box_placement(at(0.5, 0.5), PILL, Some(tiny), &[tiny]);
+        assert_eq!(margins, (0, 0));
+        assert!(on_output(offset, tiny, PILL), "{offset:?}");
+    }
+
+    #[test]
+    fn a_state_change_never_moves_the_box() {
+        let connected = [HDMI, LAPTOP];
+        for output in [Some(HDMI), Some(LAPTOP), None] {
+            for position in [
+                OverlayPosition::DEFAULT,
+                at(0.0, 0.0),
+                at(1.0, 1.0),
+                at(0.3, 0.7),
+            ] {
+                let (first, _) = box_placement(position, PILL, output, &connected);
+                for pill in STATES {
+                    assert_eq!(
+                        box_placement(position, pill, output, &connected).0,
+                        first,
+                        "{position} {pill:?} on {output:?}"
+                    );
+                }
+            }
+        }
     }
 }
