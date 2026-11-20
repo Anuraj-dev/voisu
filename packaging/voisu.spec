@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        0.93.0
+Version:        0.93.1
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -206,6 +206,9 @@ install -D -m 0644 packaging/icons/voisu.svg %{buildroot}%{_datadir}/icons/hicol
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Fri Nov 20 2026 Voisu maintainers <voisu@example.invalid> - 0.93.1-1
+- fix(windows): faster microphone start that honours Stop and Esc (#348)
+
 * Fri Nov 20 2026 Voisu maintainers <voisu@example.invalid> - 0.93.0-1
 - feat(windows): same pill on Windows and macOS with Move and Reset (#347)
 - feat(overlay): movable 120x40 pill on the focused monitor (#346)
