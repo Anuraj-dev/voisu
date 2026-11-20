@@ -31,7 +31,7 @@ It is a tray app on Windows, a menu bar app on macOS, and a set of systemd user 
 
 ## What you get
 
-- **Text where you were typing.** Voisu pastes the Transcript for you. On Windows it goes to the window that had focus when you started, even if you clicked away, and your clipboard is restored afterwards.
+- **Text where you were typing.** Voisu pastes the Transcript for you. On Windows it goes to the window that had focus when you started, even if you clicked away, and the Transcript stays on the clipboard so you can paste it again, as on Linux.
 - **Two engines, one Transcript.** Deepgram streams while you talk. Groq transcribes the whole Recording when you stop. Voisu reconciles the two.
 - **Spoken punctuation and layout.** Say "new paragraph", "dash dash", "quote … unquote" or "first … second …" and it is formatted locally, on every platform.
 - **Hold to talk, or go hands-free.** On Windows and macOS, hold the Trigger Key and let go, or double-tap for hands-free. `Esc` cancels. On Linux, press to start and press again to stop.
