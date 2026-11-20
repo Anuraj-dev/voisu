@@ -354,7 +354,9 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
     label.add_css_class("state-label");
     label.set_hexpand(true);
     label.set_vexpand(true);
-    let meter = gtk::DrawingArea::builder().content_height(24).build();
+    let meter = gtk::DrawingArea::builder()
+        .content_height(METER_HEIGHT)
+        .build();
     // Graphics-first phases (Recording/Processing/NoSpeech) hide the label and
     // glyph widgets entirely (see render_surface), so the meter is the only
     // visible child and must be free to fill the whole pill interior.
@@ -395,12 +397,12 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
         }
     });
     let capsule = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-    // The capsule must BE the 120x32 pill, not a smaller box floated inside it.
+    // The capsule must BE the 120x40 pill, not a smaller box floated inside it.
     // GTK widget margins sit OUTSIDE the styled background, so set_margin_* would
     // shrink the drawn pill and let peak bars bleed past its rounded corners.
     // Fill the whole window instead and push the interior spacing inward with CSS
     // `padding` (which GTK paints INSIDE the background) — see the CSS below.
-    // Result: capsule 120x32 (radius 16), meter interior 104x24. A text state
+    // Result: capsule 120x40 (radius 20), meter interior 104x28. A text state
     // widens it (see `size_pill`).
     capsule.set_hexpand(true);
     capsule.set_vexpand(true);
@@ -428,7 +430,7 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
     let css = gtk::CssProvider::new();
     css.load_from_data(
         "window.background { background: transparent; }
-         .capsule { background: rgba(23, 25, 29, 0.96); border-radius: 16px; border: 1px solid rgba(101, 214, 160, 0.4); padding: 3px 7px; }
+         .capsule { background: rgba(23, 25, 29, 0.96); border-radius: 20px; border: 1px solid rgba(101, 214, 160, 0.4); padding: 5px 7px; }
          .capsule.failure, .capsule.loading, .capsule.unavailable, .capsule.copied, .capsule.nospeech, .capsule.limitsoon { padding: 4px 14px; }
          .capsule .state-label, .capsule .meter { color: #F4F5F7; font-size: 10pt; font-weight: 600; }
          .capsule.processing .state-label, .capsule.processing .meter { color: #8FB4FF; }
@@ -846,6 +848,11 @@ const NO_SURFACE_MOVE: &str = "The Overlay couldn't show its pill on this deskto
 /// One move-mode button, round, in logical pixels (Windows' size).
 const MOVE_BUTTON: i32 = 24;
 
+/// The sound bars' height in the pill (the 40 px pill less its 5 px padding
+/// and 1 px border, top and bottom), in move mode too, so the bars look the
+/// same in both.
+const METER_HEIGHT: i32 = 28;
+
 /// Space between each button and the bars.
 const MOVE_BUTTON_GAP: i32 = 5;
 
@@ -1022,7 +1029,9 @@ fn build_move_window(
         }
     });
 
-    let bars = gtk::DrawingArea::builder().content_height(24).build();
+    let bars = gtk::DrawingArea::builder()
+        .content_height(METER_HEIGHT)
+        .build();
     bars.set_hexpand(true);
     bars.set_valign(gtk::Align::Center);
     bars.set_draw_func(|_, context, width, height| draw_resting(context, width, height));
@@ -1926,7 +1935,7 @@ fn watch_config(reread: &Rc<Cell<bool>>) -> Option<gtk::gio::FileMonitor> {
     Some(monitor)
 }
 
-/// Sizes the pill for what it shows: 120x32 for bars and the check mark, and
+/// Sizes the pill for what it shows: 120x40 for bars and the check mark, and
 /// for text widened to fit, up to `PILL_MAX_WIDTH`, wrapping to two lines.
 /// The label's own width request is the text width, so the capsule is exactly
 /// the pill and the window follows it.
@@ -1970,7 +1979,8 @@ fn size_pill(
         .1
         .max(0);
     label.set_size_request(text_width, height);
-    capsule.set_size_request(width, -1);
+    // Never shorter than the bar pill: one line of text sits centred in it.
+    capsule.set_size_request(width, PILL_HEIGHT);
     window.set_default_size(width, -1);
     window.queue_resize();
     // A text state's CSS padding (4 px) and border (1 px) above and below.
@@ -2107,7 +2117,7 @@ fn draw_meter(
 ) {
     let MeterState { phase, warning } = state;
     let centre = f64::from(height) / 2.0;
-    // content_height 24 minus a 2px inset -> 22px drawable (floor 2.2, max swing 19.8).
+    // content_height 28 minus a 2px inset -> 26px drawable (floor 2.6, max swing 23.4).
     let drawable = f64::from(height) - 2.0;
     let gap = PILL_BAR_GAP;
     let count = PILL_BAR_COUNT;
@@ -2115,12 +2125,12 @@ fn draw_meter(
     let bar_width = PILL_BAR_WIDTH;
     let row = bar_width * count as f64 + gap * (count - 1) as f64;
     let left = ((f64::from(width) - row) / 2.0).max(0.0);
-    // Corner-fit proof (no explicit clip needed): the 104x24 meter sits inside
-    // the 120x32 pill (radius 16) at 8px horizontal / 4px vertical (padding plus
-    // border), centred on the window's mid-line (y=16). The tightest point is the
-    // first/last bar's outer edge at window x>=8, <=8px from the corner arc's
-    // centre; there the pill's half-height is sqrt(16^2 - 8^2) ~= 13.9px versus
-    // a 22px max bar (11px each side). 11 < 13.9, so even a full-height peak bar
+    // Corner-fit proof (no explicit clip needed): the 104x28 meter sits inside
+    // the 120x40 pill (radius 20) at 8px horizontal / 6px vertical (padding plus
+    // border), centred on the window's mid-line (y=20). The tightest point is the
+    // first/last bar's outer edge at window x>=8, <=12px from the corner arc's
+    // centre; there the pill's half-height is sqrt(20^2 - 12^2) = 16px versus
+    // a 26px max bar (13px each side). 13 < 16, so even a full-height peak bar
     // stays inside the rounded corner.
     let elapsed = sweep_started.elapsed().as_secs_f64();
     for index in 0..count {

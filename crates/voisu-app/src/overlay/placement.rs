@@ -26,7 +26,7 @@ pub const CENTRE_SNAP: f64 = 12.0;
 /// the plain pill as on Windows. Move mode places and saves by this size, so
 /// the centre a ✓ saves is the centre the user saw, and the plain pill (which
 /// is narrower) lands centred on the same spot.
-pub const MOVE_PILL: Size = (158, 32);
+pub const MOVE_PILL: Size = (158, 40);
 
 /// The left and top Layer Shell margins that put the centre of a pill of
 /// `pill` size at `position` on an output of `output` size. A pill larger than
@@ -120,7 +120,7 @@ pub fn position_at(centre: (f64, f64), output: Size, pill: Size) -> OverlayPosit
 mod tests {
     use super::*;
 
-    const PILL: Size = (120, 32);
+    const PILL: Size = (120, 40);
     const FHD: Size = (1920, 1080);
 
     fn at(x: f64, y: f64) -> OverlayPosition {
@@ -129,22 +129,22 @@ mod tests {
 
     #[test]
     fn margins_centre_the_pill_on_the_fractions_of_the_output() {
-        assert_eq!(pill_margins(at(0.5, 0.5), FHD, PILL), (900, 524));
-        assert_eq!(pill_margins(at(0.25, 0.1), FHD, PILL), (420, 92));
+        assert_eq!(pill_margins(at(0.5, 0.5), FHD, PILL), (900, 520));
+        assert_eq!(pill_margins(at(0.25, 0.1), FHD, PILL), (420, 88));
         // The same fractions follow the output's size.
-        assert_eq!(pill_margins(at(0.25, 0.1), (2560, 1440), PILL), (580, 128));
-        // The default's bottom edge sits 23 px above the bottom of a 1080 px
+        assert_eq!(pill_margins(at(0.25, 0.1), (2560, 1440), PILL), (580, 124));
+        // The default's bottom edge sits 19 px above the bottom of a 1080 px
         // output.
         assert_eq!(
             pill_margins(OverlayPosition::DEFAULT, FHD, PILL),
-            (900, 1080 - 23 - 32)
+            (900, 1080 - 19 - 40)
         );
     }
 
     #[test]
     fn margins_keep_the_whole_pill_on_the_output() {
         assert_eq!(pill_margins(at(0.0, 0.0), FHD, PILL), (0, 0));
-        assert_eq!(pill_margins(at(1.0, 1.0), FHD, PILL), (1800, 1048));
+        assert_eq!(pill_margins(at(1.0, 1.0), FHD, PILL), (1800, 1040));
         assert_eq!(pill_margins(at(1.0, 0.0), FHD, PILL), (1800, 0));
         // A text pill widens about its centre and is clamped the same way.
         assert_eq!(pill_margins(at(0.5, 0.5), FHD, (320, 48)), (800, 516));
@@ -160,7 +160,7 @@ mod tests {
         // Past the edges, the pill stops at them.
         assert_eq!(
             position_at((-50.0, 5000.0), FHD, PILL),
-            at(60.0 / 1920.0, 1064.0 / 1080.0)
+            at(60.0 / 1920.0, 1060.0 / 1080.0)
         );
         // Near the vertical centre line, x snaps to it; farther, it does not.
         assert_eq!(position_at((965.0, 540.0), FHD, PILL).x(), 0.5);
@@ -175,7 +175,7 @@ mod tests {
         );
         // Saving and placing again round-trips to the pixel.
         let saved = position_at((480.0, 108.0), FHD, PILL);
-        assert_eq!(pill_margins(saved, FHD, PILL), (420, 92));
+        assert_eq!(pill_margins(saved, FHD, PILL), (420, 88));
     }
 
     #[test]
@@ -244,7 +244,7 @@ mod tests {
         // The default on the smaller laptop panel: centred, near the bottom.
         assert_eq!(
             safe_margins(OverlayPosition::DEFAULT, &[HDMI, LAPTOP], PILL),
-            (708, 909)
+            (708, 905)
         );
         // With no output at all it still never goes negative.
         assert_eq!(safe_margins(OverlayPosition::DEFAULT, &[], PILL), (0, 0));
@@ -257,11 +257,11 @@ mod tests {
         // The same saved fractions land at the same relative spot on each.
         assert_eq!(
             output_margins(position, PILL, Some(LAPTOP), &connected),
-            (708, 909)
+            (708, 905)
         );
         assert_eq!(
             output_margins(position, PILL, Some(HDMI), &connected),
-            (900, 1025)
+            (900, 1021)
         );
         // On the laptop, HDMI's margins would put the pill below the panel:
         // the very bug a margin from the wrong output caused.
@@ -283,6 +283,6 @@ mod tests {
             output_margins(saved, PILL, Some(LAPTOP), &connected),
             pill_margins(saved, LAPTOP, PILL)
         );
-        assert_eq!(pill_margins(saved, LAPTOP, PILL), (324, 80));
+        assert_eq!(pill_margins(saved, LAPTOP, PILL), (324, 76));
     }
 }

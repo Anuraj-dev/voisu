@@ -847,9 +847,9 @@ pub struct OverlayPosition {
 const OVERLAY_POSITION_SCALE: u16 = 1000;
 
 impl OverlayPosition {
-    /// Bottom centre, a little higher than the old `bottom` preset: the
-    /// 120x32 pill's bottom edge sits about 23 px above the bottom of a
-    /// 1080 px output, clear of a desktop's bottom panel.
+    /// Bottom centre, a little higher than the old `bottom` preset: the pill's
+    /// centre sits about 39 px above the bottom of a 1080 px output, clear of
+    /// a desktop's bottom panel.
     pub const DEFAULT: Self = Self { x: 500, y: 964 };
     const TOP: Self = Self { x: 500, y: 26 };
     const BOTTOM: Self = Self { x: 500, y: 974 };

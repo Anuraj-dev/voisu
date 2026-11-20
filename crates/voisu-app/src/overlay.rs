@@ -502,7 +502,7 @@ impl LevelPollLatch {
 /// history length and sweep tuning were set against.
 pub const VISUAL_BAR_COUNT: usize = 44;
 
-/// Sound bars the 120x32 pill draws: many thin lines, so the row reads as a
+/// Sound bars the 120x40 pill draws: many thin lines, so the row reads as a
 /// fine waveform. Each one reads a spaced slot of the same history, so the
 /// row spans as much time as the 44-bar one did.
 pub const PILL_BAR_COUNT: usize = 26;
@@ -511,9 +511,10 @@ pub const PILL_BAR_WIDTH: f64 = 2.0;
 /// Gap between pill sound bars, in pixels.
 pub const PILL_BAR_GAP: f64 = 2.0;
 
-/// The Overlay pill: 120x32 logical px (Windows' Medium), a full-radius capsule.
+/// The Overlay pill: 120x40 logical px, a full-radius capsule. Text pills are
+/// never shorter.
 pub const PILL_WIDTH: i32 = 120;
-pub const PILL_HEIGHT: i32 = 32;
+pub const PILL_HEIGHT: i32 = 40;
 /// A pill that carries text widens up to here, then wraps to a second line.
 pub const PILL_MAX_WIDTH: i32 = 320;
 /// Text pills show at most this many lines.
