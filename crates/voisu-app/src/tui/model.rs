@@ -626,26 +626,80 @@ pub enum SettingsRow {
     Star,
 }
 
+/// A titled group of Settings rows. The title is a heading, never a row:
+/// selection moves through [`SettingsRow::ALL`], which holds rows only.
+#[derive(Debug)]
+pub struct Section {
+    pub title: &'static str,
+    pub rows: &'static [SettingsRow],
+}
+
+/// The Settings tab, top to bottom. Every row is in exactly one section; this
+/// table alone decides the order rows are drawn and moved through.
+pub const SECTIONS: [Section; 5] = [
+    Section {
+        title: "Dictation",
+        rows: &[
+            SettingsRow::Engine,
+            SettingsRow::TriggerKey,
+            SettingsRow::Delivery,
+            SettingsRow::OverlayPosition,
+        ],
+    },
+    Section {
+        title: "Transcript",
+        rows: &[
+            SettingsRow::Writing,
+            SettingsRow::Rendering,
+            SettingsRow::Tone,
+        ],
+    },
+    Section {
+        title: "Cloud",
+        rows: &[
+            SettingsRow::GroqKey,
+            SettingsRow::DeepgramKey,
+            SettingsRow::Deepgram,
+        ],
+    },
+    Section {
+        title: "Local",
+        rows: &[
+            SettingsRow::LocalModel,
+            SettingsRow::LocalDevice,
+            SettingsRow::LocalUnload,
+        ],
+    },
+    Section {
+        title: "Voisu",
+        rows: &[
+            SettingsRow::RunSetup,
+            SettingsRow::UpdateCheck,
+            SettingsRow::StarPrompt,
+            SettingsRow::Star,
+        ],
+    },
+];
+
 impl SettingsRow {
-    pub const ALL: [SettingsRow; 17] = [
-        SettingsRow::Engine,
-        SettingsRow::Delivery,
-        SettingsRow::Writing,
-        SettingsRow::Rendering,
-        SettingsRow::Tone,
-        SettingsRow::Deepgram,
-        SettingsRow::GroqKey,
-        SettingsRow::DeepgramKey,
-        SettingsRow::TriggerKey,
-        SettingsRow::LocalUnload,
-        SettingsRow::LocalDevice,
-        SettingsRow::LocalModel,
-        SettingsRow::OverlayPosition,
-        SettingsRow::UpdateCheck,
-        SettingsRow::StarPrompt,
-        SettingsRow::RunSetup,
-        SettingsRow::Star,
-    ];
+    /// Every row in [`SECTIONS`] order, headings left out.
+    pub const ALL: [SettingsRow; 17] = {
+        let mut all = [SettingsRow::Engine; 17];
+        let mut filled = 0;
+        let mut section = 0;
+        while section < SECTIONS.len() {
+            let rows = SECTIONS[section].rows;
+            let mut index = 0;
+            while index < rows.len() {
+                all[filled] = rows[index];
+                filled += 1;
+                index += 1;
+            }
+            section += 1;
+        }
+        assert!(filled == all.len(), "SECTIONS must hold every row");
+        all
+    };
 
     pub fn label(self) -> &'static str {
         match self {
@@ -2209,6 +2263,14 @@ pub(super) mod test_support {
         app
     }
 
+    /// Selects `row` on the Settings tab, wherever its section puts it.
+    pub fn select(app: &mut App, row: SettingsRow) {
+        app.settings_selected = SettingsRow::ALL
+            .iter()
+            .position(|candidate| *candidate == row)
+            .expect("every row is in ALL");
+    }
+
     pub fn press(app: &mut App, code: KeyCode, mono_ms: u64) -> Vec<Effect> {
         update(
             app,
@@ -2425,7 +2487,7 @@ mod tests {
     fn a_key_prompt_accepts_paste_and_stops_at_a_line_break() {
         let mut app = ready_app();
         app.tab = Tab::Settings;
-        app.settings_selected = 6; // Groq key
+        select(&mut app, SettingsRow::GroqKey);
         let _ = press(&mut app, KeyCode::Enter, 0);
         let _ = update(&mut app, Msg::Paste("gsk_abc\nextra".to_owned()), at(0));
         let Some(Prompt::Key(Provider::Groq, text)) = &app.prompt else {
@@ -2478,7 +2540,7 @@ mod tests {
 
     fn deepgram_turned_off(app: &mut App) {
         app.tab = Tab::Settings;
-        app.settings_selected = 5;
+        select(app, SettingsRow::Deepgram);
         let _ = press(app, KeyCode::Enter, 0);
         let _ = update(
             app,
@@ -2495,10 +2557,7 @@ mod tests {
     fn the_update_check_row_flips_on_enter_and_needs_no_restart() {
         let mut app = ready_app();
         app.tab = Tab::Settings;
-        app.settings_selected = SettingsRow::ALL
-            .iter()
-            .position(|row| *row == SettingsRow::UpdateCheck)
-            .unwrap();
+        select(&mut app, SettingsRow::UpdateCheck);
         assert_eq!(app.setting_value(SettingsRow::UpdateCheck).0, "On");
         let effects = press(&mut app, KeyCode::Enter, 0);
         assert!(matches!(
@@ -2568,7 +2627,7 @@ mod tests {
             at(0),
         );
         app.tab = Tab::Settings;
-        app.settings_selected = SettingsRow::ALL.iter().position(|r| *r == row).unwrap();
+        select(&mut app, row);
         app
     }
 
@@ -2600,10 +2659,7 @@ mod tests {
     fn turning_the_star_prompt_row_off_hides_the_line() {
         let mut app = with_star_line();
         app.tab = Tab::Settings;
-        app.settings_selected = SettingsRow::ALL
-            .iter()
-            .position(|row| *row == SettingsRow::StarPrompt)
-            .unwrap();
+        select(&mut app, SettingsRow::StarPrompt);
         assert_eq!(app.setting_value(SettingsRow::StarPrompt).0, "On");
         let effects = press(&mut app, KeyCode::Enter, 0);
         assert!(matches!(
@@ -3174,7 +3230,7 @@ mod tests {
     fn enter_opens_the_choices_and_only_a_second_enter_changes_anything() {
         let mut app = ready_app();
         app.tab = Tab::Settings;
-        app.settings_selected = 1;
+        select(&mut app, SettingsRow::Delivery);
         let current = app.current_choice(SettingsRow::Delivery).expect("loaded");
 
         assert!(press(&mut app, KeyCode::Enter, 0).is_empty());
@@ -3211,10 +3267,7 @@ mod tests {
             at(0),
         );
         app.tab = Tab::Settings;
-        app.settings_selected = SettingsRow::ALL
-            .iter()
-            .position(|row| *row == SettingsRow::LocalUnload)
-            .unwrap();
+        select(&mut app, SettingsRow::LocalUnload);
         app
     }
 
@@ -3222,10 +3275,7 @@ mod tests {
     fn the_local_device_row_shows_and_picks_gpu_or_cpu() {
         let mut app = ready_app();
         app.tab = Tab::Settings;
-        app.settings_selected = SettingsRow::ALL
-            .iter()
-            .position(|row| *row == SettingsRow::LocalDevice)
-            .unwrap();
+        select(&mut app, SettingsRow::LocalDevice);
         assert_eq!(SettingsRow::LocalDevice.label(), "Local device");
         assert_eq!(
             app.setting_value(SettingsRow::LocalDevice),
@@ -3261,10 +3311,7 @@ mod tests {
         use crate::config::OverlayPosition;
         let mut app = ready_app();
         app.tab = Tab::Settings;
-        app.settings_selected = SettingsRow::ALL
-            .iter()
-            .position(|row| *row == SettingsRow::OverlayPosition)
-            .unwrap();
+        select(&mut app, SettingsRow::OverlayPosition);
         assert_eq!(SettingsRow::OverlayPosition.label(), "Overlay");
         let labels: Vec<_> = SettingsRow::OverlayPosition
             .choices()
@@ -3318,10 +3365,7 @@ mod tests {
     fn on_local_model_row() -> App {
         let mut app = ready_app();
         app.tab = Tab::Settings;
-        app.settings_selected = SettingsRow::ALL
-            .iter()
-            .position(|row| *row == SettingsRow::LocalModel)
-            .unwrap();
+        select(&mut app, SettingsRow::LocalModel);
         app
     }
 
@@ -3643,10 +3687,39 @@ mod tests {
     }
 
     #[test]
+    fn the_arrows_walk_every_row_in_section_order_and_never_a_heading() {
+        let flat: Vec<SettingsRow> = SECTIONS
+            .iter()
+            .flat_map(|section| section.rows.iter().copied())
+            .collect();
+        assert_eq!(flat, SettingsRow::ALL);
+        for (index, row) in SettingsRow::ALL.iter().enumerate() {
+            assert!(
+                !SettingsRow::ALL[index + 1..].contains(row),
+                "{row:?} is in two sections"
+            );
+        }
+
+        let mut app = ready_app();
+        app.tab = Tab::Settings;
+        assert_eq!(app.selected_setting(), SettingsRow::Engine);
+        for expected in &SettingsRow::ALL[1..] {
+            let _ = press(&mut app, KeyCode::Down, 0);
+            assert_eq!(app.selected_setting(), *expected);
+        }
+        // Across a section break the next row is one press away.
+        select(&mut app, SettingsRow::OverlayPosition);
+        let _ = press(&mut app, KeyCode::Down, 0);
+        assert_eq!(app.selected_setting(), SettingsRow::Writing);
+        let _ = press(&mut app, KeyCode::Up, 0);
+        assert_eq!(app.selected_setting(), SettingsRow::OverlayPosition);
+    }
+
+    #[test]
     fn the_picker_stops_at_both_ends() {
         let mut app = ready_app();
         app.tab = Tab::Settings;
-        app.settings_selected = 3;
+        select(&mut app, SettingsRow::Rendering);
         let _ = press(&mut app, KeyCode::Enter, 0);
         let picked = |app: &App| match app.prompt {
             Some(Prompt::Choice { picked, .. }) => picked,
@@ -3666,26 +3739,26 @@ mod tests {
     fn writing_and_layout_send_their_own_jobs_and_deepgram_still_flips() {
         let mut app = ready_app();
         app.tab = Tab::Settings;
-        let pick_next = |app: &mut App, row: usize| {
-            app.settings_selected = row;
+        let pick_next = |app: &mut App, row: SettingsRow| {
+            select(app, row);
             let _ = press(app, KeyCode::Enter, 0);
             let _ = press(app, KeyCode::Down, 0);
             press(app, KeyCode::Enter, 0)
         };
 
         let next = app.current_choice(SettingsRow::Writing).expect("loaded") + 1;
-        let effects = pick_next(&mut app, 2);
+        let effects = pick_next(&mut app, SettingsRow::Writing);
         assert!(
             matches!(effects.as_slice(), [Effect::Job(Job::SetWriting(mode))] if *mode == WRITINGS[next])
         );
 
         let next = app.current_choice(SettingsRow::Rendering).expect("loaded") + 1;
-        let effects = pick_next(&mut app, 3);
+        let effects = pick_next(&mut app, SettingsRow::Rendering);
         assert!(
             matches!(effects.as_slice(), [Effect::Job(Job::SetRendering(policy))] if *policy == LAYOUTS[next])
         );
 
-        app.settings_selected = 5;
+        select(&mut app, SettingsRow::Deepgram);
         let effects = press(&mut app, KeyCode::Enter, 0);
         assert!(matches!(
             effects.as_slice(),
@@ -3698,7 +3771,7 @@ mod tests {
     fn tone_sends_its_own_job_and_applies_to_the_next_recording() {
         let mut app = ready_app();
         app.tab = Tab::Settings;
-        app.settings_selected = 4;
+        select(&mut app, SettingsRow::Tone);
         assert_eq!(app.selected_setting(), SettingsRow::Tone);
         assert_eq!(app.setting_value(SettingsRow::Tone).0, "Formal");
 
@@ -3733,7 +3806,7 @@ mod tests {
     fn the_trigger_key_row_is_read_only() {
         let mut app = ready_app();
         app.tab = Tab::Settings;
-        app.settings_selected = 8;
+        select(&mut app, SettingsRow::TriggerKey);
         assert!(press(&mut app, KeyCode::Enter, 0).is_empty());
         assert!(app.prompt.is_none());
         assert_eq!(
@@ -3799,10 +3872,7 @@ mod tests {
     fn run_setup_row_hands_off_to_the_wizard() {
         let mut app = ready_app();
         app.tab = Tab::Settings;
-        app.settings_selected = SettingsRow::ALL
-            .iter()
-            .position(|row| *row == SettingsRow::RunSetup)
-            .unwrap();
+        select(&mut app, SettingsRow::RunSetup);
         let effects = press(&mut app, KeyCode::Enter, 0);
         assert!(matches!(effects.as_slice(), [Effect::StartSetup]));
         assert!(app.setup.is_some());
@@ -3824,7 +3894,7 @@ mod tests {
         const SECRET: &str = "gsk_very_secret_value";
         let mut app = ready_app();
         app.tab = Tab::Settings;
-        app.settings_selected = 6;
+        select(&mut app, SettingsRow::GroqKey);
         let _ = press(&mut app, KeyCode::Enter, 0);
         type_text(&mut app, SECRET, 0);
         assert!(!format!("{:?}", app.prompt).contains(SECRET));
@@ -3843,7 +3913,7 @@ mod tests {
     fn an_empty_key_stays_in_the_prompt() {
         let mut app = ready_app();
         app.tab = Tab::Settings;
-        app.settings_selected = 7;
+        select(&mut app, SettingsRow::DeepgramKey);
         let _ = press(&mut app, KeyCode::Enter, 0);
         assert!(press(&mut app, KeyCode::Enter, 0).is_empty());
         assert!(matches!(

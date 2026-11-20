@@ -65,7 +65,7 @@ Run `voisu` with no arguments in a terminal. It is a full-screen, keyboard-only 
 | `q` | Quit |
 
 - **Home** shows what matters now: ready to dictate, or the one problem and the single key that fixes it. `d` runs every `voisu doctor` check.
-- **Settings** covers Engine, Delivery, Writing, Layout, Tone, Deepgram, your keys, Local unload and Overlay (Move drags the pill anywhere on screen, with ✓ to save and ✗ to cancel; Reset puts it back at the bottom centre). Each choice is explained beside it, and Settings offers a restart when the service needs one.
+- **Settings** groups its rows into five sections: **Dictation** (Engine, Trigger Key, Delivery, Overlay), **Transcript** (Writing, Layout, Tone), **Cloud** (your keys and Deepgram), **Local** (Local model, device and unload) and **Voisu** (Run setup, Update check, Star prompt, Star on GitHub). Overlay's Move drags the pill anywhere on screen, with ✓ to save and ✗ to cancel; Reset puts it back at the bottom centre. Each choice is explained beside it, and Settings offers a restart when the service needs one.
 - **Dictionary** holds the words Voisu should spell your way. `a` adds, `d` removes. Local mode on the Whisper-based model also hands your words to the model as a hint before it transcribes, and corrects by sound: a name it wrote as it heard it ("voice you") becomes your entry ("Voisu") when the entry has two or more syllables. Cloud mode corrects exact spellings only.
 - **History** lists recent Recordings. `c` copies one.
 
@@ -75,26 +75,26 @@ Keys pause while you dictate, so words that land in the terminal never trigger a
 
 ### Every Settings row
 
-On the Settings tab, `↑` `↓` picks a row and `↵` opens its choices (or turns a switch on and off); `↵` again picks one. Each row has a CLI command that does the same thing.
+On the Settings tab, rows sit under section headings in the order below. `↑` `↓` moves from row to row, across sections, and `↵` opens its choices (or turns a switch on and off); `↵` again picks one. Each row has a CLI command that does the same thing.
 
-| Row | What it does | Choices | Command |
-| --- | --- | --- | --- |
-| Engine | Where your speech becomes text | Cloud (needs internet), Local (stays on this computer) | `voisu engine cloud\|local` |
-| Delivery | How your words reach your window | Paste, Copy (you press Ctrl+V) | `voisu delivery paste\|copy` |
-| Writing | How much Voisu tidies your words | Clean, Exact | `voisu writing clean\|exact` |
-| Layout | How your words are laid out | Plain, Auto, Sections | `voisu layout plain\|auto\|sections` |
-| Tone | How casual your words read | Formal, Informal (btw, no final full stop) | `voisu tone formal\|informal` |
-| Deepgram | Uses Deepgram alongside Groq, for technical words. Off uses Groq alone | On, Off | `voisu deepgram on\|off` |
-| Groq key, Deepgram key | `↵` enters a new key, checked before it is saved | | `voisu key set groq\|deepgram` |
-| Trigger Key | Shows your shortcut. Change it in your desktop (see [Trigger Key by desktop](#trigger-key-by-desktop)) | | `voisu shortcut` |
-| Local unload | When an idle Local model frees its memory | Never, After 30 min, After 1 hour | `voisu local-unload off\|SECONDS` |
-| Local device | Where the Local model runs | Auto, GPU, CPU | `voisu local-device auto\|gpu\|cpu` |
-| Local model | Which Local model runs | Auto, Accurate, Fast | `voisu local-model auto\|accurate\|fast` |
-| Overlay | Where the on-screen pill sits | Move, Reset | `voisu overlay-position move\|reset\|<x,y>` |
-| Update check | Reads the newest version number from GitHub once a day | On, Off | `voisu update-check on\|off` |
-| Star prompt | Lets Voisu ask for a GitHub star after a few days of use | On, Off | `voisu star-prompt on\|off` |
-| Run setup | Walks through your keys, Engine and Trigger Key again. Safe to re-run | | `voisu setup` |
-| Star on GitHub | Opens Voisu's GitHub page | | `voisu star` |
+| Section | Row | What it does | Choices | Command |
+| --- | --- | --- | --- | --- |
+| Dictation | Engine | Where your speech becomes text | Cloud (needs internet), Local (stays on this computer) | `voisu engine cloud\|local` |
+| | Trigger Key | Shows your shortcut. Change it in your desktop (see [Trigger Key by desktop](#trigger-key-by-desktop)) | | `voisu shortcut` |
+| | Delivery | How your words reach your window | Paste, Copy (you press Ctrl+V) | `voisu delivery paste\|copy` |
+| | Overlay | Where the on-screen pill sits | Move, Reset | `voisu overlay-position move\|reset\|<x,y>` |
+| Transcript | Writing | How much Voisu tidies your words | Clean, Exact | `voisu writing clean\|exact` |
+| | Layout | How your words are laid out | Plain, Auto, Sections | `voisu layout plain\|auto\|sections` |
+| | Tone | How casual your words read | Formal, Informal (btw, no final full stop) | `voisu tone formal\|informal` |
+| Cloud | Groq key, Deepgram key | `↵` enters a new key, checked before it is saved | | `voisu key set groq\|deepgram` |
+| | Deepgram | Uses Deepgram alongside Groq, for technical words. Off uses Groq alone | On, Off | `voisu deepgram on\|off` |
+| Local | Local model | Which Local model runs | Auto, Accurate, Fast | `voisu local-model auto\|accurate\|fast` |
+| | Local device | Where the Local model runs | Auto, GPU, CPU | `voisu local-device auto\|gpu\|cpu` |
+| | Local unload | When an idle Local model frees its memory | Never, After 30 min, After 1 hour | `voisu local-unload off\|SECONDS` |
+| Voisu | Run setup | Walks through your keys, Engine and Trigger Key again. Safe to re-run | | `voisu setup` |
+| | Update check | Reads the newest version number from GitHub once a day | On, Off | `voisu update-check on\|off` |
+| | Star prompt | Lets Voisu ask for a GitHub star after a few days of use | On, Off | `voisu star-prompt on\|off` |
+| | Star on GitHub | Opens Voisu's GitHub page | | `voisu star` |
 
 A few changes apply only when Voisu restarts. The row says so, and `r` restarts Voisu.
 
