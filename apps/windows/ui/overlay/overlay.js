@@ -1,10 +1,10 @@
 // The recording Overlay page. It listens: `recording-state` and
 // `audio-level` come from the Recording engine (or the tray's "Preview
 // overlay"), and `overlay-layout` says where the native side put the pill.
-// It sends back that it drew a layout and, in move mode, the drag and Esc.
-// Drawing stops
-// whenever the pill is idle or showing the check mark, Copied or an error,
-// so a hidden overlay costs no frames.
+// It sends back that it drew a layout and, in move mode, the drag and the
+// pill's ✓ (save) or ✗ (cancel). Drawing stops whenever the pill is idle or
+// showing the check mark, Copied or an error, so a hidden overlay costs no
+// frames.
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 
@@ -54,6 +54,7 @@ const LABELS = {
 };
 
 const capsule = document.getElementById('capsule');
+const face = document.getElementById('face');
 const canvas = document.getElementById('meter');
 const message = document.getElementById('message');
 const messageText = document.getElementById('message-text');
@@ -220,7 +221,7 @@ function setState(next, text) {
     message.hidden = false;
     check.hidden = true;
     copied.hidden = true;
-    capsule.setAttribute('aria-label', `Error: ${messageText.textContent}`);
+    face.setAttribute('aria-label', `Error: ${messageText.textContent}`);
     holdTimer = setTimeout(clear, ERROR_HOLD_MS);
     return;
   }
@@ -230,17 +231,17 @@ function setState(next, text) {
   if (next === 'copied') {
     stopDrawing();
     copied.textContent = text || 'Copied';
-    capsule.setAttribute('aria-label', copied.textContent);
+    face.setAttribute('aria-label', copied.textContent);
     holdTimer = setTimeout(clear, COPIED_HOLD_MS);
     return;
   }
   if (next === 'done') {
     stopDrawing();
-    capsule.setAttribute('aria-label', text || LABELS.done);
+    face.setAttribute('aria-label', text || LABELS.done);
     holdTimer = setTimeout(clear, DONE_HOLD_MS);
     return;
   }
-  capsule.setAttribute('aria-label', LABELS[moving ? 'moving' : next] ?? '');
+  face.setAttribute('aria-label', LABELS[moving ? 'moving' : next] ?? '');
   if (next === 'idle') {
     // Leave nothing behind for the next show to flash before its first frame.
     stopDrawing();
@@ -320,7 +321,8 @@ function sendDrag(start) {
 }
 
 capsule.addEventListener('pointerdown', (event) => {
-  if (!moving || event.button !== 0) return;
+  // A press on ✓ or ✗ is a click, not a pick-up.
+  if (!moving || event.button !== 0 || event.target.closest('button')) return;
   event.preventDefault();
   capsule.setPointerCapture(event.pointerId);
   dragging = true;
@@ -336,13 +338,38 @@ const endDrag = () => {
 capsule.addEventListener('pointerup', endDrag);
 capsule.addEventListener('lostpointercapture', endDrag);
 
-// Should the pill ever take the keyboard, Esc still cancels the move.
+// ✓ keeps the spot the pill was dropped at, ✗ puts it back. The native side
+// ends move mode and hides the pill either way, and Settings shows any
+// error. One call at a time, so a click and a key together finish once.
+let finishing = false;
+function finishMove(save) {
+  if (!moving || finishing) return;
+  finishing = true;
+  invoke('finish_overlay_move', { save })
+    .catch((error) => console.warn('overlay move finish failed', error))
+    .finally(() => {
+      finishing = false;
+    });
+}
+document.getElementById('move-save').addEventListener('click', () => finishMove(true));
+document.getElementById('move-cancel').addEventListener('click', () => finishMove(false));
+// Clicking ✓ or ✗ leaves keyboard focus where it was, so no stray focus ring
+// and Enter is never taken by a button that happened to be clicked.
+for (const button of capsule.querySelectorAll('.move-button')) {
+  button.addEventListener('mousedown', (event) => event.preventDefault());
+}
+
+// Should the pill ever take the keyboard, Enter saves and Esc cancels, as in
+// Settings. Enter on a focused ✓ or ✗ is left to that button.
 window.addEventListener('keydown', (event) => {
-  if (!moving || event.key !== 'Escape') return;
-  event.preventDefault();
-  invoke('finish_overlay_move', { save: false }).catch((error) =>
-    console.warn('overlay move cancel failed', error),
-  );
+  if (!moving || event.defaultPrevented) return;
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    finishMove(false);
+  } else if (event.key === 'Enter' && !event.target.closest?.('button')) {
+    event.preventDefault();
+    finishMove(true);
+  }
 });
 
 // Where to draw the pill, pushed before each placed show and when move mode

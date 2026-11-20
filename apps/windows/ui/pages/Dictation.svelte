@@ -1,5 +1,6 @@
 <script>
   import { invoke } from '@tauri-apps/api/core';
+  import { listen } from '@tauri-apps/api/event';
   import { ui } from '../state.svelte.js';
   import ToggleRow from '../ToggleRow.svelte';
   import ErrorLine from '../ErrorLine.svelte';
@@ -97,7 +98,7 @@
       ui.app.overlayMoving = await moveRequest;
     }, 'Could not show the overlay.');
 
-  // Done (`save`) or Cancel.
+  // Enter (`save`) or Esc here, like the pill's own ✓ and ✗.
   const finishMove = (save) =>
     positionAction(async () => {
       ui.app.overlayPosition = await invoke('finish_overlay_move', { save });
@@ -109,17 +110,42 @@
       ui.app.overlayPosition = await invoke('reset_overlay_position');
     }, 'Could not reset the overlay position.');
 
-  // The overlay is not meant to take focus, so Esc is heard here (the
-  // overlay page cancels on Esc too, should it get the keyboard).
+  // The overlay is not meant to take focus, so its keys are heard here too:
+  // Enter saves, Esc cancels. Enter on a working control is left to it (a
+  // disabled one does nothing).
+  const CONTROLS = 'button, a, input, select, textarea, [contenteditable]';
   function onKeydown(event) {
-    if (moving && event.key === 'Escape' && !event.defaultPrevented) {
+    if (!moving || event.defaultPrevented) return;
+    const control = event.target.closest?.(CONTROLS);
+    if (event.key === 'Escape') {
       event.preventDefault();
       finishMove(false);
+    } else if (event.key === 'Enter' && !(control && !control.disabled)) {
+      event.preventDefault();
+      finishMove(true);
     }
   }
 
+  // ✓ on the pill finishes the move there and the pill hides, so a save
+  // that failed is reported here. The state refresh that follows ends the
+  // move look.
+  $effect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+    listen('overlay-move-failed', ({ payload }) => {
+      errors.position = typeof payload === 'string' ? payload : 'Could not save the overlay position.';
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  });
+
   // Leaving the page cancels any move, so the pill never stays grabbable
-  // with no Done in sight. Always sent, after a start still in flight: a
+  // with nothing on screen to explain it. Always sent, after a start still in flight: a
   // start that lands later would otherwise leave move mode on.
   $effect(() => () => {
     moveRequest
@@ -215,24 +241,26 @@
     <span class="row-text" aria-live="polite">
       {#if moving}
         <span id="position-label">Drag the overlay where you want it</span>
-        <span class="hint">Esc cancels.</span>
+        <span class="hint">Use ✓ / ✗ on the overlay. Enter saves, Esc cancels.</span>
       {:else}
         <span id="position-label">Overlay position</span>
         <span class="hint">{app.overlayPosition ? 'Where you put it.' : 'Top centre.'}</span>
       {/if}
     </span>
     <div class="actions">
-      {#if moving}
-        <button type="button" class="pill" disabled={positionBusy} onclick={() => finishMove(false)}>Cancel</button>
-        <button type="button" class="primary small" disabled={positionBusy} onclick={() => finishMove(true)}>Done</button>
-      {:else}
+      {#if !moving}
         <button type="button" class="pill" id="move-overlay" disabled={positionBusy} onclick={startMove}>
           Move overlay
         </button>
-        <button type="button" class="pill" disabled={positionBusy || !app.overlayPosition} onclick={resetPosition}>
-          Reset position
-        </button>
       {/if}
+      <button
+        type="button"
+        class="pill"
+        disabled={positionBusy || moving || !app.overlayPosition}
+        onclick={resetPosition}
+      >
+        Reset position
+      </button>
     </div>
   </div>
   <ErrorLine message={errors.position} />

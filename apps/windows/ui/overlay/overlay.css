@@ -138,8 +138,9 @@ body {
 }
 
 /* Move mode (Settings' "Move overlay"): idle bars inside a dashed ring, and
-   the pill can be picked up. Only this mode takes the mouse; the native side
-   keeps the window click-through otherwise. */
+   the pill can be picked up and saved or cancelled from its own buttons.
+   Only this mode takes the mouse; the native side keeps the window
+   click-through otherwise. */
 .capsule.moving {
   outline: 1.5px dashed var(--ring);
   outline-offset: 3px;
@@ -149,4 +150,78 @@ body {
 
 .capsule.moving:active {
   cursor: grabbing;
+}
+
+/* The state shown on the pill: bars, check mark, Copied or error text. */
+.face {
+  display: grid;
+  place-items: center;
+}
+
+/* Move mode puts ✗ (cancel) and ✓ (save) either side of the idle bars:
+   24 px round targets at the medium size, white glyphs on the pill. */
+.move-button {
+  display: none;
+}
+
+.capsule.moving {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: calc(6px * var(--s));
+  padding: 0 calc(4px * var(--s));
+}
+
+.capsule.moving .move-button {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: calc(24px * var(--s));
+  height: calc(24px * var(--s));
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  transition:
+    background-color 120ms ease-out,
+    transform 120ms ease-out;
+}
+
+.move-button svg {
+  width: calc(14px * var(--s));
+  height: calc(14px * var(--s));
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.75;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.move-button:hover {
+  background: rgba(244, 245, 247, 0.14);
+}
+
+#move-save:hover {
+  background: rgba(101, 214, 160, 0.28);
+}
+
+.move-button:active {
+  transform: scale(0.9);
+}
+
+.move-button:focus-visible {
+  outline: 1.5px solid var(--text);
+  outline-offset: 1px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .capsule.moving .move-button {
+    transition: none;
+  }
+
+  .move-button:active {
+    transform: none;
+  }
 }

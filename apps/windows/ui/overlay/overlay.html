@@ -6,11 +6,20 @@
     <link rel="stylesheet" href="./overlay.css" />
   </head>
   <body>
-    <div class="capsule" id="capsule" role="status" aria-live="polite" aria-label="">
-      <canvas class="meter" id="meter" aria-hidden="true"></canvas>
-      <span class="check" id="check" aria-hidden="true" hidden>✓</span>
-      <p class="copied-text" id="copied" aria-hidden="true" hidden></p>
-      <p class="message" id="message" hidden><span aria-hidden="true">⚠</span> <span id="message-text"></span></p>
+    <div class="capsule" id="capsule">
+      <!-- Move mode only: cancel (Esc) and save (Enter) on the pill itself. -->
+      <button type="button" class="move-button" id="move-cancel" aria-label="Cancel move (Esc)" title="Cancel (Esc)">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4.5 4.5l7 7m0-7l-7 7" /></svg>
+      </button>
+      <div class="face" id="face" role="status" aria-live="polite" aria-label="">
+        <canvas class="meter" id="meter" aria-hidden="true"></canvas>
+        <span class="check" id="check" aria-hidden="true" hidden>✓</span>
+        <p class="copied-text" id="copied" aria-hidden="true" hidden></p>
+        <p class="message" id="message" hidden><span aria-hidden="true">⚠</span> <span id="message-text"></span></p>
+      </div>
+      <button type="button" class="move-button" id="move-save" aria-label="Save position (Enter)" title="Save (Enter)">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5l3 3 6-7" /></svg>
+      </button>
     </div>
     <script type="module" src="./overlay.js"></script>
   </body>

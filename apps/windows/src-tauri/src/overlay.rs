@@ -43,8 +43,8 @@ const GLOW_PAD: f64 = 8.0;
 /// Least gap between the pill and any work-area edge; the default spot is
 /// this far below the top. Not scaled by the Overlay size.
 const EDGE_MARGIN: f64 = 12.0;
-/// Done snaps the pill to the centre line, or to the default top or bottom
-/// margin, when it is dropped this close to it.
+/// Saving (the pill's ✓) snaps the pill to the centre line, or to the
+/// default top or bottom margin, when it is dropped this close to it.
 const SNAP_DISTANCE: f64 = 24.0;
 /// What `None` means: centred, at the top margin.
 const DEFAULT_POSITION: OverlayPosition = OverlayPosition { x: 0.5, y: 0.0 };
@@ -808,12 +808,13 @@ pub async fn start_move(app: &AppHandle) -> Result<bool, String> {
     .await?
 }
 
-/// Done (`save`) or Cancel. Hides the pill and puts the overlay back to
-/// click-through. With `save`, `store` keeps where the pill was dropped
+/// The pill's ✓ (`save`) or ✗, or Enter or Esc. Hides the pill and puts
+/// the overlay back to click-through. With `save`, `store` keeps where the
+/// pill was dropped
 /// (`None` is the default spot) and the next show uses it; all on the main
-/// thread in one step, so a Recording is placed either before Done, which
+/// thread in one step, so a Recording is placed either before ✓, which
 /// it cancels, or after, at the saved spot. Returns what was stored; `None`
-/// if move mode was not on, or for Cancel.
+/// if move mode was not on, or for ✗.
 pub async fn finish_move(
     app: &AppHandle,
     save: bool,
@@ -850,7 +851,7 @@ pub async fn finish_move(
     .await?
 }
 
-/// Done or Cancel once move mode has ended: the drop to keep, if any. A drop
+/// ✓ or ✗ once move mode has ended: the drop to keep, if any. A drop
 /// that cannot be read, or a store that fails, keeps the old spot and says
 /// so.
 fn conclude_move(
@@ -1992,7 +1993,7 @@ mod tests {
         assert!(!presenter.end_move(), "already ended by the Recording");
         assert_eq!(presenter.on_state(RecordingState::Idle).0, Step::Hide);
 
-        // Done or Cancel ends it, and the next Recording places as usual.
+        // ✓ or ✗ ends it, and the next Recording places as usual.
         assert!(presenter.begin_move());
         assert!(presenter.end_move());
         assert_eq!(
@@ -2087,6 +2088,47 @@ mod tests {
         assert_eq!(
             conclude_move(ended, false, || Some(spot), |_| unreachable!()),
             Ok(None)
+        );
+    }
+
+    /// ✓/✗ live on the pill and Enter/Esc work in Settings too, so two
+    /// finishes can race. The first one wins; the other finds move mode
+    /// over and changes nothing.
+    #[test]
+    fn the_first_check_or_cross_wins_and_a_late_one_changes_nothing() {
+        let spot = Some(OverlayPosition { x: 0.8, y: 0.4 });
+        let mut stored = Vec::new();
+
+        // ✓ on the pill, then Enter in Settings: stored once.
+        let mut presenter = Presenter::default();
+        presenter.begin_move();
+        assert_eq!(
+            done(&mut presenter, Some(spot), Ok(()), &mut stored),
+            Ok(Some(spot))
+        );
+        assert_eq!(
+            done(&mut presenter, Some(spot), Ok(()), &mut stored),
+            Ok(None)
+        );
+        assert_eq!(stored, [spot]);
+
+        // Esc in Settings (or ✗), then a late ✓ on the pill: the old spot
+        // stays, and the next Recording shows at it.
+        stored.clear();
+        presenter.begin_move();
+        let ended = presenter.end_move();
+        assert_eq!(
+            conclude_move(ended, false, || Some(spot), |_| unreachable!()),
+            Ok(None)
+        );
+        assert_eq!(
+            done(&mut presenter, Some(spot), Ok(()), &mut stored),
+            Ok(None)
+        );
+        assert!(stored.is_empty());
+        assert_eq!(
+            presenter.on_state(RecordingState::Recording).0,
+            Step::Show { place: true }
         );
     }
 

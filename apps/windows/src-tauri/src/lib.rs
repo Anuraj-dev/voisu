@@ -47,6 +47,9 @@ use trigger_key::TriggerChord;
 
 const SETTINGS_WINDOW: &str = "settings";
 const STATE_CHANGED: &str = "state-changed";
+/// Saving the overlay's spot from the pill failed; the payload is the message
+/// for Settings to show.
+const OVERLAY_MOVE_FAILED: &str = "overlay-move-failed";
 /// Passed by the HKCU Run entry (the LaunchAgent on macOS) so a login launch
 /// stays in the tray.
 const AUTOSTART_ARG: &str = "--autostart";
@@ -342,9 +345,11 @@ async fn start_overlay_move(app: AppHandle) -> Result<bool, String> {
     overlay::start_move(&app).await
 }
 
-/// Done (`save`) stores where the pill was dropped; Cancel keeps the old
-/// spot. Either way the overlay hides. Returns the position now in force; an
-/// error is the message to show, with the old spot kept.
+/// The pill's ✓ or Enter (`save`) stores where the pill was dropped; its ✗
+/// or Esc keeps the old spot. Either way the overlay hides. Returns the
+/// position now in force; an error is the message to show, with the old
+/// spot kept. The call usually comes from the pill, which hides, so the
+/// error also goes to Settings as [`OVERLAY_MOVE_FAILED`].
 #[tauri::command]
 async fn finish_overlay_move(
     app: AppHandle,
@@ -353,7 +358,10 @@ async fn finish_overlay_move(
     let saved = overlay::finish_move(&app, save, |app, dropped| {
         try_update_settings(app, |settings| settings.overlay_position = dropped).map(|_| ())
     })
-    .await?;
+    .await
+    .inspect_err(|message| {
+        let _ = app.emit_to(SETTINGS_WINDOW, OVERLAY_MOVE_FAILED, message);
+    })?;
     if let Some(dropped) = saved {
         tracing::info!(?dropped, "overlay position");
     }
