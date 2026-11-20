@@ -687,6 +687,9 @@ fn overlay_position_command(action: OverlayPositionAction) -> ExitCode {
                             CancelReason::Timeout =>
                                 "Move timed out after a minute; the Overlay stays where it was.",
                             CancelReason::Recording => "Move cancelled: a Recording started.",
+                            CancelReason::Unconfirmed =>
+                                "Move not saved: Voisu didn't answer, so a Recording may \
+                                 have started. The Overlay stays where it was.",
                             CancelReason::User | CancelReason::RequesterGone =>
                                 "Move cancelled; the Overlay stays where it was.",
                         }

@@ -39,8 +39,9 @@ use crate::config::OverlayPosition;
 
 /// With no drag, click or key for this long, move mode cancels by itself.
 pub const MOVE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-/// How long a ✓ waits for a daemon status sent after it, before saving
-/// anyway. Only a daemon that doesn't answer at all makes it wait this long.
+/// How long a ✓ waits for a daemon status, sent after it, that shows Voisu
+/// idle. Without one by then the move is cancelled, never saved: only a
+/// daemon that doesn't answer makes it wait this long.
 pub const SAVE_SETTLE: Duration = Duration::from_secs(2);
 /// How long a client waits for the Overlay to accept or refuse.
 const ACK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -75,6 +76,9 @@ pub enum CancelReason {
     Recording,
     /// The client that asked went away.
     RequesterGone,
+    /// ✓ was pressed, but no status in [`SAVE_SETTLE`] showed Voisu idle, so a
+    /// Recording may have started; nothing was saved.
+    Unconfirmed,
 }
 
 impl CancelReason {
@@ -84,6 +88,7 @@ impl CancelReason {
             Self::Timeout => "timeout",
             Self::Recording => "recording",
             Self::RequesterGone => "gone",
+            Self::Unconfirmed => "unconfirmed",
         }
     }
 
@@ -93,6 +98,7 @@ impl CancelReason {
             Self::Timeout,
             Self::Recording,
             Self::RequesterGone,
+            Self::Unconfirmed,
         ]
         .into_iter()
         .find(|reason| reason.as_str() == value)
@@ -249,17 +255,41 @@ impl MoveMode {
     }
 }
 
-/// Whether a ✓ (or Enter) pressed at `pressed` may be saved now. A Recording
-/// that has already started must win over it, and the Overlay only learns of
-/// one from the daemon's status: so the save waits for a status round trip
-/// *sent* at or after `pressed` that showed Voisu idle (`idle_as_of`, the send
-/// time of the newest such reply; `None` while busy). A status that showed a
-/// Recording cancels the move instead. A daemon that never answers can't hold
-/// the save past [`SAVE_SETTLE`].
+/// What becomes of a ✓ (or Enter) pressed at `pressed` to save `position`,
+/// checked every tick until it settles. A Recording that has already started
+/// must win over it, and the Overlay only learns of one from the daemon's
+/// status, so in order:
+///
+/// - a status showing a Recording (`recording`) cancels the move;
+/// - so does the client going away, as it would before ✓;
+/// - a reply to a status round trip *sent* at or after `pressed` that showed
+///   Voisu idle (`idle_as_of`, the send time of the newest such reply) saves;
+/// - a failed or late poll is no evidence either way, so the save waits, and
+///   past [`SAVE_SETTLE`] without that evidence it is cancelled
+///   ([`CancelReason::Unconfirmed`]) rather than saved blind.
+///
+/// `None` means keep waiting.
 #[must_use]
-pub fn save_may_commit(pressed: Instant, idle_as_of: Option<Instant>, now: Instant) -> bool {
-    idle_as_of.is_some_and(|idle| idle >= pressed)
-        || now.saturating_duration_since(pressed) >= SAVE_SETTLE
+pub fn settle_save(
+    position: OverlayPosition,
+    pressed: Instant,
+    idle_as_of: Option<Instant>,
+    recording: bool,
+    requester_gone: bool,
+    now: Instant,
+) -> Option<MoveEnd> {
+    let reason = if recording {
+        CancelReason::Recording
+    } else if requester_gone {
+        CancelReason::RequesterGone
+    } else if idle_as_of.is_some_and(|idle| idle >= pressed) {
+        return Some(MoveEnd::Save(position));
+    } else if now.saturating_duration_since(pressed) >= SAVE_SETTLE {
+        CancelReason::Unconfirmed
+    } else {
+        return None;
+    };
+    Some(MoveEnd::Cancel(reason))
 }
 
 /// The Overlay's end of the move socket. A thread accepts connections and
@@ -487,7 +517,7 @@ pub fn move_overlay_at(
 ) -> Result<MoveOutcome, String> {
     let mut stream = UnixStream::connect(socket).map_err(|error| match error.kind() {
         ErrorKind::NotFound | ErrorKind::ConnectionRefused => not_running(
-            std::env::var_os("WAYLAND_DISPLAY").is_some_and(|value| !value.is_empty()),
+            wayland_session(),
             &std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default(),
         ),
         _ => format!("Couldn't reach the Overlay: {error}"),
@@ -511,6 +541,20 @@ pub fn move_overlay_at(
         MoveReply::Error(message) => Err(message),
         MoveReply::Moving => Err("The Overlay answered out of turn: Moving".to_owned()),
     }
+}
+
+/// Whether this is a Wayland session, decided as the Overlay decides it
+/// (`XDG_SESSION_TYPE` first, then the displays), so an X11 session with a
+/// stray `WAYLAND_DISPLAY` isn't told to start a service that won't run.
+fn wayland_session() -> bool {
+    let var = |name| std::env::var(name).ok();
+    voisu_core::resolve_session(
+        var("WAYLAND_DISPLAY").as_deref(),
+        var("DISPLAY").as_deref(),
+        var("XDG_SESSION_TYPE").as_deref(),
+    )
+    .session
+        == voisu_core::SessionKind::Wayland
 }
 
 /// What to say when no Overlay answers. Only a layer-shell Wayland desktop
@@ -583,6 +627,7 @@ mod tests {
             MoveReply::Cancel(CancelReason::Timeout),
             MoveReply::Cancel(CancelReason::Recording),
             MoveReply::Cancel(CancelReason::RequesterGone),
+            MoveReply::Cancel(CancelReason::Unconfirmed),
             MoveReply::Error("no layer shell".to_owned()),
         ] {
             assert_eq!(
@@ -667,23 +712,54 @@ mod tests {
     }
 
     #[test]
-    fn a_save_waits_for_a_status_sent_after_it_so_a_started_recording_wins() {
+    fn a_save_needs_an_idle_status_sent_after_it_so_a_started_recording_wins() {
+        let spot = at(0.25, 0.1);
         let pressed = Instant::now();
         let before = pressed - Duration::from_millis(150);
         let after = pressed + Duration::from_millis(10);
-        // The newest status was sent before ✓: a Recording may have started
+        let settle =
+            |idle, recording, gone, now| settle_save(spot, pressed, idle, recording, gone, now);
+        // The newest idle status was sent before ✓ (or there is none, or the
+        // last poll failed and left it so): a Recording may have started
         // since, so wait.
-        assert!(!save_may_commit(pressed, Some(before), after));
-        assert!(!save_may_commit(pressed, None, after));
+        assert_eq!(settle(Some(before), false, false, after), None);
+        assert_eq!(settle(None, false, false, after), None);
         // A status sent after ✓ showed Voisu idle: save.
-        assert!(save_may_commit(pressed, Some(after), after));
-        assert!(save_may_commit(pressed, Some(pressed), pressed));
-        // A daemon that never answers can't hold the save forever.
-        assert!(save_may_commit(
-            pressed,
-            Some(before),
-            pressed + SAVE_SETTLE
-        ));
+        assert_eq!(
+            settle(Some(after), false, false, after),
+            Some(MoveEnd::Save(spot))
+        );
+        assert_eq!(
+            settle(Some(pressed), false, false, pressed),
+            Some(MoveEnd::Save(spot))
+        );
+        // A Recording seen wins over the save, even over idle evidence that
+        // came first.
+        assert_eq!(
+            settle(Some(after), true, false, after),
+            Some(MoveEnd::Cancel(CancelReason::Recording))
+        );
+        // A client that left while the save waited ends move mode.
+        assert_eq!(
+            settle(None, false, true, after),
+            Some(MoveEnd::Cancel(CancelReason::RequesterGone))
+        );
+        // A daemon that never answers can't hold the save forever, and
+        // without evidence of idle it is cancelled, never saved blind.
+        let late = pressed + SAVE_SETTLE;
+        assert_eq!(
+            settle(Some(before), false, false, late),
+            Some(MoveEnd::Cancel(CancelReason::Unconfirmed))
+        );
+        assert_eq!(
+            settle(None, false, false, late),
+            Some(MoveEnd::Cancel(CancelReason::Unconfirmed))
+        );
+        // Evidence that arrived in time still saves, however late the tick.
+        assert_eq!(
+            settle(Some(after), false, false, late),
+            Some(MoveEnd::Save(spot))
+        );
     }
 
     #[test]
@@ -748,7 +824,7 @@ mod tests {
         let path = dir.path().join("overlay.sock");
         let error = move_overlay_at(&path, |_| Ok(()), || panic!("not moving")).unwrap_err();
         let session = not_running(
-            std::env::var_os("WAYLAND_DISPLAY").is_some_and(|value| !value.is_empty()),
+            wayland_session(),
             &std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default(),
         );
         assert_eq!(error, session);

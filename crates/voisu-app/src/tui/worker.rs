@@ -579,6 +579,12 @@ fn move_overlay(on_moving: impl FnOnce()) -> Reply {
             Tone::Caution,
             "Move cancelled: a Recording started.".to_owned(),
         ),
+        Ok(MoveOutcome::Cancelled(CancelReason::Unconfirmed)) => (
+            Tone::Caution,
+            "Move not saved: Voisu didn't answer, so a Recording may have started. \
+             The pill stays where it was."
+                .to_owned(),
+        ),
         Ok(MoveOutcome::Cancelled(_)) => (
             Tone::Plain,
             "Move cancelled; the pill stays where it was.".to_owned(),

@@ -6,6 +6,12 @@
 //! pushed into place with margins, recomputed whenever the output, the pill's
 //! size or the position changes. Every function clamps so the whole pill stays
 //! on the output, whatever the output's size.
+//!
+//! The Recording pill is never bound to an output: the compositor puts each
+//! fresh map on the output it chooses (the focused one), and the Overlay only
+//! learns which once the surface enters it. Until then [`safe_margins`] keep
+//! the pill on screen on every connected output; [`output_margins`] picks
+//! between the two.
 
 use crate::config::OverlayPosition;
 
@@ -36,6 +42,46 @@ pub fn pill_margins(position: OverlayPosition, output: Size, pill: Size) -> (i32
         (x - f64::from(pill.0) / 2.0).round() as i32,
         (y - f64::from(pill.1) / 2.0).round() as i32,
     )
+}
+
+/// The largest size that fits inside every output: the narrowest width and
+/// the shortest height, each taken on its own. Outputs with no area are
+/// ignored; with none left there is no size.
+#[must_use]
+pub fn smallest_output(outputs: &[Size]) -> Option<Size> {
+    let usable = || {
+        outputs
+            .iter()
+            .copied()
+            .filter(|&(width, height)| width > 0 && height > 0)
+    };
+    Some((
+        usable().map(|(width, _)| width).min()?,
+        usable().map(|(_, height)| height).min()?,
+    ))
+}
+
+/// Margins for a surface whose output isn't known yet (a fresh map, or an
+/// output that went away): the position placed on [`smallest_output`], so the
+/// whole pill is on screen whichever connected output the compositor picks.
+#[must_use]
+pub fn safe_margins(position: OverlayPosition, connected: &[Size], pill: Size) -> (i32, i32) {
+    pill_margins(position, smallest_output(connected).unwrap_or((0, 0)), pill)
+}
+
+/// Margins for the pill: from `entered`, the output the surface is on, once it
+/// is known and has an area; otherwise [`safe_margins`] over `connected`.
+#[must_use]
+pub fn output_margins(
+    position: OverlayPosition,
+    pill: Size,
+    entered: Option<Size>,
+    connected: &[Size],
+) -> (i32, i32) {
+    match entered.filter(|&(width, height)| width > 0 && height > 0) {
+        Some(output) => pill_margins(position, output, pill),
+        None => safe_margins(position, connected, pill),
+    }
 }
 
 /// `centre` (in output pixels) moved just enough that the pill around it
@@ -148,5 +194,94 @@ mod tests {
                 "{centre:?}"
             );
         }
+    }
+    /// Raja's desk: eDP-1 1920x1200 at 1.25 and HDMI-A-1 1920x1080 at 1, as
+    /// GDK reports them, in logical pixels.
+    const LAPTOP: Size = (1536, 960);
+    const HDMI: Size = FHD;
+
+    fn on_output(margins: (i32, i32), output: Size, pill: Size) -> bool {
+        margins.0 >= 0
+            && margins.1 >= 0
+            && margins.0 + pill.0 <= output.0
+            && margins.1 + pill.1 <= output.1
+    }
+
+    #[test]
+    fn the_smallest_output_is_the_narrowest_width_and_the_shortest_height() {
+        assert_eq!(smallest_output(&[LAPTOP, HDMI]), Some(LAPTOP));
+        // Each axis on its own: a tall narrow output and a wide short one.
+        assert_eq!(
+            smallest_output(&[(1080, 1920), (2560, 1080)]),
+            Some((1080, 1080))
+        );
+        // An output with no area (unplugged, not yet configured) is ignored.
+        assert_eq!(smallest_output(&[(0, 0), HDMI]), Some(HDMI));
+        assert_eq!(smallest_output(&[]), None);
+        assert_eq!(smallest_output(&[(0, 1080)]), None);
+    }
+
+    #[test]
+    fn before_the_output_is_known_the_pill_fits_every_connected_output() {
+        let connected = [HDMI, LAPTOP, (1080, 1920), (3840, 2160)];
+        for position in [
+            OverlayPosition::DEFAULT,
+            at(1.0, 1.0),
+            at(0.0, 0.0),
+            at(0.99, 0.02),
+        ] {
+            for pill in [PILL, MOVE_PILL, (320, 48)] {
+                let margins = safe_margins(position, &connected, pill);
+                for output in connected {
+                    assert!(
+                        on_output(margins, output, pill),
+                        "{position} {pill:?} off {output:?}: {margins:?}"
+                    );
+                }
+            }
+        }
+        // The default on the smaller laptop panel: centred, near the bottom.
+        assert_eq!(
+            safe_margins(OverlayPosition::DEFAULT, &[HDMI, LAPTOP], PILL),
+            (708, 919)
+        );
+        // With no output at all it still never goes negative.
+        assert_eq!(safe_margins(OverlayPosition::DEFAULT, &[], PILL), (0, 0));
+    }
+
+    #[test]
+    fn once_the_surface_enters_an_output_its_margins_come_from_that_output() {
+        let connected = [HDMI, LAPTOP];
+        let position = OverlayPosition::DEFAULT;
+        // The same saved fractions land at the same relative spot on each.
+        assert_eq!(
+            output_margins(position, PILL, Some(LAPTOP), &connected),
+            (708, 919)
+        );
+        assert_eq!(
+            output_margins(position, PILL, Some(HDMI), &connected),
+            (900, 1036)
+        );
+        // On the laptop, HDMI's margins would put the pill below the panel:
+        // the very bug a margin from the wrong output caused.
+        assert!(!on_output(
+            output_margins(position, PILL, Some(HDMI), &connected),
+            LAPTOP,
+            PILL
+        ));
+        // Unknown (left, or not yet entered) or arealess output: safe margins.
+        for entered in [None, Some((0, 0))] {
+            assert_eq!(
+                output_margins(position, PILL, entered, &connected),
+                safe_margins(position, &connected, PILL)
+            );
+        }
+        // A position saved on one output is the same fractions on another.
+        let saved = position_at((480.0, 108.0), HDMI, MOVE_PILL);
+        assert_eq!(
+            output_margins(saved, PILL, Some(LAPTOP), &connected),
+            pill_margins(saved, LAPTOP, PILL)
+        );
+        assert_eq!(pill_margins(saved, LAPTOP, PILL), (324, 80));
     }
 }

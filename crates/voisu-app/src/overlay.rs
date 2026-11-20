@@ -228,6 +228,24 @@ impl PositionWatch {
     }
 }
 
+/// Whether a status round trip shows Voisu idle as of when it was sent: only a
+/// reply that says so. A failed or timed-out poll (`None`) is no evidence
+/// either way, since a Recording may be underway behind it.
+pub fn shows_idle(response: Option<&Response>) -> bool {
+    response.is_some_and(|response| response.state == Some(DaemonState::Idle))
+}
+
+/// Whether showing `next` after `before` maps the pill surface afresh, when it
+/// is already up. The pill is never bound to an output: the compositor puts
+/// each new map on the output it picks (the focused one) and the pill stays
+/// there while mapped. A Recording that starts while anything else is still
+/// on the pill (the last result, its processing, a notice) is a new request,
+/// so it gets a fresh map and follows focus like one shown from hidden.
+pub const fn needs_fresh_map(before: OverlayPhase, next: OverlayPhase) -> bool {
+    matches!(next, OverlayPhase::Recording)
+        && !matches!(before, OverlayPhase::Hidden | OverlayPhase::Recording)
+}
+
 /// The CSS class that turns the pill's text amber while the limit approaches.
 pub const LIMIT_APPROACHING_CLASS: &str = "limitsoon";
 
@@ -1287,6 +1305,45 @@ mod tests {
         FeedbackBackend, FeedbackCapabilities, SessionKind, select_feedback_backend,
     };
     use voisu_core::{DaemonState, OverlayEvent, OverlayOutcome, Response, VersionEnvelope};
+
+    #[test]
+    fn only_a_reply_saying_idle_shows_voisu_idle() {
+        assert!(shows_idle(Some(&overlay_status(DaemonState::Idle, None))));
+        assert!(!shows_idle(Some(&overlay_status(
+            DaemonState::Recording,
+            None
+        ))));
+        assert!(!shows_idle(Some(&overlay_status(
+            DaemonState::Processing,
+            None
+        ))));
+        // A failed poll could be hiding a Recording.
+        assert!(!shows_idle(None));
+    }
+
+    #[test]
+    fn a_recording_over_anything_still_shown_maps_the_pill_afresh() {
+        use OverlayPhase::*;
+        for before in [
+            Processing,
+            Success,
+            Failure,
+            Loading,
+            Unavailable,
+            NoSpeech,
+            Copied,
+        ] {
+            assert!(needs_fresh_map(before, Recording), "{before:?}");
+        }
+        // From hidden it is mapped afresh anyway; a Recording already shown
+        // stays put, as does everything that isn't a new Recording.
+        assert!(!needs_fresh_map(Hidden, Recording));
+        assert!(!needs_fresh_map(Recording, Recording));
+        for next in [Hidden, Processing, Success, Failure, NoSpeech, Copied] {
+            assert!(!needs_fresh_map(Recording, next), "{next:?}");
+            assert!(!needs_fresh_map(Success, next), "{next:?}");
+        }
+    }
 
     #[test]
     fn text_pills_widen_from_the_pill_to_320_and_never_past_it() {

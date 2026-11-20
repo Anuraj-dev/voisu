@@ -33,18 +33,26 @@ impl Sandbox {
 
     /// Runs the CLI in a KDE Plasma Wayland session.
     fn run(&self, arguments: &[&str]) -> Output {
-        self.run_in(arguments, Some("wayland-0"), "KDE")
+        self.run_in(arguments, Some("wayland-0"), "wayland", "KDE")
     }
 
     /// Runs the CLI in the given session: `WAYLAND_DISPLAY` (unset when
     /// `None`) and `XDG_CURRENT_DESKTOP`.
-    fn run_in(&self, arguments: &[&str], wayland: Option<&str>, desktop: &str) -> Output {
+    fn run_in(
+        &self,
+        arguments: &[&str],
+        wayland: Option<&str>,
+        session_type: &str,
+        desktop: &str,
+    ) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_voisu"));
         command
             .args(arguments)
             .env("XDG_CONFIG_HOME", self.config.path())
             .env("XDG_RUNTIME_DIR", self.runtime.path())
-            .env("XDG_CURRENT_DESKTOP", desktop);
+            .env("XDG_CURRENT_DESKTOP", desktop)
+            .env("XDG_SESSION_TYPE", session_type)
+            .env("DISPLAY", ":0");
         match wayland {
             Some(display) => command.env("WAYLAND_DISPLAY", display),
             None => command.env_remove("WAYLAND_DISPLAY"),
@@ -218,6 +226,11 @@ fn a_cancelled_move_keeps_the_saved_spot() {
             CancelReason::Recording,
             "Move cancelled: a Recording started.\n",
         ),
+        (
+            CancelReason::Unconfirmed,
+            "Move not saved: Voisu didn't answer, so a Recording may have started. \
+             The Overlay stays where it was.\n",
+        ),
     ] {
         let overlay = fake_overlay(
             &socket,
@@ -247,15 +260,25 @@ fn move_without_a_usable_overlay_fails_clearly() {
     );
     // GNOME (the Shell extension) and X11 (no Overlay service) are told move
     // mode isn't available there, not to start a service that won't help.
-    for (wayland, desktop, says) in [
+    // An X11 session is one even with a stray WAYLAND_DISPLAY, as the Overlay
+    // itself decides.
+    for (wayland, session, desktop, says) in [
         (
             Some("wayland-0"),
+            "wayland",
             "ubuntu:GNOME",
             "GNOME Shell extension, which can't be moved",
         ),
-        (None, "KDE", "this session isn't Wayland"),
+        (None, "wayland", "KDE", "this session isn't Wayland"),
+        (None, "x11", "KDE", "this session isn't Wayland"),
+        (
+            Some("wayland-0"),
+            "x11",
+            "KDE",
+            "this session isn't Wayland",
+        ),
     ] {
-        let elsewhere = sandbox.run_in(&["overlay-position", "move"], wayland, desktop);
+        let elsewhere = sandbox.run_in(&["overlay-position", "move"], wayland, session, desktop);
         assert_eq!(elsewhere.status.code(), Some(1), "{elsewhere:?}");
         let error = stderr(&elsewhere);
         assert!(error.contains(says), "{desktop}: {error}");
