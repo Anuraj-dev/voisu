@@ -36,7 +36,9 @@ It is a tray app on Windows, a menu bar app on macOS, and a set of systemd user 
 - **Spoken punctuation and layout.** Say "new paragraph", "dash dash", "quote … unquote" or "first … second …" and it is formatted locally, on every platform.
 - **Hold to talk, or go hands-free.** On Windows and macOS, hold the Trigger Key and let go, or double-tap for hands-free. `Esc` cancels. On Linux, press to start and press again to stop.
 - **Your words, your tone.** Teach Voisu the names and terms it should spell your way, and choose formal or informal writing.
-- **Local transcription on Linux.** Run a model on your own GPU or CPU, offline, after a Consented Install. Nothing downloads until you agree.
+- **Local transcription on Linux.** Run a whisper.cpp model on your own GPU or CPU, offline, after a Consented Install. Pick Accurate for a GPU or Fast for a computer without one. The model stays loaded, so every Recording starts at once. Nothing downloads until you agree, and a download that stops picks up where it left off.
+- **An Overlay you can place.** A small pill with live sound bars shows while you dictate. Drag it anywhere on screen, save with ✓ or cancel with ✗, and Reset puts it back at the bottom centre. On Linux this needs KDE Plasma or Hyprland, where the pill also follows the monitor you are working on.
+- **Stays up to date.** The Windows and macOS apps update themselves and show what's new after each update. On Linux, Voisu checks once a day and shows *Update available* on Home.
 - **A command for everything on Linux.** Every setting in the interface is also a plain `voisu` command, so a script or a coding agent can install and check it.
 - **Private by default.** Keys live in your desktop keyring, Windows Credential Manager or the macOS Keychain. Logs and history stay on your machine.
 
@@ -83,10 +85,11 @@ Cloud transcription runs on two free API keys, one from Groq and one from Deepgr
 
 ## Documentation
 
-- [Windows guide](docs/windows.md)
+- [Windows guide](docs/windows.md) and the illustrated [Windows setup walkthrough](https://anuraj-dev.github.io/voisu/docs/windows-setup.html)
 - [macOS guide](docs/macos.md) and the illustrated [Mac setup walkthrough](https://anuraj-dev.github.io/voisu/docs/macos-setup.html)
 - [Linux guide](docs/linux.md)
 - [Command reference](docs/commands.md)
+- [Website guides](https://anuraj-dev.github.io/voisu/docs/): getting started, settings, providers, privacy and troubleshooting
 - [Agent install guide](https://anuraj-dev.github.io/voisu/agent-install.md)
 - [Roadmap and known limitations](docs/ROADMAP.md)
 
