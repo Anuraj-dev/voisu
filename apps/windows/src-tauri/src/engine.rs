@@ -409,7 +409,7 @@ impl Engine {
                     .unwrap() = Some(text.clone());
                 let _ = self.app.emit(crate::STATE_CHANGED, ());
                 if self.deliver(id, target, text).await {
-                    // The Delivery result can arrive before clipboard restore.
+                    // On macOS the result can arrive before clipboard restore.
                     // This hook counts toward the star prompt and may send a
                     // notification. It leaves the clipboard and focus alone.
                     crate::dictation_delivered(&self.app);
@@ -421,10 +421,10 @@ impl Engine {
 
     /// Pastes the Transcript into `target`, or with auto-paste off only puts
     /// it on the clipboard. Delivery blocks and pumps its own messages, so it
-    /// runs on a blocking thread, which may keep the user's clipboard parked
-    /// a little after the result arrives here. Returns whether the
-    /// Transcript was delivered: pasted, or left on the clipboard for the
-    /// user to paste.
+    /// runs on a blocking thread, which on macOS may keep the user's
+    /// clipboard parked a little after the result arrives here. Returns
+    /// whether the Transcript was delivered: pasted, or left on the
+    /// clipboard for the user to paste.
     async fn deliver(&self, id: u64, target: DeliveryTarget, text: String) -> bool {
         if !self.settings().auto_paste {
             let copied = tokio::task::spawn_blocking(move || delivery::copy(&text)).await;
