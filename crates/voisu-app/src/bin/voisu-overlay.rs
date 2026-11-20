@@ -1116,9 +1116,16 @@ fn build_move_window(
     // The pill's painted size: what GtkFixed allocates it, its minimum
     // request (MOVE_PILL, or more if its CSS ever asks for more). Placement,
     // the saved centre and the input region all use it.
+    //
+    // The closures below hold the move window's widgets weakly: the drag's
+    // are owned by `fixed` itself, so a strong `fixed` or `pill` would keep
+    // the whole tree alive after the session window is destroyed.
     let pill_size = {
-        let pill = pill.clone();
+        let pill = pill.downgrade();
         move || -> Size {
+            let Some(pill) = pill.upgrade() else {
+                return MOVE_PILL;
+            };
             let (width, ..) = pill.measure(gtk::Orientation::Horizontal, -1);
             let (height, ..) = pill.measure(gtk::Orientation::Vertical, width);
             (width.max(MOVE_PILL.0), height.max(MOVE_PILL.1))
@@ -1128,13 +1135,18 @@ fn build_move_window(
     // exactly it.
     let place: Rc<dyn Fn()> = Rc::new({
         let window = window.downgrade();
-        let fixed = fixed.clone();
-        let pill = pill.clone();
+        let fixed = fixed.downgrade();
+        let pill = pill.downgrade();
         let output = Rc::clone(&output);
         let state = Rc::clone(state);
         let pill_size = pill_size.clone();
         move || {
-            let (Some(window), Some(output)) = (window.upgrade(), output.get()) else {
+            let (Some(window), Some(fixed), Some(pill), Some(output)) = (
+                window.upgrade(),
+                fixed.upgrade(),
+                pill.upgrade(),
+                output.get(),
+            ) else {
                 return;
             };
             let size = pill_size();
@@ -1169,10 +1181,14 @@ fn build_move_window(
         let output = Rc::clone(&output);
         let state = Rc::clone(state);
         let grabbed = Rc::clone(&grabbed);
-        let pill = pill.clone();
-        let fixed = fixed.clone();
+        let pill = pill.downgrade();
+        let fixed = fixed.downgrade();
         let pill_size = pill_size.clone();
         move |gesture, x, y| {
+            let (Some(pill), Some(fixed)) = (pill.upgrade(), fixed.upgrade()) else {
+                gesture.set_state(gtk::EventSequenceState::Denied);
+                return;
+            };
             let picked = fixed.pick(x, y, gtk::PickFlags::DEFAULT);
             let on_pill = picked.as_ref().is_some_and(|widget| {
                 (widget == pill.upcast_ref::<gtk::Widget>() || widget.is_ancestor(&pill))
@@ -1215,10 +1231,12 @@ fn build_move_window(
     });
     drag.connect_drag_end({
         let grabbed = Rc::clone(&grabbed);
-        let pill = pill.clone();
+        let pill = pill.downgrade();
         move |_, _, _| {
             grabbed.set(None);
-            pill.set_cursor_from_name(Some("grab"));
+            if let Some(pill) = pill.upgrade() {
+                pill.set_cursor_from_name(Some("grab"));
+            }
         }
     });
     fixed.add_controller(drag);
