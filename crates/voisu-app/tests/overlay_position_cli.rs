@@ -120,7 +120,7 @@ fn overlay_position_shows_sets_and_resets_fractions_and_defaults_to_bottom_centr
     let sandbox = Sandbox::new();
     let fresh = sandbox.run(&["overlay-position"]);
     assert!(fresh.status.success(), "{fresh:?}");
-    assert_eq!(stdout(&fresh), "Overlay position: 0.500,0.974\n");
+    assert_eq!(stdout(&fresh), "Overlay position: 0.500,0.964\n");
 
     let set = sandbox.run(&["overlay-position", "0.25,0.1"]);
     assert!(set.status.success(), "{set:?}");
@@ -144,11 +144,11 @@ fn overlay_position_shows_sets_and_resets_fractions_and_defaults_to_bottom_centr
     assert!(reset.status.success(), "{reset:?}");
     assert_eq!(
         stdout(&reset),
-        "Overlay position reset to the bottom centre (0.500,0.974).\n"
+        "Overlay position reset to the bottom centre (0.500,0.964).\n"
     );
     assert_eq!(
         stdout(&sandbox.run(&["overlay-position"])),
-        "Overlay position: 0.500,0.974\n"
+        "Overlay position: 0.500,0.964\n"
     );
 
     for invalid in ["middle", "1.5,0.5", "0.5", "0.5, 0.5"] {
@@ -161,7 +161,7 @@ fn overlay_position_shows_sets_and_resets_fractions_and_defaults_to_bottom_centr
     }
     assert_eq!(
         stdout(&sandbox.run(&["overlay-position"])),
-        "Overlay position: 0.500,0.974\n",
+        "Overlay position: 0.500,0.964\n",
         "a rejected value changes nothing"
     );
 }
@@ -179,7 +179,7 @@ fn a_hand_edited_bad_overlay_position_reads_as_the_default() {
         .expect("write config");
         let output = sandbox.run(&["overlay-position"]);
         assert!(output.status.success(), "{output:?}");
-        assert_eq!(stdout(&output), "Overlay position: 0.500,0.974\n", "{bad}");
+        assert_eq!(stdout(&output), "Overlay position: 0.500,0.964\n", "{bad}");
     }
 }
 

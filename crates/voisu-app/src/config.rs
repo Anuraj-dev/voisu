@@ -847,9 +847,10 @@ pub struct OverlayPosition {
 const OVERLAY_POSITION_SCALE: u16 = 1000;
 
 impl OverlayPosition {
-    /// Bottom centre, 12 px above the bottom edge of a 1080 px output: where
-    /// the Overlay sat before it could move.
-    pub const DEFAULT: Self = Self::BOTTOM;
+    /// Bottom centre, a little higher than the old `bottom` preset: the
+    /// 120x32 pill's bottom edge sits about 23 px above the bottom of a
+    /// 1080 px output, clear of a desktop's bottom panel.
+    pub const DEFAULT: Self = Self { x: 500, y: 964 };
     const TOP: Self = Self { x: 500, y: 26 };
     const BOTTOM: Self = Self { x: 500, y: 974 };
 
@@ -895,7 +896,7 @@ impl OverlayPosition {
     }
 
     /// Parses the persisted or typed value: `x,y` fractions such as
-    /// `0.500,0.974`, or one of the old preset words. Strict: no spaces, no
+    /// `0.500,0.964`, or one of the old preset words. Strict: no spaces, no
     /// sign or exponent, at most three decimals, both within `0..=1`. Anything
     /// else is `None`; readers fall back to [`OverlayPosition::DEFAULT`].
     #[must_use]
@@ -3000,7 +3001,7 @@ other_key = 5
         let path = dir.path().join("voisu").join("config.toml");
         let at = |x, y| OverlayPosition::from_fractions(x, y).unwrap();
         assert_eq!(overlay_position_at(&path), OverlayPosition::DEFAULT);
-        assert_eq!(OverlayPosition::DEFAULT, at(0.5, 0.974));
+        assert_eq!(OverlayPosition::DEFAULT, at(0.5, 0.964));
 
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "tone = \"informal\"\n").unwrap();

@@ -133,10 +133,11 @@ mod tests {
         assert_eq!(pill_margins(at(0.25, 0.1), FHD, PILL), (420, 92));
         // The same fractions follow the output's size.
         assert_eq!(pill_margins(at(0.25, 0.1), (2560, 1440), PILL), (580, 128));
-        // The default sits 12 px above the bottom of a 1080 px output.
+        // The default's bottom edge sits 23 px above the bottom of a 1080 px
+        // output.
         assert_eq!(
             pill_margins(OverlayPosition::DEFAULT, FHD, PILL),
-            (900, 1080 - 12 - 32)
+            (900, 1080 - 23 - 32)
         );
     }
 
@@ -243,7 +244,7 @@ mod tests {
         // The default on the smaller laptop panel: centred, near the bottom.
         assert_eq!(
             safe_margins(OverlayPosition::DEFAULT, &[HDMI, LAPTOP], PILL),
-            (708, 919)
+            (708, 909)
         );
         // With no output at all it still never goes negative.
         assert_eq!(safe_margins(OverlayPosition::DEFAULT, &[], PILL), (0, 0));
@@ -256,11 +257,11 @@ mod tests {
         // The same saved fractions land at the same relative spot on each.
         assert_eq!(
             output_margins(position, PILL, Some(LAPTOP), &connected),
-            (708, 919)
+            (708, 909)
         );
         assert_eq!(
             output_margins(position, PILL, Some(HDMI), &connected),
-            (900, 1036)
+            (900, 1025)
         );
         // On the laptop, HDMI's margins would put the pill below the panel:
         // the very bug a margin from the wrong output caused.
