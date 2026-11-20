@@ -19,12 +19,18 @@
 //! overlay → save 0.250,0.100             (or: cancel user|timeout|recording)
 //! ```
 //!
+//! Every line ends in a newline; one cut short by a hang-up is not a line.
 //! The client holding the connection open is what keeps move mode alive: if
 //! it goes away (Ctrl-C, a closed TUI), the Overlay cancels and restores.
+//!
+//! The Overlay never adopts a saved spot on its own say-so: it re-reads the
+//! config once the client has written it, so a save that fails leaves the
+//! pill where the config says.
 
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -33,6 +39,9 @@ use crate::config::OverlayPosition;
 
 /// With no drag, click or key for this long, move mode cancels by itself.
 pub const MOVE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a ✓ waits for a daemon status sent after it, before saving
+/// anyway. Only a daemon that doesn't answer at all makes it wait this long.
+pub const SAVE_SETTLE: Duration = Duration::from_secs(2);
 /// How long a client waits for the Overlay to accept or refuse.
 const ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a client waits for the outcome once moving. Far past the idle
@@ -42,6 +51,10 @@ const OUTCOME_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 /// The longest request line read; anything longer is not a request.
 const MAX_REQUEST: u64 = 64;
+/// Connections whose request is still being read, each on its own thread. A
+/// client that connects and says nothing holds one for [`REQUEST_TIMEOUT`];
+/// past this many, new connections are turned away at once.
+const MAX_UNREAD_REQUESTS: usize = 8;
 
 const MOVE_REQUEST: &str = "move";
 
@@ -109,8 +122,9 @@ impl MoveReply {
     }
 
     #[must_use]
+    /// One whole line, newline included; a line cut short is not a reply.
     pub fn parse(line: &str) -> Option<Self> {
-        let line = line.strip_suffix('\n').unwrap_or(line);
+        let line = line.strip_suffix('\n')?;
         if line == "moving" {
             return Some(Self::Moving);
         }
@@ -235,6 +249,19 @@ impl MoveMode {
     }
 }
 
+/// Whether a ✓ (or Enter) pressed at `pressed` may be saved now. A Recording
+/// that has already started must win over it, and the Overlay only learns of
+/// one from the daemon's status: so the save waits for a status round trip
+/// *sent* at or after `pressed` that showed Voisu idle (`idle_as_of`, the send
+/// time of the newest such reply; `None` while busy). A status that showed a
+/// Recording cancels the move instead. A daemon that never answers can't hold
+/// the save past [`SAVE_SETTLE`].
+#[must_use]
+pub fn save_may_commit(pressed: Instant, idle_as_of: Option<Instant>, now: Instant) -> bool {
+    idle_as_of.is_some_and(|idle| idle >= pressed)
+        || now.saturating_duration_since(pressed) >= SAVE_SETTLE
+}
+
 /// The Overlay's end of the move socket. A thread accepts connections and
 /// reads each request off the GTK thread; the GTK tick [`take`](Self::take)s
 /// accepted requests without blocking.
@@ -244,6 +271,9 @@ pub struct MoveListener {
     path: PathBuf,
     /// The socket file's identity, so dropping removes only our own file.
     inode: Option<(u64, u64)>,
+    /// `overlay.lock`, held for the listener's life: whoever holds it owns
+    /// the socket path. Dropped after the socket file is removed.
+    _lock: std::fs::File,
 }
 
 impl MoveListener {
@@ -268,18 +298,20 @@ impl MoveListener {
         Self::bind_at(&path, refusal)
     }
 
-    /// Listens on `path`. A socket file nobody answers on is stale and
-    /// replaced; one a live Overlay answers on is left alone.
+    /// Listens on `path`. The lock file beside it decides who owns the path,
+    /// never a connect probe (which could block, and which two starting
+    /// Overlays could both pass): holding the lock means any socket file
+    /// there is stale and is replaced; a held lock means another Overlay is
+    /// listening, and its socket is left alone.
     pub fn bind_at(path: &Path, refusal: Option<String>) -> Result<Self, String> {
-        if path.symlink_metadata().is_ok() {
-            if UnixStream::connect(path).is_ok() {
-                return Err(format!(
-                    "another Overlay is already listening on {}",
-                    path.display()
-                ));
-            }
-            std::fs::remove_file(path)
-                .map_err(|error| format!("cannot replace {}: {error}", path.display()))?;
+        let lock_path = path.with_extension("lock");
+        let lock = crate::daemon_lock::lock_exclusive(&lock_path)
+            .map_err(|error| format!("cannot open {}: {error}", lock_path.display()))?
+            .ok_or_else(|| format!("another Overlay is already listening on {}", path.display()))?;
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("cannot replace {}: {error}", path.display())),
         }
         let listener = UnixListener::bind(path)
             .map_err(|error| format!("cannot listen on {}: {error}", path.display()))?;
@@ -297,6 +329,7 @@ impl MoveListener {
             refusal,
             path: path.to_owned(),
             inode: inode(path),
+            _lock: lock,
         })
     }
 
@@ -332,35 +365,68 @@ impl Drop for MoveListener {
     }
 }
 
+/// Accepts connections and reads each one's request on a thread of its own,
+/// so a client that connects and stalls never holds up the next one.
 fn accept(
     listener: &UnixListener,
-    refusal: &Mutex<Option<String>>,
+    refusal: &Arc<Mutex<Option<String>>>,
     sender: &mpsc::Sender<MoveRequester>,
 ) {
+    let unread = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        if !is_move_request(&stream) {
-            let _ = (&stream).write_all(
-                MoveReply::Error("unknown request".to_owned())
-                    .line()
-                    .as_bytes(),
-            );
+        if unread.fetch_add(1, Ordering::AcqRel) >= MAX_UNREAD_REQUESTS {
+            unread.fetch_sub(1, Ordering::AcqRel);
+            turn_away(&stream, "the Overlay is busy; try again");
             continue;
         }
-        let mut requester = MoveRequester { stream };
-        let refused = refusal.lock().ok().and_then(|reason| reason.clone());
-        if let Some(reason) = refused {
-            requester.reply(&MoveReply::Error(reason));
-            continue;
-        }
-        if requester.stream.set_nonblocking(true).is_err() || sender.send(requester).is_err() {
-            // The Overlay stopped listening; the dropped stream tells the
-            // client.
-            return;
+        let spawned = thread::Builder::new()
+            .name("overlay-move-request".to_owned())
+            .spawn({
+                let (refusal, sender, unread) =
+                    (Arc::clone(refusal), sender.clone(), Arc::clone(&unread));
+                move || {
+                    handle(stream, &refusal, &sender);
+                    unread.fetch_sub(1, Ordering::AcqRel);
+                }
+            });
+        if spawned.is_err() {
+            // The closure (and with it the stream) is dropped; the client
+            // sees the hang-up.
+            unread.fetch_sub(1, Ordering::AcqRel);
         }
     }
 }
 
+fn handle(
+    stream: UnixStream,
+    refusal: &Mutex<Option<String>>,
+    sender: &mpsc::Sender<MoveRequester>,
+) {
+    if !is_move_request(&stream) {
+        turn_away(&stream, "unknown request");
+        return;
+    }
+    let mut requester = MoveRequester { stream };
+    let refused = refusal.lock().ok().and_then(|reason| reason.clone());
+    if let Some(reason) = refused {
+        requester.reply(&MoveReply::Error(reason));
+        return;
+    }
+    // If the Overlay stopped listening, the dropped stream tells the client.
+    if requester.stream.set_nonblocking(true).is_ok() {
+        let _ = sender.send(requester);
+    }
+}
+
+/// Answers `error <why>` without ever blocking the caller.
+fn turn_away(stream: &UnixStream, why: &str) {
+    if stream.set_nonblocking(true).is_ok() {
+        let _ = (&*stream).write_all(MoveReply::Error(why.to_owned()).line().as_bytes());
+    }
+}
+
+/// Exactly `move` and a newline: a request cut short by a hang-up is none.
 fn is_move_request(stream: &UnixStream) -> bool {
     if stream.set_read_timeout(Some(REQUEST_TIMEOUT)).is_err() {
         return false;
@@ -368,7 +434,7 @@ fn is_move_request(stream: &UnixStream) -> bool {
     let mut line = String::new();
     BufReader::new(stream.take(MAX_REQUEST))
         .read_line(&mut line)
-        .is_ok_and(|_| line.trim_end_matches('\n') == MOVE_REQUEST)
+        .is_ok_and(|_| line.strip_suffix('\n') == Some(MOVE_REQUEST))
 }
 
 /// The client that asked for move mode, held for as long as it lasts.
@@ -420,11 +486,10 @@ pub fn move_overlay_at(
     on_moving: impl FnOnce(),
 ) -> Result<MoveOutcome, String> {
     let mut stream = UnixStream::connect(socket).map_err(|error| match error.kind() {
-        ErrorKind::NotFound | ErrorKind::ConnectionRefused => {
-            "The Overlay isn't running. Start it \
-             with `systemctl --user start voisu-overlay`, then try again."
-                .to_owned()
-        }
+        ErrorKind::NotFound | ErrorKind::ConnectionRefused => not_running(
+            std::env::var_os("WAYLAND_DISPLAY").is_some_and(|value| !value.is_empty()),
+            &std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default(),
+        ),
         _ => format!("Couldn't reach the Overlay: {error}"),
     })?;
     stream
@@ -448,6 +513,27 @@ pub fn move_overlay_at(
     }
 }
 
+/// What to say when no Overlay answers. Only a layer-shell Wayland desktop
+/// runs the movable GTK Overlay: on GNOME the Overlay is the Shell extension
+/// (the GTK service is meant to be off), and without Wayland the service never
+/// starts. Telling those sessions to start the service would not help.
+fn not_running(wayland: bool, current_desktop: &str) -> String {
+    let gnome = current_desktop
+        .split(':')
+        .any(|desktop| desktop.eq_ignore_ascii_case("gnome"));
+    if gnome {
+        "On GNOME the Overlay is the Voisu GNOME Shell extension, which can't be moved.".to_owned()
+    } else if !wayland {
+        "Moving the Overlay needs a Wayland desktop with layer-shell \
+         (KDE Plasma, Hyprland); this session isn't Wayland."
+            .to_owned()
+    } else {
+        "The Overlay isn't running. Start it \
+         with `systemctl --user start voisu-overlay`, then try again."
+            .to_owned()
+    }
+}
+
 fn read_reply(reader: &mut BufReader<UnixStream>, timeout: Duration) -> Result<MoveReply, String> {
     reader
         .get_ref()
@@ -455,7 +541,10 @@ fn read_reply(reader: &mut BufReader<UnixStream>, timeout: Duration) -> Result<M
         .map_err(|error| format!("Couldn't reach the Overlay: {error}"))?;
     let mut line = String::new();
     match reader.read_line(&mut line) {
-        Ok(0) => Err("The Overlay stopped before the move finished.".to_owned()),
+        // A hang-up mid-line is no reply: `save 0.250,0` must never save.
+        Ok(_) if !line.ends_with('\n') => {
+            Err("The Overlay stopped before the move finished.".to_owned())
+        }
         Ok(_) => MoveReply::parse(&line)
             .ok_or_else(|| format!("The Overlay sent something unexpected: {}", line.trim_end())),
         Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => Err(
@@ -504,7 +593,16 @@ mod tests {
         }
         assert_eq!(MoveReply::Save(at(0.25, 0.1)).line(), "save 0.250,0.100\n");
         assert_eq!(MoveReply::Error("a\nb".to_owned()).line(), "error a b\n");
-        for junk in ["", "save", "save 2,2", "cancel later", "moved", "Moving"] {
+        for junk in [
+            "",
+            "save",
+            "save 2,2",
+            "cancel later",
+            "moved",
+            "Moving",
+            "moving",
+            "save 0.250,0.100",
+        ] {
             assert_eq!(MoveReply::parse(junk), None, "{junk:?}");
         }
     }
@@ -569,6 +667,26 @@ mod tests {
     }
 
     #[test]
+    fn a_save_waits_for_a_status_sent_after_it_so_a_started_recording_wins() {
+        let pressed = Instant::now();
+        let before = pressed - Duration::from_millis(150);
+        let after = pressed + Duration::from_millis(10);
+        // The newest status was sent before ✓: a Recording may have started
+        // since, so wait.
+        assert!(!save_may_commit(pressed, Some(before), after));
+        assert!(!save_may_commit(pressed, None, after));
+        // A status sent after ✓ showed Voisu idle: save.
+        assert!(save_may_commit(pressed, Some(after), after));
+        assert!(save_may_commit(pressed, Some(pressed), pressed));
+        // A daemon that never answers can't hold the save forever.
+        assert!(save_may_commit(
+            pressed,
+            Some(before),
+            pressed + SAVE_SETTLE
+        ));
+    }
+
+    #[test]
     fn a_client_saves_what_the_overlay_reports_after_it_starts_moving() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("overlay.sock");
@@ -629,11 +747,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("overlay.sock");
         let error = move_overlay_at(&path, |_| Ok(()), || panic!("not moving")).unwrap_err();
-        assert!(error.contains("isn't running"), "{error}");
-        assert!(
-            error.contains("systemctl --user start voisu-overlay"),
-            "{error}"
+        let session = not_running(
+            std::env::var_os("WAYLAND_DISPLAY").is_some_and(|value| !value.is_empty()),
+            &std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default(),
         );
+        assert_eq!(error, session);
 
         let listener =
             MoveListener::bind_at(&path, Some("no layer shell here".to_owned())).unwrap();
@@ -652,6 +770,81 @@ mod tests {
             Err("the pill's surface failed".to_owned())
         );
         assert!(listener.take().is_none());
+    }
+
+    #[test]
+    fn only_a_layer_shell_wayland_session_is_told_to_start_the_service() {
+        let kde = not_running(true, "KDE");
+        assert!(
+            kde.contains("systemctl --user start voisu-overlay"),
+            "{kde}"
+        );
+        assert_eq!(not_running(true, "Hyprland"), kde);
+        for gnome in [
+            not_running(true, "ubuntu:GNOME"),
+            not_running(false, "GNOME"),
+        ] {
+            assert!(gnome.contains("GNOME Shell extension"), "{gnome}");
+            assert!(!gnome.contains("systemctl"), "{gnome}");
+        }
+        let x11 = not_running(false, "KDE");
+        assert!(x11.contains("isn't Wayland"), "{x11}");
+        assert!(!x11.contains("systemctl"), "{x11}");
+    }
+
+    #[test]
+    fn a_reply_cut_short_by_a_hang_up_is_never_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overlay.sock");
+        let fake = UnixListener::bind(&path).unwrap();
+        for (moving, outcome) in [("moving\n", "save 0.250,0"), ("moving", "")] {
+            let overlay = thread::spawn({
+                let fake = fake.try_clone().unwrap();
+                move || {
+                    let (mut stream, _) = fake.accept().unwrap();
+                    let mut line = String::new();
+                    BufReader::new(&stream).read_line(&mut line).unwrap();
+                    stream.write_all(moving.as_bytes()).unwrap();
+                    stream.write_all(outcome.as_bytes()).unwrap();
+                    // Hangs up mid-line.
+                }
+            });
+            let error = move_overlay_at(&path, |_| panic!("a cut-short line must not save"), || {})
+                .unwrap_err();
+            assert!(error.contains("stopped before"), "{moving:?}: {error}");
+            overlay.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_request_cut_short_or_peers_that_stall_never_hold_up_a_real_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overlay.sock");
+        let listener = MoveListener::bind_at(&path, None).unwrap();
+        // `move` with no newline, then a hang-up of the write side, is no
+        // request.
+        let cut = UnixStream::connect(&path).unwrap();
+        (&cut).write_all(b"move").unwrap();
+        cut.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut answer = String::new();
+        BufReader::new(&cut).read_line(&mut answer).unwrap();
+        assert_eq!(answer, "error unknown request\n");
+        assert!(listener.take().is_none());
+        // Peers that connect and say nothing each wait out their own
+        // timeout; a real client behind them is answered at once.
+        let stalled: Vec<_> = (0..3)
+            .map(|_| UnixStream::connect(&path).unwrap())
+            .collect();
+        let started = Instant::now();
+        let mut client = UnixStream::connect(&path).unwrap();
+        client.write_all(b"move\n").unwrap();
+        let _requester = next_requester(&listener);
+        assert!(
+            started.elapsed() < REQUEST_TIMEOUT,
+            "stalled peers held up a client for {:?}",
+            started.elapsed()
+        );
+        drop(stalled);
     }
 
     #[test]
@@ -685,8 +878,40 @@ mod tests {
         let path = dir.path().join("overlay.sock");
         drop(UnixListener::bind(&path).unwrap());
         assert!(path.exists(), "a dead listener leaves its file behind");
-        let _live = MoveListener::bind_at(&path, None).unwrap();
+        let live = MoveListener::bind_at(&path, None).unwrap();
         let error = MoveListener::bind_at(&path, None).err().unwrap();
         assert!(error.contains("already listening"), "{error}");
+        // The loser touched nothing: the live socket still answers.
+        let mut client = UnixStream::connect(&path).unwrap();
+        client.write_all(b"move\n").unwrap();
+        let _requester = next_requester(&live);
+        // Once the live one is gone, the path is free again.
+        drop(live);
+        drop(MoveListener::bind_at(&path, None).unwrap());
+    }
+
+    #[test]
+    fn racing_binders_on_a_stale_socket_leave_exactly_one_live_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overlay.sock");
+        drop(UnixListener::bind(&path).unwrap());
+        let start = Arc::new(std::sync::Barrier::new(4));
+        let racers: Vec<_> = (0..4)
+            .map(|_| {
+                let (path, start) = (path.clone(), Arc::clone(&start));
+                thread::spawn(move || {
+                    start.wait();
+                    MoveListener::bind_at(&path, None).ok()
+                })
+            })
+            .collect();
+        let winners: Vec<_> = racers
+            .into_iter()
+            .filter_map(|racer| racer.join().unwrap())
+            .collect();
+        assert_eq!(winners.len(), 1, "exactly one binder wins");
+        let mut client = UnixStream::connect(&path).unwrap();
+        client.write_all(b"move\n").unwrap();
+        let _requester = next_requester(&winners[0]);
     }
 }

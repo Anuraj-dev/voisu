@@ -16,8 +16,11 @@ pub type Size = (i32, i32);
 /// dragged pill snaps to it, so the centred default is easy to get back to.
 pub const CENTRE_SNAP: f64 = 12.0;
 
-/// Space between the pill and the move-mode buttons, in logical pixels.
-pub const BUTTONS_GAP: i32 = 8;
+/// The move-mode pill: ✗, the idle bars and ✓ in one capsule, wider than
+/// the plain pill as on Windows. Move mode places and saves by this size, so
+/// the centre a ✓ saves is the centre the user saw, and the plain pill (which
+/// is narrower) lands centred on the same spot.
+pub const MOVE_PILL: Size = (158, 32);
 
 /// The left and top Layer Shell margins that put the centre of a pill of
 /// `pill` size at `position` on an output of `output` size. A pill larger than
@@ -65,29 +68,6 @@ pub fn position_at(centre: (f64, f64), output: Size, pill: Size) -> OverlayPosit
     }
     OverlayPosition::from_fractions(x / f64::from(output.0), y / f64::from(output.1))
         .unwrap_or_default()
-}
-
-/// The top-left corner of the move-mode buttons beside a pill whose top-left
-/// corner is `pill_origin`: to its right, or to its left when the right side
-/// has no room, vertically centred on the pill and kept on the output.
-#[must_use]
-pub fn buttons_origin(
-    pill_origin: (i32, i32),
-    pill: Size,
-    buttons: Size,
-    output: Size,
-) -> (i32, i32) {
-    let right = pill_origin.0 + pill.0 + BUTTONS_GAP;
-    let x = if right + buttons.0 <= output.0 {
-        right
-    } else {
-        pill_origin.0 - BUTTONS_GAP - buttons.0
-    };
-    let y = pill_origin.1 + (pill.1 - buttons.1) / 2;
-    (
-        x.clamp(0, (output.0 - buttons.0).max(0)),
-        y.clamp(0, (output.1 - buttons.1).max(0)),
-    )
 }
 
 #[cfg(test)]
@@ -152,11 +132,21 @@ mod tests {
     }
 
     #[test]
-    fn buttons_sit_right_of_the_pill_or_left_at_the_right_edge() {
-        let buttons = (64, 28);
-        assert_eq!(buttons_origin((900, 524), PILL, buttons, FHD), (1028, 526));
-        assert_eq!(buttons_origin((1800, 524), PILL, buttons, FHD), (1728, 526));
-        // Kept on the output even at the very top.
-        assert_eq!(buttons_origin((0, 0), (120, 20), buttons, FHD), (128, 0));
+    fn the_plain_pill_lands_centred_where_the_move_pill_was_dropped() {
+        for centre in [
+            (480.0, 108.0),
+            (1900.0, 1075.0),
+            (3.0, 2.0),
+            (960.0, 1052.0),
+        ] {
+            let saved = position_at(centre, FHD, MOVE_PILL);
+            let moving = pill_margins(saved, FHD, MOVE_PILL);
+            let plain = pill_margins(saved, FHD, PILL);
+            assert_eq!(
+                (plain.0 + PILL.0 / 2, plain.1 + PILL.1 / 2),
+                (moving.0 + MOVE_PILL.0 / 2, moving.1 + MOVE_PILL.1 / 2),
+                "{centre:?}"
+            );
+        }
     }
 }

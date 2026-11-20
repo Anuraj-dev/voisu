@@ -21,8 +21,9 @@ use voisu_app::feedback::{
 use voisu_app::local_overlay::TriggerRepeatLatch;
 use voisu_app::overlay::move_mode::{
     CancelReason, MoveEnd, MoveKey, MoveListener, MoveMode, MoveReply, MoveRequester,
+    save_may_commit,
 };
-use voisu_app::overlay::placement::{self, Size};
+use voisu_app::overlay::placement::{self, MOVE_PILL, Size};
 use voisu_app::overlay::waveform::{Waveform, poll_target};
 use voisu_app::overlay::{
     LIMIT_APPROACHING_CLASS, LIMIT_WARNING_CLASS, LevelPollAction, LevelPollLatch, LimitWarning,
@@ -424,12 +425,11 @@ fn build_feedback(application: &gtk::Application, selection: FeedbackSelection) 
          .capsule.copied .state-label { color: #FFB454; }
          .capsule.limitsoon .state-label { color: #FFB454; }
          .capsule.limitwarn { border: 1px solid rgba(255, 138, 138, 0.9); box-shadow: 0 0 8px rgba(255, 138, 138, 0.35); }
-         .capsule.moving { border: 1px dashed rgba(244, 245, 247, 0.55); }
-         .move-button { min-width: 28px; min-height: 28px; padding: 0; border-radius: 14px; background: rgba(23, 25, 29, 0.96); background-image: none; border: 1px solid rgba(255, 255, 255, 0.14); box-shadow: none; outline: none; color: #F4F5F7; font-size: 12pt; font-weight: 700; }
-         .move-button:hover { background: rgba(38, 41, 47, 0.98); }
-         .move-button:active { background: rgba(14, 15, 18, 0.98); }
-         .move-button.confirm:hover { color: #65D6A0; border-color: rgba(101, 214, 160, 0.7); }
-         .move-button.cancel:hover { color: #FF8A8A; border-color: rgba(255, 138, 138, 0.7); }",
+         .capsule.moving { border: 1px dashed rgba(244, 245, 247, 0.55); padding: 0 3px; }
+         .move-button { min-width: 24px; min-height: 24px; padding: 0; margin: 0; border-radius: 12px; background: transparent; background-image: none; border: 0; box-shadow: none; outline: none; color: #F4F5F7; font-size: 11pt; font-weight: 700; }
+         .move-button:hover { background: rgba(244, 245, 247, 0.14); }
+         .move-button:active { background: rgba(244, 245, 247, 0.22); }
+         .move-button.confirm:hover { background: rgba(101, 214, 160, 0.28); }",
     );
     capsule.add_css_class("capsule");
     gtk::style_context_add_provider_for_display(
@@ -525,19 +525,24 @@ fn install_surface_feedback(
     // Where the pill goes, and the margins last applied for it.
     let position = Rc::new(Cell::new(voisu_app::config::overlay_position()));
     let placed = Cell::new(None);
+    // The output the pill is bound to, once a move has picked one.
+    let output = Rc::new(RefCell::new(None::<gtk::gdk::Monitor>));
     // Set when the config file changes or a move is saved: re-read the
     // position, so a change lands even while a result pill is on screen.
     let reread = Rc::new(Cell::new(false));
     let config_monitor = watch_config(&reread);
     let busy = Rc::new(Cell::new(false));
+    let idle_as_of = Rc::new(Cell::new(None::<Instant>));
     let moves = move_listener.map(|listener| {
         let moves = Rc::new(RefCell::new(MoveController {
             application: application.clone(),
             main_window: window.clone(),
             listener,
             position: Rc::clone(&position),
+            output: Rc::clone(&output),
             reread: Rc::clone(&reread),
             busy: Rc::clone(&busy),
+            idle_as_of: Rc::clone(&idle_as_of),
             session: None,
         }));
         // Its own clock, so ✓, ✗ and the timeouts never wait on a slow daemon.
@@ -596,11 +601,14 @@ fn install_surface_feedback(
         {
             sweep_started.set(Instant::now());
         }
-        // A Recording ends move mode at once, so the pill shows it.
+        // A Recording ends move mode at once, so the pill shows it. A ✓
+        // pressed meanwhile waits for a status sent after it (`idle_as_of`),
+        // so a Recording that started first always wins over the save.
         busy.set(matches!(
             view.phase,
             OverlayPhase::Recording | OverlayPhase::Processing
         ));
+        idle_as_of.set((!busy.get()).then_some(observation.requested_at));
         if let Some(moves) = &moves
             && busy.get()
         {
@@ -643,7 +651,7 @@ fn install_surface_feedback(
         {
             // Placed before it is shown, so it never appears at a stale spot.
             if window.is_layer_window() {
-                place_pill(&window, position.get(), pill, &placed);
+                place_pill(&window, position.get(), pill, &placed, &output.borrow());
             }
             window.set_visible(true);
             meter.queue_draw();
@@ -801,17 +809,11 @@ const NO_LAYER_SHELL_MOVE: &str = "This desktop has no layer-shell support (the 
 /// Why a move is refused after the pill's surface failed.
 const NO_SURFACE_MOVE: &str = "The Overlay couldn't show its pill on this desktop (it is using notifications), so it can't be moved.";
 
-/// One move-mode button, square, in logical pixels.
-const MOVE_BUTTON: i32 = 28;
+/// One move-mode button, round, in logical pixels (Windows' size).
+const MOVE_BUTTON: i32 = 24;
 
-/// Space between the ✓ and ✗ buttons.
-const MOVE_BUTTON_GAP: i32 = 6;
-
-/// Both move-mode buttons side by side.
-const MOVE_BUTTONS: Size = (2 * MOVE_BUTTON + MOVE_BUTTON_GAP, MOVE_BUTTON);
-
-/// The bare pill, which is what is dragged.
-const PILL: Size = (PILL_WIDTH, PILL_HEIGHT);
+/// Space between each button and the bars.
+const MOVE_BUTTON_GAP: i32 = 5;
 
 /// Holds the move socket on a backend with no pill to drag, so a move request
 /// gets a clear refusal instead of "isn't running". Keep the result alive.
@@ -827,12 +829,19 @@ struct MoveController {
     application: gtk::Application,
     main_window: gtk::ApplicationWindow,
     listener: Rc<MoveListener>,
-    /// Where the pill goes; a saved move updates it at once.
+    /// Where the pill goes, as last read from the config. A move starts from
+    /// it; a save reaches it only through the config, once the client has
+    /// written it.
     position: Rc<Cell<OverlayPosition>>,
+    /// The output the pill is bound to; a saved move binds it to the output
+    /// the move happened on.
+    output: Rc<RefCell<Option<gtk::gdk::Monitor>>>,
     /// Asks the status tick to re-read the saved position.
     reread: Rc<Cell<bool>>,
     /// A Recording or its processing is on screen.
     busy: Rc<Cell<bool>>,
+    /// When the newest status that showed Voisu idle was sent.
+    idle_as_of: Rc<Cell<Option<Instant>>>,
     session: Option<MoveSession>,
 }
 
@@ -846,8 +855,9 @@ struct MoveSession {
 /// Shared between the move window's handlers and the controller's tick.
 struct MoveState {
     mode: MoveMode,
-    /// Set by ✓, ✗, Enter or Esc; acted on at the next tick.
-    end: Option<MoveEnd>,
+    /// Set by ✓, ✗, Enter or Esc, with when; acted on at the next tick (a
+    /// save once [`save_may_commit`] allows it).
+    end: Option<(MoveEnd, Instant)>,
 }
 
 impl MoveController {
@@ -876,11 +886,21 @@ impl MoveController {
         }
         let end = self.session.as_ref().and_then(|session| {
             let state = session.state.borrow();
-            state.end.or_else(|| {
-                state
+            match state.end {
+                // A Recording seen first wins; otherwise the save waits for
+                // a status sent after ✓.
+                Some((MoveEnd::Save(_), _)) if self.busy.get() => {
+                    Some(MoveEnd::Cancel(CancelReason::Recording))
+                }
+                Some((MoveEnd::Save(position), pressed)) => {
+                    save_may_commit(pressed, self.idle_as_of.get(), now)
+                        .then_some(MoveEnd::Save(position))
+                }
+                Some((end, _)) => Some(end),
+                None => state
                     .mode
-                    .tick(now, self.busy.get(), session.requester.gone())
-            })
+                    .tick(now, self.busy.get(), session.requester.gone()),
+            }
         });
         if let Some(end) = end {
             self.finish(end);
@@ -900,7 +920,7 @@ impl MoveController {
             mode: MoveMode::start(original, now),
             end: None,
         }));
-        let window = build_move_window(&self.application, &self.main_window, &state);
+        let window = build_move_window(&self.application, &state);
         if !requester.reply(&MoveReply::Moving) {
             window.destroy();
             return;
@@ -921,13 +941,21 @@ impl MoveController {
         };
         // The client writes the config: the Overlay's sandbox can't.
         let told = session.requester.reply(&end.reply());
+        // The output the move happened on, read before the window goes.
+        let moved_on = session.window.surface().and_then(|surface| {
+            gtk::prelude::RootExt::display(&session.window).monitor_at_surface(&surface)
+        });
         session.window.destroy();
         match end {
             MoveEnd::Save(position) => {
                 eprintln!("overlay_move end=save position={position} told={told}");
-                // Shown there at once; the config watch confirms it once the
-                // client has written it.
-                self.position.set(position);
+                // Not adopted here: the pill takes the spot by re-reading the
+                // config (the file watch fires when the client writes it), so
+                // a save that fails, or a client that left before it could
+                // write, leaves the pill where the config says.
+                if told && let Some(monitor) = moved_on {
+                    *self.output.borrow_mut() = Some(monitor);
+                }
                 self.reread.set(true);
             }
             MoveEnd::Cancel(reason) => {
@@ -939,12 +967,13 @@ impl MoveController {
 }
 
 /// The move-mode surface: a transparent Layer Shell window over the whole
-/// output holding an idle pill with a dashed outline and ✓/✗ beside it.
-/// Only the pill and buttons take input; everywhere else clicks through.
-/// The keyboard is on demand, for Enter and Esc, and only while it exists.
+/// output holding one wider pill, as on Windows: ✗, the idle bars and ✓,
+/// with a dashed outline round the lot. Only the pill takes input; everywhere
+/// else clicks through. The keyboard is on demand, for Enter and Esc, and only
+/// while it exists. The window is left to the compositor's choice of output
+/// (the focused one), and a save binds the pill to that output.
 fn build_move_window(
     application: &gtk::Application,
-    main_window: &gtk::ApplicationWindow,
     state: &Rc<RefCell<MoveState>>,
 ) -> gtk::ApplicationWindow {
     let window = gtk::ApplicationWindow::builder()
@@ -962,15 +991,6 @@ fn build_move_window(
     }
     window.set_exclusive_zone(-1);
     window.set_keyboard_mode(KeyboardMode::OnDemand);
-    // On the output the pill was last shown on, when there is one.
-    let display = gtk::prelude::RootExt::display(main_window);
-    if let Some(monitor) = main_window
-        .surface()
-        .filter(|_| main_window.is_mapped())
-        .and_then(|surface| display.monitor_at_surface(&surface))
-    {
-        window.set_monitor(Some(&monitor));
-    }
     window.connect_realize(|window| {
         if let Some(surface) = window.surface() {
             surface.set_input_region(Some(&gtk::cairo::Region::create()));
@@ -979,29 +999,22 @@ fn build_move_window(
 
     let bars = gtk::DrawingArea::builder().content_height(24).build();
     bars.set_hexpand(true);
+    bars.set_valign(gtk::Align::Center);
     bars.set_draw_func(|_, context, width, height| draw_resting(context, width, height));
-    let pill = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    pill.add_css_class("capsule");
-    pill.add_css_class("moving");
-    pill.set_size_request(PILL.0, PILL.1);
-    pill.append(&bars);
-    pill.set_cursor_from_name(Some("grab"));
-    pill.update_property(&[gtk::accessible::Property::Label(
-        "Voisu Overlay. Drag to move; Enter saves, Escape cancels.",
-    )]);
 
     let button = |glyph: &str, class: &str, label: &str| {
         let button = gtk::Button::with_label(glyph);
         button.add_css_class("move-button");
         button.add_css_class(class);
         button.set_size_request(MOVE_BUTTON, MOVE_BUTTON);
+        button.set_valign(gtk::Align::Center);
         button.set_focusable(false);
         button.set_cursor_from_name(Some("pointer"));
         button.update_property(&[gtk::accessible::Property::Label(label)]);
         button
     };
-    let confirm = button("✓", "confirm", "Save the Overlay position");
     let cancel = button("✗", "cancel", "Cancel moving the Overlay");
+    let confirm = button("✓", "confirm", "Save the Overlay position");
     for (button, save) in [(&confirm, true), (&cancel, false)] {
         let state = Rc::clone(state);
         button.connect_clicked(move |_| {
@@ -1011,16 +1024,27 @@ fn build_move_window(
             } else {
                 state.mode.cancel()
             };
-            state.end = Some(end);
+            state.end = Some((end, Instant::now()));
         });
     }
-    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, MOVE_BUTTON_GAP);
-    buttons.append(&confirm);
-    buttons.append(&cancel);
+
+    // ✗ · bars · ✓ in one capsule, exactly MOVE_PILL in size (CSS border
+    // and padding included), so what is painted, placed, saved and clickable
+    // are the same rectangle.
+    let pill = gtk::Box::new(gtk::Orientation::Horizontal, MOVE_BUTTON_GAP);
+    pill.add_css_class("capsule");
+    pill.add_css_class("moving");
+    pill.set_size_request(MOVE_PILL.0, MOVE_PILL.1);
+    pill.append(&cancel);
+    pill.append(&bars);
+    pill.append(&confirm);
+    pill.set_cursor_from_name(Some("grab"));
+    pill.update_property(&[gtk::accessible::Property::Label(
+        "Voisu Overlay. Drag to move; Enter saves, Escape cancels.",
+    )]);
 
     let fixed = gtk::Fixed::new();
     fixed.put(&pill, 0.0, 0.0);
-    fixed.put(&buttons, 0.0, 0.0);
     // Hidden until the output's size is known and the pill is in place.
     fixed.set_opacity(0.0);
     // The base child is only there to report the output's size.
@@ -1033,34 +1057,37 @@ fn build_move_window(
     window.set_child(Some(&layers));
 
     let output = Rc::new(Cell::new(None::<Size>));
-    // Puts the pill at the current position, the buttons beside it, and the
-    // input region around exactly those two.
+    // The pill's real size: its request, or more if its CSS ever asks for
+    // more. Placement, the saved centre and the input region all use it.
+    let pill_size = {
+        let pill = pill.clone();
+        move || -> Size {
+            let (_, width, _, _) = pill.measure(gtk::Orientation::Horizontal, -1);
+            let (_, height, _, _) = pill.measure(gtk::Orientation::Vertical, width);
+            (width.max(MOVE_PILL.0), height.max(MOVE_PILL.1))
+        }
+    };
+    // Puts the pill at the current position and the input region around
+    // exactly it.
     let place: Rc<dyn Fn()> = Rc::new({
         let window = window.downgrade();
         let fixed = fixed.clone();
         let pill = pill.clone();
-        let buttons = buttons.clone();
         let output = Rc::clone(&output);
         let state = Rc::clone(state);
+        let pill_size = pill_size.clone();
         move || {
             let (Some(window), Some(output)) = (window.upgrade(), output.get()) else {
                 return;
             };
-            let origin = placement::pill_margins(state.borrow().mode.current(), output, PILL);
-            let beside = placement::buttons_origin(origin, PILL, MOVE_BUTTONS, output);
+            let size = pill_size();
+            let origin = placement::pill_margins(state.borrow().mode.current(), output, size);
             fixed.move_(&pill, f64::from(origin.0), f64::from(origin.1));
-            fixed.move_(&buttons, f64::from(beside.0), f64::from(beside.1));
             fixed.set_opacity(1.0);
             if let Some(surface) = window.surface() {
-                let region = gtk::cairo::Region::create_rectangles(&[
-                    gtk::cairo::RectangleInt::new(origin.0, origin.1, PILL.0, PILL.1),
-                    gtk::cairo::RectangleInt::new(
-                        beside.0,
-                        beside.1,
-                        MOVE_BUTTONS.0,
-                        MOVE_BUTTONS.1,
-                    ),
-                ]);
+                let region = gtk::cairo::Region::create_rectangle(&gtk::cairo::RectangleInt::new(
+                    origin.0, origin.1, size.0, size.1,
+                ));
                 surface.set_input_region(Some(&region));
             }
         }
@@ -1077,7 +1104,8 @@ fn build_move_window(
     });
 
     // Dragging: the gesture sits on the still Fixed, not the moving pill, so
-    // its offsets stay true while the pill follows the pointer.
+    // its offsets stay true while the pill follows the pointer. A press on
+    // ✓ or ✗ is theirs, never a drag.
     let drag = gtk::GestureDrag::new();
     let grabbed = Rc::new(Cell::new(None::<(f64, f64)>));
     drag.connect_drag_begin({
@@ -1085,24 +1113,24 @@ fn build_move_window(
         let state = Rc::clone(state);
         let grabbed = Rc::clone(&grabbed);
         let pill = pill.clone();
+        let fixed = fixed.clone();
+        let pill_size = pill_size.clone();
         move |gesture, x, y| {
-            let Some(output) = output.get() else {
+            let picked = fixed.pick(x, y, gtk::PickFlags::DEFAULT);
+            let on_pill = picked.as_ref().is_some_and(|widget| {
+                (widget == pill.upcast_ref::<gtk::Widget>() || widget.is_ancestor(&pill))
+                    && widget.ancestor(gtk::Button::static_type()).is_none()
+            });
+            let Some(output) = output.get().filter(|_| on_pill) else {
                 gesture.set_state(gtk::EventSequenceState::Denied);
                 return;
             };
-            let origin = placement::pill_margins(state.borrow().mode.current(), output, PILL);
-            let on_pill = x >= f64::from(origin.0)
-                && x < f64::from(origin.0 + PILL.0)
-                && y >= f64::from(origin.1)
-                && y < f64::from(origin.1 + PILL.1);
-            if !on_pill {
-                gesture.set_state(gtk::EventSequenceState::Denied);
-                return;
-            }
             gesture.set_state(gtk::EventSequenceState::Claimed);
+            let size = pill_size();
+            let origin = placement::pill_margins(state.borrow().mode.current(), output, size);
             grabbed.set(Some((
-                f64::from(origin.0) + f64::from(PILL.0) / 2.0,
-                f64::from(origin.1) + f64::from(PILL.1) / 2.0,
+                f64::from(origin.0) + f64::from(size.0) / 2.0,
+                f64::from(origin.1) + f64::from(size.1) / 2.0,
             )));
             pill.set_cursor_from_name(Some("grabbing"));
         }
@@ -1112,11 +1140,13 @@ fn build_move_window(
         let state = Rc::clone(state);
         let grabbed = Rc::clone(&grabbed);
         let place = Rc::clone(&place);
+        let pill_size = pill_size.clone();
         move |_, dx, dy| {
             let (Some(start), Some(output)) = (grabbed.get(), output.get()) else {
                 return;
             };
-            let position = placement::position_at((start.0 + dx, start.1 + dy), output, PILL);
+            let position =
+                placement::position_at((start.0 + dx, start.1 + dy), output, pill_size());
             state.borrow_mut().mode.drag_to(position, Instant::now());
             place();
         }
@@ -1144,9 +1174,10 @@ fn build_move_window(
                 _ => MoveKey::Other,
             };
             let mut state = state.borrow_mut();
-            match state.mode.key(key, Instant::now()) {
+            let now = Instant::now();
+            match state.mode.key(key, now) {
                 Some(end) => {
-                    state.end = Some(end);
+                    state.end = Some((end, now));
                     gtk::glib::Propagation::Stop
                 }
                 None => gtk::glib::Propagation::Proceed,
@@ -1164,11 +1195,17 @@ fn build_move_window(
     window
 }
 
-/// The idle pill's resting bars, in the pill's own white.
+/// The idle pill's resting bars, in the pill's own white: the same thin
+/// 2 px bars as the pill, as many as fit between ✗ and ✓.
 fn draw_resting(context: &gtk::cairo::Context, width: i32, height: i32) {
     let centre = f64::from(height) / 2.0;
     let bar_height = resting_floor(f64::from(height) - 2.0);
-    let count = PILL_BAR_COUNT;
+    let pitch = PILL_BAR_WIDTH + PILL_BAR_GAP;
+    let fits = ((f64::from(width) + PILL_BAR_GAP) / pitch).floor().max(0.0) as usize;
+    let count = PILL_BAR_COUNT.min(fits);
+    if count == 0 {
+        return;
+    }
     let row = PILL_BAR_WIDTH * count as f64 + PILL_BAR_GAP * (count - 1) as f64;
     let left = ((f64::from(width) - row) / 2.0).max(0.0);
     for index in 0..count {
@@ -1618,20 +1655,29 @@ fn render_surface(
     Some(size_pill(window, capsule, label, glyph))
 }
 
-/// Pushes the top-left-anchored surface so the pill's centre sits at
-/// `position` on its output, wholly on screen. Called on every visible tick,
-/// so a new output size, pill size or position lands within one tick; the
-/// margins are only touched when they change.
+/// Binds the top-left-anchored surface to one output and pushes it so the
+/// pill's centre sits at `position` on that output, wholly on screen. The
+/// margins always come from the output the surface is bound to: an unbound
+/// surface placed by another output's size could land wholly off screen,
+/// where no output would ever claim it. Called on every visible tick, so a
+/// new output, pill size or position lands within one tick; the surface is
+/// only touched when something changed.
 fn place_pill(
     window: &gtk::ApplicationWindow,
     position: OverlayPosition,
     pill: Size,
     placed: &Cell<Option<(i32, i32)>>,
+    preferred: &Option<gtk::gdk::Monitor>,
 ) {
-    let Some(output) = output_size(window) else {
+    let Some(monitor) = pill_output(window, preferred) else {
         return;
     };
-    let margins = placement::pill_margins(position, output, pill);
+    if LayerShell::monitor(window).as_ref() != Some(&monitor) {
+        window.set_monitor(Some(&monitor));
+        placed.set(None);
+    }
+    let geometry = monitor.geometry();
+    let margins = placement::pill_margins(position, (geometry.width(), geometry.height()), pill);
     if placed.get() == Some(margins) {
         return;
     }
@@ -1640,25 +1686,28 @@ fn place_pill(
     window.set_margin(Edge::Top, margins.1);
 }
 
-/// The logical size of the output the pill is on. Before the surface has
-/// been shown, the compositor has not picked an output yet, so the first
-/// monitor stands in; the next tick corrects it if that guess was wrong.
-fn output_size(window: &gtk::ApplicationWindow) -> Option<Size> {
-    let display = gtk::prelude::RootExt::display(window);
-    let monitor = LayerShell::monitor(window)
+/// The output for the pill: the one the last saved move happened on, else
+/// the one it is already bound to, else the first, skipping any that have
+/// been unplugged. Kept in memory only: a restarted Overlay starts on the
+/// first output again.
+fn pill_output(
+    window: &gtk::ApplicationWindow,
+    preferred: &Option<gtk::gdk::Monitor>,
+) -> Option<gtk::gdk::Monitor> {
+    let usable = |monitor: &gtk::gdk::Monitor| {
+        let geometry = monitor.geometry();
+        monitor.is_valid() && geometry.width() > 0 && geometry.height() > 0
+    };
+    preferred
+        .clone()
+        .filter(usable)
+        .or_else(|| LayerShell::monitor(window).filter(usable))
         .or_else(|| {
-            window
-                .surface()
-                .and_then(|surface| display.monitor_at_surface(&surface))
+            let monitors = gtk::prelude::RootExt::display(window).monitors();
+            (0..monitors.n_items())
+                .filter_map(|index| monitors.item(index)?.downcast::<gtk::gdk::Monitor>().ok())
+                .find(usable)
         })
-        .or_else(|| {
-            display
-                .monitors()
-                .item(0)
-                .and_then(|item| item.downcast::<gtk::gdk::Monitor>().ok())
-        })?;
-    let geometry = monitor.geometry();
-    (geometry.width() > 0 && geometry.height() > 0).then(|| (geometry.width(), geometry.height()))
 }
 
 /// Watches the config file, so a position set by the CLI or the TUI moves the

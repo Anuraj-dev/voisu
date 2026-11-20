@@ -31,13 +31,25 @@ impl Sandbox {
         }
     }
 
+    /// Runs the CLI in a KDE Plasma Wayland session.
     fn run(&self, arguments: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_voisu"))
+        self.run_in(arguments, Some("wayland-0"), "KDE")
+    }
+
+    /// Runs the CLI in the given session: `WAYLAND_DISPLAY` (unset when
+    /// `None`) and `XDG_CURRENT_DESKTOP`.
+    fn run_in(&self, arguments: &[&str], wayland: Option<&str>, desktop: &str) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_voisu"));
+        command
             .args(arguments)
             .env("XDG_CONFIG_HOME", self.config.path())
             .env("XDG_RUNTIME_DIR", self.runtime.path())
-            .output()
-            .expect("run voisu CLI")
+            .env("XDG_CURRENT_DESKTOP", desktop);
+        match wayland {
+            Some(display) => command.env("WAYLAND_DISPLAY", display),
+            None => command.env_remove("WAYLAND_DISPLAY"),
+        };
+        command.output().expect("run voisu CLI")
     }
 
     fn config_file(&self) -> PathBuf {
@@ -229,6 +241,26 @@ fn move_without_a_usable_overlay_fails_clearly() {
         stderr(&missing).contains("The Overlay isn't running"),
         "{missing:?}"
     );
+    assert!(
+        stderr(&missing).contains("systemctl --user start voisu-overlay"),
+        "{missing:?}"
+    );
+    // GNOME (the Shell extension) and X11 (no Overlay service) are told move
+    // mode isn't available there, not to start a service that won't help.
+    for (wayland, desktop, says) in [
+        (
+            Some("wayland-0"),
+            "ubuntu:GNOME",
+            "GNOME Shell extension, which can't be moved",
+        ),
+        (None, "KDE", "this session isn't Wayland"),
+    ] {
+        let elsewhere = sandbox.run_in(&["overlay-position", "move"], wayland, desktop);
+        assert_eq!(elsewhere.status.code(), Some(1), "{elsewhere:?}");
+        let error = stderr(&elsewhere);
+        assert!(error.contains(says), "{desktop}: {error}");
+        assert!(!error.contains("systemctl"), "{desktop}: {error}");
+    }
 
     let overlay = fake_overlay(
         &sandbox.overlay_socket(),

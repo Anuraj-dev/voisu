@@ -1211,6 +1211,9 @@ pub fn read_until_eof_within(
 #[derive(Debug)]
 pub struct StatusObservation {
     pub response: Option<Response>,
+    /// When this round trip was sent: the reply shows the daemon as it was
+    /// at or after this instant.
+    pub requested_at: Instant,
     /// The cadence the worker chose after this round trip; the GTK tick that
     /// consumes observations follows it so it never lags the worker.
     pub period: Duration,
@@ -1245,9 +1248,14 @@ impl StatusWorker {
         thread::spawn(move || {
             let mut cadence = StatusCadence::default();
             while !thread_stop.load(Ordering::Relaxed) {
+                let requested_at = Instant::now();
                 let response = fetch();
                 let period = cadence.next(response.as_ref(), Instant::now());
-                *thread_latest.lock().unwrap() = Some(StatusObservation { response, period });
+                *thread_latest.lock().unwrap() = Some(StatusObservation {
+                    response,
+                    requested_at,
+                    period,
+                });
                 thread::sleep(period);
             }
         });
@@ -1525,10 +1533,12 @@ mod tests {
         // rendered.
         *worker.latest.lock().unwrap() = Some(StatusObservation {
             response: Some(overlay_status(DaemonState::Idle, None)),
+            requested_at: Instant::now(),
             period: STATUS_POLL_PERIOD,
         });
         *worker.latest.lock().unwrap() = Some(StatusObservation {
             response: Some(overlay_status(DaemonState::Recording, None)),
+            requested_at: Instant::now(),
             period: STATUS_POLL_PERIOD,
         });
         let taken = worker.take_latest().unwrap();
@@ -2491,13 +2501,17 @@ mod tests {
         use std::sync::{Arc, Mutex, mpsc};
         let at = |x, y| OverlayPosition::from_fractions(x, y).unwrap();
         let file = Arc::new(Mutex::new(OverlayPosition::DEFAULT));
-        let gate: Arc<Mutex<Option<mpsc::Receiver<()>>>> = Arc::default();
+        // A gated read reports that it has read the file, then waits for its
+        // release, so the test changes the file only after that read.
+        type Gate = (mpsc::Sender<()>, mpsc::Receiver<()>);
+        let gate: Arc<Mutex<Option<Gate>>> = Arc::default();
         let mut watch = PositionWatch::with_reader({
             let (file, gate) = (Arc::clone(&file), Arc::clone(&gate));
             move || {
                 let position = *file.lock().unwrap();
-                if let Some(gate) = gate.lock().unwrap().take() {
-                    let _ = gate.recv();
+                if let Some((read, release)) = gate.lock().unwrap().take() {
+                    read.send(()).unwrap();
+                    let _ = release.recv();
                 }
                 position
             }
@@ -2527,10 +2541,15 @@ mod tests {
         // A slow read never blocks a tick, and a change saved while it is out
         // is read after it rather than dropped.
         let (release, held) = mpsc::channel::<()>();
-        *gate.lock().unwrap() = Some(held);
+        let (read, was_read) = mpsc::channel::<()>();
+        *gate.lock().unwrap() = Some((read, held));
         *file.lock().unwrap() = at(0.7, 0.2);
         watch.refresh();
-        assert_eq!(watch.take(), None);
+        was_read
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the gated read never ran");
+        assert_eq!(watch.take(), None, "the read is still out");
+        // Saved after the out read took 0.7: only the queued read sees it.
         *file.lock().unwrap() = at(0.9, 0.9);
         watch.refresh();
         release.send(()).unwrap();
