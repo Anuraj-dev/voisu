@@ -838,7 +838,9 @@ mod tests {
         drop(listener);
 
         // A listener that starts accepting can turn to refusing later, when
-        // the pill's surface fails.
+        // the pill's surface fails. A second path: another test thread's
+        // child can briefly hold a dup of the first lock fd until its exec.
+        let path = dir.path().join("overlay-2.sock");
         let listener = MoveListener::bind_at(&path, None).unwrap();
         listener.refuse("the pill's surface failed");
         assert_eq!(
