@@ -27,8 +27,9 @@
 //! # Windows (MSVC)
 //!
 //! The same build yields `whisper.dll`, `ggml.dll`, `ggml-base.dll` and the
-//! `ggml-cpu-<variant>.dll` modules, all in `bin/`, with import libraries in
-//! `lib/`. Windows has no rpath: the loader searches the exe's own directory
+//! `ggml-cpu-<variant>.dll` (and `ggml-vulkan.dll`) modules, all in `bin/`,
+//! with import libraries in `lib/`. whisper.cpp also builds `parakeet.dll`
+//! there; the worker does not link it, so it is not in the runtime list. Windows has no rpath: the loader searches the exe's own directory
 //! first, so the DLLs are copied there and the installer ships them beside
 //! `voisu-local-asr.exe`.
 //!
@@ -163,7 +164,9 @@ fn main() {
     .expect("write runtime list");
 }
 
-/// The backend modules in `dir`; on Windows every DLL there, linked or not.
+/// The backend modules in `dir`; on Windows also the linked DLLs, which
+/// install there too. Other libraries whisper.cpp builds (`parakeet.dll`)
+/// are not linked by the worker and are left out.
 fn modules(dir: &Path, windows: bool, suffix: &str) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
@@ -173,7 +176,12 @@ fn modules(dir: &Path, windows: bool, suffix: &str) -> Vec<PathBuf> {
         .map(|entry| entry.path())
         .filter(|path| {
             let name = file_name(path);
-            name.ends_with(suffix) && (windows || name.starts_with("libggml-"))
+            name.ends_with(suffix)
+                && if windows {
+                    name == "whisper.dll" || name == "ggml.dll" || name.starts_with("ggml-")
+                } else {
+                    name.starts_with("libggml-")
+                }
         })
         .collect();
     found.sort();
