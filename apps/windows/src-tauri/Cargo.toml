@@ -1,6 +1,6 @@
 [package]
 name = "voisu-windows"
-version = "1.3.0"
+version = "1.4.0"
 description = "Voisu for Windows and macOS: tray app for voice dictation"
 edition = "2024"
 license = "MIT"

@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        1.3.0
+Version:        1.4.0
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -206,6 +206,9 @@ install -D -m 0644 packaging/icons/voisu.svg %{buildroot}%{_datadir}/icons/hicol
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Sat Nov 21 2026 Voisu maintainers <voisu@example.invalid> - 1.4.0-1
+- feat(windows): keep the microphone ready so the first word isn't cut off (#360)
+
 * Sat Nov 21 2026 Voisu maintainers <voisu@example.invalid> - 1.3.0-1
 - feat(windows): add opt-in Local mode with on-device transcription (#359)
 

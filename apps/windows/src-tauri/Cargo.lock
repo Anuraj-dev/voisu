@@ -5072,7 +5072,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voisu-cloud"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "flacenc",
  "futures-util",
@@ -5089,7 +5089,7 @@ dependencies = [
 
 [[package]]
 name = "voisu-core"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "libc",
  "regex",
@@ -5102,7 +5102,7 @@ dependencies = [
 
 [[package]]
 name = "voisu-windows"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "block2",
  "chrono",
