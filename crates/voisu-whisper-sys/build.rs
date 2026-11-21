@@ -4,8 +4,9 @@
 //!
 //! ggml is built with `GGML_BACKEND_DL=ON`: `libwhisper.so.1`,
 //! `libggml.so.0` and `libggml-base.so.0` are linked, and every backend is a
-//! module the worker loads at start from its own directory
-//! (`voisu_whisper_load_backends`):
+//! module the worker loads at start from its own directory: all of them for
+//! the GPU probe and a GPU worker (`voisu_whisper_load_backends`), the best
+//! CPU variant alone for a CPU worker (`load_cpu_backend`):
 //!
 //! - CPU: `GGML_CPU_ALL_VARIANTS=ON` builds `libggml-cpu-<variant>.so` from
 //!   plain `x64` up to `sapphirerapids`. ggml scores each against the running
@@ -23,6 +24,20 @@
 //! for this crate's tests and by `voisu-local-asr/build.rs` for the worker);
 //! packages install the same files beside `voisu-local-asr` in
 //! `/usr/libexec/voisu/`.
+//!
+//! # Windows (MSVC)
+//!
+//! The same build yields `whisper.dll`, `ggml.dll`, `ggml-base.dll` and the
+//! `ggml-cpu-<variant>.dll` (and `ggml-vulkan.dll`) modules, all in `bin/`,
+//! with import libraries in `lib/`. whisper.cpp also builds `parakeet.dll`
+//! there; the worker does not link it, so it is not in the runtime list. Windows has no rpath: the loader searches the exe's own directory
+//! first, so the DLLs are copied there and the installer ships them beside
+//! `voisu-local-asr.exe`.
+//!
+//! The C runtime follows the Rust target: with `-C target-feature=+crt-static`
+//! (how `apps/windows/stage-local-asr.sh` builds the shipped worker) every
+//! DLL and the shim link the static CRT (`/MT`), so the installed worker
+//! needs no Visual C++ Redistributable. Without it, all of them use `/MD`.
 
 use std::env;
 use std::fs;
@@ -50,32 +65,63 @@ fn main() {
     if env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64") {
         config.define("GGML_CPU_ALL_VARIANTS", "ON");
     }
+    if target_env == "msvc" {
+        let crt_static = env::var("CARGO_CFG_TARGET_FEATURE")
+            .unwrap_or_default()
+            .split(',')
+            .any(|feature| feature == "crt-static");
+        // cc passes /MT or /MD in the flags; the policy and the runtime
+        // library make whisper.cpp's and ggml's own CMake files agree,
+        // whatever `cmake_minimum_required` each one declares.
+        config
+            .static_crt(crt_static)
+            .define("CMAKE_POLICY_DEFAULT_CMP0091", "NEW")
+            .define(
+                "CMAKE_MSVC_RUNTIME_LIBRARY",
+                if crt_static {
+                    "MultiThreaded"
+                } else {
+                    "MultiThreadedDLL"
+                },
+            );
+    }
     let out = config.build();
+    let windows = target_os == "windows";
 
     let mut runtime = Vec::new();
     for dir in ["lib", "lib64"] {
         let path: PathBuf = out.join(dir);
         if path.is_dir() {
             println!("cargo:rustc-link-search=native={}", path.display());
-            runtime.extend(LINKED.iter().map(|name| path.join(name)));
+            if !windows {
+                runtime.extend(LINKED.iter().map(|name| path.join(name)));
+            }
         }
     }
-    // Backend modules install to bin/ (ggml's CMAKE_INSTALL_BINDIR default).
-    runtime.extend(modules(&out.join("bin")));
+    // Backend modules install to bin/ (ggml's CMAKE_INSTALL_BINDIR default),
+    // and on Windows so do the linked DLLs.
+    let (prefix, suffix) = if windows {
+        ("", ".dll")
+    } else {
+        ("lib", ".so")
+    };
+    runtime.extend(modules(&out.join("bin"), windows, suffix));
     let runtime: Vec<PathBuf> = runtime.into_iter().filter(|path| path.exists()).collect();
+    let built = |name: &str| runtime.iter().any(|path| file_name(path) == name);
+    if windows {
+        for name in ["whisper.dll", "ggml.dll", "ggml-base.dll"] {
+            assert!(built(name), "{name} was not built");
+        }
+    }
     assert!(
         runtime
             .iter()
-            .any(|path| file_name(path).starts_with("libggml-cpu")),
+            .any(|path| file_name(path).starts_with(&format!("{prefix}ggml-cpu"))),
         "no CPU backend module was built"
     );
     if vulkan {
-        assert!(
-            runtime
-                .iter()
-                .any(|path| file_name(path) == "libggml-vulkan.so"),
-            "the vulkan feature built no libggml-vulkan.so"
-        );
+        let name = format!("{prefix}ggml-vulkan{suffix}");
+        assert!(built(&name), "the vulkan feature built no {name}");
     }
 
     println!("cargo:rustc-link-lib=static=voisu_whisper_shim");
@@ -87,7 +133,9 @@ fn main() {
         (_, "msvc") => {}
         _ => println!("cargo:rustc-link-lib=stdc++"),
     }
-    println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+    if !windows {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+    }
 
     // OUT_DIR is <profile>/build/<crate>-<hash>/out, or
     // <profile>/build/<crate>/<hash>/out under cargo's newer build-dir
@@ -117,7 +165,10 @@ fn main() {
     .expect("write runtime list");
 }
 
-fn modules(dir: &Path) -> Vec<PathBuf> {
+/// The backend modules in `dir`; on Windows also the linked DLLs, which
+/// install there too. Other libraries whisper.cpp builds (`parakeet.dll`)
+/// are not linked by the worker and are left out.
+fn modules(dir: &Path, windows: bool, suffix: &str) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -126,7 +177,12 @@ fn modules(dir: &Path) -> Vec<PathBuf> {
         .map(|entry| entry.path())
         .filter(|path| {
             let name = file_name(path);
-            name.starts_with("libggml-") && name.ends_with(".so")
+            name.ends_with(suffix)
+                && if windows {
+                    name == "whisper.dll" || name == "ggml.dll" || name.starts_with("ggml-")
+                } else {
+                    name.starts_with("libggml-")
+                }
         })
         .collect();
     found.sort();

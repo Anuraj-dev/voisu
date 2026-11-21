@@ -4,6 +4,8 @@
 
 use std::ffi::{c_char, c_int, c_void};
 
+mod modules;
+
 /// The whisper.cpp release this crate vendors.
 pub const WHISPER_CPP_VERSION: &str = "1.9.5";
 
@@ -66,6 +68,8 @@ unsafe extern "C" {
     /// once.
     pub fn voisu_whisper_load_backends(dir: *const c_char) -> usize;
     pub fn voisu_whisper_cpu_backend_loaded() -> bool;
+    /// Registered devices that are not the CPU: GPUs and accelerators.
+    pub fn voisu_whisper_non_cpu_devices() -> usize;
     /// The first discrete GPU, else the first integrated one.
     pub fn voisu_whisper_pick_gpu(out: *mut VoisuGpu) -> bool;
     /// `gpu_ready` is set true only when `use_gpu` and the GPU backend
@@ -98,14 +102,26 @@ unsafe extern "C" {
     pub fn whisper_print_system_info() -> *const c_char;
 }
 
-/// Load the ggml backend modules from `dir` once per process and return the
-/// number of registered devices. ggml's registry takes no lock, so two
-/// threads loading at once corrupt it; every later call returns the first
-/// call's count and ignores its `dir`.
+/// The backend registration a process makes, once: ggml's registry takes no
+/// lock, so two threads loading at once corrupt it.
+static LOADED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Load every ggml backend module from `dir` (the GPU ones included) once
+/// per process and return the number of registered devices. Every later
+/// call, of this or [`load_cpu_backend`], returns the first call's count and
+/// ignores its arguments.
 pub fn load_backends(dir: &std::ffi::CStr) -> usize {
-    static LOADED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     // SAFETY: `dir` is NUL-terminated for the call; ggml copies what it keeps.
     *LOADED.get_or_init(|| unsafe { voisu_whisper_load_backends(dir.as_ptr()) })
+}
+
+/// Load only the best CPU backend variant from `dir`, as ggml picks it, once
+/// per process, and return the number of registered devices. No GPU module
+/// is opened, so a CPU worker never initializes a GPU driver (a Vulkan
+/// driver that hangs or crashes on init cannot take the CPU fallback with
+/// it). Shares [`load_backends`]'s once-per-process rule.
+pub fn load_cpu_backend(dir: &std::path::Path) -> usize {
+    *LOADED.get_or_init(|| modules::load_cpu(dir))
 }
 
 /// The CPU floor for decoding on the CPU device: x86-64-v3 (Haswell / Zen 1),
@@ -182,7 +198,11 @@ mod tests {
     fn every_cpu_variant_is_built_and_one_loads_on_this_host() {
         let dir = backend_dir();
         for variant in ["x64", "sse42", "haswell", "skylakex", "alderlake"] {
-            let module = dir.join(format!("libggml-cpu-{variant}.so"));
+            let module = if cfg!(windows) {
+                dir.join(format!("ggml-cpu-{variant}.dll"))
+            } else {
+                dir.join(format!("libggml-cpu-{variant}.so"))
+            };
             assert!(module.is_file(), "{} missing", module.display());
         }
         assert!(load_backends() >= 1);

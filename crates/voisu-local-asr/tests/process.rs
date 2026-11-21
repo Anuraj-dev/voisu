@@ -225,7 +225,12 @@ fn the_gpu_probe_ignores_ggml_backend_path() {
         !stderr.contains("libggml-planted"),
         "GGML_BACKEND_PATH reached ggml: {stderr}"
     );
-    if cfg!(feature = "vulkan") {
+    if cfg!(windows) {
+        // Removing it would not reach ggml's own C runtime copy: refused.
+        assert_eq!(output.status.code(), Some(2), "{stderr}");
+        assert!(output.stdout.is_empty());
+        assert!(stderr.contains("GGML_BACKEND_PATH is set"), "{stderr}");
+    } else if cfg!(feature = "vulkan") {
         // A Vulkan build exits 0 with a GPU and 3 without one.
         assert!(matches!(output.status.code(), Some(0 | 3)), "{stderr}");
     } else {

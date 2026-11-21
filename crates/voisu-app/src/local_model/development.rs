@@ -45,9 +45,9 @@ pub const DEV_MODEL_IDS: [&str; 15] = [
 
 /// The in-repo whisper.cpp worker's model: distil-large-v3.5 at q8_0 (the
 /// Phase 0 verdict over q5_0).
-pub const WHISPER_CPP_DISTIL_ID: &str = "whisper-cpp-distil-large-v3.5-q8-0";
+pub const WHISPER_CPP_DISTIL_ID: &str = voisu_core::local_tier::LocalTier::Accurate.model_id();
 /// The same worker's Fast-tier model: small.en at q8_0.
-pub const WHISPER_CPP_SMALL_EN_ID: &str = "whisper-cpp-small-en-q8-0";
+pub const WHISPER_CPP_SMALL_EN_ID: &str = voisu_core::local_tier::LocalTier::Fast.model_id();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DevRuntimeKind {
@@ -219,8 +219,8 @@ static DEVELOPMENT_CATALOG: &[DevCatalogEntry] = &[
         vram_bytes: 1792 * 1024 * 1024,
     },
     // The in-repo `voisu-local-asr` worker (whisper.cpp, Vulkan or CPU).
-    // vram_bytes is an estimate for q8_0 (818 MB of weights, beam 5, flash
-    // attention), not a measured peak.
+    // vram_bytes is the shared tier estimate (818 MB of weights), not a
+    // measured peak.
     DevCatalogEntry {
         model_id: WHISPER_CPP_DISTIL_ID,
         runtime: DevRuntimeKind::Native,
@@ -228,7 +228,7 @@ static DEVELOPMENT_CATALOG: &[DevCatalogEntry] = &[
         languages: EN,
         devices: CPU_GPU,
         memory_bytes: 2048 * 1024 * 1024,
-        vram_bytes: 1536 * 1024 * 1024,
+        vram_bytes: voisu_core::local_tier::LocalTier::Accurate.vram_bytes(),
     },
     // Same worker with small.en q8_0 (264 MB of weights); vram_bytes is an
     // estimate, not a measured peak.
@@ -239,7 +239,7 @@ static DEVELOPMENT_CATALOG: &[DevCatalogEntry] = &[
         languages: EN,
         devices: CPU_GPU,
         memory_bytes: 1024 * 1024 * 1024,
-        vram_bytes: 768 * 1024 * 1024,
+        vram_bytes: voisu_core::local_tier::LocalTier::Fast.vram_bytes(),
     },
 ];
 

@@ -4,6 +4,7 @@
 //! reach the network through the live provider key checks, so callers that must
 //! stay responsive run [`collect_rows`] off their render thread.
 
+use crate::local_model::TierEntry as _;
 use voisu_core::{
     DaemonReadiness, KeyDiagnosis, KeyLocation, PasteActionState, PasteBackend, Provider,
     ProviderKeyStatus, ReadinessStatus, SecretStore, SessionKind, provider_free_tier_hint,
@@ -246,7 +247,7 @@ fn local_model_rows(
     let crate::setup_engine::ConsentedStatus::Installed { entry_id, .. } = installed else {
         return rows;
     };
-    let Some(running) = LocalTier::of_entry_id(entry_id) else {
+    let Some(running) = crate::local_model::tier_of_entry_id(entry_id) else {
         return rows;
     };
     let entry = running.entry();

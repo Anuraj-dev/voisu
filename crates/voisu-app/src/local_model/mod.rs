@@ -88,7 +88,10 @@ pub use store::{
 pub use suggest::{
     LocalSuggestion, RECOMMENDATION_PREFIX, suggest_local, suggestion_line, warnings,
 };
-pub use tier::{ACCURATE_ON_CPU_WARNING, ACCURATE_ON_GPU_HINT, LocalTier, runs_on_gpu};
+pub use tier::{
+    ACCURATE_ON_CPU_WARNING, ACCURATE_ON_GPU_HINT, LocalTier, TierEntry, runs_on_gpu,
+    tier_of_entry_id,
+};
 pub use url_policy::{CatalogUrl, UrlPolicyError, validate_catalog_url};
 
 use crate::local_worker::local_runtime_admission;

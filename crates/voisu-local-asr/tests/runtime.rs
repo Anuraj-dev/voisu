@@ -1,6 +1,7 @@
 //! The built worker is shaped the way every package ships it: RUNPATH
 //! `$ORIGIN` and each file `voisu-whisper-runtime.txt` lists beside it. The
 //! same script checks the packaged directories.
+#![cfg(target_os = "linux")]
 
 use std::path::Path;
 use std::process::Command;

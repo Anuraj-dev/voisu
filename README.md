@@ -27,7 +27,7 @@
 
 Voisu turns speech into text wherever your cursor is: a reply, a doc, or a terminal. If the text can't land there, Voisu keeps it on the clipboard instead of dropping it.
 
-It is a tray app on Windows, a menu bar app on macOS, and a set of systemd user services with a terminal interface on Linux. There is no Voisu account, server or analytics. You bring your own Groq and Deepgram API keys.
+It is a tray app on Windows, a menu bar app on macOS, and a set of systemd user services with a terminal interface on Linux. There is no Voisu account, server or analytics. You bring your own Groq and Deepgram API keys, or use Local transcription on Linux and Windows with no keys at all.
 
 ## What you get
 
@@ -36,7 +36,7 @@ It is a tray app on Windows, a menu bar app on macOS, and a set of systemd user 
 - **Spoken punctuation and layout.** Say "new paragraph", "dash dash", "quote … unquote" or "first … second …" and it is formatted locally, on every platform.
 - **Hold to talk, or go hands-free.** On Windows and macOS, hold the Trigger Key and let go, or double-tap for hands-free. `Esc` cancels. On Linux, press to start and press again to stop.
 - **Your words, your tone.** Teach Voisu the names and terms it should spell your way, and choose formal or informal writing.
-- **Local transcription on Linux.** Run a whisper.cpp model on your own GPU or CPU, offline, after a Consented Install. Pick Accurate for a GPU or Fast for a computer without one. The model stays loaded, so every Recording starts at once. Nothing downloads until you agree, and a download that stops picks up where it left off.
+- **Local transcription on Linux and Windows.** Run a whisper.cpp model on your own computer, offline, after a Consented Install. On Linux, pick Accurate for a GPU or Fast for a computer without one; the model stays loaded, so every Recording starts at once. On Windows, Local is opt-in, uses the Fast model on the CPU, and works best on a recent 4-core CPU ([details](docs/windows.md#local-mode-opt-in)). Nothing downloads until you agree, and a download that stops picks up where it left off.
 - **An Overlay you can place.** A small pill with live sound bars shows while you dictate. Drag it anywhere on screen, save with ✓ or cancel with ✗, and Reset puts it back at the bottom centre. On Linux this needs KDE Plasma or Hyprland, where the pill also follows the monitor you are working on.
 - **Stays up to date.** The Windows and macOS apps update themselves and show what's new after each update. On Linux, Voisu checks once a day and shows *Update available* on Home.
 - **A command for everything on Linux.** Every setting in the interface is also a plain `voisu` command, so a script or a coding agent can install and check it.

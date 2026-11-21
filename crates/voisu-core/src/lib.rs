@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 mod asr_mode;
+pub mod local_tier;
 pub mod local_wire;
 pub use asr_mode::{ASR_MODE_V1, AsrMode, AsrModeStatus, LocalReadiness};
 
