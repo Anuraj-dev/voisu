@@ -8,7 +8,9 @@
 //! - Esc, or another key pressed during the chord, cancels with no Transcript.
 //!
 //! A Recording starts on the first press so no speech is clipped; a single tap
-//! is cancelled once the double-tap window lapses.
+//! is cancelled once the double-tap window lapses. [`Action::Held`] tells the
+//! engine when a press has become a Recording, so a tap's audio never leaves
+//! the process.
 
 use std::time::{Duration, Instant};
 
@@ -25,6 +27,8 @@ pub enum Action {
         id: u64,
         hotkey_at: Instant,
     },
+    /// The press outlasted [`MIN_HOLD`]: it is a Recording, not a tap.
+    Held(u64),
     /// The Recording continues hands-free.
     HandsFree(u64),
     Stop(u64),
@@ -34,9 +38,19 @@ pub enum Action {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum State {
     Idle,
-    Holding { id: u64, since: Instant },
-    TapPending { id: u64, until: Instant },
-    HandsFree { id: u64 },
+    /// `held` once [`Action::Held`] was sent.
+    Holding {
+        id: u64,
+        since: Instant,
+        held: bool,
+    },
+    TapPending {
+        id: u64,
+        until: Instant,
+    },
+    HandsFree {
+        id: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -64,6 +78,9 @@ impl GestureMachine {
     /// When [`Self::on_timeout`] must next run, if ever.
     pub fn next_deadline(&self) -> Option<Instant> {
         match self.state {
+            State::Holding {
+                since, held: false, ..
+            } => Some(since + MIN_HOLD),
             State::TapPending { until, .. } => Some(until),
             _ => None,
         }
@@ -74,7 +91,7 @@ impl GestureMachine {
     /// starts a fresh Recording instead of entering hands-free.
     pub fn on_signal(&mut self, signal: ChordSignal, now: Instant) -> Vec<Action> {
         let mut actions = Vec::with_capacity(2);
-        actions.extend(self.on_timeout(now));
+        actions.extend(self.settle_tap(now));
         actions.extend(self.step(signal, now));
         actions
     }
@@ -84,11 +101,15 @@ impl GestureMachine {
             (State::Idle, ChordSignal::Pressed) => {
                 let id = self.next_id;
                 self.next_id += 1;
-                self.state = State::Holding { id, since: now };
+                self.state = State::Holding {
+                    id,
+                    since: now,
+                    held: false,
+                };
                 Some(Action::Start { id, hotkey_at: now })
             }
-            (State::Holding { id, since }, ChordSignal::Released) => {
-                if now.saturating_duration_since(since) >= MIN_HOLD {
+            (State::Holding { id, since, held }, ChordSignal::Released) => {
+                if held || now.saturating_duration_since(since) >= MIN_HOLD {
                     self.state = State::Idle;
                     Some(Action::Stop(id))
                 } else {
@@ -118,8 +139,29 @@ impl GestureMachine {
         }
     }
 
-    /// Settles a lapsed double-tap window: the tap was not a Recording.
+    /// Runs at [`Self::next_deadline`]: a press still held after
+    /// [`MIN_HOLD`] is a Recording, and a lapsed double-tap window means the
+    /// tap was not one.
     pub fn on_timeout(&mut self, now: Instant) -> Option<Action> {
+        match self.state {
+            State::Holding {
+                id,
+                since,
+                held: false,
+            } if now >= since + MIN_HOLD => {
+                self.state = State::Holding {
+                    id,
+                    since,
+                    held: true,
+                };
+                Some(Action::Held(id))
+            }
+            _ => self.settle_tap(now),
+        }
+    }
+
+    /// Settles a lapsed double-tap window: the tap was not a Recording.
+    fn settle_tap(&mut self, now: Instant) -> Option<Action> {
         match self.state {
             State::TapPending { id, until } if now >= until => {
                 self.state = State::Idle;
@@ -198,6 +240,28 @@ mod tests {
         assert_eq!(g.on_timeout(c.at(500)), Some(Action::Cancel(1)));
         assert!(!g.armed());
         assert_eq!(g.next_deadline(), None);
+    }
+
+    #[test]
+    fn a_press_held_past_min_hold_is_confirmed_once_before_its_stop() {
+        let (mut g, c) = setup();
+        g.on_signal(Pressed, c.at(0));
+        assert_eq!(g.next_deadline(), Some(c.at(300)));
+        assert_eq!(g.on_timeout(c.at(299)), None);
+        assert_eq!(g.on_timeout(c.at(300)), Some(Action::Held(1)));
+        assert_eq!(g.next_deadline(), None, "confirmed once");
+        assert_eq!(g.on_timeout(c.at(900)), None);
+        assert_eq!(g.on_signal(Released, c.at(1_000)), [Action::Stop(1)]);
+    }
+
+    #[test]
+    fn a_tap_is_never_confirmed() {
+        let (mut g, c) = setup();
+        g.on_signal(Pressed, c.at(0));
+        assert_eq!(g.on_signal(Released, c.at(299)), []);
+        // Every deadline from here on settles the tap, never confirms it.
+        assert_eq!(g.next_deadline(), Some(c.at(699)));
+        assert_eq!(g.on_timeout(c.at(699)), Some(Action::Cancel(1)));
     }
 
     #[test]

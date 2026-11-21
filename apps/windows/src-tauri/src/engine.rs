@@ -11,6 +11,7 @@
 //! auto-paste off), and held in memory only so "Last transcript" can copy it
 //! when the paste does not land.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -22,8 +23,8 @@ use voisu_cloud::{
     CleanupSupervisor, CloudHost, DeepgramProvider, GroqProvider, MergeResultValidator,
 };
 use voisu_core::{
-    ActiveCapture, BoundaryError, BoundaryFuture, BoundaryKind, CancelRegistry, CaptureLimit,
-    CapturedAudio, Credential, DEFAULT_RENDERING_POLICY, EnglishEligibilityOutcome,
+    ActiveCapture, AudioChunk, BoundaryError, BoundaryFuture, BoundaryKind, CancelRegistry,
+    CaptureLimit, CapturedAudio, Credential, DEFAULT_RENDERING_POLICY, EnglishEligibilityOutcome,
     PreparedTranscriptDecision, Provider, ProviderCoordinator, ProviderStreams,
     ResolvedRecordingLanguages, SecretStore, SourceTranscript, Tone, TranscriptProvider,
     TranscriptValidator, apply_tone, sanitize_source_transcripts,
@@ -322,6 +323,7 @@ impl Engine {
         )
         .await;
         startup.log(id, hotkey_at, providers_started);
+        let confirmed = trigger.confirmed();
         let (audio, (mut providers, vocabulary, tone)) = match started {
             Ok(Some(started)) => started,
             Ok(None) => {
@@ -346,7 +348,10 @@ impl Engine {
                 };
             }
         };
-        match self.pump(id, &mut capture, &mut providers, actions).await {
+        match self
+            .pump(id, &mut capture, &mut providers, actions, confirmed)
+            .await
+        {
             Outcome::Stop(limit) => Captured::Process {
                 audio: RecordingAudio::Live(capture),
                 providers,
@@ -502,32 +507,40 @@ impl Engine {
     /// Streams capture chunks to Deepgram until the trigger stops or cancels
     /// the Recording, the capture ends, or something fails. Mirrors the
     /// Linux `capture_pump`: actions are always observed, even while a chunk
-    /// send is stalled.
+    /// send is stalled. Until the gesture `confirmed` the press is a
+    /// Recording, its audio stays in an [`AudioGate`]: a single tap is
+    /// cancelled with none of it sent. A Stop needs no flush: completion
+    /// sends the unstreamed tail.
     async fn pump(
         &self,
         id: u64,
         capture: &mut Box<dyn ActiveCapture>,
         providers: &mut ProviderCoordinator,
         actions: &mut UnboundedReceiver<Action>,
+        confirmed: bool,
     ) -> Outcome {
+        let mut gate = AudioGate::new(confirmed);
         loop {
-            let chunk = tokio::select! {
-                biased;
-                action = actions.recv() => match self.on_action(id, action) {
-                    Some(outcome) => return outcome,
-                    None => continue,
-                },
-                chunk = capture.next_chunk() => chunk,
-            };
-            let chunk = match chunk {
-                Ok(Some(chunk)) => chunk,
-                // The capture hit its byte cap.
-                Ok(None) => return Outcome::Stop(None),
-                Err(error) if error.kind() == BoundaryKind::RecordingDeadline => {
-                    tracing::info!(id, "Recording Deadline reached");
-                    return Outcome::Stop(Some(CaptureLimit::RecordingDeadline));
+            let Some(chunk) = gate.next_to_send() else {
+                let chunk = tokio::select! {
+                    biased;
+                    action = actions.recv() => match self.on_action(id, action, &mut gate) {
+                        Some(outcome) => return outcome,
+                        None => continue,
+                    },
+                    chunk = capture.next_chunk() => chunk,
+                };
+                match chunk {
+                    Ok(Some(chunk)) => gate.push(chunk),
+                    // The capture hit its byte cap.
+                    Ok(None) => return Outcome::Stop(None),
+                    Err(error) if error.kind() == BoundaryKind::RecordingDeadline => {
+                        tracing::info!(id, "Recording Deadline reached");
+                        return Outcome::Stop(Some(CaptureLimit::RecordingDeadline));
+                    }
+                    Err(error) => return Outcome::Failed(error),
                 }
-                Err(error) => return Outcome::Failed(error),
+                continue;
             };
             let send = providers.stream_audio(chunk);
             tokio::pin!(send);
@@ -535,7 +548,7 @@ impl Engine {
                 tokio::select! {
                     biased;
                     action = actions.recv() => {
-                        if let Some(outcome) = self.on_action(id, action) {
+                        if let Some(outcome) = self.on_action(id, action, &mut gate) {
                             return outcome;
                         }
                     }
@@ -550,9 +563,14 @@ impl Engine {
 
     /// Applies a trigger action during Recording `id`. Returns how the
     /// capture phase ends, if this action ends it.
-    fn on_action(&self, id: u64, action: Option<Action>) -> Option<Outcome> {
+    fn on_action(&self, id: u64, action: Option<Action>, gate: &mut AudioGate) -> Option<Outcome> {
         match recording_action(id, action, &self.ended)? {
+            TriggerAction::Held => {
+                gate.confirm();
+                None
+            }
             TriggerAction::HandsFree => {
+                gate.confirm();
                 self.emit_state(Phase::HandsFree, None);
                 None
             }
@@ -671,12 +689,50 @@ async fn load_recording_keys() -> Option<RecordingKeys> {
 enum TriggerAction {
     Stop,
     Cancel,
+    /// The press is a Recording, not a tap; it keeps recording.
+    Held,
     HandsFree,
+}
+
+/// A Recording's audio, held in the process until the gesture shows the
+/// press is a Recording: held past `MIN_HOLD`, a double tap or a Stop. A
+/// single tap is cancelled before a byte of it, or of the ready mic's
+/// pre-roll, reaches a provider.
+struct AudioGate {
+    confirmed: bool,
+    held: VecDeque<AudioChunk>,
+}
+
+impl AudioGate {
+    fn new(confirmed: bool) -> Self {
+        Self {
+            confirmed,
+            held: VecDeque::new(),
+        }
+    }
+
+    fn confirm(&mut self) {
+        self.confirmed = true;
+    }
+
+    fn push(&mut self, chunk: AudioChunk) {
+        self.held.push_back(chunk);
+    }
+
+    /// The next chunk that may leave the process, oldest first.
+    fn next_to_send(&mut self) -> Option<AudioChunk> {
+        if self.confirmed {
+            self.held.pop_front()
+        } else {
+            None
+        }
+    }
 }
 
 fn recording_action(id: u64, action: Option<Action>, ended: &EndedSink) -> Option<TriggerAction> {
     match action {
         None => Some(TriggerAction::Cancel),
+        Some(Action::Held(current)) if current == id => Some(TriggerAction::Held),
         Some(Action::HandsFree(current)) if current == id => Some(TriggerAction::HandsFree),
         Some(Action::Stop(current)) if current == id => Some(TriggerAction::Stop),
         Some(Action::Cancel(current)) if current == id => Some(TriggerAction::Cancel),
@@ -695,6 +751,7 @@ struct StartupTrigger<'a> {
     id: u64,
     actions: &'a mut UnboundedReceiver<Action>,
     ended: &'a EndedSink,
+    held: bool,
     hands_free: bool,
 }
 
@@ -704,17 +761,28 @@ impl<'a> StartupTrigger<'a> {
             id,
             actions,
             ended,
+            held: false,
             hands_free: false,
         }
     }
 
+    /// Whether the gesture has shown this press is a Recording, not a tap.
+    fn confirmed(&self) -> bool {
+        self.held || self.hands_free
+    }
+
     async fn next(&mut self) -> TriggerAction {
         loop {
-            if let Some(action) = recording_action(self.id, self.actions.recv().await, self.ended) {
-                if matches!(action, TriggerAction::HandsFree) {
-                    self.hands_free = true;
+            match recording_action(self.id, self.actions.recv().await, self.ended) {
+                // Remembered for the pump; startup carries on as before.
+                Some(TriggerAction::Held) => self.held = true,
+                Some(action) => {
+                    if matches!(action, TriggerAction::HandsFree) {
+                        self.hands_free = true;
+                    }
+                    return action;
                 }
-                return action;
+                None => {}
             }
         }
     }
@@ -760,7 +828,8 @@ async fn start_recording<P>(
                     return while_busy(finish, trigger.actions, trigger.ended).await;
                 }
                 TriggerAction::HandsFree if opened.is_some() => emit(Phase::HandsFree),
-                TriggerAction::HandsFree => {}
+                // `next` keeps Held to itself.
+                TriggerAction::HandsFree | TriggerAction::Held => {}
             },
             result = &mut capture, if opened.is_none() => {
                 opened = Some(result?);
@@ -857,6 +926,54 @@ mod tests {
             next_phase(processing, Phase::Recording, later),
             Some((Phase::Recording, later))
         );
+    }
+
+    #[test]
+    fn a_single_taps_audio_never_leaves_the_gate() {
+        let mut gate = AudioGate::new(false);
+        for byte in 1..=4u8 {
+            gate.push(AudioChunk(vec![byte; 640]));
+            assert!(gate.next_to_send().is_none(), "chunk {byte} held");
+        }
+        // The tap is cancelled here: the gate is dropped with all of it.
+    }
+
+    #[test]
+    fn a_confirmed_press_sends_its_held_audio_first_then_streams() {
+        let mut gate = AudioGate::new(false);
+        gate.push(AudioChunk(vec![1, 1]));
+        gate.push(AudioChunk(vec![2, 2]));
+        gate.confirm();
+        gate.push(AudioChunk(vec![3, 3]));
+        let sent: Vec<_> = std::iter::from_fn(|| gate.next_to_send())
+            .map(|chunk| chunk.0)
+            .collect();
+        assert_eq!(sent, [vec![1, 1], vec![2, 2], vec![3, 3]]);
+        gate.push(AudioChunk(vec![4, 4]));
+        assert_eq!(gate.next_to_send().map(|chunk| chunk.0), Some(vec![4, 4]));
+
+        // A press confirmed during startup (held, or a double tap) streams
+        // straight through.
+        let mut gate = AudioGate::new(true);
+        gate.push(AudioChunk(vec![5, 5]));
+        assert_eq!(gate.next_to_send().map(|chunk| chunk.0), Some(vec![5, 5]));
+    }
+
+    #[tokio::test]
+    async fn a_hold_confirmed_during_startup_is_remembered() {
+        let (send, mut actions) = mpsc::unbounded_channel();
+        let ended: EndedSink = Arc::new(|_| {});
+        let mut trigger = StartupTrigger::new(1, &mut actions, &ended);
+        send.send(Action::Held(1)).unwrap();
+        send.send(Action::Held(2)).unwrap();
+        send.send(Action::Stop(1)).unwrap();
+        assert!(matches!(trigger.next().await, TriggerAction::Stop));
+        assert!(trigger.confirmed());
+
+        let mut trigger = StartupTrigger::new(2, &mut actions, &ended);
+        send.send(Action::Cancel(2)).unwrap();
+        assert!(matches!(trigger.next().await, TriggerAction::Cancel));
+        assert!(!trigger.confirmed(), "a tap is never confirmed");
     }
 
     #[tokio::test]

@@ -1,5 +1,6 @@
 //! The gesture thread: turns timestamped chord signals from the keyboard
-//! hook into engine actions, and settles the double-tap window on time.
+//! hook into engine actions, and confirms holds and settles the double-tap
+//! window on time.
 //!
 //! The hook callback must stay O(1), so it only `try_send`s onto a bounded
 //! channel; every timing decision happens here.
@@ -125,9 +126,12 @@ mod tests {
     fn hold_then_release_stops() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let trigger = spawn(tx).unwrap();
+        let pressed = Instant::now();
         trigger.signal(ChordSignal::Pressed);
         assert!(matches!(recv(&mut rx), Action::Start { id: 1, .. }));
-        thread::sleep(MIN_HOLD + Duration::from_millis(20));
+        // The thread confirms the hold on its own once MIN_HOLD passes.
+        assert_eq!(recv(&mut rx), Action::Held(1));
+        assert!(pressed.elapsed() >= MIN_HOLD);
         trigger.signal(ChordSignal::Released);
         assert_eq!(recv(&mut rx), Action::Stop(1));
     }
