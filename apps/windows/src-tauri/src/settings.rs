@@ -44,6 +44,21 @@ impl TryFrom<RawPosition> for OverlayPosition {
     }
 }
 
+/// How long the microphone stays open between Recordings (Windows). Ready,
+/// a press records at once and keeps the half second before it; closed, it
+/// opens on the press, which takes about 0.8 s.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeepMicReady {
+    /// Opened at app start and kept open.
+    #[default]
+    WhileRunning,
+    /// Kept open for five minutes after each Recording.
+    ForFiveMinutes,
+    /// Opened on each press, as before this setting existed.
+    Off,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
 pub struct Settings {
@@ -81,6 +96,10 @@ pub struct Settings {
     /// version differs. None before any; junk reads as None.
     #[serde(deserialize_with = "lenient")]
     pub seen_version: Option<String>,
+    /// Keep microphone ready. Files from before it, and values this version
+    /// does not know, read as while Voisu is running.
+    #[serde(deserialize_with = "lenient")]
+    pub keep_mic_ready: KeepMicReady,
 }
 
 /// A field with a value this version does not understand (a size a later
@@ -148,6 +167,7 @@ impl Default for Settings {
             tone: Tone::Formal,
             star_prompt: true,
             seen_version: None,
+            keep_mic_ready: KeepMicReady::WhileRunning,
         }
     }
 }
@@ -531,6 +551,55 @@ mod tests {
             let settings = Settings::load(&path);
             assert_eq!(settings.seen_version, None, "{json}");
             assert!(!settings.auto_paste, "{json} wiped another setting");
+        }
+    }
+
+    #[test]
+    fn keep_mic_ready_defaults_to_while_running_for_old_and_mistyped_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        assert_eq!(
+            Settings::default().keep_mic_ready,
+            KeepMicReady::WhileRunning
+        );
+        fs::write(&path, br#"{"hotkey": "Ctrl+Win", "tone": "informal"}"#).unwrap();
+        let old = Settings::load(&path);
+        assert_eq!(old.keep_mic_ready, KeepMicReady::WhileRunning);
+        assert_eq!(old.tone, Tone::Informal);
+        fs::write(
+            &path,
+            br#"{"keep_mic_ready": "always", "tone": "informal"}"#,
+        )
+        .unwrap();
+        let mistyped = Settings::load(&path);
+        assert_eq!(mistyped.keep_mic_ready, KeepMicReady::WhileRunning);
+        assert_eq!(
+            mistyped.tone,
+            Tone::Informal,
+            "only the bad field falls back"
+        );
+    }
+
+    #[test]
+    fn every_keep_mic_ready_choice_round_trips_in_snake_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        for (choice, written) in [
+            (KeepMicReady::WhileRunning, "while_running"),
+            (KeepMicReady::ForFiveMinutes, "for_five_minutes"),
+            (KeepMicReady::Off, "off"),
+        ] {
+            let settings = Settings {
+                keep_mic_ready: choice,
+                ..Settings::default()
+            };
+            settings.save(&path).unwrap();
+            let json = fs::read_to_string(&path).unwrap();
+            assert!(
+                json.contains(&format!(r#""keep_mic_ready": "{written}""#)),
+                "{json}"
+            );
+            assert_eq!(Settings::load(&path), settings);
         }
     }
 }
