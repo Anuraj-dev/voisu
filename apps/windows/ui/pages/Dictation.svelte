@@ -1,8 +1,7 @@
 <script>
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
-  import { tick } from 'svelte';
-  import { ui, isMac } from '../state.svelte.js';
+  import { ui, isMac, chooseMicReady } from '../state.svelte.js';
   import ToggleRow from '../ToggleRow.svelte';
   import ErrorLine from '../ErrorLine.svelte';
 
@@ -11,7 +10,6 @@
   let triggerBusy = $state(false);
   let autoPasteBusy = $state(false);
   let toneBusy = $state(false);
-  let micBusy = $state(false);
 
   // Microphone (Windows): the backend keeps the stream open so a press
   // starts at once. The default first, then from most to least ready. `delay`
@@ -45,31 +43,14 @@
 
   let micGroup = $state();
 
-  async function chooseMicReady(mode) {
-    if (micBusy || ui.app.keepMicReady === mode) return;
-    // Disabling the radios drops keyboard focus; it goes back after the call.
-    const hadFocus = micGroup?.contains(document.activeElement);
-    micBusy = true;
-    errors.mic = '';
-    try {
-      const choice = await invoke('set_keep_mic_ready', { mode });
-      ui.app.keepMicReady = choice.mode;
-      // Applied for this run, but the settings file kept the old choice.
-      if (!choice.saved) {
-        errors.mic = "Changed for now, but Voisu couldn't save it, so it may change back after a restart.";
-      }
-    } catch (e) {
-      errors.mic = 'Could not change the Microphone setting.';
-    } finally {
-      micBusy = false;
-      await tick();
-      // Render the backend's actual choice, not the radio the user picked.
-      for (const radio of micGroup?.querySelectorAll('input') ?? []) {
-        radio.checked = radio.value === ui.app.keepMicReady;
-        if (hadFocus && radio.checked) radio.focus();
-      }
-    }
-  }
+  // The radios stay enabled during a save, so a choice made then becomes the
+  // next save. Once saving settles, they show the backend's actual choice,
+  // not the radio last picked (a save that failed, or came back different).
+  $effect(() => {
+    const mode = ui.app.keepMicReady;
+    if (ui.micSaving || !micGroup) return;
+    for (const radio of micGroup.querySelectorAll('input')) radio.checked = radio.value === mode;
+  });
 
   const app = $derived(ui.app);
 
@@ -258,7 +239,13 @@
   <div class="group">
     <div class="block">
       <span class="row-text" id="mic-ready-title">Microphone</span>
-      <div class="mic-options" role="radiogroup" aria-labelledby="mic-ready-title" bind:this={micGroup}>
+      <div
+        class="mic-options"
+        role="radiogroup"
+        aria-labelledby="mic-ready-title"
+        aria-busy={ui.micSaving}
+        bind:this={micGroup}
+      >
         {#each MIC_CHOICES as choice (choice.mode)}
           <label class="mic-option">
             <input
@@ -266,7 +253,6 @@
               name="mic-ready"
               value={choice.mode}
               checked={app.keepMicReady === choice.mode}
-              disabled={micBusy}
               aria-labelledby="mic-{choice.mode}-name mic-{choice.mode}-badge"
               aria-describedby="mic-{choice.mode}-delay mic-{choice.mode}-body"
               onchange={() => chooseMicReady(choice.mode)}
@@ -285,7 +271,7 @@
           </label>
         {/each}
       </div>
-      <ErrorLine message={errors.mic} />
+      <ErrorLine message={ui.micError} />
     </div>
   </div>
 {/if}
@@ -369,11 +355,7 @@
     border-color: color-mix(in srgb, var(--accent) 55%, transparent);
     background: color-mix(in srgb, var(--accent) 7%, transparent);
   }
-  .mic-option:has(:focus-visible) {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
-  }
-  .mic-option:has(:disabled) {
+  .mic-options[aria-busy='true'] .mic-option {
     cursor: progress;
   }
   .mic-option input {
@@ -384,8 +366,16 @@
     accent-color: var(--accent);
     cursor: inherit;
   }
-  .mic-option input:focus-visible {
-    outline: none;
+  /* The ring moves to the whole card where :has() works; elsewhere the
+     radio keeps its own. */
+  @supports selector(:has(:focus-visible)) {
+    .mic-option:has(:focus-visible) {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+    .mic-option input:focus-visible {
+      outline: none;
+    }
   }
   .mic-main {
     display: flex;
