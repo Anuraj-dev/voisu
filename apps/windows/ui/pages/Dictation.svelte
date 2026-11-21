@@ -1,6 +1,7 @@
 <script>
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
+  import { tick } from 'svelte';
   import { ui, isMac } from '../state.svelte.js';
   import ToggleRow from '../ToggleRow.svelte';
   import ErrorLine from '../ErrorLine.svelte';
@@ -12,16 +13,42 @@
   let toneBusy = $state(false);
   let micBusy = $state(false);
 
-  // Keep microphone ready (Windows): the backend keeps the stream open so a
-  // press starts at once. The default first, then from most to least ready.
+  // Microphone (Windows): the backend keeps the stream open so a press
+  // starts at once. The default first, then from most to least ready. `delay`
+  // draws the start-delay bar: none, sometimes, or every time.
   const MIC_CHOICES = [
-    { mode: 'while_running', name: 'While Voisu is running' },
-    { mode: 'for_five_minutes', name: 'For 5 minutes after each use' },
-    { mode: 'off', name: 'Off' },
+    {
+      mode: 'while_running',
+      name: 'Always on',
+      badge: 'Fastest',
+      delay: 'none',
+      delayText: '0 s',
+      body: 'Speak the moment you press. Every dictation starts about 0.8 s sooner, and Voisu even catches the word you began a split second early. Windows shows its mic icon while Voisu runs.',
+    },
+    {
+      mode: 'for_five_minutes',
+      name: 'On for 5 minutes after dictating',
+      badge: 'Balanced',
+      delay: 'sometimes',
+      delayText: "0 s while you're on a roll",
+      body: 'Back-to-back dictations start instantly. After each one, the mic stays on for 5 more minutes. The first dictation after a break takes about 0.8 s to start.',
+    },
+    {
+      mode: 'off',
+      name: 'Only while dictating',
+      badge: 'Most private',
+      delay: 'full',
+      delayText: '~0.8 s',
+      body: "The mic turns on only while you're dictating, and Windows shows no mic icon in between. Wait a beat after pressing before you speak.",
+    },
   ];
+
+  let micGroup = $state();
 
   async function chooseMicReady(mode) {
     if (micBusy || ui.app.keepMicReady === mode) return;
+    // Disabling the radios drops keyboard focus; it goes back after the call.
+    const hadFocus = micGroup?.contains(document.activeElement);
     micBusy = true;
     errors.mic = '';
     try {
@@ -32,9 +59,15 @@
         errors.mic = "Changed for now, but Voisu couldn't save it, so it may change back after a restart.";
       }
     } catch (e) {
-      errors.mic = 'Could not change Keep microphone ready.';
+      errors.mic = 'Could not change the Microphone setting.';
     } finally {
       micBusy = false;
+      await tick();
+      // Render the backend's actual choice, not the radio the user picked.
+      for (const radio of micGroup?.querySelectorAll('input') ?? []) {
+        radio.checked = radio.value === ui.app.keepMicReady;
+        if (hadFocus && radio.checked) radio.focus();
+      }
     }
   }
 
@@ -223,26 +256,33 @@
 
 {#if !isMac()}
   <div class="group">
-    <div class="block" role="group" aria-labelledby="mic-ready-title" aria-describedby="mic-ready-hint">
-      <span class="row-text">
-        <span id="mic-ready-title">Keep microphone ready</span>
-        <span class="hint" id="mic-ready-hint">
-          Recording starts instantly instead of after ~0.8 s, so your first word is never cut off. Windows shows the
-          mic icon while it's ready.
-        </span>
-      </span>
-      <div class="presets">
+    <div class="block">
+      <span class="row-text" id="mic-ready-title">Microphone</span>
+      <div class="mic-options" role="radiogroup" aria-labelledby="mic-ready-title" bind:this={micGroup}>
         {#each MIC_CHOICES as choice (choice.mode)}
-          <button
-            type="button"
-            class="chip"
-            class:on={app.keepMicReady === choice.mode}
-            aria-pressed={app.keepMicReady === choice.mode}
-            disabled={micBusy}
-            onclick={() => chooseMicReady(choice.mode)}
-          >
-            {choice.name}
-          </button>
+          <label class="mic-option">
+            <input
+              type="radio"
+              name="mic-ready"
+              value={choice.mode}
+              checked={app.keepMicReady === choice.mode}
+              disabled={micBusy}
+              aria-labelledby="mic-{choice.mode}-name mic-{choice.mode}-badge"
+              aria-describedby="mic-{choice.mode}-delay mic-{choice.mode}-body"
+              onchange={() => chooseMicReady(choice.mode)}
+            />
+            <span class="mic-main">
+              <span class="mic-head">
+                <span class="mic-name" id="mic-{choice.mode}-name">{choice.name}</span>
+                <span class="mic-badge" id="mic-{choice.mode}-badge">{choice.badge}</span>
+              </span>
+              <span class="hint" id="mic-{choice.mode}-body">{choice.body}</span>
+              <span class="mic-delay" id="mic-{choice.mode}-delay">
+                <span class="delay-bar {choice.delay}" aria-hidden="true"><span></span></span>
+                <span><span class="sr-only">Start delay: </span>{choice.delayText}</span>
+              </span>
+            </span>
+          </label>
         {/each}
       </div>
       <ErrorLine message={errors.mic} />
@@ -302,6 +342,117 @@
     display: flex;
     flex-wrap: wrap;
     gap: 6px;
+  }
+  /* Microphone: one card per choice, a native radio on the left. */
+  .mic-options {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .mic-option {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 10px 12px;
+    border: 1px solid var(--overlay-2);
+    border-radius: 10px;
+    background: transparent;
+    cursor: pointer;
+    transition:
+      background 0.15s,
+      border-color 0.15s;
+  }
+  .mic-option:hover {
+    background: var(--overlay-1);
+  }
+  .mic-option:has(:checked) {
+    border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+    background: color-mix(in srgb, var(--accent) 7%, transparent);
+  }
+  .mic-option:has(:focus-visible) {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .mic-option:has(:disabled) {
+    cursor: progress;
+  }
+  .mic-option input {
+    flex: none;
+    width: 16px;
+    height: 16px;
+    margin: 2px 0 0;
+    accent-color: var(--accent);
+    cursor: inherit;
+  }
+  .mic-option input:focus-visible {
+    outline: none;
+  }
+  .mic-main {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 0;
+  }
+  .mic-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 8px;
+  }
+  .mic-name {
+    font-weight: 600;
+  }
+  .mic-badge {
+    padding: 0 7px;
+    border: 1px solid var(--border);
+    border-radius: 32px;
+    font-size: 11px;
+    line-height: 17px;
+    color: var(--text-2);
+  }
+  .mic-option:has(:checked) .mic-badge {
+    border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+    color: var(--accent);
+  }
+  .mic-delay {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 3px;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-2);
+  }
+  /* The start delay, out of ~0.8 s: empty, sometimes (hatched), full. */
+  .delay-bar {
+    flex: none;
+    width: 40px;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--overlay-2);
+    overflow: hidden;
+  }
+  .delay-bar span {
+    display: block;
+    height: 100%;
+    width: 0;
+    background: var(--text-2);
+  }
+  .delay-bar.sometimes span {
+    width: 100%;
+    background: repeating-linear-gradient(90deg, var(--text-2) 0 3px, transparent 3px 6px);
+  }
+  .delay-bar.full span {
+    width: 100%;
+  }
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
   }
   .warn span {
     font-weight: 700;
