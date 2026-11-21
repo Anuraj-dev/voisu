@@ -3,7 +3,7 @@
     "version": "1.3.0",
     "date": "2026-11-21",
     "items": [
-      { "kind": "improved", "text": "Voisu now keeps the microphone on by default, so you can speak the moment you press your Trigger Key: every dictation starts about 0.8 s sooner. Windows shows its mic icon while Voisu runs. To change this, open Dictation, then Microphone: On for 5 minutes after dictating, or Only while dictating.", "platforms": ["windows"] }
+      { "kind": "improved", "text": "Dictation now starts the moment you press: Voisu keeps the microphone on. Change it in Dictation, then Microphone.", "platforms": ["windows"] }
     ]
   },
   {

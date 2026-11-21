@@ -12,32 +12,25 @@
   let toneBusy = $state(false);
 
   // Microphone (Windows): the backend keeps the stream open so a press
-  // starts at once. The default first, then from most to least ready. `delay`
-  // draws the start-delay bar: none, sometimes, or every time.
+  // starts at once. The default first, then from most to least ready.
   const MIC_CHOICES = [
     {
       mode: 'while_running',
       name: 'Always on',
       badge: 'Fastest',
-      delay: 'none',
-      delayText: '0 s',
-      body: 'Speak the moment you press. Every dictation starts about 0.8 s sooner, and Voisu even catches the word you began a split second early. Windows shows its mic icon while Voisu runs.',
+      body: 'Starts the instant you press. Windows shows the mic icon while Voisu runs.',
     },
     {
       mode: 'for_five_minutes',
       name: 'On for 5 minutes after dictating',
       badge: 'Balanced',
-      delay: 'sometimes',
-      delayText: "0 s while you're on a roll",
-      body: 'Back-to-back dictations start instantly. After each one, the mic stays on for 5 more minutes. The first dictation after a break takes about 0.8 s to start.',
+      body: 'Instant for 5 minutes after each dictation.',
     },
     {
       mode: 'off',
       name: 'Only while dictating',
       badge: 'Most private',
-      delay: 'full',
-      delayText: '~0.8 s',
-      body: "The mic turns on only while you're dictating, and Windows shows no mic icon in between. Wait a beat after pressing before you speak.",
+      body: 'Mic on only while you dictate. Starts about 0.8 s later.',
     },
   ];
 
@@ -254,7 +247,7 @@
               value={choice.mode}
               checked={app.keepMicReady === choice.mode}
               aria-labelledby="mic-{choice.mode}-name mic-{choice.mode}-badge"
-              aria-describedby="mic-{choice.mode}-delay mic-{choice.mode}-body"
+              aria-describedby="mic-{choice.mode}-body"
               onchange={() => chooseMicReady(choice.mode)}
             />
             <span class="mic-main">
@@ -263,10 +256,6 @@
                 <span class="mic-badge" id="mic-{choice.mode}-badge">{choice.badge}</span>
               </span>
               <span class="hint" id="mic-{choice.mode}-body">{choice.body}</span>
-              <span class="mic-delay" id="mic-{choice.mode}-delay">
-                <span class="delay-bar {choice.delay}" aria-hidden="true"><span></span></span>
-                <span><span class="sr-only">Start delay: </span>{choice.delayText}</span>
-              </span>
             </span>
           </label>
         {/each}
@@ -339,7 +328,7 @@
     display: flex;
     align-items: flex-start;
     gap: 10px;
-    padding: 10px 12px;
+    padding: 9px 12px;
     border: 1px solid var(--overlay-2);
     border-radius: 10px;
     background: transparent;
@@ -380,7 +369,7 @@
   .mic-main {
     display: flex;
     flex-direction: column;
-    gap: 3px;
+    gap: 2px;
     min-width: 0;
   }
   .mic-head {
@@ -394,55 +383,15 @@
   }
   .mic-badge {
     padding: 0 7px;
-    border: 1px solid var(--border);
     border-radius: 32px;
+    background: var(--overlay-2);
     font-size: 11px;
     line-height: 17px;
     color: var(--text-2);
   }
   .mic-option:has(:checked) .mic-badge {
-    border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
     color: var(--accent);
-  }
-  .mic-delay {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-top: 3px;
-    font-size: 12px;
-    font-variant-numeric: tabular-nums;
-    color: var(--text-2);
-  }
-  /* The start delay, out of ~0.8 s: empty, sometimes (hatched), full. */
-  .delay-bar {
-    flex: none;
-    width: 40px;
-    height: 4px;
-    border-radius: 2px;
-    background: var(--overlay-2);
-    overflow: hidden;
-  }
-  .delay-bar span {
-    display: block;
-    height: 100%;
-    width: 0;
-    background: var(--text-2);
-  }
-  .delay-bar.sometimes span {
-    width: 100%;
-    background: repeating-linear-gradient(90deg, var(--text-2) 0 3px, transparent 3px 6px);
-  }
-  .delay-bar.full span {
-    width: 100%;
-  }
-  .sr-only {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    margin: -1px;
-    overflow: hidden;
-    clip-path: inset(50%);
-    white-space: nowrap;
   }
   .warn span {
     font-weight: 700;
