@@ -834,12 +834,18 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("Voisu failed to start");
 
-    app.run(|_app, event| match event {
+    app.run(|app, event| match event {
         // Only the tray's Quit (an explicit exit code) ends the process.
         RunEvent::ExitRequested {
             code: None, api, ..
         } => api.prevent_exit(),
-        RunEvent::Exit => tracing::info!("Voisu exiting"),
+        RunEvent::Exit => {
+            tracing::info!("Voisu exiting");
+            // Keep microphone ready: the mic closes with the app.
+            if let Some(ready) = app.try_state::<platform::capture::ReadyMic>() {
+                ready.shutdown();
+            }
+        }
         _ => {}
     });
 }

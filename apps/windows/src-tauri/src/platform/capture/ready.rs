@@ -40,6 +40,8 @@ const STALL_AFTER: Duration = Duration::from_secs(2);
 const VERIFY_TIMEOUT: Duration = Duration::from_millis(200);
 const RETRY_FIRST: Duration = Duration::from_secs(2);
 const RETRY_MAX: Duration = Duration::from_secs(60);
+/// The longest quitting waits for the keeper to close the stream.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(1);
 
 /// What the keeper should do to the stream, and why (for the log).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,6 +135,14 @@ impl Policy {
     pub(super) fn attached(&mut self) {
         self.in_use = true;
         self.linger_until = None;
+    }
+
+    /// A close found a Recording attached whose [`Policy::attached`] had not
+    /// arrived yet: the stream stays open for it, and its
+    /// [`Policy::released`] decides again.
+    pub(super) fn kept_for_recording(&mut self) {
+        self.open = true;
+        self.attached();
     }
 
     /// A Recording's capture ended, whether it used the ready stream or
@@ -340,15 +350,38 @@ impl Tap {
         }
     }
 
-    /// Retires the current stream's callbacks before a new one is built or
-    /// the stream is dropped.
-    fn retire(&self) -> u64 {
+    /// Retires the current stream's callbacks before a new one is built for
+    /// the same Recording: an attached Recording stays attached and carries
+    /// over. A press can no longer attach to the retired stream.
+    fn retire(&self) {
+        Self::retire_locked(&mut self.state.lock().unwrap());
+    }
+
+    /// Retires the stream and detaches any Recording in one step, so no
+    /// press attaches between the two. Returns the detached Recording.
+    fn retire_and_detach(&self) -> Option<Arc<Shared>> {
         let mut state = self.state.lock().unwrap();
+        Self::retire_locked(&mut state);
+        state.recording.take()
+    }
+
+    /// Retires the stream unless a Recording is attached to it, checked and
+    /// done under one lock so a press cannot attach in between. False when
+    /// a Recording keeps it.
+    fn retire_if_idle(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.recording.is_some() {
+            return false;
+        }
+        Self::retire_locked(&mut state);
+        true
+    }
+
+    fn retire_locked(state: &mut TapState) {
         state.attempt += 1;
         state.live = None;
         state.last_audio = None;
         state.preroll.clear();
-        state.attempt
     }
 }
 
@@ -358,6 +391,8 @@ enum Msg {
     Released,
     DefaultChanged,
     Stream(u64, StreamEvent),
+    /// Voisu is quitting: close the stream, then answer.
+    Shutdown(mpsc::Sender<()>),
 }
 
 /// The handle to the ready stream: the press, the settings command and the
@@ -410,6 +445,18 @@ impl ReadyMic {
         let _ = self.events.send(Msg::DefaultChanged);
     }
 
+    /// Closes the ready stream before Voisu exits, waiting at most
+    /// [`SHUTDOWN_WAIT`]: the process ending would release it anyway, but
+    /// this closes it cleanly and logs it.
+    pub(crate) fn shutdown(&self) {
+        let (done, closed) = mpsc::channel();
+        if self.events.send(Msg::Shutdown(done)).is_ok()
+            && closed.recv_timeout(SHUTDOWN_WAIT).is_err()
+        {
+            tracing::warn!("ready microphone still closing at exit");
+        }
+    }
+
     /// A Recording's capture ended.
     pub(super) fn released(&self) {
         let _ = self.events.send(Msg::Released);
@@ -421,18 +468,25 @@ impl ReadyMic {
     pub(super) async fn attach(&self, shared: &Arc<Shared>) -> Result<Duration, Cold> {
         let (attempt, id) = self.live()?;
         // #348's revalidation: never record from a mic that stopped being
-        // the default before the watcher said so.
+        // the default before the watcher said so. And never from one
+        // Windows privacy settings now deny: the cold open reports that.
         let current = tokio::time::timeout(
             VERIFY_TIMEOUT,
-            tokio::task::spawn_blocking(move || ResolvedInput::default_id(&cpal::default_host())),
+            tokio::task::spawn_blocking(move || {
+                if microphone_blocked() {
+                    return Err(());
+                }
+                Ok(ResolvedInput::default_id(&cpal::default_host()))
+            }),
         )
         .await;
         match current {
-            Ok(Ok(Some(current))) if current == id => {}
-            Ok(Ok(_)) => {
+            Ok(Ok(Ok(Some(current)))) if current == id => {}
+            Ok(Ok(Ok(_))) => {
                 self.default_changed();
                 return Err("default microphone changed");
             }
+            Ok(Ok(Err(()))) => return Err("microphone access denied"),
             Ok(Err(_)) | Err(_) => return Err("default microphone check timed out"),
         }
         self.join(shared, attempt)
@@ -543,6 +597,17 @@ fn run_keeper(mode: KeepMicReady, ready: &ReadyMic, requests: &mpsc::Receiver<Ms
                 keeper.fail(failure, &mut policy);
                 None
             }
+            Ok(Msg::Shutdown(done)) => {
+                keeper.shutdown();
+                let _ = done.send(());
+                return;
+            }
+            // Access turned off in Windows privacy settings while open: let
+            // the mic go rather than hold it against the user's choice.
+            Err(RecvTimeoutError::Timeout) if policy.is_open() && microphone_blocked() => {
+                keeper.fail(blocked(), &mut policy);
+                None
+            }
             Err(RecvTimeoutError::Timeout) => {
                 if keeper.delivering() {
                     policy.healthy();
@@ -569,7 +634,15 @@ fn run_keeper(mode: KeepMicReady, ready: &ReadyMic, requests: &mpsc::Receiver<Ms
         // A deadline that passed while messages kept arriving still fires.
         command = reaction.or_else(|| policy.tick(now));
     }
-    keeper.close("app closing");
+    keeper.shutdown();
+}
+
+fn blocked() -> Failure {
+    Failure::new(
+        voisu_core::BoundaryKind::Capture,
+        "microphone access is denied in privacy settings".into(),
+        super::MIC_BLOCKED,
+    )
 }
 
 struct Keeper<'a> {
@@ -614,15 +687,30 @@ impl Keeper<'_> {
 
     fn execute(&mut self, command: Command, policy: &mut Policy) {
         match command {
-            Command::Close(reason) => self.close(reason),
+            Command::Close(reason) => {
+                if !self.ready.tap.retire_if_idle() {
+                    // A press attached just before the close, its Attached
+                    // message still queued: never cut a Recording's mic.
+                    policy.kept_for_recording();
+                    tracing::info!(
+                        reason,
+                        "ready microphone kept open for the Recording using it"
+                    );
+                    return;
+                }
+                if self.stream.take().is_some() {
+                    tracing::info!(reason, "ready microphone closed");
+                }
+            }
             Command::Open(reason) | Command::Rebuild(reason) => self.open(reason, policy),
         }
     }
 
-    fn close(&mut self, reason: &'static str) {
-        self.ready.tap.retire();
+    /// Voisu is quitting: drop the stream whatever uses it.
+    fn shutdown(&mut self) {
+        self.ready.tap.retire_and_detach();
         if self.stream.take().is_some() {
-            tracing::info!(reason, "ready microphone closed");
+            tracing::info!(reason = "app closing", "ready microphone closed");
         }
     }
 
@@ -658,6 +746,7 @@ impl Keeper<'_> {
                 tracing::info!(
                     reason,
                     rebuilt = rebuilding,
+                    carrying_recording = state.recording.is_some(),
                     stream_built_ms = built_ms,
                     rate = live.map(|live| live.rate),
                     channels = live.map(|live| live.channels),
@@ -670,11 +759,7 @@ impl Keeper<'_> {
 
     /// Drops the stream, fails any attached Recording and backs off.
     fn fail(&mut self, failure: Failure, policy: &mut Policy) {
-        let recording = {
-            let mut state = self.tap().state.lock().unwrap();
-            state.recording.take()
-        };
-        self.ready.tap.retire();
+        let recording = self.ready.tap.retire_and_detach();
         drop(self.stream.take());
         if let Some(shared) = recording {
             shared.pipeline.lock().unwrap().failure = Some(failure.clone());
@@ -698,11 +783,7 @@ impl Keeper<'_> {
     /// how long the build took.
     fn try_open(&self) -> Result<(cpal::Stream, u128), Failure> {
         if microphone_blocked() {
-            return Err(Failure::new(
-                voisu_core::BoundaryKind::Capture,
-                "microphone access is denied in privacy settings".into(),
-                super::MIC_BLOCKED,
-            ));
+            return Err(blocked());
         }
         let begun = Instant::now();
         let input = ResolvedInput::resolve(self.host)?;
@@ -720,6 +801,11 @@ impl Keeper<'_> {
             // Allocated here, never in the callback.
             let frames = (u128::from(rate) * PREROLL.as_millis() / 1000) as usize;
             state.preroll.reset(frames, channels);
+            if let Some(shared) = &state.recording {
+                // A Recording carried over takes the new mic's format before
+                // its first callback, which can come as soon as it plays.
+                shared.pipeline.lock().unwrap().reformat(rate, channels);
+            }
             state.attempt
         };
         let tap = Arc::clone(&self.ready.tap);
@@ -745,10 +831,6 @@ impl Keeper<'_> {
                 "ready stream retired while opening".into(),
                 super::MIC_FAILED,
             ));
-        }
-        if let Some(shared) = &state.recording {
-            // Carrying a Recording over to the new mic's format.
-            shared.pipeline.lock().unwrap().reformat(rate, channels);
         }
         state.live = Some(Live {
             id: input.id,
@@ -855,6 +937,38 @@ mod tests {
             busy.released(now),
             Some(Command::Close("setting turned off"))
         );
+    }
+
+    #[test]
+    fn a_close_that_finds_a_recording_attached_waits_for_it_to_end() {
+        let now = Instant::now();
+        for mode in [KeepMicReady::Off, KeepMicReady::ForFiveMinutes] {
+            // The press attached, but its Attached is still queued when the
+            // setting turns off or the five minutes run out.
+            let mut policy = opened(KeepMicReady::WhileRunning, now);
+            let close = match mode {
+                KeepMicReady::Off => policy.set_mode(mode, now),
+                _ => {
+                    policy.set_mode(mode, now);
+                    policy.tick(now + LINGER)
+                }
+            };
+            assert!(matches!(close, Some(Command::Close(_))), "{mode:?}");
+            policy.kept_for_recording();
+            policy.attached();
+            assert_eq!(policy.tick(now + 2 * LINGER), None, "{mode:?} kept");
+            let ended = now + 2 * LINGER;
+            match mode {
+                KeepMicReady::Off => assert_eq!(
+                    policy.released(ended),
+                    Some(Command::Close("setting turned off"))
+                ),
+                _ => {
+                    assert_eq!(policy.released(ended), None);
+                    assert_eq!(policy.deadline(), Some(ended + LINGER));
+                }
+            }
+        }
     }
 
     #[test]
@@ -1117,6 +1231,47 @@ mod tests {
             Err("ready stream rebuilt")
         );
         assert!(ready.tap.state.lock().unwrap().recording.is_none());
+    }
+
+    #[test]
+    fn a_close_never_drops_a_stream_a_recording_is_attached_to() {
+        let (capture, _commands) =
+            super::super::tests::capture_with_pipeline(super::super::tests::pipeline().0);
+        let (ready, _requests) = ready_mic();
+        go_live(&ready, 16_000, 1);
+        let (attempt, _) = ready.live().unwrap();
+        ready.join(&capture.shared, attempt).unwrap();
+        assert!(!ready.tap.retire_if_idle(), "the Recording keeps it");
+        ready.tap.deliver(attempt, &[0.5; 1_600]);
+        assert_eq!(recorded_bytes(&capture.shared), 1_600 * 2, "still live");
+
+        ready.detach(&capture.shared);
+        assert!(ready.tap.retire_if_idle());
+        let (next, _commands) =
+            super::super::tests::capture_with_pipeline(super::super::tests::pipeline().0);
+        assert_eq!(
+            ready.join(&next.shared, attempt),
+            Err("ready stream rebuilt"),
+            "nothing attaches to a closed stream"
+        );
+    }
+
+    #[test]
+    fn a_failed_stream_detaches_its_recording_in_the_same_step() {
+        let (capture, _commands) =
+            super::super::tests::capture_with_pipeline(super::super::tests::pipeline().0);
+        let (ready, _requests) = ready_mic();
+        go_live(&ready, 16_000, 1);
+        let (attempt, _) = ready.live().unwrap();
+        ready.join(&capture.shared, attempt).unwrap();
+        let detached = ready.tap.retire_and_detach().unwrap();
+        assert!(Arc::ptr_eq(&detached, &capture.shared));
+        ready.tap.deliver(attempt, &[0.5; 1_600]);
+        assert_eq!(
+            recorded_bytes(&capture.shared),
+            0,
+            "stale callbacks dropped"
+        );
     }
 
     #[test]

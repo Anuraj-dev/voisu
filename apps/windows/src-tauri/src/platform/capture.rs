@@ -178,7 +178,11 @@ impl CpalCapture {
             startup,
             stop: CaptureStop::default(),
         });
-        let why = match self.ready.attach(&shared).await {
+        let asked = Instant::now();
+        let attach = self.ready.attach(&shared).await;
+        // The default-mic check a ready press waits on.
+        let check_ms = asked.elapsed().as_millis();
+        let why = match attach {
             Ok(preroll) => {
                 let attached = Instant::now();
                 shared.startup.stream.lock().unwrap().first_audio = Some(attached);
@@ -186,6 +190,7 @@ impl CpalCapture {
                     id = recording_id,
                     start = "ready",
                     preroll_ms = preroll.as_millis(),
+                    check_ms,
                     "microphone start"
                 );
                 return Ok(Box::new(CpalActiveCapture {
@@ -202,6 +207,7 @@ impl CpalCapture {
             id = recording_id,
             start = "cold",
             preroll_ms = 0,
+            check_ms,
             why,
             "microphone start"
         );
