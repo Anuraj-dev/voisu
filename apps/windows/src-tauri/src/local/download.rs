@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
-use super::{PINS, Pin};
+use voisu_core::local_tier::{LocalTier, ModelFile};
+
+use super::{HEALTH_CLIP, pins};
 
 #[derive(Debug)]
 pub enum DownloadError {
@@ -32,7 +34,9 @@ impl DownloadError {
             Self::Network(_) => {
                 "Couldn't download the Local model. Check your connection and try again; it picks up where it stopped."
             }
-            Self::Disk(_) => "Couldn't save the Local model. Check that the drive has 300 MB free.",
+            Self::Disk(_) => {
+                "Couldn't save the Local model. Check that the drive has room for it and try again."
+            }
             Self::Damaged => {
                 "The downloaded model didn't match its checksum, so Voisu deleted it. Try again."
             }
@@ -77,10 +81,11 @@ impl Cancel {
     }
 }
 
-/// Downloads every pinned file missing from `dir`. `progress` gets the bytes
-/// of the whole install that are on disk so far.
+/// Downloads every file `tier` needs that is missing from `dir`. `progress`
+/// gets the bytes of the whole install that are on disk so far.
 pub async fn install(
     dir: &Path,
+    tier: LocalTier,
     cancel: &Cancel,
     mut progress: impl FnMut(u64),
 ) -> Result<(), DownloadError> {
@@ -101,7 +106,7 @@ pub async fn install(
         .build()
         .map_err(|error| DownloadError::Network(error.to_string()))?;
     let mut done = 0;
-    for pin in PINS {
+    for pin in pins(tier) {
         let target = dir.join(pin.name);
         if !fs::metadata(&target).is_ok_and(|meta| meta.len() == pin.bytes) {
             // Cancelling ends the fetch wherever it waits, a stalled
@@ -189,7 +194,7 @@ fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
 
 async fn fetch(
     client: &reqwest::Client,
-    pin: Pin,
+    pin: ModelFile,
     target: &Path,
     cancel: &Cancel,
     mut progress: impl FnMut(u64),
@@ -293,14 +298,20 @@ fn remove_file(path: &Path) -> io::Result<()> {
     })
 }
 
-fn matches_pin(path: &Path, pin: Pin) -> io::Result<bool> {
+fn matches_pin(path: &Path, pin: ModelFile) -> io::Result<bool> {
     Ok(fs::metadata(path)?.len() == pin.bytes && super::worker::sha256_file(path)? == pin.sha256)
 }
 
-/// Deletes the downloaded files, any partial ones and any manifest a
-/// launch left behind. Call it only while no download or Recording runs.
+/// Deletes both tiers' models, the health clip, any partial files and any
+/// manifest a launch left behind. Call it only while no download runs and
+/// the worker is stopped.
 pub fn remove(dir: &Path) -> io::Result<()> {
-    for pin in PINS {
+    let files = [
+        HEALTH_CLIP,
+        LocalTier::Accurate.model(),
+        LocalTier::Fast.model(),
+    ];
+    for pin in files {
         let target = dir.join(pin.name);
         remove_file(&part_path(&target))?;
         remove_file(&target)?;
@@ -382,7 +393,7 @@ mod tests {
     fn only_the_pinned_bytes_pass_verification() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hello.part");
-        let pin = Pin {
+        let pin = ModelFile {
             name: "hello",
             url: "https://example.invalid/hello",
             // sha256("hello")
@@ -400,7 +411,11 @@ mod tests {
     #[test]
     fn remove_deletes_finished_and_partial_files() {
         let dir = tempfile::tempdir().unwrap();
-        for pin in PINS {
+        for pin in [
+            HEALTH_CLIP,
+            LocalTier::Accurate.model(),
+            LocalTier::Fast.model(),
+        ] {
             let target = dir.path().join(pin.name);
             fs::write(&target, b"x").unwrap();
             fs::write(part_path(&target), b"x").unwrap();

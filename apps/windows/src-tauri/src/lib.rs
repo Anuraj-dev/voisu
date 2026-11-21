@@ -787,6 +787,7 @@ pub fn run() {
             close_star_banner,
             engine::last_transcript,
             local::set_mode,
+            local::set_local_model,
             local::download_local_model,
             local::cancel_local_download,
             local::remove_local_model
@@ -818,6 +819,8 @@ pub fn run() {
                 show_settings(handle);
             }
             start_dictation(handle);
+            // Probes the GPU, then loads the Local worker if Local is on.
+            local::start(handle);
             updater::start(handle);
             Ok(())
         })
@@ -836,12 +839,16 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("Voisu failed to start");
 
-    app.run(|_app, event| match event {
+    app.run(|app, event| match event {
         // Only the tray's Quit (an explicit exit code) ends the process.
         RunEvent::ExitRequested {
             code: None, api, ..
         } => api.prevent_exit(),
-        RunEvent::Exit => tracing::info!("Voisu exiting"),
+        RunEvent::Exit => {
+            tracing::info!("Voisu exiting");
+            // A clean shutdown, so the worker never sees its pipe vanish.
+            local::shutdown(app, std::time::Duration::from_secs(3));
+        }
         _ => {}
     });
 }

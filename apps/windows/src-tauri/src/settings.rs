@@ -8,6 +8,7 @@ use std::path::Path;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use voisu_core::Tone;
+use voisu_core::local_tier::LocalModel;
 
 use crate::trigger_key::TriggerChord;
 
@@ -86,6 +87,35 @@ pub struct Settings {
     /// user's file is unchanged.
     #[serde(deserialize_with = "lenient", skip_serializing_if = "Mode::is_cloud")]
     pub mode: Mode,
+    /// The Local model tier: `auto` (the default) runs Accurate on a GPU and
+    /// Fast on the CPU; `accurate` or `fast` pins one, as on Linux. Anything
+    /// unknown reads as `auto`, which is not written.
+    #[serde(
+        deserialize_with = "lenient_local_model",
+        serialize_with = "local_model_value",
+        skip_serializing_if = "is_auto"
+    )]
+    pub local_model: LocalModel,
+}
+
+fn is_auto(model: &LocalModel) -> bool {
+    *model == LocalModel::Auto
+}
+
+/// [`lenient`] for the Local tier, read in any case as on Linux.
+fn lenient_local_model<'de, D: Deserializer<'de>>(deserializer: D) -> Result<LocalModel, D::Error> {
+    let value = value(deserializer)?;
+    Ok(value
+        .as_str()
+        .and_then(LocalModel::from_value)
+        .unwrap_or_default())
+}
+
+fn local_model_value<S: serde::Serializer>(
+    model: &LocalModel,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(model.as_str())
 }
 
 /// Where a Recording is transcribed.
@@ -177,6 +207,7 @@ impl Default for Settings {
             star_prompt: true,
             seen_version: None,
             mode: Mode::Cloud,
+            local_model: LocalModel::Auto,
         }
     }
 }
@@ -588,5 +619,38 @@ mod tests {
             Mode::Cloud
         };
         assert_eq!(Mode::Local.effective(), expected);
+    }
+
+    #[test]
+    fn the_local_tier_round_trips_and_anything_else_reads_as_auto() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        Settings::default().save(&path).unwrap();
+        assert!(!fs::read_to_string(&path).unwrap().contains("local_model"));
+        for model in [LocalModel::Accurate, LocalModel::Fast] {
+            let settings = Settings {
+                local_model: model,
+                ..Settings::default()
+            };
+            settings.save(&path).unwrap();
+            let written = fs::read_to_string(&path).unwrap();
+            assert!(
+                written.contains(&format!(r#""local_model": "{}""#, model.as_str())),
+                "{written}"
+            );
+            assert_eq!(Settings::load(&path), settings);
+        }
+        for (value, expected) in [
+            (r#""Accurate""#, LocalModel::Accurate),
+            (r#""large""#, LocalModel::Auto),
+            ("7", LocalModel::Auto),
+            ("null", LocalModel::Auto),
+        ] {
+            let json = format!(r#"{{"auto_paste": false, "local_model": {value}}}"#);
+            fs::write(&path, &json).unwrap();
+            let settings = Settings::load(&path);
+            assert_eq!(settings.local_model, expected, "{json}");
+            assert!(!settings.auto_paste, "{json} wiped another setting");
+        }
     }
 }
