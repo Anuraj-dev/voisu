@@ -61,8 +61,11 @@
     if (!local) return null;
     if (local.cloudUntilDownloaded) return { value: 'Cloud until the model finishes' };
     if (ui.app.mode !== 'local') return { value: 'Cloud' };
-    const tier = local.tiers.find((t) => t.id === local.activeTier);
-    const gpu = local.engineDevice ? local.engineDevice !== 'cpu' : local.onGpu;
+    // The loaded tier and device once the worker is ready; until then what
+    // it is loading.
+    const ready = local.engine === 'ready' && local.engineTier;
+    const tier = local.tiers.find((t) => t.id === (ready ? local.engineTier : local.activeTier));
+    const gpu = ready ? local.engineDevice !== 'cpu' : local.onGpu;
     const device = gpu ? 'GPU' : 'CPU';
     return {
       value: `Local · ${tier?.name ?? 'no model'} · ${device}`,

@@ -75,6 +75,8 @@
   const shownTier = $derived(local ? tierFor(shownModel) : null);
   const autoUnknown = $derived(shownModel === 'auto' && !!local?.detecting);
   const activeTier = $derived(local?.activeTier ? tier(local.activeTier) : null);
+  // The tier the ready worker runs: Fast after a GPU failure under Auto.
+  const loadedTier = $derived(local?.engine === 'ready' && local.engineTier ? tier(local.engineTier) : null);
   // Auto runs the other downloaded tier until this PC's own is downloaded.
   const offerAutoTier = $derived(
     local?.installed && local.model === 'auto' && !pendingModel && !tier(local.autoTier).installed,
@@ -424,12 +426,12 @@
         {/if}
         {#if app.mode === 'local' && activeTier && !local.downloading}
           <p class="hint" aria-live="polite">
-            {#if local.engine === 'ready'}
-              {activeTier.name} ({activeTier.modelName}) is loaded on {local.engineDevice === 'cpu' ? 'the CPU' : local.device}.
+            {#if loadedTier}
+              {loadedTier.name} ({loadedTier.modelName}) is loaded on {local.engineDevice === 'cpu' ? 'the CPU' : local.device}.
             {:else if local.engine === 'starting'}
               Loading {activeTier.name} ({activeTier.modelName})…
             {/if}
-            {#if fellBackToCpu}The GPU couldn't run it, so it uses the CPU.{/if}
+            {#if fellBackToCpu}The GPU couldn't run {activeTier.name}, so Local uses the CPU.{/if}
           </p>
         {/if}
       </div>

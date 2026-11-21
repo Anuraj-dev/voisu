@@ -114,6 +114,7 @@ function mockLocal(onDisk, onGpu) {
       { id: 'fast', name: 'Fast', modelName: 'small.en', installed: has('fast'), size: 264_829_639 },
     ],
     engine: 'off',
+    engineTier: null,
     engineDevice: null,
     installed: false,
     downloading: null,
@@ -146,6 +147,8 @@ function refreshLocal(local) {
     : local.model !== 'auto' || tier(preferred).installed
       ? preferred
       : local.tiers.find((t) => t.installed).id;
+  // The mock loads a new tier at once.
+  if (local.engine === 'ready') local.engineTier = local.activeTier;
 }
 
 // A fake download: about five seconds end to end; Cancel keeps its place.
@@ -189,7 +192,12 @@ const COMMANDS = {
         local.cloudUntilDownloaded = false;
         downloadWantsLocal = false;
       }
-      Object.assign(local, mode === 'local' ? { engine: 'ready', engineDevice: local.onGpu ? 'vulkan:0' : 'cpu' } : { engine: 'off', engineDevice: null });
+      Object.assign(
+        local,
+        mode === 'local'
+          ? { engine: 'ready', engineTier: local.activeTier, engineDevice: local.onGpu ? 'vulkan:0' : 'cpu' }
+          : { engine: 'off', engineTier: null, engineDevice: null },
+      );
     }
     emit('state-changed', null);
     return mode;
@@ -247,7 +255,7 @@ const COMMANDS = {
     state.mode = 'cloud';
     const local = state.local;
     for (const t of local.tiers) t.installed = false;
-    Object.assign(local, { downloaded: 0, error: null, engine: 'off', engineDevice: null });
+    Object.assign(local, { downloaded: 0, error: null, engine: 'off', engineTier: null, engineDevice: null });
     refreshLocal(local);
     emit('state-changed', null);
   },

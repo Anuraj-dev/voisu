@@ -46,7 +46,7 @@ export const ui = $state({
     mode: 'cloud',
     // Windows only: { available, detecting, device, onGpu, model, autoTier,
     // activeTier, tiers: [{ id, name, modelName, installed, bytes, note }],
-    // engine, engineDevice, installed, downloading, downloaded, total, error,
+    // engine, engineTier, engineDevice, installed, downloading, downloaded, total, error,
     // cloudUntilDownloaded }; null on macOS, which offers no Local mode.
     local: null,
   },
