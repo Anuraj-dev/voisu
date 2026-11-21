@@ -6,7 +6,8 @@
 //! `<device> <description>` and exit 0, or exit 3 when there is none.
 //!
 //! On Windows either mode exits 2 when started with `GGML_BACKEND_PATH` set
-//! (see [`planted_backend`]).
+//! (see [`planted_backend`]) or when it cannot limit where DLLs load from
+//! (see [`restrict_dll_search`]).
 
 #[cfg(unix)]
 use std::fs::File;
@@ -103,6 +104,34 @@ fn planted_backend() -> Option<String> {
     None
 }
 
+/// A backend module's own imports (the Vulkan loader, say) are found by the
+/// standard DLL search, which includes the working directory and `PATH`
+/// when the system copy is missing. Every later load searches only this
+/// worker's directory and System32. A worker that cannot ensure that
+/// refuses to run.
+#[cfg(windows)]
+fn restrict_dll_search() -> Option<String> {
+    const LOAD_LIBRARY_SEARCH_DEFAULT_DIRS: u32 = 0x0000_1000;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetDefaultDllDirectories(flags: u32) -> i32;
+    }
+    // SAFETY: a plain Win32 call with a documented flag, made before any
+    // module is loaded at run time.
+    if unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) } != 0 {
+        return None;
+    }
+    Some(format!(
+        "DLL search not restricted: {}",
+        std::io::Error::last_os_error()
+    ))
+}
+
+#[cfg(not(windows))]
+fn restrict_dll_search() -> Option<String> {
+    None
+}
+
 fn refuse(frames: &mut Frames, message: &str) -> ExitCode {
     eprintln!("voisu-asr: manifest refused: {message}");
     let refusal = serde_json::json!({
@@ -117,7 +146,7 @@ fn refuse(frames: &mut Frames, message: &str) -> ExitCode {
 }
 
 fn main() -> ExitCode {
-    let planted = planted_backend();
+    let planted = restrict_dll_search().or_else(planted_backend);
     if std::env::args_os().skip(1).eq(["--probe-gpu"]) {
         if let Some(message) = planted {
             eprintln!("voisu-asr: refused: {message}");

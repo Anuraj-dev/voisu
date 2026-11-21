@@ -56,11 +56,34 @@ pub(super) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[cfg(windows)]
 const CREATE_SUSPENDED: u32 = 0x0000_0004;
 
-/// The environment every worker process starts with. ggml would load any
-/// module `GGML_BACKEND_PATH` names, and the worker refuses to start on
-/// Windows while it is set, so it never reaches the worker.
+/// Variables that make a worker load a module from outside its own
+/// directory and the system's: ggml's `GGML_BACKEND_PATH` (the worker
+/// refuses to start on Windows while it is set), and the Vulkan loader's
+/// driver and layer overrides, which the GPU probe would act on even for a
+/// Cloud user. The loader then uses only the drivers and layers the system
+/// registers.
+const LOAD_OVERRIDES: &[&str] = &[
+    "GGML_BACKEND_PATH",
+    "VK_ICD_FILENAMES",
+    "VK_DRIVER_FILES",
+    "VK_ADD_DRIVER_FILES",
+    "VK_LAYER_PATH",
+    "VK_ADD_LAYER_PATH",
+    "VK_IMPLICIT_LAYER_PATH",
+    "VK_ADD_IMPLICIT_LAYER_PATH",
+    "VK_INSTANCE_LAYERS",
+    "VK_LOADER_LAYERS_ENABLE",
+    "VK_LOADER_LAYERS_DISABLE",
+    "VK_LOADER_DRIVERS_SELECT",
+    "VK_LOADER_DRIVERS_DISABLE",
+];
+
+/// The environment every worker process starts with, the GPU probe's too:
+/// none of [`LOAD_OVERRIDES`] reaches it.
 pub(super) fn scrub_environment(command: &mut Command) {
-    command.env_remove("GGML_BACKEND_PATH");
+    for name in LOAD_OVERRIDES {
+        command.env_remove(name);
+    }
 }
 
 /// What a resident starts its workers with.
@@ -1172,14 +1195,29 @@ mod tests {
     }
 
     #[test]
-    fn the_worker_never_inherits_a_backend_path() {
+    fn the_worker_never_inherits_a_backend_path_or_vulkan_overrides() {
         let mut command = Command::new("voisu-local-asr");
         command.env("GGML_BACKEND_PATH", "C:\\evil.dll");
+        command.env("VK_ICD_FILENAMES", "C:\\evil.json");
+        command.env("VK_ADD_LAYER_PATH", "C:\\layers");
         scrub_environment(&mut command);
-        assert!(
-            command
-                .get_envs()
-                .any(|(key, value)| key == "GGML_BACKEND_PATH" && value.is_none())
-        );
+        let removed: Vec<_> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        for name in [
+            "GGML_BACKEND_PATH",
+            "VK_ICD_FILENAMES",
+            "VK_DRIVER_FILES",
+            "VK_ADD_DRIVER_FILES",
+            "VK_LAYER_PATH",
+            "VK_ADD_LAYER_PATH",
+            "VK_IMPLICIT_LAYER_PATH",
+            "VK_INSTANCE_LAYERS",
+            "VK_LOADER_DRIVERS_SELECT",
+        ] {
+            assert!(removed.iter().any(|key| key == name), "{name} kept");
+        }
     }
 }
