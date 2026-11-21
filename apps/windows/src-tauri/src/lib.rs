@@ -301,13 +301,22 @@ const HOOK_DOWN: &str =
 /// Applies `change`, saves, and returns the settings as now held. A failed
 /// write is logged; the change still applies for this run.
 fn update_settings(app: &AppHandle, change: impl FnOnce(&mut Settings)) -> Settings {
+    update_settings_saved(app, change).0
+}
+
+/// [`update_settings`], also saying whether the write succeeded.
+fn update_settings_saved(app: &AppHandle, change: impl FnOnce(&mut Settings)) -> (Settings, bool) {
     let state = app.state::<AppState>();
     let mut settings = state.settings.lock().unwrap();
     change(&mut settings);
-    if let Err(error) = settings.save(&paths::settings_file()) {
-        tracing::warn!(%error, "settings save failed");
-    }
-    settings.clone()
+    let saved = match settings.save(&paths::settings_file()) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(%error, "settings save failed");
+            false
+        }
+    };
+    (settings.clone(), saved)
 }
 
 /// Like `update_settings`, but all or nothing: a failed write keeps the
@@ -420,16 +429,26 @@ fn set_tone(app: AppHandle, tone: Tone) -> Tone {
     update_settings(&app, |settings| settings.tone = tone).tone
 }
 
+/// The Keep microphone ready choice as applied, and whether it was saved
+/// for the next start too.
+#[derive(Serialize)]
+struct MicReadyChoice {
+    mode: KeepMicReady,
+    saved: bool,
+}
+
 /// Applies at once: Off closes the ready mic now unless a Recording is
-/// using it, in which case it closes when that Recording ends.
+/// using it, in which case it closes when that Recording ends. A failed
+/// save still applies for this run; the window says it may not last.
 #[tauri::command]
-fn set_keep_mic_ready(app: AppHandle, mode: KeepMicReady) -> KeepMicReady {
+fn set_keep_mic_ready(app: AppHandle, mode: KeepMicReady) -> MicReadyChoice {
     tracing::info!(?mode, "keep microphone ready");
-    let saved = update_settings(&app, |settings| settings.keep_mic_ready = mode).keep_mic_ready;
+    let (settings, saved) = update_settings_saved(&app, |settings| settings.keep_mic_ready = mode);
+    let mode = settings.keep_mic_ready;
     if let Some(ready) = app.try_state::<platform::capture::ReadyMic>() {
-        ready.set_mode(saved);
+        ready.set_mode(mode);
     }
-    saved
+    MicReadyChoice { mode, saved }
 }
 
 fn local_today() -> chrono::NaiveDate {

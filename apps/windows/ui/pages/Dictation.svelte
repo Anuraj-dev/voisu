@@ -25,7 +25,12 @@
     micBusy = true;
     errors.mic = '';
     try {
-      ui.app.keepMicReady = await invoke('set_keep_mic_ready', { mode });
+      const choice = await invoke('set_keep_mic_ready', { mode });
+      ui.app.keepMicReady = choice.mode;
+      // Applied for this run, but the settings file kept the old choice.
+      if (!choice.saved) {
+        errors.mic = "Changed for now, but Voisu couldn't save it, so it may change back after a restart.";
+      }
     } catch (e) {
       errors.mic = 'Could not change Keep microphone ready.';
     } finally {

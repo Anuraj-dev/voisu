@@ -116,7 +116,7 @@ const COMMANDS = {
   },
   set_auto_paste: ({ enabled }) => (state.autoPaste = enabled),
   set_tone: ({ tone }) => (state.tone = tone),
-  set_keep_mic_ready: ({ mode }) => (state.keepMicReady = mode),
+  set_keep_mic_ready: ({ mode }) => ({ mode: (state.keepMicReady = mode), saved: true }),
   start_overlay_move: () => {
     if (!state.overlayMoving) {
       console.info('mock: overlay shown in move mode');
