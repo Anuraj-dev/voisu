@@ -7,16 +7,24 @@
 //! `transcribe` frame as raw s16le bytes. Requests go one at a time, each id
 //! is used once per worker, and each reply must answer the request sent.
 //!
-//! A worker asked for the GPU that fails to start there is started again on
-//! the CPU. A worker that crashes is restarted, up to [`Restarts`]; past that
-//! the resident fails with [`LocalError::KeepsStopping`] until the user acts.
-//! Stopping sends `shutdown` and reads its reply before closing the pipes, so
-//! the worker never writes into a closed pipe; it is killed if it has not
-//! exited within [`SHUTDOWN_GRACE`].
+//! A worker asked for the GPU that fails to start there, or crashes there
+//! [`GPU_CRASHES`] times, is started again on the CPU with the CPU's tier. A
+//! worker that crashes is restarted, up to [`Restarts`]; past that the
+//! resident fails with [`LocalError::KeepsStopping`] until the user acts.
+//! `prepare` gets [`PREPARE_DEADLINE`], and each Recording its own deadline:
+//! one that runs out kills only the worker decoding it, and a Recording
+//! still queued when its deadline passes is never sent.
+//!
+//! A resident replaced by another (a new tier, Cloud, Remove) is retired: it
+//! serves the Recordings that hold a [`Lease`] on it, then stops. Its
+//! replacement starts its first worker only once the old one has exited, so
+//! two models never compete for memory. Stopping sends `shutdown` and reads
+//! its reply before closing the pipes, so the worker never writes into a
+//! closed pipe; it is killed if it has not exited within [`SHUTDOWN_GRACE`].
 //!
 //! On Windows each worker starts suspended, goes into a kill-on-close Job
-//! Object, and only then runs, so it can never outlive Voisu: not when Voisu
-//! exits, crashes or is killed.
+//! Object, and only then runs, so it outlives Voisu only if Voisu dies in
+//! the moment between the two, while the worker is still suspended.
 
 use std::collections::VecDeque;
 use std::fs::{self, File};
@@ -25,8 +33,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::thread::JoinHandle;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -44,6 +51,13 @@ const FLASH_ATTN: bool = true;
 const MAX_THREADS: usize = 8;
 /// How long a worker has to exit after `shutdown` is sent before it is killed.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+/// How long `prepare` (the model load and the health check) may take before
+/// the worker is killed. Accurate on the CPU takes longest; only a stuck
+/// worker reaches it.
+pub const PREPARE_DEADLINE: Duration = Duration::from_secs(90);
+/// Crashes after a good `prepare` on the GPU before the resident moves to
+/// the CPU: a GPU that loads the model but fails on longer Recordings.
+const GPU_CRASHES: u32 = 2;
 /// How often an idle resident checks that its worker is still running.
 const IDLE_CHECK: Duration = Duration::from_millis(500);
 /// Manifests are `manifest-<pid>-<n>.json`, one per worker start, so a quick
@@ -54,7 +68,7 @@ pub(super) const MANIFEST_PREFIX: &str = "manifest";
 pub(super) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// The new process waits until it is in its Job Object.
 #[cfg(windows)]
-const CREATE_SUSPENDED: u32 = 0x0000_0004;
+pub(super) const CREATE_SUSPENDED: u32 = 0x0000_0004;
 
 /// Variables that make a worker load a module from outside its own
 /// directory and the system's: ggml's `GGML_BACKEND_PATH` (the worker
@@ -93,6 +107,9 @@ pub struct Launch {
     /// The worker's stderr, appended: whisper.cpp's own log lines.
     pub log: PathBuf,
     pub tier: LocalTier,
+    /// The tier to run if the GPU fails: `auto` resolved for the CPU, or the
+    /// tier the user picked, which never changes.
+    pub cpu_tier: LocalTier,
     /// Ask for the GPU the probe found. A GPU start that fails falls back to
     /// the CPU.
     pub gpu: bool,
@@ -103,8 +120,10 @@ pub struct Launch {
 pub struct Failure {
     pub error: LocalError,
     pub diagnostic: String,
-    /// The worker can no longer be talked to: it died, or its replies no
-    /// longer follow the protocol. A worker error reply leaves it usable.
+    /// The worker can no longer be talked to: it died, its replies no
+    /// longer follow the protocol, the request did not reach it whole, or
+    /// it replied with an error it exits after. Only a
+    /// [`RECOVERABLE_CODES`] reply leaves it usable.
     broken: bool,
 }
 
@@ -133,9 +152,11 @@ pub type Heard = Result<Option<String>, Failure>;
 pub enum State {
     /// Starting a worker: loading the model and checking its health.
     Starting,
-    /// Ready to transcribe on `device`, as the worker reports it (`cpu`, or
-    /// a GPU such as `vulkan:0`).
+    /// Ready to transcribe with `tier` on `device`, as the worker reports
+    /// it (`cpu`, or a GPU such as `vulkan:0`). After a GPU fallback `tier`
+    /// is the CPU's, which can differ from [`Resident::tier`].
     Ready {
+        tier: LocalTier,
         device: String,
     },
     /// Refusing every Recording until the user acts.
@@ -147,8 +168,11 @@ pub enum State {
 pub type Changed = Arc<dyn Fn() + Send + Sync>;
 
 struct Job {
+    id: u64,
     pcm: Vec<u8>,
     prompt: Option<String>,
+    /// When its Recording gives up: a job still queued then is never sent.
+    expires: Instant,
     reply: oneshot::Sender<Heard>,
 }
 
@@ -164,6 +188,13 @@ struct Shared {
     worker: Mutex<Option<Worker>>,
     state: Mutex<State>,
     stopping: AtomicBool,
+    /// The job the worker is decoding, which its Recording's timeout kills.
+    serving: Mutex<Option<u64>>,
+    /// The resident this one replaced, until its last worker has exited.
+    after: Mutex<Option<Arc<Resident>>>,
+    /// The resident thread has ended and reaped its last worker.
+    finished: Mutex<bool>,
+    done: Condvar,
     changed: Changed,
 }
 
@@ -203,6 +234,55 @@ impl Shared {
             let _ = worker.child.wait();
         }
     }
+
+    /// A Recording gave up on job `id`: the worker dies only if it is
+    /// decoding that job. Checked under the lock [`Conn::serve`] takes to
+    /// start a job, so an expired job is either killed here or skipped there.
+    fn cancel(&self, id: u64) {
+        let serving = lock(&self.serving);
+        if *serving == Some(id) {
+            self.kill();
+        }
+    }
+
+    fn finish(&self) {
+        *lock(&self.finished) = true;
+        self.done.notify_all();
+    }
+
+    /// Waits until the resident thread has ended, at most until `deadline`.
+    fn wait_finished(&self, deadline: Option<Instant>) -> bool {
+        let mut finished = lock(&self.finished);
+        while !*finished {
+            match deadline {
+                None => {
+                    finished = self
+                        .done
+                        .wait(finished)
+                        .unwrap_or_else(PoisonError::into_inner)
+                }
+                Some(deadline) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return false;
+                    }
+                    finished = self
+                        .done
+                        .wait_timeout(finished, left)
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0;
+                }
+            }
+        }
+        true
+    }
+}
+
+/// How many Recordings hold a resident, and whether it was replaced.
+#[derive(Default)]
+struct Leases {
+    held: usize,
+    retired: bool,
 }
 
 /// The resident worker for one tier.
@@ -210,37 +290,55 @@ pub struct Resident {
     tier: LocalTier,
     jobs: Mutex<Option<mpsc::Sender<Job>>>,
     shared: Arc<Shared>,
-    thread: Mutex<Option<JoinHandle<()>>>,
+    leases: Mutex<Leases>,
+    next_job: AtomicU64,
 }
 
 impl Resident {
     /// Starts the worker and its `prepare` on a new thread; never blocks.
-    pub fn start(launch: Launch, changed: Changed) -> Self {
+    /// With `after`, the resident it replaces, the first worker starts once
+    /// that one's last worker has exited.
+    pub fn start(launch: Launch, after: Option<Arc<Resident>>, changed: Changed) -> Self {
         let (jobs, requests) = mpsc::channel();
         let shared = Arc::new(Shared {
             worker: Mutex::new(None),
             state: Mutex::new(State::Starting),
             stopping: AtomicBool::new(false),
+            serving: Mutex::new(None),
+            after: Mutex::new(after),
+            finished: Mutex::new(false),
+            done: Condvar::new(),
             changed,
         });
         let tier = launch.tier;
         let thread_shared = Arc::clone(&shared);
-        let thread = std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("voisu-local-asr".into())
-            .spawn(move || run(&launch, &thread_shared, &requests))
-            .inspect_err(|error| {
-                tracing::warn!(%error, "Local worker thread failed to start");
-                shared.set(State::Failed(LocalError::WorkerFailed));
-            })
-            .ok();
+            .spawn(move || {
+                let shared = thread_shared;
+                let after = lock(&shared.after).clone();
+                if let Some(after) = after {
+                    after.wait_finished(None);
+                    lock(&shared.after).take();
+                }
+                run(&launch, &shared, &requests);
+                shared.finish();
+            });
+        if let Err(error) = spawned {
+            tracing::warn!(%error, "Local worker thread failed to start");
+            shared.set(State::Failed(LocalError::WorkerFailed));
+            shared.finish();
+        }
         Self {
             tier,
             jobs: Mutex::new(Some(jobs)),
             shared,
-            thread: Mutex::new(thread),
+            leases: Mutex::new(Leases::default()),
+            next_job: AtomicU64::new(0),
         }
     }
 
+    /// The tier it was started for. [`State::Ready`] says which one runs.
     pub fn tier(&self) -> LocalTier {
         self.tier
     }
@@ -249,44 +347,123 @@ impl Resident {
         lock(&self.shared.state).clone()
     }
 
-    /// Transcribes one stopped Recording; a Recording sent while the worker
-    /// starts waits for it. Bound it with a timeout and [`Self::kill`] the
-    /// worker when it runs out.
-    pub async fn transcribe(&self, pcm: Vec<u8>, prompt: Option<String>) -> Heard {
+    /// Binds a Recording to this resident: retired meanwhile, it still
+    /// serves that Recording, and stops only once every lease is dropped.
+    pub fn lease(self: &Arc<Self>) -> Lease {
+        lock(&self.leases).held += 1;
+        Lease(Arc::clone(self))
+    }
+
+    /// Replaced: stops as soon as no Recording holds it. Never blocks.
+    pub fn retire(&self) {
+        let mut leases = lock(&self.leases);
+        leases.retired = true;
+        if leases.held == 0 {
+            drop(leases);
+            self.stop();
+        }
+    }
+
+    /// Stops it now, held or not, and every resident it was waiting for.
+    /// For Quit and Remove. Never blocks.
+    pub fn halt(&self) {
+        self.stop();
+        let after = lock(&self.shared.after).clone();
+        if let Some(after) = after {
+            after.halt();
+        }
+    }
+
+    /// Kills its worker and those of the residents it was waiting for, and
+    /// waits for each to exit: what Quit does once its grace runs out.
+    pub fn reap(&self) {
+        self.shared.reap();
+        let after = lock(&self.shared.after).clone();
+        if let Some(after) = after {
+            after.reap();
+        }
+    }
+
+    /// Waits until its last worker, and those of the residents it waits
+    /// for, have exited; at most until `deadline`. Whether they have.
+    pub fn wait_finished(&self, deadline: Option<Instant>) -> bool {
+        let after = lock(&self.shared.after).clone();
+        after.is_none_or(|after| after.wait_finished(deadline))
+            && self.shared.wait_finished(deadline)
+    }
+
+    /// Transcribes one stopped Recording within `limit`; a Recording sent
+    /// while the worker starts waits for it. When `limit` runs out the
+    /// worker is killed if it is decoding this Recording (the resident
+    /// starts a fresh one), and the Recording is never sent if it is still
+    /// queued.
+    pub async fn transcribe(&self, pcm: Vec<u8>, prompt: Option<String>, limit: Duration) -> Heard {
+        let id = self.next_job.fetch_add(1, Ordering::Relaxed);
+        let expires = Instant::now() + limit;
         let (reply, heard) = oneshot::channel();
+        let job = Job {
+            id,
+            pcm,
+            prompt,
+            expires,
+            reply,
+        };
         let sent = lock(&self.jobs)
             .as_ref()
-            .is_some_and(|jobs| jobs.send(Job { pcm, prompt, reply }).is_ok());
+            .is_some_and(|jobs| jobs.send(job).is_ok());
         if !sent {
             return Err(Failure::new(
                 LocalError::WorkerFailed,
                 "Local worker stopped",
             ));
         }
-        heard.await.unwrap_or_else(|_| {
-            Err(Failure::new(
-                LocalError::WorkerFailed,
-                "Local worker thread ended without a result",
-            ))
-        })
+        match tokio::time::timeout(limit, heard).await {
+            Ok(heard) => heard.unwrap_or_else(|_| {
+                Err(Failure::new(
+                    LocalError::WorkerFailed,
+                    "Local worker thread ended without a result",
+                ))
+            }),
+            Err(_) => {
+                self.shared.cancel(id);
+                Err(Failure::new(
+                    LocalError::TimedOut,
+                    format!("Local worker exceeded {} s", limit.as_secs()),
+                ))
+            }
+        }
     }
 
-    /// Ends the worker process now, mid-request; the resident restarts it.
-    pub fn kill(&self) {
-        self.shared.kill();
-    }
-
-    /// Stops the resident. A worker still starting is killed; one serving a
-    /// Recording finishes it first, then shuts down. Returns the thread to
-    /// join, which can block for [`SHUTDOWN_GRACE`] and more: never join it
-    /// on the main thread or the async executor.
-    pub fn stop(&self) -> Option<JoinHandle<()>> {
+    /// A worker still starting is killed; one serving a Recording finishes
+    /// it first, then shuts down on the resident thread.
+    fn stop(&self) {
         self.shared.stopping.store(true, Ordering::SeqCst);
         drop(lock(&self.jobs).take());
         if !matches!(self.state(), State::Ready { .. }) {
             self.shared.kill();
         }
-        lock(&self.thread).take()
+    }
+}
+
+/// A Recording's hold on the resident that transcribes it.
+pub struct Lease(Arc<Resident>);
+
+impl std::ops::Deref for Lease {
+    type Target = Resident;
+
+    fn deref(&self) -> &Resident {
+        &self.0
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let mut leases = lock(&self.0.leases);
+        leases.held -= 1;
+        if leases.held == 0 && leases.retired {
+            drop(leases);
+            self.0.stop();
+        }
     }
 }
 
@@ -324,21 +501,24 @@ enum Served {
 fn run(launch: &Launch, shared: &Shared, requests: &mpsc::Receiver<Job>) {
     let mut restarts = Restarts::default();
     let mut gpu = launch.gpu;
+    let mut tier = launch.tier;
+    let mut gpu_crashes = 0;
     let fatal = loop {
         if shared.stopping() {
             return shared.set(State::Stopped);
         }
         let started = Instant::now();
-        match Conn::start(launch, gpu, shared) {
+        match Conn::start(launch, tier, gpu, shared) {
             Ok(mut conn) => {
                 tracing::info!(
-                    tier = launch.tier.name(),
+                    tier = tier.name(),
                     device = %conn.device,
-                    model_id = launch.tier.model_id(),
+                    model_id = tier.model_id(),
                     ms = started.elapsed().as_millis() as u64,
                     "Local worker ready"
                 );
                 shared.set(State::Ready {
+                    tier,
                     device: conn.device.clone(),
                 });
                 match conn.serve(requests, shared) {
@@ -349,6 +529,17 @@ fn run(launch: &Launch, shared: &Shared, requests: &mpsc::Receiver<Job>) {
                     }
                     Served::Crashed(reason) => {
                         tracing::warn!(%reason, "Local worker stopped unexpectedly");
+                        if gpu {
+                            gpu_crashes += 1;
+                        }
+                        if gpu && gpu_crashes >= GPU_CRASHES {
+                            tracing::warn!(
+                                crashes = gpu_crashes,
+                                "Local worker keeps stopping on the GPU; using the CPU"
+                            );
+                            gpu = false;
+                            tier = launch.cpu_tier;
+                        }
                     }
                 }
             }
@@ -363,6 +554,7 @@ fn run(launch: &Launch, shared: &Shared, requests: &mpsc::Receiver<Job>) {
                     "Local worker couldn't start on the GPU; using the CPU"
                 );
                 gpu = false;
+                tier = launch.cpu_tier;
                 continue;
             }
             Err(failure) if failure.error.needs_settings() => {
@@ -415,15 +607,43 @@ struct Conn {
 
 impl Conn {
     /// Writes the manifest, starts the worker and prepares it.
-    fn start(launch: &Launch, gpu: bool, shared: &Shared) -> Result<Self, Failure> {
-        let manifest = ManifestFile::write(launch, gpu).map_err(|error| {
+    /// A `prepare` past [`PREPARE_DEADLINE`] kills the worker.
+    fn start(
+        launch: &Launch,
+        tier: LocalTier,
+        gpu: bool,
+        shared: &Shared,
+    ) -> Result<Self, Failure> {
+        let manifest = ManifestFile::write(launch, tier, gpu).map_err(|error| {
             Failure::new(
                 LocalError::WorkerFailed,
                 format!("manifest write failed: {error}"),
             )
         })?;
         let (mut stdin, mut stdout) = spawn(launch, &manifest.0, shared)?;
-        match request(&mut stdin, &mut stdout, &control(PREPARE), None)? {
+        let (replied, expired) = std::thread::scope(|scope| {
+            let (prepared, wait) = mpsc::channel::<()>();
+            let watchdog = scope.spawn(move || {
+                let expired = matches!(
+                    wait.recv_timeout(PREPARE_DEADLINE),
+                    Err(RecvTimeoutError::Timeout)
+                );
+                if expired {
+                    shared.kill();
+                }
+                expired
+            });
+            let replied = request(&mut stdin, &mut stdout, &control(PREPARE), None);
+            drop(prepared);
+            (replied, watchdog.join().unwrap_or(false))
+        });
+        if expired {
+            return Err(Failure::broken(format!(
+                "prepare took over {} s",
+                PREPARE_DEADLINE.as_secs()
+            )));
+        }
+        match replied? {
             Reply::Ready { device } => Ok(Self {
                 stdin,
                 stdout,
@@ -440,7 +660,16 @@ impl Conn {
         loop {
             match requests.recv_timeout(IDLE_CHECK) {
                 Ok(job) => {
+                    {
+                        let mut serving = lock(&shared.serving);
+                        if Instant::now() >= job.expires {
+                            // Its Recording gave up while it waited.
+                            continue;
+                        }
+                        *serving = Some(job.id);
+                    }
                     let heard = self.transcribe(job.pcm, job.prompt);
+                    *lock(&shared.serving) = None;
                     let broken = match &heard {
                         Err(failure) => failure.broken.then(|| failure.diagnostic.clone()),
                         Ok(_) => None,
@@ -541,9 +770,7 @@ fn spawn(
     let pipes = child.stdin.take().zip(child.stdout.take());
     // Fail closed: a worker that cannot be contained never runs.
     #[cfg(windows)]
-    let contained = job::Job::assign(&child).and_then(|job| job::resume(&child).map(|()| job));
-    #[cfg(windows)]
-    let worker = match contained {
+    let worker = match job::contain(&child) {
         Ok(job) => Worker { child, _job: job },
         Err(error) => {
             let _ = child.kill();
@@ -570,7 +797,7 @@ fn spawn(
 /// Kill-on-close Job Objects: a worker in one ends when the last handle to
 /// the job closes, which Windows does for Voisu however it exits.
 #[cfg(windows)]
-mod job {
+pub(super) mod job {
     use std::os::windows::io::AsRawHandle;
     use std::process::Child;
 
@@ -606,7 +833,7 @@ mod job {
     impl Job {
         /// A new job holding `child`, which was started suspended, so it runs
         /// nothing before it is inside.
-        pub fn assign(child: &Child) -> windows::core::Result<Self> {
+        fn assign(child: &Child) -> windows::core::Result<Self> {
             // SAFETY: the job handle is owned here (closed on drop), the
             // limits struct outlives the call, and the child's process
             // handle is open for as long as `child` lives.
@@ -632,10 +859,19 @@ mod job {
         }
     }
 
+    /// Puts `child`, started with [`super::CREATE_SUSPENDED`], into a new
+    /// kill-on-close job, then lets it run. On an error it is still
+    /// suspended: the caller kills it.
+    pub fn contain(child: &Child) -> windows::core::Result<Job> {
+        let job = Job::assign(child)?;
+        resume(child)?;
+        Ok(job)
+    }
+
     /// Resumes the suspended `child`. std closes the main thread's handle
     /// after `CreateProcessW`, so the thread is found by its process id; a
     /// process started suspended has only that one.
-    pub fn resume(child: &Child) -> windows::core::Result<()> {
+    fn resume(child: &Child) -> windows::core::Result<()> {
         // SAFETY: every handle opened here is owned and closed on drop, and
         // `entry` outlives the calls that fill it.
         unsafe {
@@ -681,9 +917,22 @@ fn control(op: &str) -> Value {
     json!({ "v": PROTOCOL_VERSION, "id": op, "op": op })
 }
 
+/// Error replies after which the worker still serves: that one request
+/// failed and the stream is intact. After any other error the worker exits
+/// (a broken frame or PCM, a refused manifest) or is not worth another
+/// request, so the connection is retired before the next one can write into
+/// a closing pipe.
+const RECOVERABLE_CODES: &[&str] = &[
+    "inference_failed",
+    "too_many_windows",
+    "transcript_too_large",
+    "cancelled",
+];
+
 /// Sends one request and reads its reply. A worker that refused its
 /// manifest writes its error and exits before reading anything, so a failed
-/// write still reads the reply waiting on stdout.
+/// write still reads the reply waiting on stdout; the connection is retired
+/// either way.
 fn request(
     stdin: &mut impl Write,
     stdout: &mut impl Read,
@@ -695,22 +944,27 @@ fn request(
         Some(pcm) => stdin.write_all(pcm).and_then(|()| stdin.flush()),
         None => Ok(()),
     });
-    match read_frame(stdout) {
-        Ok(reply) => match parse_reply(&reply, id) {
-            // The worker's message is not logged: it can quote input.
-            Reply::Error { code } => Err(Failure::new(
-                LocalError::from_code(&code),
-                format!("worker error {code}"),
-            )),
-            Reply::Invalid(reason) => {
-                Err(Failure::broken(format!("invalid reply to {id}: {reason}")))
-            }
-            reply => Ok(reply),
+    let reply = match read_frame(stdout) {
+        Ok(reply) => parse_reply(&reply, id),
+        Err(error) => {
+            return Err(Failure::broken(format!(
+                "worker reply unreadable: {error}; send: {sent:?}"
+            )));
+        }
+    };
+    let failure = match reply {
+        // The worker's message is not logged: it can quote input.
+        Reply::Error { code } => Failure {
+            broken: sent.is_err() || !RECOVERABLE_CODES.contains(&code.as_str()),
+            ..Failure::new(LocalError::from_code(&code), format!("worker error {code}"))
         },
-        Err(error) => Err(Failure::broken(format!(
-            "worker reply unreadable: {error}; send: {sent:?}"
-        ))),
-    }
+        Reply::Invalid(reason) => Failure::broken(format!("invalid reply to {id}: {reason}")),
+        reply => match sent {
+            Ok(()) => return Ok(reply),
+            Err(error) => Failure::broken(format!("request {id} not sent whole: {error}")),
+        },
+    };
+    Err(failure)
 }
 
 /// Names the reply without its text: diagnostics never carry a Transcript.
@@ -817,6 +1071,14 @@ const KNOWN_CODES: &[&str] = &[
     "invalid_pcm",
     "unsupported_version",
     "unsupported_op",
+    "unknown_operation",
+    // Sent just before the worker exits on a broken stream.
+    "eof_mid_frame",
+    "eof_mid_pcm",
+    "read_failed",
+    "frame_too_large",
+    "invalid_json",
+    "invalid_pcm_bytes",
 ];
 
 fn error_code(code: Option<&str>) -> String {
@@ -854,7 +1116,7 @@ pub fn read_frame(reader: &mut impl Read) -> io::Result<Value> {
 struct ManifestFile(PathBuf);
 
 impl ManifestFile {
-    fn write(launch: &Launch, gpu: bool) -> io::Result<Self> {
+    fn write(launch: &Launch, tier: LocalTier, gpu: bool) -> io::Result<Self> {
         static STARTS: AtomicU64 = AtomicU64::new(0);
         let worker_bytes = fs::metadata(&launch.worker)?.len();
         let cores = std::thread::available_parallelism()
@@ -862,6 +1124,7 @@ impl ManifestFile {
             .min(MAX_THREADS);
         let document = manifest(
             launch,
+            tier,
             &sha256_file(&launch.worker)?,
             worker_bytes,
             gpu,
@@ -888,22 +1151,23 @@ impl Drop for ManifestFile {
 /// needs free there; a CPU manifest asks for none.
 fn manifest(
     launch: &Launch,
+    tier: LocalTier,
     worker_sha256: &str,
     worker_bytes: u64,
     gpu: bool,
     cores: usize,
 ) -> Value {
-    let model = launch.tier.model();
+    let model = tier.model();
     let model_path = launch.models.join(model.name);
     let clip = launch.models.join(HEALTH_CLIP.name);
     let (device, vram_bytes) = if gpu {
-        ("gpu", launch.tier.vram_bytes())
+        ("gpu", tier.vram_bytes())
     } else {
         ("cpu", 0)
     };
     json!({
         "version": 1,
-        "model_id": launch.tier.model_id(),
+        "model_id": tier.model_id(),
         "device": device,
         "language": "en",
         "limits": { "cpu_cores": cores, "vram_bytes": vram_bytes },
@@ -969,6 +1233,7 @@ mod tests {
             models: dir.to_owned(),
             log: dir.join("worker.log"),
             tier,
+            cpu_tier: tier,
             gpu: false,
         }
     }
@@ -1091,7 +1356,7 @@ mod tests {
     }
 
     #[test]
-    fn a_request_round_trips_and_only_a_dead_worker_is_broken() {
+    fn a_request_round_trips_and_a_dead_or_refusing_worker_is_broken() {
         let mut sent = Vec::new();
         let mut answer = Vec::new();
         write_frame(
@@ -1128,14 +1393,78 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(failure.error, LocalError::Damaged);
-        // The worker's message stays out of the log, and the worker that
-        // sent an error can still be asked again.
+        // The worker's message stays out of the log, and a worker that
+        // refused its manifest has exited.
         assert_eq!(failure.diagnostic, "worker error manifest_error");
-        assert!(!failure.broken);
+        assert!(failure.broken);
         // A worker that died without a reply.
         let mut nothing: &[u8] = &[];
         let failure = request(&mut Vec::new(), &mut nothing, &control(PREPARE), None).unwrap_err();
         assert_eq!(failure.error, LocalError::WorkerFailed);
+        assert!(failure.broken);
+    }
+
+    fn error_reply(code: &str) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        write_frame(
+            &mut bytes,
+            &reply(
+                "x",
+                json!({"status": "error", "code": code, "message": "m"}),
+            ),
+        )
+        .unwrap();
+        bytes
+    }
+
+    /// A pipe the worker has already closed.
+    struct Closed;
+
+    impl Write for Closed {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn only_a_recoverable_error_keeps_the_connection() {
+        let ask = |answer: Vec<u8>| {
+            request(&mut Vec::new(), &mut answer.as_slice(), &control("x"), None).unwrap_err()
+        };
+        let failed = ask(error_reply("inference_failed"));
+        assert_eq!(failed.error, LocalError::TranscribeFailed);
+        assert!(!failed.broken);
+        assert!(!ask(error_reply("cancelled")).broken);
+        // The worker exits after these: the next request would hit its
+        // closing pipe (OS error 232).
+        for code in [
+            "invalid_pcm_bytes",
+            "eof_mid_pcm",
+            "frame_too_large",
+            "not_ready",
+        ] {
+            let failure = ask(error_reply(code));
+            assert!(failure.broken, "{code}");
+            assert_eq!(failure.diagnostic, format!("worker error {code}"));
+        }
+        // A request that did not reach the worker whole retires it, even
+        // when a reply can still be read.
+        let failure = request(
+            &mut Closed,
+            &mut error_reply("inference_failed").as_slice(),
+            &control("x"),
+            None,
+        )
+        .unwrap_err();
+        assert!(failure.broken);
+        let mut answer = Vec::new();
+        write_frame(&mut answer, &reply("x", json!({"status": "no_text"}))).unwrap();
+        let failure =
+            request(&mut Closed, &mut answer.as_slice(), &control("x"), None).unwrap_err();
         assert!(failure.broken);
     }
 
@@ -1158,8 +1487,8 @@ mod tests {
     fn each_worker_start_writes_its_own_manifest_and_deletes_it() {
         let dir = tempfile::tempdir().unwrap();
         let launch = launch(dir.path(), LocalTier::Fast);
-        let first = ManifestFile::write(&launch, false).unwrap();
-        let second = ManifestFile::write(&launch, true).unwrap();
+        let first = ManifestFile::write(&launch, LocalTier::Fast, false).unwrap();
+        let second = ManifestFile::write(&launch, LocalTier::Fast, true).unwrap();
         assert_ne!(first.0, second.0);
         assert!(first.0.exists() && second.0.exists());
         let kept = second.0.clone();
@@ -1174,7 +1503,7 @@ mod tests {
         for tier in LocalTier::ALL {
             let launch = launch(dir.path(), tier);
             let sha = sha256_file(&launch.worker).unwrap();
-            let cpu = manifest(&launch, &sha, 6, false, 4);
+            let cpu = manifest(&launch, tier, &sha, 6, false, 4);
             assert_eq!(cpu["model_id"], tier.model_id());
             assert_eq!(cpu["runtime"]["worker"], cpu["files"][0]["path"]);
             assert_eq!(cpu["model_path"], cpu["files"][1]["path"]);
@@ -1188,7 +1517,7 @@ mod tests {
             assert_eq!(cpu["files"][1]["bytes"], tier.model().bytes);
             assert_eq!(cpu["device"], "cpu");
             assert_eq!(cpu["limits"]["vram_bytes"], 0);
-            let gpu = manifest(&launch, &sha, 6, true, 4);
+            let gpu = manifest(&launch, tier, &sha, 6, true, 4);
             assert_eq!(gpu["device"], "gpu");
             assert_eq!(gpu["limits"]["vram_bytes"], tier.vram_bytes());
         }

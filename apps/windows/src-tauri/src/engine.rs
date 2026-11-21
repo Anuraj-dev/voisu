@@ -34,7 +34,7 @@ use voisu_core::{
 };
 
 use crate::gesture::Action;
-use crate::local::{self, LocalError};
+use crate::local;
 use crate::overlay::{
     self, AUDIO_LEVEL, AudioLevelPayload, RECORDING_STATE, RecordingState as Phase,
     RecordingStatePayload,
@@ -239,15 +239,16 @@ enum Captured {
 enum Backend {
     /// Deepgram live and Groq at stop.
     Cloud(ProviderCoordinator),
-    /// The resident Local worker, loaded before the Recording stops.
-    Local,
+    /// The resident Local worker, bound when the Recording was admitted and
+    /// loaded before it stops.
+    Local(local::LocalRecording),
 }
 
 /// What a Recording needs before the mic opens: the Cloud keys, or the
 /// Local worker and a model.
 enum Route {
     Cloud(RecordingKeys),
-    Local,
+    Local(local::LocalRecording),
 }
 
 impl Engine {
@@ -292,12 +293,9 @@ impl Engine {
         let mut trigger = StartupTrigger::new(id, actions, &self.ended);
         let settings = self.settings();
         let route = match settings.mode.effective() {
-            Mode::Local => match local::check(&self.app) {
-                Ok(()) => {
-                    // Already loaded unless the tier just changed or it crashed.
-                    local::warm(&self.app);
-                    Some(Some(Route::Local))
-                }
+            // Starts the worker unless it is loaded for this tier already.
+            Mode::Local => match local::admit(&self.app) {
+                Ok(recording) => Some(Some(Route::Local(recording))),
                 Err(error) => {
                     tracing::info!(id, ?error, "Recording refused: Local mode not ready");
                     self.emit_state(Phase::Error, Some(error.message().to_owned()));
@@ -346,7 +344,7 @@ impl Engine {
                             streams,
                         ))
                     }
-                    Route::Local => Backend::Local,
+                    Route::Local(recording) => Backend::Local(recording),
                 };
                 providers_started = Some(Instant::now());
                 Ok((backend, vocabulary, settings.tone))
@@ -641,7 +639,9 @@ impl Engine {
     ) -> Result<String, BoundaryError> {
         let providers = match providers {
             Backend::Cloud(providers) => providers,
-            Backend::Local => return self.decide_local(audio, &vocabulary).await,
+            Backend::Local(recording) => {
+                return self.decide_local(recording, audio, &vocabulary).await;
+            }
         };
         let completed = providers.complete_with_timings(audio).await?;
         for failure in &completed.provider_failures {
@@ -668,6 +668,7 @@ impl Engine {
     /// No text is a silent Recording.
     async fn decide_local(
         &self,
+        mut recording: local::LocalRecording,
         audio: voisu_core::CapturedAudio,
         vocabulary: &[String],
     ) -> Result<String, BoundaryError> {
@@ -678,15 +679,11 @@ impl Engine {
                 "Recording contained no speech above the silence floor",
             ));
         }
-        let app = self.app.clone();
-        let resident = match tokio::task::spawn_blocking(move || local::resident(&app)).await {
-            Ok(Ok(resident)) => resident,
-            Ok(Err(error)) => {
+        let resident = match recording.resident().await {
+            Ok(resident) => resident,
+            Err(error) => {
                 local::report(&self.app, error);
                 return Err(error.into_boundary("Local worker unavailable"));
-            }
-            Err(_) => {
-                return Err(LocalError::WorkerFailed.into_boundary("Local worker lookup panicked"));
             }
         };
         let ready = matches!(resident.state(), local::worker::State::Ready { .. });
@@ -694,27 +691,22 @@ impl Engine {
         let prompt = vocabulary::whisper_prompt(vocabulary);
         let prompt = voisu_core::local_wire::is_valid_prompt(&prompt).then_some(prompt);
         let started = Instant::now();
-        let heard = match tokio::time::timeout(deadline, resident.transcribe(pcm, prompt)).await {
-            Ok(Ok(heard)) => heard,
-            Ok(Err(failure)) => {
+        // Past the deadline the worker is killed if it is decoding this
+        // Recording, and the resident starts a fresh one.
+        let heard = match resident.transcribe(pcm, prompt, deadline).await {
+            Ok(heard) => heard,
+            Err(failure) => {
                 local::report(&self.app, failure.error);
                 return Err(failure.error.into_boundary(failure.diagnostic));
             }
-            Err(_) => {
-                // The resident starts a fresh worker.
-                resident.kill();
-                local::report(&self.app, LocalError::TimedOut);
-                return Err(LocalError::TimedOut
-                    .into_boundary(format!("Local worker exceeded {} s", deadline.as_secs())));
-            }
         };
-        let device = match resident.state() {
-            local::worker::State::Ready { device } => device,
-            _ => "unknown".to_owned(),
+        let (tier, device) = match resident.state() {
+            local::worker::State::Ready { tier, device } => (tier, device),
+            _ => (resident.tier(), "unknown".to_owned()),
         };
         tracing::info!(
             ms = started.elapsed().as_millis() as u64,
-            tier = resident.tier().name(),
+            tier = tier.name(),
             device,
             "Local transcription"
         );
@@ -925,7 +917,7 @@ async fn abort(capture: Box<dyn ActiveCapture>, providers: Backend) {
         match providers {
             Backend::Cloud(providers) => providers.abort().await,
             // The resident worker stays loaded for the next Recording.
-            Backend::Local => Ok(()),
+            Backend::Local(_) => Ok(()),
         }
     };
     let (capture, providers) = tokio::join!(capture.abort(), providers);

@@ -18,7 +18,6 @@ pub mod worker;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -31,7 +30,7 @@ use voisu_core::{
 
 use crate::settings::Mode;
 use gpu::Detected;
-use worker::{Resident, State};
+use worker::{Lease, Resident, State};
 
 /// The clip the worker transcribes at every start to prove the model works.
 pub const HEALTH_CLIP: ModelFile = ModelFile {
@@ -218,14 +217,17 @@ impl LocalError {
 
 /// At worst real time for the Recording, plus room for a stuck request to
 /// be noticed. A worker still loading its model (`ready` false) also gets
-/// time for the load and health check: Accurate on the CPU takes longest.
-/// Only a stuck worker reaches either.
+/// [`worker::PREPARE_DEADLINE`], the most its load and health check may
+/// take. Only a stuck worker reaches either.
 pub fn decode_deadline(pcm_bytes: usize, ready: bool) -> Duration {
     const BYTES_PER_SECOND: u64 = 16_000 * 2;
-    const PREPARE: Duration = Duration::from_secs(90);
     let audio_ms = (pcm_bytes as u64).saturating_mul(1000) / BYTES_PER_SECOND;
     let decode = Duration::from_secs(30) + Duration::from_millis(audio_ms);
-    if ready { decode } else { decode + PREPARE }
+    if ready {
+        decode
+    } else {
+        decode + worker::PREPARE_DEADLINE
+    }
 }
 
 /// Whether the Recording holds speech, by the gate Linux applies before
@@ -312,10 +314,11 @@ impl Detection {
 /// worker, download progress and the latest error.
 #[derive(Default)]
 pub struct LocalState {
+    /// Locked before the settings, never after: every change to the mode,
+    /// the tier or the model files saves its setting under this lock, and a
+    /// worker starts under it only while that setting still asks for it.
     status: Mutex<Status>,
     detection: Detection,
-    /// Never locked while `status` is held.
-    worker: Mutex<Option<Arc<Resident>>>,
 }
 
 struct Download {
@@ -338,6 +341,27 @@ struct Status {
     /// The "Using Cloud" notification went out for this download.
     cloud_notice_shown: bool,
     error: Option<&'static str>,
+    /// The resident worker for the tier Local runs, while Local is on.
+    worker: Option<Arc<Resident>>,
+    /// The last resident replaced, which the next one waits for.
+    retired: Option<Arc<Resident>>,
+    /// Local Recordings admitted and not yet finished.
+    recordings: usize,
+    /// Remove is deleting the models: nothing starts meanwhile.
+    removing: bool,
+    /// Voisu is quitting: no worker starts again.
+    closed: bool,
+}
+
+impl Status {
+    /// Takes the resident out of the slot. It serves the Recordings bound
+    /// to it, then stops, and the next resident waits for it to exit.
+    fn retire(&mut self) {
+        if let Some(resident) = self.worker.take() {
+            resident.retire();
+            self.retired = Some(resident);
+        }
+    }
 }
 
 /// Starts the GPU probe off the main thread, then warms the worker if Local
@@ -385,43 +409,60 @@ fn changed(app: &AppHandle) -> worker::Changed {
 }
 
 /// The resident worker for the tier Local runs now, started if none runs
-/// or it runs another tier. Blocks while the GPU probe has not answered:
-/// never call it on the main thread or the executor.
-pub fn resident(app: &AppHandle) -> Result<Arc<Resident>, LocalError> {
-    let worker = worker_path(app).ok_or(LocalError::WorkerMissing)?;
-    let state = app.state::<LocalState>();
-    let detected = state.detection.wait();
+/// or it runs another tier. Called with the status lock held, so it sees
+/// the latest mode and tier: `None` when Local is off, Remove is deleting
+/// the models or Voisu is quitting.
+fn resident_locked(
+    app: &AppHandle,
+    status: &mut Status,
+    worker: PathBuf,
+    detected: &Detected,
+) -> Result<Option<Arc<Resident>>, LocalError> {
+    if status.closed || status.removing || !local_on(app) {
+        return Ok(None);
+    }
     let models = crate::paths::local_model_dir();
-    let tier = active_tier(local_model_setting(app), detected.on_gpu(), |tier| {
-        installed(&models, tier)
-    });
+    let setting = local_model_setting(app);
+    let is_installed = |tier| installed(&models, tier);
+    let tier = active_tier(setting, detected.on_gpu(), is_installed);
     if !installed(&models, tier) {
         return Err(LocalError::ModelMissing);
     }
-    let mut slot = state.worker.lock().unwrap();
-    if let Some(resident) = slot.as_ref()
+    if let Some(resident) = status.worker.as_ref()
         && resident.tier() == tier
         && resident.state() != State::Stopped
     {
-        return Ok(Arc::clone(resident));
+        return Ok(Some(Arc::clone(resident)));
     }
-    if let Some(old) = slot.take() {
-        // It shuts down on its own thread; a Recording it is serving
-        // finishes first.
-        drop(old.stop());
-    }
+    status.retire();
+    let cpu_tier = active_tier(setting, false, is_installed);
     let resident = Arc::new(Resident::start(
         worker::Launch {
             worker,
             models,
             log: worker_log(),
             tier,
+            cpu_tier,
             gpu: detected.on_gpu(),
         },
+        status.retired.take(),
         changed(app),
     ));
-    *slot = Some(Arc::clone(&resident));
-    Ok(resident)
+    status.worker = Some(Arc::clone(&resident));
+    Ok(Some(resident))
+}
+
+/// [`resident_locked`] once the GPU probe has answered, leased before the
+/// lock is released so nothing retires it unseen. Blocks while the probe
+/// has not answered: never call it on the main thread or the executor.
+fn resident(app: &AppHandle) -> Result<Option<Lease>, LocalError> {
+    let worker = worker_path(app).ok_or(LocalError::WorkerMissing)?;
+    let state = app.state::<LocalState>();
+    let detected = state.detection.wait();
+    let mut status = state.status.lock().unwrap();
+    let lease = resident_locked(app, &mut status, worker, &detected)?.map(|found| found.lease());
+    drop(status);
+    Ok(lease)
 }
 
 /// Starts the resident worker in the background, so the model is loaded
@@ -441,36 +482,94 @@ pub fn warm(app: &AppHandle) {
     }
 }
 
-/// Stops the resident worker; the thread to join, if one was running.
-fn stop_worker(app: &AppHandle) -> Option<JoinHandle<()>> {
-    let resident = app.state::<LocalState>().worker.lock().unwrap().take()?;
-    resident.stop()
-}
-
-/// At exit: shuts the worker down cleanly, waiting at most `bound`. The Job
-/// Object ends it anyway once Voisu is gone.
+/// At exit: no worker starts again, and the one running (with any it
+/// replaced) shuts down cleanly within `bound`, or is killed and reaped.
 pub fn shutdown(app: &AppHandle, bound: Duration) {
-    let Some(thread) = stop_worker(app) else {
+    let resident = {
+        let mut status = app.state::<LocalState>().status.lock().unwrap();
+        status.closed = true;
+        status.retire();
+        status.retired.take()
+    };
+    let Some(resident) = resident else {
         return;
     };
-    let deadline = Instant::now() + bound;
-    while !thread.is_finished() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
+    resident.halt();
+    if !resident.wait_finished(Some(Instant::now() + bound)) {
+        tracing::warn!("Local worker still running at exit; killed");
+        resident.reap();
     }
 }
 
-/// Whether a Local Recording can start: the worker and a model are here and
-/// the resident hasn't given up. Never blocks.
-pub fn check(app: &AppHandle) -> Result<(), LocalError> {
-    worker_path(app).ok_or(LocalError::WorkerMissing)?;
+/// A Local Recording, admitted before its mic opens. It holds the resident
+/// that transcribes it, so a tier or Cloud chosen meanwhile lets it finish
+/// on the model it started with, and Remove waits until none is held.
+pub struct LocalRecording {
+    app: AppHandle,
+    /// `None` when the GPU probe had not answered at admission: bound at
+    /// stop instead.
+    lease: Option<Lease>,
+}
+
+impl LocalRecording {
+    /// The resident that transcribes this Recording.
+    pub async fn resident(&mut self) -> Result<&Resident, LocalError> {
+        if self.lease.is_none() {
+            let app = self.app.clone();
+            let lease = tokio::task::spawn_blocking(move || resident(&app))
+                .await
+                .unwrap_or(Err(LocalError::WorkerFailed))?
+                // Local was turned off, or Voisu is quitting.
+                .ok_or(LocalError::WorkerFailed)?;
+            self.lease = Some(lease);
+        }
+        self.lease.as_deref().ok_or(LocalError::WorkerFailed)
+    }
+}
+
+impl Drop for LocalRecording {
+    fn drop(&mut self) {
+        let state = self.app.state::<LocalState>();
+        let mut status = state.status.lock().unwrap();
+        status.recordings = status.recordings.saturating_sub(1);
+    }
+}
+
+/// Admits a Local Recording: the worker and a model are here, the resident
+/// hasn't given up, and Local is still on. Binds the resident for the tier
+/// Local runs now, starting it if needed. Never blocks.
+pub fn admit(app: &AppHandle) -> Result<LocalRecording, LocalError> {
+    let worker = worker_path(app).ok_or(LocalError::WorkerMissing)?;
     if !any_installed(&crate::paths::local_model_dir()) {
         return Err(LocalError::ModelMissing);
     }
-    let resident = app.state::<LocalState>().worker.lock().unwrap().clone();
-    match resident.map(|resident| resident.state()) {
-        Some(State::Failed(error)) => Err(error),
-        _ => Ok(()),
+    let state = app.state::<LocalState>();
+    let detected = state.detection.get();
+    let mut status = state.status.lock().unwrap();
+    // Cloud was chosen as the hotkey went down, or Remove or Quit runs.
+    if status.closed || status.removing || !local_on(app) {
+        return Err(LocalError::WorkerFailed);
     }
+    if let Some(State::Failed(error)) = status.worker.as_ref().map(|resident| resident.state()) {
+        return Err(error);
+    }
+    let lease = match &detected {
+        Some(detected) => Some(
+            resident_locked(app, &mut status, worker, detected)?
+                .ok_or(LocalError::WorkerFailed)?
+                .lease(),
+        ),
+        None => None,
+    };
+    status.recordings += 1;
+    drop(status);
+    if lease.is_none() {
+        warm(app);
+    }
+    Ok(LocalRecording {
+        app: app.clone(),
+        lease,
+    })
 }
 
 /// Local was chosen while its model downloads, so Recordings use Cloud.
@@ -540,6 +639,9 @@ pub struct LocalUi {
     tiers: Vec<TierUi>,
     /// The resident worker: `off`, `starting`, `ready` or `failed`.
     engine: &'static str,
+    /// The tier the ready worker runs: `active_tier`, or after a GPU
+    /// failure the CPU's.
+    engine_tier: Option<&'static str>,
     /// Where the ready worker runs, as it reports it (`cpu`, `vulkan:0`).
     engine_device: Option<String>,
     /// Some tier is downloaded, so Local can be chosen.
@@ -577,14 +679,22 @@ pub fn ui(app: &AppHandle) -> Option<LocalUi> {
         })
         .collect();
     let any = any_installed(&models);
-    let resident = state.worker.lock().unwrap().clone();
-    let (engine, engine_device, failed) = match resident.map(|resident| resident.state()) {
-        None | Some(State::Stopped) => ("off", None, None),
-        Some(State::Starting) => ("starting", None, None),
-        Some(State::Ready { device }) => ("ready", Some(device), None),
-        Some(State::Failed(error)) => ("failed", None, Some(error.message())),
-    };
+    let active = any.then(|| active_tier(setting, on_gpu, is_installed));
     let status = state.status.lock().unwrap();
+    let engine = status
+        .worker
+        .as_ref()
+        .map(|resident| (resident.tier(), resident.state()));
+    let (engine, engine_tier, engine_device, failed) = match engine {
+        None | Some((_, State::Stopped)) => ("off", None, None, None),
+        Some((_, State::Failed(error))) => ("failed", None, None, Some(error.message())),
+        // A new tier was chosen and its worker is not up yet.
+        Some((tier, _)) if Some(tier) != active => ("starting", None, None, None),
+        Some((_, State::Starting)) => ("starting", None, None, None),
+        Some((_, State::Ready { tier, device })) => {
+            ("ready", Some(tier.setting().as_str()), Some(device), None)
+        }
+    };
     let downloading = status.download.as_ref().map(|download| download.tier);
     Some(LocalUi {
         available: worker_path(app).is_some(),
@@ -595,13 +705,10 @@ pub fn ui(app: &AppHandle) -> Option<LocalUi> {
         auto_tier: LocalTier::resolve(LocalModel::Auto, on_gpu)
             .setting()
             .as_str(),
-        active_tier: any.then(|| {
-            active_tier(setting, on_gpu, is_installed)
-                .setting()
-                .as_str()
-        }),
+        active_tier: active.map(|tier| tier.setting().as_str()),
         tiers,
         engine,
+        engine_tier,
         engine_device,
         installed: any,
         downloading: downloading.map(|tier| tier.setting().as_str()),
@@ -638,13 +745,16 @@ fn emit_changed(app: &AppHandle) {
 /// An error is the message to show.
 #[tauri::command]
 pub fn set_mode(app: AppHandle, mode: Mode) -> Result<Mode, String> {
+    if mode == Mode::Local && (mode.effective() != Mode::Local || worker_path(&app).is_none()) {
+        return Err(LocalError::WorkerMissing.message().into());
+    }
     let state = app.state::<LocalState>();
+    let mut status = state.status.lock().unwrap();
     if mode == Mode::Local {
-        if mode.effective() != Mode::Local || worker_path(&app).is_none() {
-            return Err(LocalError::WorkerMissing.message().into());
+        if status.removing {
+            return Err("Wait for the Local model to be removed.".into());
         }
         if !any_installed(&crate::paths::local_model_dir()) {
-            let mut status = state.status.lock().unwrap();
             if status.download.is_none() {
                 return Err("Download the Local model first.".into());
             }
@@ -657,28 +767,26 @@ pub fn set_mode(app: AppHandle, mode: Mode) -> Result<Mode, String> {
     }
     crate::try_update_settings(&app, |settings| settings.mode = mode)?;
     tracing::info!(?mode, "transcription mode");
-    {
-        let mut status = state.status.lock().unwrap();
-        status.error = None;
-        if mode == Mode::Cloud {
+    status.error = None;
+    match mode {
+        Mode::Cloud => {
             status.after_local = false;
+            status.retire();
+        }
+        // Choosing Local again retries a worker that gave up.
+        Mode::Local => {
+            if status
+                .worker
+                .as_ref()
+                .is_some_and(|resident| matches!(resident.state(), State::Failed(_)))
+            {
+                status.retire();
+            }
         }
     }
-    match mode {
-        Mode::Cloud => drop(stop_worker(&app)),
-        Mode::Local => {
-            // Choosing Local again retries a worker that gave up.
-            let failed = state
-                .worker
-                .lock()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|resident| matches!(resident.state(), State::Failed(_)));
-            if failed {
-                drop(stop_worker(&app));
-            }
-            warm(&app);
-        }
+    drop(status);
+    if mode == Mode::Local {
+        warm(&app);
     }
     emit_changed(&app);
     Ok(mode)
@@ -695,14 +803,14 @@ pub fn set_local_model(app: AppHandle, model: String) -> Result<&'static str, St
     {
         return Err(format!("Download {} first.", tier.name()));
     }
-    crate::try_update_settings(&app, |settings| settings.local_model = model)?;
-    tracing::info!(model = model.as_str(), "Local model setting");
     {
         let state = app.state::<LocalState>();
         let mut status = state.status.lock().unwrap();
+        crate::try_update_settings(&app, |settings| settings.local_model = model)?;
         status.after_model = None;
         status.error = None;
     }
+    tracing::info!(model = model.as_str(), "Local model setting");
     if local_on(&app) {
         warm(&app);
     }
@@ -756,23 +864,24 @@ pub async fn download_local_model(
         if status.download.is_some() {
             return Err("A Local model is already downloading.".into());
         }
+        if status.removing {
+            return Err("Wait for the Local model to be removed.".into());
+        }
         // Never more than the user agreed to.
         let missing = missing_bytes(&dir, tier);
         if missing != bytes {
             return Err("The download size changed. Check it and try again.".into());
         }
         let cancel = Arc::new(download::Cancel::default());
-        *status = Status {
-            download: Some(Download {
-                cancel: Arc::clone(&cancel),
-                tier,
-            }),
-            downloaded: total - missing,
-            after_model: Some(model),
-            after_local: switch_to_local,
-            cloud_notice_shown: false,
-            error: None,
-        };
+        status.download = Some(Download {
+            cancel: Arc::clone(&cancel),
+            tier,
+        });
+        status.downloaded = total - missing;
+        status.after_model = Some(model);
+        status.after_local = switch_to_local;
+        status.cloud_notice_shown = false;
+        status.error = None;
         (cancel, missing)
     };
     let _ = app.emit(crate::STATE_CHANGED, ());
@@ -797,37 +906,42 @@ pub async fn download_local_model(
         }
     })
     .await;
-    let (after_model, after_local) = {
+    // Still registered until its settings are saved: Remove refuses while it
+    // is, and Cloud or a tier chosen meanwhile has already cleared what it
+    // would apply.
+    let outcome = {
         let mut status = state.status.lock().unwrap();
+        let after_model = status.after_model.take();
+        let after_local = std::mem::take(&mut status.after_local);
+        let outcome = match result {
+            Ok(()) => {
+                tracing::info!(tier = tier.name(), "Local model installed");
+                apply_installed(&app, after_model, after_local)
+            }
+            Err(download::DownloadError::Cancelled) => {
+                tracing::info!("Local model download cancelled");
+                Ok(DownloadOutcome::Cancelled)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Local model download failed");
+                Err(error.message())
+            }
+        };
         status.download = None;
-        (
-            status.after_model.take(),
-            std::mem::take(&mut status.after_local),
-        )
+        if let Err(message) = outcome {
+            status.error = Some(message);
+        }
+        outcome
     };
-    let outcome = match result {
-        Ok(()) => {
-            tracing::info!(tier = tier.name(), "Local model installed");
-            apply_installed(&app, after_model, after_local)
-        }
-        Err(download::DownloadError::Cancelled) => {
-            tracing::info!("Local model download cancelled");
-            Ok(DownloadOutcome::Cancelled)
-        }
-        Err(error) => {
-            tracing::warn!(%error, "Local model download failed");
-            Err(error.message())
-        }
-    };
-    if let Err(message) = outcome {
-        state.status.lock().unwrap().error = Some(message);
+    if outcome == Ok(DownloadOutcome::Installed) && local_on(&app) {
+        warm(&app);
     }
     emit_changed(&app);
     outcome.map_err(str::to_owned)
 }
 
-/// Applies what the user asked for when the download started, if it still
-/// stands, and warms the worker when Local is on.
+/// Saves what the user asked for when the download started, if it still
+/// stands. Called with the status lock held.
 fn apply_installed(
     app: &AppHandle,
     model: Option<LocalModel>,
@@ -847,9 +961,6 @@ fn apply_installed(
             tracing::info!(mode = ?Mode::Local, "transcription mode");
         }
     }
-    if local_on(app) {
-        warm(app);
-    }
     Ok(DownloadOutcome::Installed)
 }
 
@@ -862,30 +973,42 @@ pub fn cancel_local_download(app: AppHandle) {
 
 /// Deletes both tiers' models, switching to Cloud and stopping the worker
 /// first so nothing holds the files open. Refused while a download or a
-/// dictation runs. The files go while the status lock is held, so no
-/// download can start meanwhile.
+/// Local Recording runs; while it deletes, no worker, download or Local
+/// Recording starts.
 #[tauri::command]
 pub async fn remove_local_model(app: AppHandle) -> Result<(), String> {
-    const BUSY: &str = "Cancel the download first.";
-    let state = app.state::<LocalState>();
-    if state.status.lock().unwrap().download.is_some() {
-        return Err(BUSY.into());
-    }
+    const RECORDING: &str = "Wait for the dictation to finish, then remove the model.";
     if crate::engine::current_phase(&app).is_some() {
-        return Err("Wait for the dictation to finish, then remove the model.".into());
+        return Err(RECORDING.into());
     }
-    crate::try_update_settings(&app, |settings| settings.mode = Mode::Cloud)?;
-    if let Some(thread) = stop_worker(&app) {
-        let _ = tokio::task::spawn_blocking(move || thread.join()).await;
-    }
-    let removed = {
+    let state = app.state::<LocalState>();
+    let resident = {
         let mut status = state.status.lock().unwrap();
         if status.download.is_some() {
-            return Err(BUSY.into());
+            return Err("Cancel the download first.".into());
         }
+        if status.removing {
+            return Err("The Local model is already being removed.".into());
+        }
+        if status.recordings > 0 {
+            return Err(RECORDING.into());
+        }
+        crate::try_update_settings(&app, |settings| settings.mode = Mode::Cloud)?;
+        status.removing = true;
         status.error = None;
         status.after_local = false;
         status.after_model = None;
+        status.retire();
+        status.retired.take()
+    };
+    emit_changed(&app);
+    if let Some(resident) = resident {
+        resident.halt();
+        let _ = tokio::task::spawn_blocking(move || resident.wait_finished(None)).await;
+    }
+    let removed = {
+        let mut status = state.status.lock().unwrap();
+        status.removing = false;
         download::remove(&crate::paths::local_model_dir())
     };
     emit_changed(&app);
