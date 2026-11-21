@@ -1,9 +1,10 @@
 // Drives the overlay page under `npm run dev:mock` (loaded by core.js):
-// `overlay.html?state=` picks recording, handsFree, processing, done,
+// `overlay.html?state=` picks starting, recording, handsFree, processing, done,
 // copied, error or moving.
 import { emit, hasListener } from './event.js';
 
 const STATES = {
+  starting: [{ state: 'starting' }],
   recording: [{ state: 'recording' }],
   handsFree: [{ state: 'handsFree' }],
   processing: [{ state: 'recording' }, { state: 'processing' }],

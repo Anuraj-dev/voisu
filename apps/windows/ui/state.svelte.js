@@ -21,6 +21,8 @@ export const ui = $state({
     lastOverlayMove: 0,
     boostWords: [],
     tone: 'formal',
+    // Microphone (Windows): 'while_running' | 'for_five_minutes' | 'off'.
+    keepMicReady: 'while_running',
     // Blank until get_state names this platform's Trigger Key; the presets
     // come from the backend too, the default first.
     trigger: { key: '', label: '', warnings: [], isDefault: true },
@@ -55,7 +57,8 @@ export const ui = $state({
   error: '',
   // Held in the backend's memory only; never written to disk.
   transcript: null,
-  // idle | recording | handsFree | processing | error
+  // idle | recording | handsFree | processing | error (the overlay's
+  // `starting` leaves it as it was)
   phase: 'idle',
   phaseMessage: '',
   // Date.now() when the current Recording started; the hero ticks from it.
@@ -72,7 +75,45 @@ export const ui = $state({
   // one run and its error.
   updating: false,
   updateError: '',
+  // Dictation's Microphone choice: a save in flight, the choice made during
+  // it (sent next), and the last failure. Kept here so leaving the page
+  // mid-save keeps them.
+  micSaving: false,
+  micPending: null,
+  micError: '',
 });
+
+// Saves one Microphone choice at a time, the latest winning: a choice made
+// while a save is in flight is sent when that save ends.
+export async function chooseMicReady(mode) {
+  if (ui.micSaving) {
+    ui.micPending = mode;
+    return;
+  }
+  ui.micSaving = true;
+  ui.micError = '';
+  let next = mode;
+  try {
+    while (next != null) {
+      ui.micPending = null;
+      if (next !== ui.app.keepMicReady) {
+        try {
+          const choice = await invoke('set_keep_mic_ready', { mode: next });
+          ui.app.keepMicReady = choice.mode;
+          // Applied for this run, but the settings file kept the old choice.
+          ui.micError = choice.saved
+            ? ''
+            : "Changed for now, but Voisu couldn't save it, so it may change back after a restart.";
+        } catch (e) {
+          ui.micError = 'Could not change the Microphone setting.';
+        }
+      }
+      next = ui.micPending;
+    }
+  } finally {
+    ui.micSaving = false;
+  }
+}
 
 export async function installUpdate() {
   if (ui.updating) return;
@@ -192,6 +233,9 @@ function seedPhase(phase) {
 }
 
 export function onRecordingState({ state, message }) {
+  // The mic is still opening: the overlay shows that; the window waits for
+  // the Recording itself.
+  if (state === 'starting') return;
   if (state === 'recording' || state === 'handsFree') {
     // Hands-free continues the Recording that is already running.
     if (ui.phase !== 'recording' && ui.phase !== 'handsFree') ui.recordingSince = Date.now();

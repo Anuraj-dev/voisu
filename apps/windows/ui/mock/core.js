@@ -52,6 +52,7 @@ const state = {
   lastOverlayMove: 0,
   boostWords: ['Voisu', 'Deepgram'],
   tone: 'formal',
+  keepMicReady: 'while_running',
   trigger: { key: DEFAULT_KEY, label: mac ? 'Ctrl+Option' : 'Ctrl+Win', warnings: [], isDefault: true },
   triggerPresets: mac
     ? [
@@ -260,6 +261,7 @@ const COMMANDS = {
     emit('state-changed', null);
   },
   set_tone: ({ tone }) => (state.tone = tone),
+  set_keep_mic_ready: ({ mode }) => ({ mode: (state.keepMicReady = mode), saved: true }),
   start_overlay_move: () => {
     if (!state.overlayMoving) {
       console.info('mock: overlay shown in move mode');

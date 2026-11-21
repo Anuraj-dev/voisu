@@ -1,7 +1,7 @@
 <script>
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
-  import { ui } from '../state.svelte.js';
+  import { ui, isMac, chooseMicReady } from '../state.svelte.js';
   import ToggleRow from '../ToggleRow.svelte';
   import ErrorLine from '../ErrorLine.svelte';
 
@@ -10,6 +10,40 @@
   let triggerBusy = $state(false);
   let autoPasteBusy = $state(false);
   let toneBusy = $state(false);
+
+  // Microphone (Windows): the backend keeps the stream open so a press
+  // starts at once. The default first, then from most to least ready.
+  const MIC_CHOICES = [
+    {
+      mode: 'while_running',
+      name: 'Always on',
+      badge: 'Fastest',
+      body: 'Starts the instant you press. Windows shows the mic icon while Voisu runs.',
+    },
+    {
+      mode: 'for_five_minutes',
+      name: 'On for 5 minutes after dictating',
+      badge: 'Balanced',
+      body: 'Instant for 5 minutes after each dictation.',
+    },
+    {
+      mode: 'off',
+      name: 'Only while dictating',
+      badge: 'Most private',
+      body: 'Mic on only while you dictate. Starts about 0.8 s later.',
+    },
+  ];
+
+  let micGroup = $state();
+
+  // The radios stay enabled during a save, so a choice made then becomes the
+  // next save. Once saving settles, they show the backend's actual choice,
+  // not the radio last picked (a save that failed, or came back different).
+  $effect(() => {
+    const mode = ui.app.keepMicReady;
+    if (ui.micSaving || !micGroup) return;
+    for (const radio of micGroup.querySelectorAll('input')) radio.checked = radio.value === mode;
+  });
 
   const app = $derived(ui.app);
 
@@ -297,6 +331,43 @@
   </div>
 </div>
 
+{#if !isMac()}
+  <div class="group">
+    <div class="block">
+      <span class="row-text" id="mic-ready-title">Microphone</span>
+      <div
+        class="mic-options"
+        role="radiogroup"
+        aria-labelledby="mic-ready-title"
+        aria-busy={ui.micSaving}
+        bind:this={micGroup}
+      >
+        {#each MIC_CHOICES as choice (choice.mode)}
+          <label class="mic-option">
+            <input
+              type="radio"
+              name="mic-ready"
+              value={choice.mode}
+              checked={app.keepMicReady === choice.mode}
+              aria-labelledby="mic-{choice.mode}-name mic-{choice.mode}-badge"
+              aria-describedby="mic-{choice.mode}-body"
+              onchange={() => chooseMicReady(choice.mode)}
+            />
+            <span class="mic-main">
+              <span class="mic-head">
+                <span class="mic-name" id="mic-{choice.mode}-name">{choice.name}</span>
+                <span class="mic-badge" id="mic-{choice.mode}-badge">{choice.badge}</span>
+              </span>
+              <span class="hint" id="mic-{choice.mode}-body">{choice.body}</span>
+            </span>
+          </label>
+        {/each}
+      </div>
+      <ErrorLine message={ui.micError} />
+    </div>
+  </div>
+{/if}
+
 <div class="group">
   <ToggleRow
     id="auto-paste"
@@ -508,6 +579,81 @@
     display: flex;
     flex-wrap: wrap;
     gap: 6px;
+  }
+  /* Microphone: one card per choice, a native radio on the left. */
+  .mic-options {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .mic-option {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 9px 12px;
+    border: 1px solid var(--overlay-2);
+    border-radius: 10px;
+    background: transparent;
+    cursor: pointer;
+    transition:
+      background 0.15s,
+      border-color 0.15s;
+  }
+  .mic-option:hover {
+    background: var(--overlay-1);
+  }
+  .mic-option:has(:checked) {
+    border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+    background: color-mix(in srgb, var(--accent) 7%, transparent);
+  }
+  .mic-options[aria-busy='true'] .mic-option {
+    cursor: progress;
+  }
+  .mic-option input {
+    flex: none;
+    width: 16px;
+    height: 16px;
+    margin: 2px 0 0;
+    accent-color: var(--accent);
+    cursor: inherit;
+  }
+  /* The ring moves to the whole card where :has() works; elsewhere the
+     radio keeps its own. */
+  @supports selector(:has(:focus-visible)) {
+    .mic-option:has(:focus-visible) {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+    .mic-option input:focus-visible {
+      outline: none;
+    }
+  }
+  .mic-main {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+  .mic-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 8px;
+  }
+  .mic-name {
+    font-weight: 600;
+  }
+  .mic-badge {
+    padding: 0 7px;
+    border-radius: 32px;
+    background: var(--overlay-2);
+    font-size: 11px;
+    line-height: 17px;
+    color: var(--text-2);
+  }
+  .mic-option:has(:checked) .mic-badge {
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+    color: var(--accent);
   }
   .warn span {
     font-weight: 700;

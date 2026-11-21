@@ -15,6 +15,7 @@ The installer isn't code-signed yet, so SmartScreen may warn on first run. Choos
 - **Pages**: the window has a sidebar with Home, Dictation, Words, API keys, General and What's new. *Informal tone* (Dictation) uses chat abbreviations like btw and drops the final full stop.
 - **Overlay**: a small pill with sound bars shows while you dictate, at the bottom centre by default. *Move overlay* (Dictation) lets you drag it anywhere; click ✓ on the pill or press Enter to save, ✗ or Esc to cancel. *Reset position* puts it back.
 - **Recording**: the microphone starts faster, and letting go of the Trigger Key or pressing `Esc` works even while it is still starting.
+- **Microphone** (Dictation): choose how long Voisu keeps the microphone on. *Always on* (the default): starts the instant you press; Windows shows the mic icon while Voisu runs. *On for 5 minutes after dictating*: instant for 5 minutes after each dictation. *Only while dictating*: mic on only while you dictate; starts about 0.8 s later. Voisu sends nothing anywhere until you press the Trigger Key: it holds only the last half second of sound, in memory, and keeps overwriting it. Turning microphone access off in Windows privacy settings releases the microphone.
 - **Updates**: when an update is ready, a banner offers to restart and install it. After an update, Voisu shows what changed, and *What's new* lists every release.
 - **Star prompt**: after steady use, Voisu may ask for a GitHub star. Turn it off with *Star prompt* on the General page.
 

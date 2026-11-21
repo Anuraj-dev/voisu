@@ -41,7 +41,7 @@ use voisu_core::{Provider, SecretStore, Tone};
 use platform::hotkey::{is_dead_key, key_label};
 use platform::permissions::{self, Pane, Permissions};
 use platform::secrets::CredentialManagerStore;
-use settings::{OverlayPosition, Settings};
+use settings::{KeepMicReady, OverlayPosition, Settings};
 use setup::{KeyInputs, KeyResult};
 use star_prompt::StarPrompt;
 use trigger_key::TriggerChord;
@@ -131,6 +131,9 @@ struct UiState {
     last_overlay_move: u64,
     boost_words: Vec<String>,
     tone: Tone,
+    /// Keep microphone ready: `"while_running"`, `"for_five_minutes"` or
+    /// `"off"`. Windows only.
+    keep_mic_ready: KeepMicReady,
     trigger: UiTrigger,
     /// The only Trigger Keys the window offers, the default first.
     trigger_presets: Vec<UiPreset>,
@@ -265,6 +268,7 @@ fn get_state(app: AppHandle) -> UiState {
         last_overlay_move,
         boost_words: settings.boost_words,
         tone: settings.tone,
+        keep_mic_ready: settings.keep_mic_ready,
         trigger: UiTrigger::of(settings.hotkey),
         trigger_presets: ui_presets(),
         hook_ok: hook_ok(),
@@ -312,13 +316,22 @@ const HOOK_DOWN: &str =
 /// Applies `change`, saves, and returns the settings as now held. A failed
 /// write is logged; the change still applies for this run.
 fn update_settings(app: &AppHandle, change: impl FnOnce(&mut Settings)) -> Settings {
+    update_settings_saved(app, change).0
+}
+
+/// [`update_settings`], also saying whether the write succeeded.
+fn update_settings_saved(app: &AppHandle, change: impl FnOnce(&mut Settings)) -> (Settings, bool) {
     let state = app.state::<AppState>();
     let mut settings = state.settings.lock().unwrap();
     change(&mut settings);
-    if let Err(error) = settings.save(&paths::settings_file()) {
-        tracing::warn!(%error, "settings save failed");
-    }
-    settings.clone()
+    let saved = match settings.save(&paths::settings_file()) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(%error, "settings save failed");
+            false
+        }
+    };
+    (settings.clone(), saved)
 }
 
 /// Like `update_settings`, but all or nothing: a failed write keeps the
@@ -429,6 +442,28 @@ fn set_boost_words(app: AppHandle, words: Vec<String>) -> Vec<String> {
 fn set_tone(app: AppHandle, tone: Tone) -> Tone {
     tracing::info!(tone = tone.as_str(), "tone");
     update_settings(&app, |settings| settings.tone = tone).tone
+}
+
+/// The Keep microphone ready choice as applied, and whether it was saved
+/// for the next start too.
+#[derive(Serialize)]
+struct MicReadyChoice {
+    mode: KeepMicReady,
+    saved: bool,
+}
+
+/// Applies at once: Off closes the ready mic now unless a Recording is
+/// using it, in which case it closes when that Recording ends. A failed
+/// save still applies for this run; the window says it may not last.
+#[tauri::command]
+fn set_keep_mic_ready(app: AppHandle, mode: KeepMicReady) -> MicReadyChoice {
+    tracing::info!(?mode, "keep microphone ready");
+    let (settings, saved) = update_settings_saved(&app, |settings| settings.keep_mic_ready = mode);
+    let mode = settings.keep_mic_ready;
+    if let Some(ready) = app.try_state::<platform::capture::ReadyMic>() {
+        ready.set_mode(mode);
+    }
+    MicReadyChoice { mode, saved }
 }
 
 fn local_today() -> chrono::NaiveDate {
@@ -775,6 +810,7 @@ pub fn run() {
             reset_overlay_position,
             set_boost_words,
             set_tone,
+            set_keep_mic_ready,
             set_trigger_key,
             open_key_page,
             open_guide,
@@ -846,6 +882,10 @@ pub fn run() {
         } => api.prevent_exit(),
         RunEvent::Exit => {
             tracing::info!("Voisu exiting");
+            // Keep microphone ready: the mic closes with the app.
+            if let Some(ready) = app.try_state::<platform::capture::ReadyMic>() {
+                ready.shutdown();
+            }
             // A clean shutdown, so the worker never sees its pipe vanish.
             local::shutdown(app, std::time::Duration::from_secs(3));
         }

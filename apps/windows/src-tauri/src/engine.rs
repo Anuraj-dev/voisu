@@ -15,6 +15,7 @@
 //! auto-paste off), and held in memory only so "Last transcript" can copy it
 //! when the paste does not land.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -26,8 +27,8 @@ use voisu_cloud::{
     CleanupSupervisor, CloudHost, DeepgramProvider, GroqProvider, MergeResultValidator,
 };
 use voisu_core::{
-    ActiveCapture, BoundaryError, BoundaryFuture, BoundaryKind, CancelRegistry, CaptureLimit,
-    CapturedAudio, Credential, DEFAULT_RENDERING_POLICY, EnglishEligibilityOutcome,
+    ActiveCapture, AudioChunk, BoundaryError, BoundaryFuture, BoundaryKind, CancelRegistry,
+    CaptureLimit, CapturedAudio, Credential, DEFAULT_RENDERING_POLICY, EnglishEligibilityOutcome,
     PreparedTranscriptDecision, Provider, ProviderCoordinator, ProviderStreams,
     ResolvedRecordingLanguages, SecretStore, SourceTranscript, Tone, TranscriptProvider,
     TranscriptValidator, apply_tone, sanitize_source_transcripts,
@@ -166,7 +167,7 @@ fn next_phase(
 ) -> Option<(Phase, Instant)> {
     match state {
         Phase::Idle | Phase::Done | Phase::Copied | Phase::Error => None,
-        Phase::Recording => Some((state, now)),
+        Phase::Starting | Phase::Recording => Some((state, now)),
         Phase::HandsFree | Phase::Processing => Some((state, prev.map_or(now, |(_, since)| since))),
     }
 }
@@ -179,6 +180,18 @@ pub fn last_transcript(state: tauri::State<'_, EngineState>) -> Option<String> {
 /// Starts the engine actor and returns the sender the trigger drives it with.
 pub fn start(app: &AppHandle, ended: EndedSink) -> UnboundedSender<Action> {
     app.manage(EngineState::default());
+    let keep_ready = || {
+        app.state::<crate::AppState>()
+            .settings
+            .lock()
+            .unwrap()
+            .keep_mic_ready
+    };
+    let microphone = CpalCapture::new(keep_ready());
+    let ready_mic = microphone.ready_mic();
+    app.manage(ready_mic.clone());
+    // A choice saved before the handle was managed still applies.
+    ready_mic.set_mode(keep_ready());
     let (tx, rx) = mpsc::unbounded_channel();
     let engine = Engine {
         app: app.clone(),
@@ -186,7 +199,7 @@ pub fn start(app: &AppHandle, ended: EndedSink) -> UnboundedSender<Action> {
             cleanup: CleanupSupervisor::new(),
             recording_keys: None,
         },
-        microphone: CpalCapture::new(),
+        microphone,
         ended,
     };
     tauri::async_runtime::spawn(engine.run(rx));
@@ -287,7 +300,7 @@ impl Engine {
         let target = DeliveryTarget::capture();
         // A tray preview still playing must not hide or feed this session's
         // capsule.
-        overlay::end_preview();
+        let stopped_preview = overlay::end_preview();
         let startup = Arc::new(CaptureStartup::default());
         let mut providers_started = None;
         let mut trigger = StartupTrigger::new(id, actions, &self.ended);
@@ -326,6 +339,11 @@ impl Engine {
             }
             None => {
                 startup.log(id, hotkey_at, None);
+                // Cancelled before anything was shown: a preview this press
+                // stopped (its dim bars, say) must not stay on the pill.
+                if stopped_preview {
+                    self.emit_state(Phase::Idle, None);
+                }
                 return Captured::Done;
             }
         };
@@ -349,11 +367,13 @@ impl Engine {
                 providers_started = Some(Instant::now());
                 Ok((backend, vocabulary, settings.tone))
             },
+            startup.opening_cold(),
             |phase| self.emit_state(phase, None),
             &mut trigger,
         )
         .await;
         startup.log(id, hotkey_at, providers_started);
+        let confirmed = trigger.confirmed();
         let (audio, (mut providers, vocabulary, tone)) = match started {
             Ok(Some(started)) => started,
             Ok(None) => {
@@ -378,7 +398,10 @@ impl Engine {
                 };
             }
         };
-        match self.pump(id, &mut capture, &mut providers, actions).await {
+        match self
+            .pump(id, &mut capture, &mut providers, actions, confirmed)
+            .await
+        {
             Outcome::Stop(limit) => Captured::Process {
                 audio: RecordingAudio::Live(capture),
                 providers,
@@ -534,32 +557,40 @@ impl Engine {
     /// Streams capture chunks to Deepgram (Cloud) until the trigger stops or cancels
     /// the Recording, the capture ends, or something fails. Mirrors the
     /// Linux `capture_pump`: actions are always observed, even while a chunk
-    /// send is stalled.
+    /// send is stalled. Until the gesture `confirmed` the press is a
+    /// Recording, its audio stays in an [`AudioGate`]: a single tap is
+    /// cancelled with none of it sent. A Stop needs no flush: completion
+    /// sends the unstreamed tail.
     async fn pump(
         &self,
         id: u64,
         capture: &mut Box<dyn ActiveCapture>,
         providers: &mut Backend,
         actions: &mut UnboundedReceiver<Action>,
+        confirmed: bool,
     ) -> Outcome {
+        let mut gate = AudioGate::new(confirmed);
         loop {
-            let chunk = tokio::select! {
-                biased;
-                action = actions.recv() => match self.on_action(id, action) {
-                    Some(outcome) => return outcome,
-                    None => continue,
-                },
-                chunk = capture.next_chunk() => chunk,
-            };
-            let chunk = match chunk {
-                Ok(Some(chunk)) => chunk,
-                // The capture hit its byte cap.
-                Ok(None) => return Outcome::Stop(None),
-                Err(error) if error.kind() == BoundaryKind::RecordingDeadline => {
-                    tracing::info!(id, "Recording Deadline reached");
-                    return Outcome::Stop(Some(CaptureLimit::RecordingDeadline));
+            let Some(chunk) = gate.next_to_send() else {
+                let chunk = tokio::select! {
+                    biased;
+                    action = actions.recv() => match self.on_action(id, action, &mut gate) {
+                        Some(outcome) => return outcome,
+                        None => continue,
+                    },
+                    chunk = capture.next_chunk() => chunk,
+                };
+                match chunk {
+                    Ok(Some(chunk)) => gate.push(chunk),
+                    // The capture hit its byte cap.
+                    Ok(None) => return Outcome::Stop(None),
+                    Err(error) if error.kind() == BoundaryKind::RecordingDeadline => {
+                        tracing::info!(id, "Recording Deadline reached");
+                        return Outcome::Stop(Some(CaptureLimit::RecordingDeadline));
+                    }
+                    Err(error) => return Outcome::Failed(error),
                 }
-                Err(error) => return Outcome::Failed(error),
+                continue;
             };
             // Local hears the whole Recording at stop; the capture keeps it.
             let Backend::Cloud(providers) = providers else {
@@ -571,7 +602,7 @@ impl Engine {
                 tokio::select! {
                     biased;
                     action = actions.recv() => {
-                        if let Some(outcome) = self.on_action(id, action) {
+                        if let Some(outcome) = self.on_action(id, action, &mut gate) {
                             return outcome;
                         }
                     }
@@ -586,9 +617,14 @@ impl Engine {
 
     /// Applies a trigger action during Recording `id`. Returns how the
     /// capture phase ends, if this action ends it.
-    fn on_action(&self, id: u64, action: Option<Action>) -> Option<Outcome> {
+    fn on_action(&self, id: u64, action: Option<Action>, gate: &mut AudioGate) -> Option<Outcome> {
         match recording_action(id, action, &self.ended)? {
+            TriggerAction::Held => {
+                gate.confirm();
+                None
+            }
             TriggerAction::HandsFree => {
+                gate.confirm();
                 self.emit_state(Phase::HandsFree, None);
                 None
             }
@@ -735,6 +771,8 @@ impl Engine {
         }
         if let Some(tray) = self.app.state::<crate::AppState>().tray.get() {
             match state {
+                // Not "recording" before the first audio: nothing is heard yet.
+                Phase::Starting => tray.set_status("Voisu: opening the microphone…"),
                 Phase::Recording | Phase::HandsFree => tray.set_status("Voisu: recording…"),
                 Phase::Processing => tray.set_status("Voisu: transcribing…"),
                 Phase::Idle | Phase::Done | Phase::Copied | Phase::Error => {
@@ -765,12 +803,50 @@ async fn load_recording_keys() -> Option<RecordingKeys> {
 enum TriggerAction {
     Stop,
     Cancel,
+    /// The press is a Recording, not a tap; it keeps recording.
+    Held,
     HandsFree,
+}
+
+/// A Recording's audio, held in the process until the gesture shows the
+/// press is a Recording: held past `MIN_HOLD`, a double tap or a Stop. A
+/// single tap is cancelled before a byte of it, or of the ready mic's
+/// pre-roll, reaches a provider.
+struct AudioGate {
+    confirmed: bool,
+    held: VecDeque<AudioChunk>,
+}
+
+impl AudioGate {
+    fn new(confirmed: bool) -> Self {
+        Self {
+            confirmed,
+            held: VecDeque::new(),
+        }
+    }
+
+    fn confirm(&mut self) {
+        self.confirmed = true;
+    }
+
+    fn push(&mut self, chunk: AudioChunk) {
+        self.held.push_back(chunk);
+    }
+
+    /// The next chunk that may leave the process, oldest first.
+    fn next_to_send(&mut self) -> Option<AudioChunk> {
+        if self.confirmed {
+            self.held.pop_front()
+        } else {
+            None
+        }
+    }
 }
 
 fn recording_action(id: u64, action: Option<Action>, ended: &EndedSink) -> Option<TriggerAction> {
     match action {
         None => Some(TriggerAction::Cancel),
+        Some(Action::Held(current)) if current == id => Some(TriggerAction::Held),
         Some(Action::HandsFree(current)) if current == id => Some(TriggerAction::HandsFree),
         Some(Action::Stop(current)) if current == id => Some(TriggerAction::Stop),
         Some(Action::Cancel(current)) if current == id => Some(TriggerAction::Cancel),
@@ -789,6 +865,7 @@ struct StartupTrigger<'a> {
     id: u64,
     actions: &'a mut UnboundedReceiver<Action>,
     ended: &'a EndedSink,
+    held: bool,
     hands_free: bool,
 }
 
@@ -798,17 +875,28 @@ impl<'a> StartupTrigger<'a> {
             id,
             actions,
             ended,
+            held: false,
             hands_free: false,
         }
     }
 
+    /// Whether the gesture has shown this press is a Recording, not a tap.
+    fn confirmed(&self) -> bool {
+        self.held || self.hands_free
+    }
+
     async fn next(&mut self) -> TriggerAction {
         loop {
-            if let Some(action) = recording_action(self.id, self.actions.recv().await, self.ended) {
-                if matches!(action, TriggerAction::HandsFree) {
-                    self.hands_free = true;
+            match recording_action(self.id, self.actions.recv().await, self.ended) {
+                // Remembered for the pump; startup carries on as before.
+                Some(TriggerAction::Held) => self.held = true,
+                Some(action) => {
+                    if matches!(action, TriggerAction::HandsFree) {
+                        self.hands_free = true;
+                    }
+                    return action;
                 }
-                return action;
+                None => {}
             }
         }
     }
@@ -820,15 +908,19 @@ impl<'a> StartupTrigger<'a> {
 
 /// Provider setup starts as soon as the capture worker is in flight. Keep
 /// polling the Trigger Key while either branch is pending.
+/// `cold` resolves when the capture opens the microphone itself; until the
+/// first audio the overlay then shows `Starting`. A ready stream skips it.
 async fn start_recording<P>(
     capture: impl Future<Output = Result<Box<dyn ActiveCapture>, BoundaryError>>,
     providers: impl Future<Output = Result<P, BoundaryError>>,
+    cold: impl Future<Output = ()>,
     mut emit: impl FnMut(Phase),
     trigger: &mut StartupTrigger<'_>,
 ) -> Result<Option<(RecordingAudio, P)>, BoundaryError> {
-    tokio::pin!(capture, providers);
+    tokio::pin!(capture, providers, cold);
     let mut opened: Option<Box<dyn ActiveCapture>> = None;
     let mut ready_providers = None;
+    let mut starting = false;
     loop {
         tokio::select! {
             biased;
@@ -850,7 +942,8 @@ async fn start_recording<P>(
                     return while_busy(finish, trigger.actions, trigger.ended).await;
                 }
                 TriggerAction::HandsFree if opened.is_some() => emit(Phase::HandsFree),
-                TriggerAction::HandsFree => {}
+                // `next` keeps Held to itself.
+                TriggerAction::HandsFree | TriggerAction::Held => {}
             },
             result = &mut capture, if opened.is_none() => {
                 opened = Some(result?);
@@ -858,6 +951,10 @@ async fn start_recording<P>(
                 if trigger.hands_free {
                     emit(Phase::HandsFree);
                 }
+            },
+            () = &mut cold, if opened.is_none() && !starting => {
+                starting = true;
+                emit(Phase::Starting);
             },
             result = &mut providers, if ready_providers.is_none() => ready_providers = Some(result?),
         }
@@ -952,6 +1049,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_single_taps_audio_never_leaves_the_gate() {
+        let mut gate = AudioGate::new(false);
+        for byte in 1..=4u8 {
+            gate.push(AudioChunk(vec![byte; 640]));
+            assert!(gate.next_to_send().is_none(), "chunk {byte} held");
+        }
+        // The tap is cancelled here: the gate is dropped with all of it.
+    }
+
+    #[test]
+    fn a_confirmed_press_sends_its_held_audio_first_then_streams() {
+        let mut gate = AudioGate::new(false);
+        gate.push(AudioChunk(vec![1, 1]));
+        gate.push(AudioChunk(vec![2, 2]));
+        gate.confirm();
+        gate.push(AudioChunk(vec![3, 3]));
+        let sent: Vec<_> = std::iter::from_fn(|| gate.next_to_send())
+            .map(|chunk| chunk.0)
+            .collect();
+        assert_eq!(sent, [vec![1, 1], vec![2, 2], vec![3, 3]]);
+        gate.push(AudioChunk(vec![4, 4]));
+        assert_eq!(gate.next_to_send().map(|chunk| chunk.0), Some(vec![4, 4]));
+
+        // A press confirmed during startup (held, or a double tap) streams
+        // straight through.
+        let mut gate = AudioGate::new(true);
+        gate.push(AudioChunk(vec![5, 5]));
+        assert_eq!(gate.next_to_send().map(|chunk| chunk.0), Some(vec![5, 5]));
+    }
+
+    #[tokio::test]
+    async fn a_hold_confirmed_during_startup_is_remembered() {
+        let (send, mut actions) = mpsc::unbounded_channel();
+        let ended: EndedSink = Arc::new(|_| {});
+        let mut trigger = StartupTrigger::new(1, &mut actions, &ended);
+        send.send(Action::Held(1)).unwrap();
+        send.send(Action::Held(2)).unwrap();
+        send.send(Action::Stop(1)).unwrap();
+        assert!(matches!(trigger.next().await, TriggerAction::Stop));
+        assert!(trigger.confirmed());
+
+        let mut trigger = StartupTrigger::new(2, &mut actions, &ended);
+        send.send(Action::Cancel(2)).unwrap();
+        assert!(matches!(trigger.next().await, TriggerAction::Cancel));
+        assert!(!trigger.confirmed(), "a tap is never confirmed");
+    }
+
     #[tokio::test]
     async fn listening_is_reported_only_after_audio_arrives_even_if_providers_start_first() {
         let (_send, mut actions) = mpsc::unbounded_channel();
@@ -968,6 +1113,7 @@ mod tests {
                 events.borrow_mut().push("providers started");
                 Ok("providers")
             },
+            std::future::pending(),
             |phase| {
                 assert_eq!(phase, Phase::Recording);
                 events.borrow_mut().push("recording");
@@ -991,6 +1137,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cold_open_shows_starting_until_the_first_audio() {
+        let (_send, mut actions) = mpsc::unbounded_channel();
+        let ended: EndedSink = Arc::new(|_| {});
+        let mut trigger = StartupTrigger::new(1, &mut actions, &ended);
+        let (first_audio, audio) = tokio::sync::oneshot::channel();
+        let phases = std::cell::RefCell::new(Vec::new());
+        let start = start_recording(
+            async {
+                audio.await.unwrap();
+                Ok(startup_mic(None))
+            },
+            async { Ok(()) },
+            async {},
+            |phase| phases.borrow_mut().push(phase),
+            &mut trigger,
+        );
+        tokio::pin!(start);
+        poll_fn(|cx| {
+            assert!(start.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(*phases.borrow(), [Phase::Starting]);
+
+        first_audio.send(()).unwrap();
+        assert!(start.await.unwrap().is_some());
+        assert_eq!(*phases.borrow(), [Phase::Starting, Phase::Recording]);
+    }
+
+    #[tokio::test]
+    async fn a_ready_stream_skips_starting() {
+        let (_send, mut actions) = mpsc::unbounded_channel();
+        let ended: EndedSink = Arc::new(|_| {});
+        let mut trigger = StartupTrigger::new(1, &mut actions, &ended);
+        let phases = std::cell::RefCell::new(Vec::new());
+        // The cold signal never fires when the ready stream takes the press.
+        let start = start_recording(
+            async { Ok(startup_mic(None)) },
+            async { Ok(()) },
+            std::future::pending(),
+            |phase| phases.borrow_mut().push(phase),
+            &mut trigger,
+        );
+        assert!(start.await.unwrap().is_some());
+        assert_eq!(*phases.borrow(), [Phase::Recording]);
+    }
+
+    #[tokio::test]
     async fn listening_does_not_wait_for_provider_setup() {
         let (_send, mut actions) = mpsc::unbounded_channel();
         let ended: EndedSink = Arc::new(|_| {});
@@ -1000,6 +1194,7 @@ mod tests {
         let start = start_recording(
             async { Ok(startup_mic(None)) },
             async { Ok(providers.await.unwrap()) },
+            std::future::pending(),
             |phase| {
                 assert_eq!(phase, Phase::Recording);
                 listening.set(true);
@@ -1034,6 +1229,7 @@ mod tests {
                     Ok(startup_mic(None))
                 },
                 std::future::pending::<Result<(), BoundaryError>>(),
+                std::future::pending(),
                 |_| panic!("bars shown for {action:?}"),
                 &mut trigger,
             );
@@ -1068,6 +1264,7 @@ mod tests {
                 providers.await.unwrap();
                 Ok(())
             },
+            std::future::pending(),
             |phase| phases.borrow_mut().push(phase),
             &mut trigger,
         );
