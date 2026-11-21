@@ -40,7 +40,7 @@ use voisu_core::{Provider, SecretStore, Tone};
 use platform::hotkey::{is_dead_key, key_label};
 use platform::permissions::{self, Pane, Permissions};
 use platform::secrets::CredentialManagerStore;
-use settings::{OverlayPosition, Settings};
+use settings::{KeepMicReady, OverlayPosition, Settings};
 use setup::{KeyInputs, KeyResult};
 use star_prompt::StarPrompt;
 use trigger_key::TriggerChord;
@@ -123,6 +123,9 @@ struct UiState {
     last_overlay_move: u64,
     boost_words: Vec<String>,
     tone: Tone,
+    /// Keep microphone ready: `"while_running"`, `"for_five_minutes"` or
+    /// `"off"`. Windows only.
+    keep_mic_ready: KeepMicReady,
     trigger: UiTrigger,
     /// The only Trigger Keys the window offers, the default first.
     trigger_presets: Vec<UiPreset>,
@@ -252,6 +255,7 @@ fn get_state(app: AppHandle) -> UiState {
         last_overlay_move,
         boost_words: settings.boost_words,
         tone: settings.tone,
+        keep_mic_ready: settings.keep_mic_ready,
         trigger: UiTrigger::of(settings.hotkey),
         trigger_presets: ui_presets(),
         hook_ok: hook_ok(),
@@ -414,6 +418,18 @@ fn set_boost_words(app: AppHandle, words: Vec<String>) -> Vec<String> {
 fn set_tone(app: AppHandle, tone: Tone) -> Tone {
     tracing::info!(tone = tone.as_str(), "tone");
     update_settings(&app, |settings| settings.tone = tone).tone
+}
+
+/// Applies at once: Off closes the ready mic now unless a Recording is
+/// using it, in which case it closes when that Recording ends.
+#[tauri::command]
+fn set_keep_mic_ready(app: AppHandle, mode: KeepMicReady) -> KeepMicReady {
+    tracing::info!(?mode, "keep microphone ready");
+    let saved = update_settings(&app, |settings| settings.keep_mic_ready = mode).keep_mic_ready;
+    if let Some(ready) = app.try_state::<platform::capture::ReadyMic>() {
+        ready.set_mode(saved);
+    }
+    saved
 }
 
 fn local_today() -> chrono::NaiveDate {
@@ -761,6 +777,7 @@ pub fn run() {
             reset_overlay_position,
             set_boost_words,
             set_tone,
+            set_keep_mic_ready,
             set_trigger_key,
             open_key_page,
             open_guide,

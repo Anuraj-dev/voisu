@@ -23,7 +23,9 @@ enum Event {
 }
 
 impl InputCache {
-    pub(super) fn new() -> Self {
+    /// `on_default_change` runs on every default-mic change, so the ready
+    /// microphone shares this one notification registration.
+    pub(super) fn new(on_default_change: impl Fn() + Send + Sync + 'static) -> Self {
         let cache = Arc::new(Cache::default());
         let worker_cache = Arc::clone(&cache);
         let (events, requests) = mpsc::channel();
@@ -37,6 +39,7 @@ impl InputCache {
                 let watch = watch_default(move || {
                     changes.revision.fetch_add(1, Ordering::Release);
                     let _ = worker_events.send(Event::Refresh);
+                    on_default_change();
                 });
                 // Without notifications we can't keep the cached config
                 // current, including after a switch away and back.

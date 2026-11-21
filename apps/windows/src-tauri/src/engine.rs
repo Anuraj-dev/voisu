@@ -172,6 +172,18 @@ pub fn last_transcript(state: tauri::State<'_, EngineState>) -> Option<String> {
 /// Starts the engine actor and returns the sender the trigger drives it with.
 pub fn start(app: &AppHandle, ended: EndedSink) -> UnboundedSender<Action> {
     app.manage(EngineState::default());
+    let keep_ready = || {
+        app.state::<crate::AppState>()
+            .settings
+            .lock()
+            .unwrap()
+            .keep_mic_ready
+    };
+    let microphone = CpalCapture::new(keep_ready());
+    let ready_mic = microphone.ready_mic();
+    app.manage(ready_mic.clone());
+    // A choice saved before the handle was managed still applies.
+    ready_mic.set_mode(keep_ready());
     let (tx, rx) = mpsc::unbounded_channel();
     let engine = Engine {
         app: app.clone(),
@@ -179,7 +191,7 @@ pub fn start(app: &AppHandle, ended: EndedSink) -> UnboundedSender<Action> {
             cleanup: CleanupSupervisor::new(),
             recording_keys: None,
         },
-        microphone: CpalCapture::new(),
+        microphone,
         ended,
     };
     tauri::async_runtime::spawn(engine.run(rx));
