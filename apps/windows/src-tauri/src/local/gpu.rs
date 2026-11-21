@@ -63,7 +63,9 @@ pub fn parse_probe(code: Option<i32>, stdout: &str) -> Detected {
 }
 
 /// Runs the probe. Its stderr (ggml's device list) is appended to `log`.
-/// Any failure to run it is the CPU.
+/// Any failure to run it is the CPU. On Windows it runs in a kill-on-close
+/// Job Object, as the worker does, so a probe stuck in a GPU driver ends
+/// with Voisu.
 pub fn probe(worker: &Path, log: &Path) -> Detected {
     let started = Instant::now();
     let detected = run(worker, log).unwrap_or_else(|reason| {
@@ -98,9 +100,19 @@ fn run(worker: &Path, log: &Path) -> Result<Detected, String> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        command.creation_flags(super::worker::CREATE_NO_WINDOW);
+        command.creation_flags(super::worker::CREATE_NO_WINDOW | super::worker::CREATE_SUSPENDED);
     }
     let mut child = command.spawn().map_err(|error| format!("spawn: {error}"))?;
+    // Held until the probe has exited or been killed.
+    #[cfg(windows)]
+    let _job = match super::worker::job::contain(&child) {
+        Ok(job) => job,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("not started in a Job Object: {error}"));
+        }
+    };
     let deadline = Instant::now() + PROBE_DEADLINE;
     let status = loop {
         match child.try_wait() {
