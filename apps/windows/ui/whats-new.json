@@ -1,5 +1,12 @@
 [
   {
+    "version": "1.3.0",
+    "date": "2026-11-21",
+    "items": [
+      { "kind": "improved", "text": "Recording starts instantly, so your first word is no longer cut off: Voisu keeps the microphone ready while it runs. Change this in Dictation, then Keep microphone ready.", "platforms": ["windows"] }
+    ]
+  },
+  {
     "version": "1.0.0",
     "date": "2026-11-20",
     "items": [

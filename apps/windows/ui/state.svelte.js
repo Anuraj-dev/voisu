@@ -21,6 +21,8 @@ export const ui = $state({
     lastOverlayMove: 0,
     boostWords: [],
     tone: 'formal',
+    // Keep microphone ready (Windows): 'while_running' | 'for_five_minutes' | 'off'.
+    keepMicReady: 'while_running',
     // Blank until get_state names this platform's Trigger Key; the presets
     // come from the backend too, the default first.
     trigger: { key: '', label: '', warnings: [], isDefault: true },

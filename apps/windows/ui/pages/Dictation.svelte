@@ -1,7 +1,7 @@
 <script>
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
-  import { ui } from '../state.svelte.js';
+  import { ui, isMac } from '../state.svelte.js';
   import ToggleRow from '../ToggleRow.svelte';
   import ErrorLine from '../ErrorLine.svelte';
 
@@ -10,6 +10,28 @@
   let triggerBusy = $state(false);
   let autoPasteBusy = $state(false);
   let toneBusy = $state(false);
+  let micBusy = $state(false);
+
+  // Keep microphone ready (Windows): the backend keeps the stream open so a
+  // press starts at once. The default first, then from most to least ready.
+  const MIC_CHOICES = [
+    { mode: 'while_running', name: 'While Voisu is running' },
+    { mode: 'for_five_minutes', name: 'For 5 minutes after each use' },
+    { mode: 'off', name: 'Off' },
+  ];
+
+  async function chooseMicReady(mode) {
+    if (micBusy || ui.app.keepMicReady === mode) return;
+    micBusy = true;
+    errors.mic = '';
+    try {
+      ui.app.keepMicReady = await invoke('set_keep_mic_ready', { mode });
+    } catch (e) {
+      errors.mic = 'Could not change Keep microphone ready.';
+    } finally {
+      micBusy = false;
+    }
+  }
 
   const app = $derived(ui.app);
 
@@ -193,6 +215,35 @@
     {/if}
   </div>
 </div>
+
+{#if !isMac()}
+  <div class="group">
+    <div class="block" role="group" aria-labelledby="mic-ready-title" aria-describedby="mic-ready-hint">
+      <span class="row-text">
+        <span id="mic-ready-title">Keep microphone ready</span>
+        <span class="hint" id="mic-ready-hint">
+          Recording starts instantly instead of after ~0.8 s, so your first word is never cut off. Windows shows the
+          mic icon while it's ready.
+        </span>
+      </span>
+      <div class="presets">
+        {#each MIC_CHOICES as choice (choice.mode)}
+          <button
+            type="button"
+            class="chip"
+            class:on={app.keepMicReady === choice.mode}
+            aria-pressed={app.keepMicReady === choice.mode}
+            disabled={micBusy}
+            onclick={() => chooseMicReady(choice.mode)}
+          >
+            {choice.name}
+          </button>
+        {/each}
+      </div>
+      <ErrorLine message={errors.mic} />
+    </div>
+  </div>
+{/if}
 
 <div class="group">
   <ToggleRow
