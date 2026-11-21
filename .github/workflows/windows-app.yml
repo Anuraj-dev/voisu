@@ -60,6 +60,10 @@ jobs:
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
       - name: Tests
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+      # ggml-vulkan.dll needs the Vulkan headers, loader library and glslc.
+      - name: Install the Vulkan SDK
+        shell: pwsh
+        run: ./install-vulkan-sdk.ps1
       # The Local worker and its whisper.cpp DLLs ship beside the app; the
       # model does not (ADR 0014).
       - name: Build and stage the Local worker
