@@ -4,8 +4,9 @@
 //!
 //! ggml is built with `GGML_BACKEND_DL=ON`: `libwhisper.so.1`,
 //! `libggml.so.0` and `libggml-base.so.0` are linked, and every backend is a
-//! module the worker loads at start from its own directory
-//! (`voisu_whisper_load_backends`):
+//! module the worker loads at start from its own directory: all of them for
+//! the GPU probe and a GPU worker (`voisu_whisper_load_backends`), the best
+//! CPU variant alone for a CPU worker (`load_cpu_backend`):
 //!
 //! - CPU: `GGML_CPU_ALL_VARIANTS=ON` builds `libggml-cpu-<variant>.so` from
 //!   plain `x64` up to `sapphirerapids`. ggml scores each against the running
