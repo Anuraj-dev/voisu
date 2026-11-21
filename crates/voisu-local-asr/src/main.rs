@@ -4,6 +4,9 @@
 //!
 //! `voisu-local-asr --probe-gpu`: print the GPU the worker would use as
 //! `<device> <description>` and exit 0, or exit 3 when there is none.
+//!
+//! On Windows either mode exits 2 when started with `GGML_BACKEND_PATH` set
+//! (see [`planted_backend`]).
 
 #[cfg(unix)]
 use std::fs::File;
@@ -80,13 +83,46 @@ fn probe() -> ExitCode {
     }
 }
 
-fn main() -> ExitCode {
-    // ggml loads every module GGML_BACKEND_PATH names, whatever directory the
-    // backends are loaded from; only the modules beside this worker may load.
+/// ggml loads every module `GGML_BACKEND_PATH` names, whatever directory the
+/// backends are loaded from; only the modules beside this worker may load.
+///
+/// On Unix removing the variable is enough: ggml's `getenv` reads the same
+/// `environ`. On Windows it is not: each C runtime copy (this exe's, and each
+/// statically linked ggml DLL's) caches its own environment, which removing
+/// the Win32 variable does not reach. So a worker started with it set
+/// refuses to run instead; the app starts it with the variable removed from
+/// the child's environment block.
+fn planted_backend() -> Option<String> {
+    std::env::var_os("GGML_BACKEND_PATH")?;
+    if cfg!(windows) {
+        return Some("GGML_BACKEND_PATH is set; start the worker without it".into());
+    }
     // SAFETY: no other thread exists yet, so nothing reads the environment
     // concurrently.
     unsafe { std::env::remove_var("GGML_BACKEND_PATH") };
+    None
+}
+
+fn refuse(frames: &mut Frames, message: &str) -> ExitCode {
+    eprintln!("voisu-asr: manifest refused: {message}");
+    let refusal = serde_json::json!({
+        "v": PROTOCOL_VERSION,
+        "id": "",
+        "status": "error",
+        "code": "manifest_error",
+        "message": wire::sanitize_message(message),
+    });
+    let _ = wire::write_frame(frames, &refusal);
+    ExitCode::from(2)
+}
+
+fn main() -> ExitCode {
+    let planted = planted_backend();
     if std::env::args_os().skip(1).eq(["--probe-gpu"]) {
+        if let Some(message) = planted {
+            eprintln!("voisu-asr: refused: {message}");
+            return ExitCode::from(2);
+        }
         return probe();
     }
     let mut frames: Frames = match claim_stdout() {
@@ -96,20 +132,12 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    if let Some(message) = planted {
+        return refuse(&mut frames, &message);
+    }
     let (config, manifest) = match config() {
         Ok(loaded) => loaded,
-        Err(ManifestError(message)) => {
-            eprintln!("voisu-asr: manifest refused: {message}");
-            let refusal = serde_json::json!({
-                "v": PROTOCOL_VERSION,
-                "id": "",
-                "status": "error",
-                "code": "manifest_error",
-                "message": wire::sanitize_message(&message),
-            });
-            let _ = wire::write_frame(&mut frames, &refusal);
-            return ExitCode::from(2);
-        }
+        Err(ManifestError(message)) => return refuse(&mut frames, &message),
     };
     let load = || {
         WhisperCpp::load(
