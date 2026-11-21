@@ -1,0 +1,7 @@
+{
+  "bundle": {
+    "resources": {
+      "local-asr/*": "local-asr/"
+    }
+  }
+}

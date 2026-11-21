@@ -5,6 +5,7 @@
 //! second download; it stays evidence-gated. This offer is the only setup path
 //! that can fetch, and only after an explicit yes.
 
+use crate::local_model::TierEntry as _;
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -162,7 +163,7 @@ pub fn setup_entry(
 /// a tier.
 #[must_use]
 pub fn installed_line(entry: &ConsentedCatalogEntry) -> String {
-    match LocalTier::of_entry_id(entry.id) {
+    match crate::local_model::tier_of_entry_id(entry.id) {
         Some(tier) => format!("Installed {}.", tier.title()),
         None => format!("Installed {} (Consented Install).", entry.id),
     }
@@ -174,8 +175,9 @@ pub fn accurate_on_cpu_warning(
     entry: &ConsentedCatalogEntry,
     device: SetupDevice,
 ) -> Option<&'static str> {
-    (device != SetupDevice::Gpu && LocalTier::of_entry_id(entry.id) == Some(LocalTier::Accurate))
-        .then_some(ACCURATE_ON_CPU_WARNING)
+    (device != SetupDevice::Gpu
+        && crate::local_model::tier_of_entry_id(entry.id) == Some(LocalTier::Accurate))
+    .then_some(ACCURATE_ON_CPU_WARNING)
 }
 
 /// The one device fact worth a line: `auto` found no GPU, so this install
@@ -785,7 +787,7 @@ pub fn local_model_status_lines(
             ));
         }
         (LocalModelChange::Download { .. }, ConsentedStatus::Installed { entry_id, .. }) => {
-            let running = LocalTier::of_entry_id(entry_id).map_or_else(
+            let running = crate::local_model::tier_of_entry_id(entry_id).map_or_else(
                 || entry_id.clone(),
                 |other| {
                     if unprobed {

@@ -8,6 +8,7 @@ use std::path::Path;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use voisu_core::Tone;
+use voisu_core::local_tier::LocalModel;
 
 use crate::trigger_key::TriggerChord;
 
@@ -100,6 +101,63 @@ pub struct Settings {
     /// does not know, read as while Voisu is running.
     #[serde(deserialize_with = "lenient")]
     pub keep_mic_ready: KeepMicReady,
+    /// Cloud (the default) or opt-in Local mode (Windows only, ADR 0014).
+    /// Anything unknown reads as Cloud. Not written while Cloud, so a Cloud
+    /// user's file is unchanged.
+    #[serde(deserialize_with = "lenient", skip_serializing_if = "Mode::is_cloud")]
+    pub mode: Mode,
+    /// The Local model tier: `auto` (the default) runs Accurate on a GPU and
+    /// Fast on the CPU; `accurate` or `fast` pins one, as on Linux. Anything
+    /// unknown reads as `auto`, which is not written.
+    #[serde(
+        deserialize_with = "lenient_local_model",
+        serialize_with = "local_model_value",
+        skip_serializing_if = "is_auto"
+    )]
+    pub local_model: LocalModel,
+}
+
+fn is_auto(model: &LocalModel) -> bool {
+    *model == LocalModel::Auto
+}
+
+/// [`lenient`] for the Local tier, read in any case as on Linux.
+fn lenient_local_model<'de, D: Deserializer<'de>>(deserializer: D) -> Result<LocalModel, D::Error> {
+    let value = value(deserializer)?;
+    Ok(value
+        .as_str()
+        .and_then(LocalModel::from_value)
+        .unwrap_or_default())
+}
+
+fn local_model_value<S: serde::Serializer>(
+    model: &LocalModel,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(model.as_str())
+}
+
+/// Where a Recording is transcribed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    /// Deepgram and Groq with the user's keys.
+    #[default]
+    Cloud,
+    /// On this PC with the downloaded whisper.cpp model.
+    Local,
+}
+
+impl Mode {
+    fn is_cloud(&self) -> bool {
+        *self == Self::Cloud
+    }
+
+    /// The mode a Recording uses here: Local exists only on Windows, so a
+    /// settings file carried to a Mac still dictates with Cloud.
+    pub fn effective(self) -> Self {
+        if cfg!(windows) { self } else { Self::Cloud }
+    }
 }
 
 /// A field with a value this version does not understand (a size a later
@@ -168,6 +226,8 @@ impl Default for Settings {
             star_prompt: true,
             seen_version: None,
             keep_mic_ready: KeepMicReady::WhileRunning,
+            mode: Mode::Cloud,
+            local_model: LocalModel::Auto,
         }
     }
 }
@@ -600,6 +660,66 @@ mod tests {
                 "{json}"
             );
             assert_eq!(Settings::load(&path), settings);
+        }
+    }
+
+    #[test]
+    fn mode_is_cloud_unless_local_was_chosen_and_cloud_is_never_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        Settings::default().save(&path).unwrap();
+        assert!(!fs::read_to_string(&path).unwrap().contains("mode"));
+        for value in ["", r#", "mode": "gpu""#, r#", "mode": 3"#] {
+            let json = format!(r#"{{"auto_paste": false{value}}}"#);
+            fs::write(&path, &json).unwrap();
+            let settings = Settings::load(&path);
+            assert_eq!(settings.mode, Mode::Cloud, "{json}");
+            assert!(!settings.auto_paste, "{json} wiped another setting");
+        }
+        let local = Settings {
+            mode: Mode::Local,
+            ..Settings::default()
+        };
+        local.save(&path).unwrap();
+        assert_eq!(Settings::load(&path), local);
+        let expected = if cfg!(windows) {
+            Mode::Local
+        } else {
+            Mode::Cloud
+        };
+        assert_eq!(Mode::Local.effective(), expected);
+    }
+
+    #[test]
+    fn the_local_tier_round_trips_and_anything_else_reads_as_auto() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        Settings::default().save(&path).unwrap();
+        assert!(!fs::read_to_string(&path).unwrap().contains("local_model"));
+        for model in [LocalModel::Accurate, LocalModel::Fast] {
+            let settings = Settings {
+                local_model: model,
+                ..Settings::default()
+            };
+            settings.save(&path).unwrap();
+            let written = fs::read_to_string(&path).unwrap();
+            assert!(
+                written.contains(&format!(r#""local_model": "{}""#, model.as_str())),
+                "{written}"
+            );
+            assert_eq!(Settings::load(&path), settings);
+        }
+        for (value, expected) in [
+            (r#""Accurate""#, LocalModel::Accurate),
+            (r#""large""#, LocalModel::Auto),
+            ("7", LocalModel::Auto),
+            ("null", LocalModel::Auto),
+        ] {
+            let json = format!(r#"{{"auto_paste": false, "local_model": {value}}}"#);
+            fs::write(&path, &json).unwrap();
+            let settings = Settings::load(&path);
+            assert_eq!(settings.local_model, expected, "{json}");
+            assert!(!settings.auto_paste, "{json} wiped another setting");
         }
     }
 }

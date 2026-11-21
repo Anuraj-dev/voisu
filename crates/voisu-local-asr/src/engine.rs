@@ -116,20 +116,29 @@ static LOAD_LOCK: Mutex<()> = Mutex::new(());
 /// The backend modules ship beside the worker (`target/<profile>/` or
 /// `/usr/libexec/voisu/`). An explicit directory: given none, ggml would also
 /// search the working directory.
-fn backend_dir() -> Option<CString> {
+fn backend_dir() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    path_cstring(exe.parent()?)
+    Some(exe.parent()?.to_owned())
 }
 
-fn backends() -> &'static Backends {
+/// The backends this process registers, once: every module for the GPU probe
+/// and a GPU load, the CPU variant alone for a CPU load, so a GPU driver that
+/// hangs or crashes on init never reaches a CPU worker. A process loads one
+/// device (its manifest's), so the first caller's choice is the only one.
+fn backends(cpu_only: bool) -> &'static Backends {
     BACKENDS.get_or_init(|| {
-        let Some(dir) = backend_dir() else {
+        let dir = backend_dir();
+        let Some(dir) = dir.as_deref() else {
             return Backends {
                 cpu: false,
                 gpu: None,
             };
         };
-        sys::load_backends(&dir);
+        if cpu_only {
+            sys::load_cpu_backend(dir);
+        } else if let Some(dir) = path_cstring(dir) {
+            sys::load_backends(&dir);
+        }
         // SAFETY: the registry was initialized by the call above.
         let cpu = unsafe { sys::voisu_whisper_cpu_backend_loaded() };
         let mut raw = sys::VoisuGpu::default();
@@ -163,7 +172,7 @@ fn c_text(raw: &[c_char]) -> String {
 /// `gpu_unavailable` when no GPU backend device registered.
 pub fn probe_gpu() -> Result<Gpu, EngineError> {
     ROUTE_LOGS.call_once(|| unsafe { sys::voisu_whisper_route_logs_to_stderr() });
-    gpu_support(backends().gpu.as_ref(), 0).cloned()
+    gpu_support(backends(false).gpu.as_ref(), 0).cloned()
 }
 
 impl WhisperCpp {
@@ -185,7 +194,7 @@ impl WhisperCpp {
         options: DecodeOptions,
     ) -> Result<Self, EngineError> {
         ROUTE_LOGS.call_once(|| unsafe { sys::voisu_whisper_route_logs_to_stderr() });
-        let backends = backends();
+        let backends = backends(device == Device::Cpu);
         if !backends.cpu {
             return Err(EngineError::new(
                 "cpu_unsupported",

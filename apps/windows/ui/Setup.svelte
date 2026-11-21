@@ -26,6 +26,12 @@
     !busy && !done && unsaved.length > 0 && unsaved.every((p) => values[p.id].trim()),
   );
 
+  // Local mode needs no keys: its download sits on the Dictation page.
+  function useLocal() {
+    ui.skipSetup = true;
+    ui.page = 'dictation';
+  }
+
   function showError(message) {
     error = typeof message === 'string' ? message : 'Could not open the browser.';
   }
@@ -166,6 +172,11 @@
     <button type="submit" class="primary" class:busy disabled={!canSubmit}>
       {busy ? 'Checking…' : 'Save and start'}
     </button>
+    {#if ui.app.local?.available}
+      <button type="button" class="link" disabled={busy} onclick={useLocal}>
+        No keys? Transcribe on this PC instead{ui.app.local.onGpu ? `, on your ${ui.app.local.device}` : ''}
+      </button>
+    {/if}
   {/if}
   {#if error}<p class="error" role="alert"><span aria-hidden="true">✕</span> {error}</p>{/if}
 </form>

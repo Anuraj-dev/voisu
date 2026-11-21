@@ -1,5 +1,7 @@
 # Ship Windows as a cloud-only Tauri app
 
+> Amended by [0014](0014-windows-local-mode.md): Windows now offers opt-in Local mode.
+
 Raja decided on 2026-11-02 that Voisu ships on Windows without Local mode. A Windows Recording goes to Deepgram and Groq with the user's own keys, the same Cloud path as Linux. The `local_*` code stays Linux-only.
 
 The Windows shell is Tauri. It owns the tray, the settings and setup window, the Overlay window, the installer and the updater. Tauri uses the system WebView2 and bundles no Chromium, so ADR 0007 already names it as the only acceptable web-tech surface. That ADR's GTK layer-shell argument is a Wayland constraint and does not apply to Windows. Linux keeps the GTK Overlay. The Recording → Transcript pipeline is not forked. Windows implements the `voisu-core` seams (`AudioCapture`, `DeliveryAdapter`, `SecretStore`, Trigger Key) and reuses the shared cloud crate. Windows runs one process: ADR 0003's daemon/Overlay split protects a GTK client on Wayland, and Windows has no such risk.

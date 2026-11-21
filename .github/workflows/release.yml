@@ -416,7 +416,7 @@ jobs:
     name: Build Windows installer (signed for the updater)
     needs: validate
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
     defaults:
       run:
         shell: bash
@@ -456,8 +456,16 @@ jobs:
         run: npm ci
       # The build runs npm/vite and every crate's build.rs, so it never sees
       # the signing key; only the signer step below does.
+      # ggml-vulkan.dll needs the Vulkan headers, loader library and glslc.
+      - name: Install the Vulkan SDK
+        shell: pwsh
+        run: ./install-vulkan-sdk.ps1
+      # The Local worker and its whisper.cpp DLLs ship beside the app; the
+      # model does not (ADR 0014).
+      - name: Build and stage the Local worker
+        run: ./stage-local-asr.sh
       - name: Build the NSIS installer
-        run: npx tauri build --bundles nsis -- --locked
+        run: npx tauri build --bundles nsis --config src-tauri/tauri.local-asr.conf.json -- --locked
       - name: Collect the installer
         run: |
           set -euo pipefail

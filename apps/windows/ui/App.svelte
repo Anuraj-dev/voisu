@@ -3,7 +3,7 @@
   import { listen } from '@tauri-apps/api/event';
   import {
     ui,
-    keysReady,
+    dictationReady,
     refresh,
     refreshTranscript,
     onRecordingState,
@@ -27,7 +27,7 @@
   // Setup holds the screen while it checks keys and while it shows its
   // "You're set" line, so a save never flashes the sidebar early.
   let finishing = $state(false);
-  const inSetup = $derived(!keysReady() || finishing);
+  const inSetup = $derived((!dictationReady() && !ui.skipSetup) || finishing);
 
   // After an update, the notes since the last version seen, shown once per
   // launch. A version with no notes for this platform is marked seen quietly.

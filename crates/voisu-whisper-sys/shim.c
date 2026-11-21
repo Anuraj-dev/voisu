@@ -93,6 +93,17 @@ bool voisu_whisper_cpu_backend_loaded(void) {
     return ggml_backend_reg_by_name("CPU") != NULL;
 }
 
+// Registered devices of any type but the CPU: none after a CPU-only load.
+size_t voisu_whisper_non_cpu_devices(void) {
+    size_t found = 0;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        if (ggml_backend_dev_type(ggml_backend_dev_get(i)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            ++found;
+        }
+    }
+    return found;
+}
+
 // Mirrored by `VoisuGpu` in src/lib.rs.
 struct voisu_gpu {
     // The `gpu_device` index whisper.cpp counts over GPU and iGPU devices.

@@ -1505,7 +1505,7 @@ fn model_identity_on(
     device: impl FnOnce() -> crate::config::LocalDevice,
 ) -> String {
     if is_consented_receipt(receipt)
-        && let Some(tier) = crate::local_model::LocalTier::of_entry_id(&receipt.catalog_id)
+        && let Some(tier) = crate::local_model::tier_of_entry_id(&receipt.catalog_id)
     {
         return tier.label(crate::local_model::runs_on_gpu(device()));
     }

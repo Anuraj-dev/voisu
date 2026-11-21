@@ -763,34 +763,10 @@ pub(crate) fn set_local_device_at(path: &Path, device: LocalDevice) -> Result<Pa
 /// `local_model`: which Local model tier runs.
 const LOCAL_MODEL_KEY: &str = "local_model";
 
-/// Which Local model tier the user asked for. `auto` picks Accurate on a GPU
-/// and Fast on the CPU; see [`crate::local_model::LocalTier::resolve`].
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum LocalModel {
-    #[default]
-    Auto,
-    Accurate,
-    Fast,
-}
-
-impl LocalModel {
-    pub const ALL: [Self; 3] = [Self::Auto, Self::Accurate, Self::Fast];
-
-    /// The config value and CLI word.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Accurate => "accurate",
-            Self::Fast => "fast",
-        }
-    }
-
-    fn from_value(value: &str) -> Option<Self> {
-        let value = value.trim().to_ascii_lowercase();
-        Self::ALL.into_iter().find(|model| model.as_str() == value)
-    }
-}
+/// Which Local model tier the user asked for, shared with Windows. `auto`
+/// picks Accurate on a GPU and Fast on the CPU; see
+/// [`crate::local_model::LocalTier::resolve`].
+pub use voisu_core::local_tier::LocalModel;
 
 /// The Local model setting. Missing, unreadable or unknown values keep
 /// `auto`.

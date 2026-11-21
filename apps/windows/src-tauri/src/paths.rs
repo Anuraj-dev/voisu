@@ -33,3 +33,12 @@ pub fn log_dir() -> PathBuf {
         .join(APP_DIR)
         .join("logs")
 }
+
+/// `%LOCALAPPDATA%\Voisu\models`: the downloaded Local model. Per machine,
+/// like the logs, so a few hundred MB never roam with the profile.
+pub fn local_model_dir() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join(APP_DIR)
+        .join("models")
+}

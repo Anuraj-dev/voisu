@@ -30,6 +30,14 @@ set(GGML_BUILD_COMMIT "whisper.cpp-v1.9.5" CACHE STRING "" FORCE)
 set(WHISPER_BUILD_COMMIT "v1.9.5" CACHE STRING "" FORCE)
 set(WHISPER_BUILD_NUMBER 0 CACHE STRING "" FORCE)
 
+# ggml-vulkan builds vulkan-shaders-gen as an ExternalProject, by default in
+# whisper.cpp/ggml/src/ggml-vulkan/vulkan-shaders-gen-prefix/src/vulkan-shaders-gen-build.
+# Under cargo's OUT_DIR on Windows, MSBuild's compiler-ID files there pass the
+# 260-character path limit, so the sub-build finds no MSVC ("No
+# CMAKE_C_COMPILER could be found"). A short base takes about 60 characters
+# off every path in it.
+set_property(DIRECTORY PROPERTY EP_BASE "${CMAKE_BINARY_DIR}/ep")
+
 add_subdirectory(whisper.cpp)
 
 add_library(voisu_whisper_shim STATIC shim.c)

@@ -1,6 +1,7 @@
 //! Catalog beside the Bakeoff catalog. It cannot participate in production selection.
 use super::consented_pins::{PYTHON, TOTAL_DOWNLOAD_BYTES, WHEELS};
 use super::{CatalogFile, FileKind, pilot_candidate, shipped_catalog};
+use voisu_core::local_tier::LocalTier;
 #[derive(Clone, Copy, Debug)]
 pub struct DownloadPin {
     pub name: &'static str,
@@ -269,19 +270,24 @@ pub const PARAKEET_ENTRY: ConsentedCatalogEntry = ConsentedCatalogEntry {
     consent_text: "Download 769,772,225 bytes for parakeet-tdt-0.6b-v3 and its pinned Python/NumPy/NeMo-Speech.cpp v0.1.0 CPU runtime. Licence: CC-BY-4.0. English only. Runs offline on CPU. Development evidence: EN WER 12.8%, warm p50 0.61 s on 4 cores, peak RAM 0.9 GB; one host, one speaker — not the release gate. No automatic GPU or Cloud fallback. This is a Consented Install, not a Bakeoff Winner, and is never selected by default.",
 };
 
-/// Voisu's Hugging Face repo, pinned to one commit so the bytes behind the URL
-/// cannot change; the sha256 below is checked after download anyway.
-pub const WHISPER_CPP_Q8_URL: &str = "https://huggingface.co/Anurajjit/voisu-distil-large-v3.5-ggml/resolve/33b03a8479479b1ad96d4b7b51ebdeecbd1d9b71/ggml-distil-large-v3.5-q8_0.bin";
+/// A tier's pinned model file (shared with Windows in `voisu_core`; each URL
+/// is pinned to one commit and the sha256 is checked after download anyway)
+/// as a download from the weight hosts.
+const fn tier_pin(tier: LocalTier) -> DownloadPin {
+    let model = tier.model();
+    DownloadPin {
+        name: model.name,
+        url: model.url,
+        sha256: model.sha256,
+        bytes: model.bytes,
+        hosts: WEIGHT_HOSTS,
+        requirement: None,
+    }
+}
+
 /// distil-large-v3.5 quantized to q8_0 with whisper.cpp 1.9.5's
 /// `whisper-quantize` (the Phase 0 verdict).
-pub const WHISPER_CPP_Q8: DownloadPin = DownloadPin {
-    name: "ggml-distil-large-v3.5-q8_0.bin",
-    url: WHISPER_CPP_Q8_URL,
-    sha256: "7e570abdf13b681354a2ecc93802e25bf204dd6f8c0dd9f6ecb9478b71b231d7",
-    bytes: 818_305_955,
-    hosts: WEIGHT_HOSTS,
-    requirement: None,
-};
+pub const WHISPER_CPP_Q8: DownloadPin = tier_pin(LocalTier::Accurate);
 /// The JFK health clip's size; the entry's total adds it to the model.
 const JFK_BYTES: u64 = 352_078;
 /// The whisper.cpp entry. Its `device` is `gpu`; the worker runs where the
@@ -310,18 +316,8 @@ pub const WHISPER_CPP_ENTRY: ConsentedCatalogEntry = ConsentedCatalogEntry {
     consent_text: "Download 818,658,033 bytes for distil-large-v3.5 (whisper.cpp q8_0). Licence: MIT. English only. Runs on this computer with your GPU through Vulkan, or on the CPU if you choose `voisu local-device cpu`; audio never leaves it. No automatic CPU or Cloud fallback. This is a Consented Install, not a Bakeoff Winner, and is never selected by default.",
 };
 
-/// ggerganov's whisper.cpp repo, pinned to one commit; the sha256 is checked
-/// after download anyway.
-pub const WHISPER_CPP_SMALL_EN_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-small.en-q8_0.bin";
 /// small.en at q8_0, the Fast tier for computers without a GPU.
-pub const WHISPER_CPP_SMALL_EN_Q8: DownloadPin = DownloadPin {
-    name: "ggml-small.en-q8_0.bin",
-    url: WHISPER_CPP_SMALL_EN_URL,
-    sha256: "67a179f608ea6114bd3fdb9060e762b588a3fb3bd00c4387971be4d177958067",
-    bytes: 264_477_561,
-    hosts: WEIGHT_HOSTS,
-    requirement: None,
-};
+pub const WHISPER_CPP_SMALL_EN_Q8: DownloadPin = tier_pin(LocalTier::Fast);
 /// The Fast tier: small.en through the same whisper.cpp worker and decode
 /// settings as [`WHISPER_CPP_ENTRY`], about a third of its size.
 pub const WHISPER_CPP_SMALL_EN_ENTRY: ConsentedCatalogEntry = ConsentedCatalogEntry {

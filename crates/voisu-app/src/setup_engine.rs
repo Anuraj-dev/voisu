@@ -2,6 +2,7 @@
 //!
 //! The core prints and reads through [`WizardIo`]. It does not persist ASR mode.
 
+use crate::local_model::TierEntry as _;
 use voisu_core::{AsrMode, KeyDiagnosis, KeyLocation, Provider};
 
 use crate::local_model::{
@@ -114,10 +115,14 @@ fn write_engine_screen(
 
 fn availability_line(suggestion: &LocalSuggestion, consented: &ConsentedStatus) -> String {
     match consented {
-        ConsentedStatus::Installed { entry_id, device } => match LocalTier::of_entry_id(entry_id) {
-            Some(tier) => format!("Availability: installed — {}", tier.label(device == "gpu")),
-            None => format!("Availability: installed — {entry_id} (Consented Install, {device})"),
-        },
+        ConsentedStatus::Installed { entry_id, device } => {
+            match crate::local_model::tier_of_entry_id(entry_id) {
+                Some(tier) => format!("Availability: installed — {}", tier.label(device == "gpu")),
+                None => {
+                    format!("Availability: installed — {entry_id} (Consented Install, {device})")
+                }
+            }
+        }
         ConsentedStatus::Unknown(reason) => format!("Availability: unknown — {reason}"),
         ConsentedStatus::NotInstalled if suggested_consented_entry(suggestion).is_some() => {
             let size = |tier: LocalTier| format_size(tier.entry().total_download_bytes);

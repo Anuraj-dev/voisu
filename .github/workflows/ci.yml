@@ -165,9 +165,11 @@ jobs:
   windows:
     name: Windows portability gate (voisu-core + voisu-cloud)
     # Only the portable crates: voisu-app is the Linux daemon (pw-record,
-    # Unix sockets, secret-tool, libei, portal) and does not build here.
+    # Unix sockets, secret-tool, libei, portal) and does not build here. The
+    # Local worker (voisu-local-asr + whisper.cpp) ships in the Windows app
+    # (ADR 0014), so it is linted and its process tests run here too.
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -179,6 +181,14 @@ jobs:
         run: cargo clippy -p voisu-core -p voisu-cloud --all-targets --locked -- -D warnings
       - name: Test portable crates (--locked)
         run: cargo test -p voisu-core -p voisu-cloud --locked
+      # MSVC build of whisper.cpp; the process tests spawn the real worker
+      # exe, so its DLLs load from beside it. The golden suites stay on Linux.
+      - name: Clippy Local worker (all targets, warnings are errors)
+        run: cargo clippy -p voisu-whisper-sys -p voisu-local-asr --all-targets --locked -- -D warnings
+      - name: Test whisper.cpp bindings (--locked)
+        run: cargo test -p voisu-whisper-sys --locked
+      - name: Test Local worker (--locked)
+        run: cargo test -p voisu-local-asr --locked --lib --bins --test process
 
   msrv:
     name: MSRV gate (1.92.0 workspace check)
