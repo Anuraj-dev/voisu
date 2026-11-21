@@ -296,7 +296,7 @@ fn load_settings() -> SettingsSnapshot {
         overlay_position: config::overlay_position(),
         installed_tier: match crate::setup_consented::production_consented_status() {
             ConsentedStatus::Installed { entry_id, .. } => {
-                crate::local_model::LocalTier::of_entry_id(&entry_id)
+                crate::local_model::tier_of_entry_id(&entry_id)
             }
             _ => None,
         },
