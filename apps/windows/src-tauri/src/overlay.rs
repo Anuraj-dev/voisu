@@ -84,6 +84,9 @@ const COPIED_DISPLAY: Duration = Duration::from_secs(2);
 #[serde(rename_all = "camelCase")]
 pub enum RecordingState {
     Idle,
+    /// The press is opening the microphone itself (no ready stream): dim
+    /// bars until the first audio turns this into `Recording`.
+    Starting,
     Recording,
     HandsFree,
     Processing,
@@ -102,7 +105,9 @@ impl RecordingState {
             Self::Done => Some(DONE_DISPLAY),
             Self::Copied => Some(COPIED_DISPLAY),
             Self::Error => Some(ERROR_DISPLAY),
-            Self::Idle | Self::Recording | Self::HandsFree | Self::Processing => None,
+            Self::Idle | Self::Starting | Self::Recording | Self::HandsFree | Self::Processing => {
+                None
+            }
         }
     }
 }
@@ -152,10 +157,12 @@ pub struct Presenter {
 impl Presenter {
     /// Returns the window step and, for `done` and `error`, the generation a
     /// delayed [`Presenter::on_hide_timer`] call must carry to still apply.
-    /// Any state but `idle` ends move mode first: Recording always wins.
+    /// Any state but `idle` or `starting` ends move mode first: Recording
+    /// always wins. A press still opening the mic may yet be cancelled, so
+    /// the unsaved placement waits for its first audio.
     pub fn on_state(&mut self, state: RecordingState) -> (Step, Option<u64>) {
         if self.moving {
-            if state == RecordingState::Idle {
+            if matches!(state, RecordingState::Idle | RecordingState::Starting) {
                 return (Step::Nothing, None);
             }
             self.moving = false;
@@ -1092,8 +1099,13 @@ fn preview_gate() -> std::sync::MutexGuard<'static, PreviewGate> {
 }
 
 /// Called by the engine as a real Recording starts: stops any preview.
-pub fn end_preview() {
-    preview_gate().end();
+/// Returns whether one was running, so a press that ends before showing
+/// anything still clears the preview it stopped from the pill.
+pub fn end_preview() -> bool {
+    let mut gate = preview_gate();
+    let running = gate.running;
+    gate.end();
+    running
 }
 
 /// Emits only while the preview holding `token` is current; false once a
@@ -1134,6 +1146,14 @@ fn play_preview(app: &AppHandle, token: u64) -> bool {
         });
         true
     };
+    // A cold open's dim bars first, about as long as one takes (Windows
+    // only, as in a real press).
+    if cfg!(not(target_os = "macos")) {
+        if !state(RecordingState::Starting) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(800));
+    }
     if !state(RecordingState::Recording) {
         return false;
     }
@@ -2141,9 +2161,19 @@ mod tests {
         assert!(!presenter.begin_move(), "already moving");
         assert!(presenter.is_moving());
         assert_eq!(presenter.on_hide_timer(timer.unwrap()), Step::Nothing);
-        // A stray idle leaves the pill where the user is dragging it.
+        // A stray idle leaves the pill where the user is dragging it, and so
+        // does a press that is still opening the mic and then cancelled.
+        assert_eq!(presenter.on_state(RecordingState::Idle).0, Step::Nothing);
+        assert_eq!(
+            presenter.on_state(RecordingState::Starting).0,
+            Step::Nothing
+        );
         assert_eq!(presenter.on_state(RecordingState::Idle).0, Step::Nothing);
         assert!(presenter.is_moving());
+        assert_eq!(
+            presenter.on_state(RecordingState::Starting).0,
+            Step::Nothing
+        );
         // Recording always wins: move mode ends and the pill is placed anew.
         assert_eq!(
             presenter.on_state(RecordingState::Recording),

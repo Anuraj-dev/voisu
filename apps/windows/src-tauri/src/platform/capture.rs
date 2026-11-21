@@ -69,6 +69,8 @@ pub type LevelSink = Arc<dyn Fn(f32) + Send + Sync>;
 #[derive(Default)]
 pub(crate) struct CaptureStartup {
     stream: Mutex<StreamStartup>,
+    /// Woken when this press opens the microphone itself (no ready stream).
+    cold: Notify,
 }
 
 #[derive(Default)]
@@ -82,6 +84,17 @@ struct StreamStartup {
 }
 
 impl CaptureStartup {
+    /// Resolves once this press opens the microphone itself instead of
+    /// taking a ready stream, so the overlay can show it is still starting.
+    /// Never resolves once audio has arrived: the capture is then ready in
+    /// all but name, and `Starting` would flash before `Recording`.
+    pub(crate) async fn opening_cold(&self) {
+        self.cold.notified().await;
+        if self.stream.lock().unwrap().first_audio.is_some() {
+            std::future::pending::<()>().await;
+        }
+    }
+
     fn begin_attempt(&self) -> (u64, bool) {
         let mut stream = self.stream.lock().unwrap();
         stream.attempt += 1;
@@ -192,6 +205,12 @@ impl CpalCapture {
             why,
             "microphone start"
         );
+        // A stored permit: the engine may not be waiting on it yet. Windows
+        // only: there a cold open takes ~0.8 s, and the Mac never keeps a
+        // ready stream, so it keeps showing nothing until the first audio.
+        if cfg!(not(target_os = "macos")) {
+            shared.startup.cold.notify_one();
+        }
         let (control_tx, control_rx) = mpsc::channel();
         let (ready_tx, mut ready_rx) = oneshot::channel();
         let thread_shared = Arc::clone(&shared);
@@ -1142,6 +1161,26 @@ mod tests {
         let first = Instant::now();
         assert!(startup.note_first_audio(replacement, first));
         assert_eq!(startup.stream.lock().unwrap().first_audio, Some(first));
+    }
+
+    #[tokio::test]
+    async fn a_cold_open_shows_starting_only_until_its_first_audio() {
+        let startup = CaptureStartup::default();
+        startup.cold.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), startup.opening_cold())
+            .await
+            .expect("still opening: Starting shows");
+
+        // The first callback beats the worker's readiness: no Starting.
+        let startup = CaptureStartup::default();
+        let (attempt, _) = startup.begin_attempt();
+        startup.cold.notify_one();
+        assert!(startup.note_first_audio(attempt, Instant::now()));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), startup.opening_cold())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

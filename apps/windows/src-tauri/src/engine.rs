@@ -159,7 +159,7 @@ fn next_phase(
 ) -> Option<(Phase, Instant)> {
     match state {
         Phase::Idle | Phase::Done | Phase::Copied | Phase::Error => None,
-        Phase::Recording => Some((state, now)),
+        Phase::Starting | Phase::Recording => Some((state, now)),
         Phase::HandsFree | Phase::Processing => Some((state, prev.map_or(now, |(_, since)| since))),
     }
 }
@@ -276,7 +276,7 @@ impl Engine {
         let target = DeliveryTarget::capture();
         // A tray preview still playing must not hide or feed this session's
         // capsule.
-        overlay::end_preview();
+        let stopped_preview = overlay::end_preview();
         let startup = Arc::new(CaptureStartup::default());
         let mut providers_started = None;
         let mut trigger = StartupTrigger::new(id, actions, &self.ended);
@@ -296,6 +296,11 @@ impl Engine {
             }
             None => {
                 startup.log(id, hotkey_at, None);
+                // Cancelled before anything was shown: a preview this press
+                // stopped (its dim bars, say) must not stay on the pill.
+                if stopped_preview {
+                    self.emit_state(Phase::Idle, None);
+                }
                 return Captured::Done;
             }
         };
@@ -311,6 +316,7 @@ impl Engine {
                 providers_started = Some(Instant::now());
                 Ok((providers, vocabulary, settings.tone))
             },
+            startup.opening_cold(),
             |phase| self.emit_state(phase, None),
             &mut trigger,
         )
@@ -633,6 +639,8 @@ impl Engine {
         }
         if let Some(tray) = self.app.state::<crate::AppState>().tray.get() {
             match state {
+                // Not "recording" before the first audio: nothing is heard yet.
+                Phase::Starting => tray.set_status("Voisu: opening the microphone…"),
                 Phase::Recording | Phase::HandsFree => tray.set_status("Voisu: recording…"),
                 Phase::Processing => tray.set_status("Voisu: transcribing…"),
                 Phase::Idle | Phase::Done | Phase::Copied | Phase::Error => {
@@ -718,15 +726,19 @@ impl<'a> StartupTrigger<'a> {
 
 /// Provider setup starts as soon as the capture worker is in flight. Keep
 /// polling the Trigger Key while either branch is pending.
+/// `cold` resolves when the capture opens the microphone itself; until the
+/// first audio the overlay then shows `Starting`. A ready stream skips it.
 async fn start_recording<P>(
     capture: impl Future<Output = Result<Box<dyn ActiveCapture>, BoundaryError>>,
     providers: impl Future<Output = Result<P, BoundaryError>>,
+    cold: impl Future<Output = ()>,
     mut emit: impl FnMut(Phase),
     trigger: &mut StartupTrigger<'_>,
 ) -> Result<Option<(RecordingAudio, P)>, BoundaryError> {
-    tokio::pin!(capture, providers);
+    tokio::pin!(capture, providers, cold);
     let mut opened: Option<Box<dyn ActiveCapture>> = None;
     let mut ready_providers = None;
+    let mut starting = false;
     loop {
         tokio::select! {
             biased;
@@ -756,6 +768,10 @@ async fn start_recording<P>(
                 if trigger.hands_free {
                     emit(Phase::HandsFree);
                 }
+            },
+            () = &mut cold, if opened.is_none() && !starting => {
+                starting = true;
+                emit(Phase::Starting);
             },
             result = &mut providers, if ready_providers.is_none() => ready_providers = Some(result?),
         }
@@ -859,6 +875,7 @@ mod tests {
                 events.borrow_mut().push("providers started");
                 Ok("providers")
             },
+            std::future::pending(),
             |phase| {
                 assert_eq!(phase, Phase::Recording);
                 events.borrow_mut().push("recording");
@@ -882,6 +899,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cold_open_shows_starting_until_the_first_audio() {
+        let (_send, mut actions) = mpsc::unbounded_channel();
+        let ended: EndedSink = Arc::new(|_| {});
+        let mut trigger = StartupTrigger::new(1, &mut actions, &ended);
+        let (first_audio, audio) = tokio::sync::oneshot::channel();
+        let phases = std::cell::RefCell::new(Vec::new());
+        let start = start_recording(
+            async {
+                audio.await.unwrap();
+                Ok(startup_mic(None))
+            },
+            async { Ok(()) },
+            async {},
+            |phase| phases.borrow_mut().push(phase),
+            &mut trigger,
+        );
+        tokio::pin!(start);
+        poll_fn(|cx| {
+            assert!(start.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(*phases.borrow(), [Phase::Starting]);
+
+        first_audio.send(()).unwrap();
+        assert!(start.await.unwrap().is_some());
+        assert_eq!(*phases.borrow(), [Phase::Starting, Phase::Recording]);
+    }
+
+    #[tokio::test]
+    async fn a_ready_stream_skips_starting() {
+        let (_send, mut actions) = mpsc::unbounded_channel();
+        let ended: EndedSink = Arc::new(|_| {});
+        let mut trigger = StartupTrigger::new(1, &mut actions, &ended);
+        let phases = std::cell::RefCell::new(Vec::new());
+        // The cold signal never fires when the ready stream takes the press.
+        let start = start_recording(
+            async { Ok(startup_mic(None)) },
+            async { Ok(()) },
+            std::future::pending(),
+            |phase| phases.borrow_mut().push(phase),
+            &mut trigger,
+        );
+        assert!(start.await.unwrap().is_some());
+        assert_eq!(*phases.borrow(), [Phase::Recording]);
+    }
+
+    #[tokio::test]
     async fn listening_does_not_wait_for_provider_setup() {
         let (_send, mut actions) = mpsc::unbounded_channel();
         let ended: EndedSink = Arc::new(|_| {});
@@ -891,6 +956,7 @@ mod tests {
         let start = start_recording(
             async { Ok(startup_mic(None)) },
             async { Ok(providers.await.unwrap()) },
+            std::future::pending(),
             |phase| {
                 assert_eq!(phase, Phase::Recording);
                 listening.set(true);
@@ -925,6 +991,7 @@ mod tests {
                     Ok(startup_mic(None))
                 },
                 std::future::pending::<Result<(), BoundaryError>>(),
+                std::future::pending(),
                 |_| panic!("bars shown for {action:?}"),
                 &mut trigger,
             );
@@ -959,6 +1026,7 @@ mod tests {
                 providers.await.unwrap();
                 Ok(())
             },
+            std::future::pending(),
             |phase| phases.borrow_mut().push(phase),
             &mut trigger,
         );

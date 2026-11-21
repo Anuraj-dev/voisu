@@ -9,6 +9,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { createDrag } from './drag.js';
 import { startsDrag } from './press.js';
+import { startingAlpha } from './starting.js';
 
 // Motion from the Linux overlay (voisu-overlay.rs), on the pill's thin
 // sound bars: 26 white 2 px lines, 2 px apart, so the row reads as a fine
@@ -50,6 +51,7 @@ const GLOW_PAD = 8;
 
 const LABELS = {
   moving: 'Overlay: drag it where you want it',
+  starting: 'Opening the microphone',
   recording: 'Recording',
   handsFree: 'Recording hands-free',
   processing: 'Processing',
@@ -72,6 +74,7 @@ let smoothed = 0;
 let frame = 0;
 let lastFrame = 0;
 let sweepStart = 0;
+let breathStart = 0;
 let holdTimer = 0;
 let scale = 1;
 // The pill's centre as fractions of the window (overlay.rs `Anchor`).
@@ -166,6 +169,9 @@ function draw(now) {
     let alpha = edgeAlpha(i, count);
     if (state === 'processing') {
       alpha *= sweepBrightness(i, count, now);
+    } else if (state === 'starting') {
+      // Flat and dim: nothing is heard until the live bars take over.
+      alpha *= startingAlpha(now - breathStart, reducedMotion.matches);
     } else {
       barHeight = floor + barLevel(i, count) * (drawable - floor);
     }
@@ -179,19 +185,21 @@ function draw(now) {
 }
 
 const metering = () => state === 'recording' || state === 'handsFree';
+// The processing sweep and the starting breath run their own loop; a still
+// starting cue (reduced motion) draws once.
+const animating = () => state === 'processing' || (state === 'starting' && !reducedMotion.matches);
 
 // Recording redraws once per level event (W2 caps those at 30 Hz); the
-// processing sweep runs its own loop, capped at 30 fps. Move mode draws its
-// idle bars once.
+// animations are capped at 30 fps. Move mode draws its idle bars once.
 function onFrame(now) {
   frame = 0;
-  if (state === 'processing') {
+  if (animating()) {
     if (now - lastFrame >= FRAME_MS) {
       lastFrame = now;
       draw(now);
     }
     frame = requestAnimationFrame(onFrame);
-  } else if (metering() || (state === 'idle' && moving)) {
+  } else if (metering() || state === 'starting' || (state === 'idle' && moving)) {
     draw(now);
   }
 }
@@ -209,6 +217,9 @@ function setState(next, text) {
   // `done`, `copied` and `error` hold until their own timer, even if `idle`
   // follows.
   if (next === 'idle' && (state === 'error' || state === 'done' || state === 'copied')) return;
+  // A press still opening the mic leaves move mode alone (overlay.rs
+  // `Presenter::on_state`): it may be cancelled before its first audio.
+  if (moving && next === 'starting') return;
   // A real Recording ends move mode (the native side has already left it).
   if (next !== 'idle') moving = false;
   clearTimeout(holdTimer);
@@ -219,6 +230,10 @@ function setState(next, text) {
   }
   if (next === 'processing' && state !== 'processing') {
     sweepStart = performance.now();
+    lastFrame = 0;
+  }
+  if (next === 'starting' && state !== 'starting') {
+    breathStart = performance.now();
     lastFrame = 0;
   }
   state = next;
@@ -300,7 +315,11 @@ place();
 window.addEventListener('resize', () => {
   fitScale();
   place();
-  if (metering() || state === 'processing' || moving) requestDraw();
+  if (metering() || state === 'processing' || state === 'starting' || moving) requestDraw();
+});
+// Turning reduced motion on or off mid-cue starts or settles the breath.
+reducedMotion.addEventListener('change', () => {
+  if (state === 'starting') requestDraw();
 });
 // Text widens the pill and the size changes with it: re-centre on the anchor.
 new ResizeObserver(place).observe(capsule);

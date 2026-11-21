@@ -50,7 +50,8 @@ export const ui = $state({
   error: '',
   // Held in the backend's memory only; never written to disk.
   transcript: null,
-  // idle | recording | handsFree | processing | error
+  // idle | recording | handsFree | processing | error (the overlay's
+  // `starting` leaves it as it was)
   phase: 'idle',
   phaseMessage: '',
   // Date.now() when the current Recording started; the hero ticks from it.
@@ -181,6 +182,9 @@ function seedPhase(phase) {
 }
 
 export function onRecordingState({ state, message }) {
+  // The mic is still opening: the overlay shows that; the window waits for
+  // the Recording itself.
+  if (state === 'starting') return;
   if (state === 'recording' || state === 'handsFree') {
     // Hands-free continues the Recording that is already running.
     if (ui.phase !== 'recording' && ui.phase !== 'handsFree') ui.recordingSince = Date.now();
