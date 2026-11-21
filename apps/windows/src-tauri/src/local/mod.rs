@@ -486,7 +486,8 @@ pub fn warm(app: &AppHandle) {
 /// replaced) shuts down cleanly within `bound`, or is killed and reaped.
 pub fn shutdown(app: &AppHandle, bound: Duration) {
     let resident = {
-        let mut status = app.state::<LocalState>().status.lock().unwrap();
+        let local = app.state::<LocalState>();
+        let mut status = local.status.lock().unwrap();
         status.closed = true;
         status.retire();
         status.retired.take()
