@@ -242,6 +242,8 @@ impl CpalCapture {
                     format!("capture thread unavailable: {error}"),
                 )
             })?;
+        // Ended by the capture's release, which runs once however it ends.
+        self.ready.cold_began();
         // Owning the stop guard before awaiting also releases the stream if
         // startup is cancelled or times out.
         let mut capture = Box::new(CpalActiveCapture {
@@ -326,7 +328,19 @@ impl CpalActiveCapture {
 
     fn release(&mut self) {
         if let Some(ready) = self.ready.take() {
-            ready.released();
+            let cold = matches!(self.source, Source::Thread { .. });
+            // A ready press counts from its attach; a cold one from its
+            // first audio, so one cancelled while opening is no use.
+            let heard = !cold
+                || self
+                    .shared
+                    .startup
+                    .stream
+                    .lock()
+                    .unwrap()
+                    .first_audio
+                    .is_some();
+            ready.released(cold, heard);
         }
     }
 }

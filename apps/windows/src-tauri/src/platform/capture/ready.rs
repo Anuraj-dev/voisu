@@ -40,8 +40,6 @@ const STALL_AFTER: Duration = Duration::from_secs(2);
 const VERIFY_TIMEOUT: Duration = Duration::from_millis(200);
 const RETRY_FIRST: Duration = Duration::from_secs(2);
 const RETRY_MAX: Duration = Duration::from_secs(60);
-/// The longest quitting waits for the keeper to close the stream.
-const SHUTDOWN_WAIT: Duration = Duration::from_secs(1);
 
 /// What the keeper should do to the stream, and why (for the log).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,7 +57,9 @@ pub(super) struct Policy {
     open: bool,
     /// A Recording is attached to the open stream.
     in_use: bool,
-    linger_until: Option<Instant>,
+    /// When the last capture that heard audio ended: For 5 minutes counts
+    /// from here.
+    last_used: Option<Instant>,
     retry_at: Option<Instant>,
     failures: u32,
 }
@@ -70,7 +70,7 @@ impl Policy {
             mode,
             open: false,
             in_use: false,
-            linger_until: None,
+            last_used: None,
             retry_at: None,
             failures: 0,
         }
@@ -84,11 +84,16 @@ impl Policy {
         self.open
     }
 
+    /// When For 5 minutes ends, if anything has used the mic.
+    fn linger_until(&self) -> Option<Instant> {
+        self.last_used.map(|at| at + LINGER)
+    }
+
     fn wants_open(&self, now: Instant) -> bool {
         match self.mode {
             KeepMicReady::WhileRunning => true,
             KeepMicReady::ForFiveMinutes => {
-                self.in_use || self.linger_until.is_some_and(|until| now < until)
+                self.in_use || self.linger_until().is_some_and(|until| now < until)
             }
             KeepMicReady::Off => false,
         }
@@ -96,7 +101,6 @@ impl Policy {
 
     fn close(&mut self, reason: &'static str) -> Option<Command> {
         self.open = false;
-        self.linger_until = None;
         Some(Command::Close(reason))
     }
 
@@ -112,29 +116,23 @@ impl Policy {
         self.retry_at = None;
         self.failures = 0;
         match mode {
-            KeepMicReady::WhileRunning => {
-                self.linger_until = None;
-                (!self.open).then_some(Command::Open("setting changed"))
+            KeepMicReady::WhileRunning => (!self.open).then_some(Command::Open("setting changed")),
+            // Five minutes from the last use, not from now: a mic nothing
+            // used closes at once. Closed stays closed until the next
+            // Recording ends.
+            KeepMicReady::ForFiveMinutes if self.open && !self.wants_open(now) => {
+                self.close("idle for 5 minutes")
             }
-            KeepMicReady::ForFiveMinutes => {
-                // Kept for five minutes from now; closed stays closed until
-                // the next Recording ends.
-                self.linger_until = (self.open && !self.in_use).then(|| now + LINGER);
-                None
-            }
+            KeepMicReady::ForFiveMinutes => None,
             // A Recording using the stream keeps it until it ends.
             KeepMicReady::Off if self.open && !self.in_use => self.close("setting turned off"),
-            KeepMicReady::Off => {
-                self.linger_until = None;
-                None
-            }
+            KeepMicReady::Off => None,
         }
     }
 
     /// A press attached a Recording to the open stream.
     pub(super) fn attached(&mut self) {
         self.in_use = true;
-        self.linger_until = None;
     }
 
     /// A close found a Recording attached whose [`Policy::attached`] had not
@@ -145,18 +143,19 @@ impl Policy {
         self.attached();
     }
 
-    /// A Recording's capture ended, whether it used the ready stream or
-    /// opened its own.
-    pub(super) fn released(&mut self, now: Instant) -> Option<Command> {
+    /// A Recording's capture ended at `ended`, whether it used the ready
+    /// stream or opened its own. Only one that `heard` audio counts as a
+    /// use: a press cancelled while the mic opened starts no five minutes.
+    pub(super) fn released(&mut self, ended: Instant, heard: bool) -> Option<Command> {
         self.in_use = false;
+        if heard {
+            self.last_used = self.last_used.max(Some(ended));
+        }
         match self.mode {
             KeepMicReady::Off if self.open => self.close("setting turned off"),
             KeepMicReady::Off => None,
             KeepMicReady::ForFiveMinutes | KeepMicReady::WhileRunning => {
-                if self.mode == KeepMicReady::ForFiveMinutes {
-                    self.linger_until = Some(now + LINGER);
-                }
-                if self.open {
+                if self.open || !self.wants_open(ended) {
                     return None;
                 }
                 // A Recording worked or failed in front of the user: try
@@ -214,7 +213,7 @@ impl Policy {
                 return self.close("setting turned off");
             }
             if self.mode == KeepMicReady::ForFiveMinutes
-                && self.linger_until.is_none_or(|until| now >= until)
+                && self.linger_until().is_none_or(|until| now >= until)
             {
                 return self.close("idle for 5 minutes");
             }
@@ -234,7 +233,7 @@ impl Policy {
             return if self.in_use || self.mode != KeepMicReady::ForFiveMinutes {
                 None
             } else {
-                self.linger_until
+                self.linger_until()
             };
         }
         self.retry_at
@@ -319,6 +318,43 @@ struct TapState {
     last_audio: Option<Instant>,
     preroll: PreRoll,
     recording: Option<Arc<Shared>>,
+    /// The setting, changed here before the keeper hears of it, so a press
+    /// never attaches after Off returns.
+    mode: KeepMicReady,
+    /// When the last capture that heard audio ended (For 5 minutes).
+    last_used: Option<Instant>,
+    /// Recordings capturing on a stream of their own. Their speech must
+    /// never wait in the ring for the next press.
+    cold: usize,
+    /// Voisu is quitting: nothing attaches and no new stream is published.
+    closing: bool,
+}
+
+impl TapState {
+    /// Whether a press may attach to the ready stream now, or why not.
+    /// Checked under the lock the attach happens under.
+    fn admits(&self, now: Instant) -> Result<(), Cold> {
+        if self.closing {
+            return Err("app closing");
+        }
+        match self.mode {
+            KeepMicReady::Off => return Err("setting is off"),
+            KeepMicReady::ForFiveMinutes if !self.last_used.is_some_and(|at| now < at + LINGER) => {
+                return Err("idle for 5 minutes");
+            }
+            _ => {}
+        }
+        if self.live.is_none() {
+            return Err("not ready");
+        }
+        let fresh = self
+            .last_audio
+            .is_some_and(|at| now.saturating_duration_since(at) < LIVE_WINDOW);
+        if !fresh {
+            return Err("ready stream silent");
+        }
+        Ok(())
+    }
 }
 
 struct Live {
@@ -346,6 +382,8 @@ impl Tap {
                 drop(pipeline);
                 shared.wake.notify_one();
             }
+            // A cold capture is recording this speech itself.
+            None if state.cold > 0 => {}
             None => state.preroll.write(samples),
         }
     }
@@ -363,6 +401,22 @@ impl Tap {
         let mut state = self.state.lock().unwrap();
         Self::retire_locked(&mut state);
         state.recording.take()
+    }
+
+    /// [`Tap::retire_and_detach`] for a stream that died: the Recording is
+    /// failed in the same step, so a release cannot finish it as a success
+    /// in between.
+    fn retire_and_fail(&self, failure: &Failure) {
+        let mut state = self.state.lock().unwrap();
+        Self::retire_locked(&mut state);
+        if let Some(shared) = state.recording.take() {
+            shared.pipeline.lock().unwrap().failure = Some(failure.clone());
+            shared.wake.notify_one();
+        }
+    }
+
+    fn closing(&self) -> bool {
+        self.state.lock().unwrap().closing
     }
 
     /// Retires the stream unless a Recording is attached to it, checked and
@@ -388,11 +442,15 @@ impl Tap {
 enum Msg {
     Mode(KeepMicReady),
     Attached,
-    Released,
+    /// A capture ended at this instant; `heard` when it got audio.
+    Released {
+        ended: Instant,
+        heard: bool,
+    },
     DefaultChanged,
     Stream(u64, StreamEvent),
-    /// Voisu is quitting: close the stream, then answer.
-    Shutdown(mpsc::Sender<()>),
+    /// Voisu is quitting: close the stream.
+    Shutdown,
 }
 
 /// The handle to the ready stream: the press, the settings command and the
@@ -400,8 +458,6 @@ enum Msg {
 #[derive(Clone)]
 pub(crate) struct ReadyMic {
     tap: Arc<Tap>,
-    /// The setting as last applied, for the per-Recording log.
-    mode: Arc<Mutex<KeepMicReady>>,
     events: mpsc::Sender<Msg>,
 }
 
@@ -417,9 +473,14 @@ impl ReadyMic {
             mode
         };
         let (events, requests) = mpsc::channel();
+        let tap = Tap {
+            state: Mutex::new(TapState {
+                mode,
+                ..TapState::default()
+            }),
+        };
         let ready = Self {
-            tap: Arc::default(),
-            mode: Arc::new(Mutex::new(mode)),
+            tap: Arc::new(tap),
             events,
         };
         let keeper = ready.clone();
@@ -436,7 +497,7 @@ impl ReadyMic {
     /// a Recording is using it.
     pub(crate) fn set_mode(&self, mode: KeepMicReady) {
         if !cfg!(target_os = "macos") {
-            *self.mode.lock().unwrap() = mode;
+            self.tap.state.lock().unwrap().mode = mode;
             let _ = self.events.send(Msg::Mode(mode));
         }
     }
@@ -445,21 +506,40 @@ impl ReadyMic {
         let _ = self.events.send(Msg::DefaultChanged);
     }
 
-    /// Closes the ready stream before Voisu exits, waiting at most
-    /// [`SHUTDOWN_WAIT`]: the process ending would release it anyway, but
-    /// this closes it cleanly and logs it.
+    /// Voisu is quitting: from now on nothing attaches and no new stream
+    /// is published, and the keeper drops the stream. Never waits, so the
+    /// event loop is not held up; the process ending releases the mic if
+    /// the keeper has not yet.
     pub(crate) fn shutdown(&self) {
-        let (done, closed) = mpsc::channel();
-        if self.events.send(Msg::Shutdown(done)).is_ok()
-            && closed.recv_timeout(SHUTDOWN_WAIT).is_err()
-        {
-            tracing::warn!("ready microphone still closing at exit");
-        }
+        self.tap.state.lock().unwrap().closing = true;
+        tracing::info!(reason = "app closing", "ready microphone closing");
+        let _ = self.events.send(Msg::Shutdown);
     }
 
-    /// A Recording's capture ended.
-    pub(super) fn released(&self) {
-        let _ = self.events.send(Msg::Released);
+    /// A press is opening the mic itself: until it ends the ready stream
+    /// holds nothing, or a cancelled Recording's speech could reach the next
+    /// press as pre-roll.
+    pub(super) fn cold_began(&self) {
+        let mut state = self.tap.state.lock().unwrap();
+        state.cold += 1;
+        state.preroll.clear();
+    }
+
+    /// A Recording's capture ended: `cold` when it had opened its own
+    /// stream ([`ReadyMic::cold_began`]), `heard` when it got audio.
+    pub(super) fn released(&self, cold: bool, heard: bool) {
+        let ended = Instant::now();
+        {
+            let mut state = self.tap.state.lock().unwrap();
+            if cold {
+                state.cold = state.cold.saturating_sub(1);
+                state.preroll.clear();
+            }
+            if heard {
+                state.last_used = state.last_used.max(Some(ended));
+            }
+        }
+        let _ = self.events.send(Msg::Released { ended, heard });
     }
 
     /// Attaches the Recording to the ready stream and hands it the pre-roll.
@@ -495,28 +575,23 @@ impl ReadyMic {
     /// The stream a press may attach to, if it is delivering audio.
     fn live(&self) -> Result<(u64, cpal::DeviceId), Cold> {
         let state = self.tap.state.lock().unwrap();
-        let Some(live) = &state.live else {
-            return Err(if *self.mode.lock().unwrap() == KeepMicReady::Off {
-                "setting is off"
-            } else {
-                "not ready"
-            });
-        };
-        let fresh = state
-            .last_audio
-            .is_some_and(|at| at.elapsed() < LIVE_WINDOW);
-        if !fresh {
-            return Err("ready stream silent");
-        }
+        state.admits(Instant::now())?;
+        let live = state.live.as_ref().ok_or("not ready")?;
         Ok((state.attempt, live.id.clone()))
     }
 
     /// Hands the pre-roll to `shared` and routes the stream's audio to it,
-    /// unless the stream was rebuilt since [`ReadyMic::live`].
+    /// unless the stream was rebuilt since [`ReadyMic::live`] or may no
+    /// longer be attached to: the setting, five minutes, freshness and
+    /// quitting are checked again under the lock the attach happens under.
     fn join(&self, shared: &Arc<Shared>, attempt: u64) -> Result<Duration, Cold> {
         let mut state = self.tap.state.lock().unwrap();
-        let Some(live) = state.live.as_ref().filter(|_| state.attempt == attempt) else {
+        if state.attempt != attempt {
             return Err("ready stream rebuilt");
+        }
+        state.admits(Instant::now())?;
+        let Some(live) = state.live.as_ref() else {
+            return Err("not ready");
         };
         let (rate, channels) = (live.rate, live.channels);
         let samples = {
@@ -560,16 +635,21 @@ fn run_keeper(mode: KeepMicReady, ready: &ReadyMic, requests: &mpsc::Receiver<Ms
         last_failure: None,
     };
     let mut command = policy.start(Instant::now());
+    // An absolute schedule: messages arriving never put the check off.
+    let mut next_health = Instant::now() + HEALTH_CHECK;
     loop {
         if let Some(command) = command.take() {
             keeper.execute(command, &mut policy);
         }
         let now = Instant::now();
+        if !policy.is_open() {
+            next_health = now + HEALTH_CHECK;
+        }
         let mut wait = policy
             .deadline()
             .map_or(Duration::MAX, |at| at.saturating_duration_since(now));
         if policy.is_open() {
-            wait = wait.min(HEALTH_CHECK);
+            wait = wait.min(next_health.saturating_duration_since(now));
         }
         let message = if wait == Duration::MAX {
             requests.recv().map_err(|_| RecvTimeoutError::Disconnected)
@@ -588,7 +668,10 @@ fn run_keeper(mode: KeepMicReady, ready: &ReadyMic, requests: &mpsc::Receiver<Ms
                 policy.attached();
                 None
             }
-            Ok(Msg::Released) => policy.released(now),
+            Ok(Msg::Released { ended, heard }) => policy.released(ended, heard),
+            // The stream already moved to this default, after its old mic's
+            // Reopen: one switch, one rebuild.
+            Ok(Msg::DefaultChanged) if keeper.on_current_default() => None,
             Ok(Msg::DefaultChanged) => policy.lost("default microphone changed"),
             Ok(Msg::Stream(attempt, _)) if !keeper.is_current(attempt) => None,
             Ok(Msg::Stream(_, StreamEvent::Audio)) => None,
@@ -597,44 +680,31 @@ fn run_keeper(mode: KeepMicReady, ready: &ReadyMic, requests: &mpsc::Receiver<Ms
                 keeper.fail(failure, &mut policy);
                 None
             }
-            Ok(Msg::Shutdown(done)) => {
-                keeper.shutdown();
-                let _ = done.send(());
-                return;
-            }
-            // Access turned off in Windows privacy settings while open: let
-            // the mic go rather than hold it against the user's choice.
-            Err(RecvTimeoutError::Timeout) if policy.is_open() && microphone_blocked() => {
-                keeper.fail(blocked(), &mut policy);
-                None
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                if keeper.delivering() {
-                    policy.healthy();
-                }
-                keeper.stalled().and_then(|silent_since_open| {
-                    if silent_since_open {
-                        // Never delivered: treat as a failed open, backing off.
-                        keeper.fail(
-                            Failure::new(
-                                voisu_core::BoundaryKind::Capture,
-                                "ready microphone produced no audio".into(),
-                                super::MIC_FAILED,
-                            ),
-                            &mut policy,
-                        );
-                        None
-                    } else {
-                        policy.lost("microphone stopped delivering audio")
-                    }
-                })
-            }
+            Ok(Msg::Shutdown) => break,
+            Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => break,
+        };
+        // A due check waits only for a command this message already caused;
+        // the next turn of the loop runs it straight after.
+        let reaction = match reaction {
+            None if policy.is_open() && now >= next_health => {
+                next_health = now + HEALTH_CHECK;
+                keeper.check_health(&mut policy)
+            }
+            reaction => reaction,
         };
         // A deadline that passed while messages kept arriving still fires.
         command = reaction.or_else(|| policy.tick(now));
     }
     keeper.shutdown();
+}
+
+fn app_closing() -> Failure {
+    Failure::new(
+        voisu_core::BoundaryKind::Capture,
+        "app closing".into(),
+        super::MIC_FAILED,
+    )
 }
 
 fn blocked() -> Failure {
@@ -683,6 +753,58 @@ impl Keeper<'_> {
         let live = state.live.as_ref()?;
         let since = state.last_audio.unwrap_or(live.opened);
         (since.elapsed() >= STALL_AFTER).then_some(state.last_audio.is_none())
+    }
+
+    /// The open stream's health check: access still allowed, audio still
+    /// flowing.
+    fn check_health(&mut self, policy: &mut Policy) -> Option<Command> {
+        // Access turned off in Windows privacy settings while open: let the
+        // mic go rather than hold it against the user's choice.
+        if microphone_blocked() {
+            self.fail(blocked(), policy);
+            return None;
+        }
+        if self.delivering() {
+            policy.healthy();
+        }
+        let silent_since_open = self.stalled()?;
+        if silent_since_open {
+            // Never delivered: treat as a failed open, backing off.
+            self.fail(
+                Failure::new(
+                    voisu_core::BoundaryKind::Capture,
+                    "ready microphone produced no audio".into(),
+                    super::MIC_FAILED,
+                ),
+                policy,
+            );
+            return None;
+        }
+        policy.lost("microphone stopped delivering audio")
+    }
+
+    /// The open stream is on the current default mic.
+    fn on_current_default(&self) -> bool {
+        if self.stream.is_none() {
+            return false;
+        }
+        let Some(id) = self
+            .tap()
+            .state
+            .lock()
+            .unwrap()
+            .live
+            .as_ref()
+            .map(|live| live.id.clone())
+        else {
+            return false;
+        };
+        // Asked without the tap locked: it is a device query.
+        let current = ResolvedInput::default_id(self.host) == Some(id);
+        if current {
+            tracing::debug!("default microphone change already applied to the ready stream");
+        }
+        current
     }
 
     fn execute(&mut self, command: Command, policy: &mut Policy) {
@@ -753,18 +875,16 @@ impl Keeper<'_> {
                     "ready microphone open"
                 );
             }
+            // Quitting: the keeper drops everything next.
+            Err(_) if self.ready.tap.closing() => {}
             Err(failure) => self.fail(failure, policy),
         }
     }
 
     /// Drops the stream, fails any attached Recording and backs off.
     fn fail(&mut self, failure: Failure, policy: &mut Policy) {
-        let recording = self.ready.tap.retire_and_detach();
+        self.ready.tap.retire_and_fail(&failure);
         drop(self.stream.take());
-        if let Some(shared) = recording {
-            shared.pipeline.lock().unwrap().failure = Some(failure.clone());
-            shared.wake.notify_one();
-        }
         let retry = policy.failed(Instant::now());
         let retry_in_s = retry.map(|delay| delay.as_secs());
         if self.last_failure.as_deref() == Some(failure.diagnostic.as_str()) {
@@ -782,6 +902,9 @@ impl Keeper<'_> {
     /// Builds and plays a stream on the current default mic. Returns it and
     /// how long the build took.
     fn try_open(&self) -> Result<(cpal::Stream, u128), Failure> {
+        if self.ready.tap.closing() {
+            return Err(app_closing());
+        }
         if microphone_blocked() {
             return Err(blocked());
         }
@@ -821,10 +944,17 @@ impl Keeper<'_> {
         )?;
         let built_ms = begun.elapsed().as_millis();
         input.verify_default(self.host)?;
+        // Access may have been turned off while the stream was building.
+        if microphone_blocked() {
+            return Err(blocked());
+        }
         stream
             .play()
             .map_err(|error| super::classify("input stream did not start", &error))?;
         let mut state = self.tap().state.lock().unwrap();
+        if state.closing {
+            return Err(app_closing());
+        }
         if state.attempt != attempt {
             return Err(Failure::new(
                 voisu_core::BoundaryKind::Capture,
@@ -860,7 +990,7 @@ mod tests {
         let mut policy = Policy::new(mode);
         policy.opened();
         if mode == KeepMicReady::ForFiveMinutes {
-            policy.linger_until = Some(now + LINGER);
+            policy.last_used = Some(now);
         }
         policy
     }
@@ -881,7 +1011,7 @@ mod tests {
     fn off_never_opens_and_has_no_deadline() {
         let now = Instant::now();
         let mut policy = Policy::new(KeepMicReady::Off);
-        assert_eq!(policy.released(now), None);
+        assert_eq!(policy.released(now, true), None);
         assert_eq!(policy.lost("default microphone changed"), None);
         assert_eq!(policy.tick(now + 10 * MIN), None);
         assert_eq!(policy.deadline(), None);
@@ -892,7 +1022,10 @@ mod tests {
         let t0 = Instant::now();
         let mut policy = Policy::new(KeepMicReady::ForFiveMinutes);
         assert_eq!(policy.start(t0), None);
-        assert_eq!(policy.released(t0), Some(Command::Open("Recording ended")));
+        assert_eq!(
+            policy.released(t0, true),
+            Some(Command::Open("Recording ended"))
+        );
         policy.opened();
         assert_eq!(policy.deadline(), Some(t0 + LINGER));
         assert_eq!(policy.tick(t0 + 4 * MIN), None);
@@ -913,7 +1046,7 @@ mod tests {
         assert_eq!(policy.deadline(), None);
         assert_eq!(policy.tick(t0 + 10 * MIN), None);
         let ended = t0 + 10 * MIN;
-        assert_eq!(policy.released(ended), None);
+        assert_eq!(policy.released(ended, true), None);
         assert_eq!(policy.deadline(), Some(ended + LINGER));
         assert_eq!(policy.tick(ended + 4 * MIN), None);
         assert!(policy.tick(ended + LINGER).is_some());
@@ -934,7 +1067,7 @@ mod tests {
         assert_eq!(busy.set_mode(KeepMicReady::Off, now), None);
         assert_eq!(busy.tick(now), None, "the Recording keeps its mic");
         assert_eq!(
-            busy.released(now),
+            busy.released(now, true),
             Some(Command::Close("setting turned off"))
         );
     }
@@ -946,6 +1079,7 @@ mod tests {
             // The press attached, but its Attached is still queued when the
             // setting turns off or the five minutes run out.
             let mut policy = opened(KeepMicReady::WhileRunning, now);
+            policy.released(now, true);
             let close = match mode {
                 KeepMicReady::Off => policy.set_mode(mode, now),
                 _ => {
@@ -960,11 +1094,11 @@ mod tests {
             let ended = now + 2 * LINGER;
             match mode {
                 KeepMicReady::Off => assert_eq!(
-                    policy.released(ended),
+                    policy.released(ended, true),
                     Some(Command::Close("setting turned off"))
                 ),
                 _ => {
-                    assert_eq!(policy.released(ended), None);
+                    assert_eq!(policy.released(ended, true), None);
                     assert_eq!(policy.deadline(), Some(ended + LINGER));
                 }
             }
@@ -981,14 +1115,52 @@ mod tests {
         );
         assert_eq!(policy.set_mode(KeepMicReady::WhileRunning, now), None);
         policy.opened();
-        assert_eq!(policy.set_mode(KeepMicReady::ForFiveMinutes, now), None);
-        assert_eq!(policy.deadline(), Some(now + LINGER));
+        policy.released(now, true);
+        assert_eq!(
+            policy.set_mode(KeepMicReady::ForFiveMinutes, now + MIN),
+            None
+        );
+        assert_eq!(
+            policy.deadline(),
+            Some(now + LINGER),
+            "five minutes from the last use, not from the switch"
+        );
         assert_eq!(
             policy.set_mode(KeepMicReady::WhileRunning, now),
             None,
             "already open"
         );
         assert_eq!(policy.deadline(), None, "while running never times out");
+    }
+
+    #[test]
+    fn five_minutes_counts_only_captures_that_heard_audio() {
+        let t0 = Instant::now();
+        // Never used: switching to five minutes closes the open mic now.
+        let mut unused = opened(KeepMicReady::WhileRunning, t0);
+        assert_eq!(
+            unused.set_mode(KeepMicReady::ForFiveMinutes, t0),
+            Some(Command::Close("idle for 5 minutes"))
+        );
+
+        // A press cancelled before the mic gave audio starts no window.
+        let mut closed = Policy::new(KeepMicReady::ForFiveMinutes);
+        assert_eq!(closed.released(t0, false), None);
+        assert_eq!(closed.deadline(), None);
+        assert_eq!(
+            closed.released(t0 + MIN, true),
+            Some(Command::Open("Recording ended"))
+        );
+
+        // Nor does it move the end of the current one.
+        let mut open = opened(KeepMicReady::ForFiveMinutes, t0);
+        open.attached();
+        assert_eq!(open.released(t0 + 4 * MIN, false), None);
+        assert_eq!(open.deadline(), Some(t0 + LINGER));
+        assert_eq!(
+            open.tick(t0 + LINGER),
+            Some(Command::Close("idle for 5 minutes"))
+        );
     }
 
     #[test]
@@ -1031,14 +1203,17 @@ mod tests {
             Some(Command::Open("default microphone changed"))
         );
         policy.failed(now);
-        assert_eq!(policy.released(now), Some(Command::Open("Recording ended")));
+        assert_eq!(
+            policy.released(now, true),
+            Some(Command::Open("Recording ended"))
+        );
     }
 
     #[test]
     fn five_minutes_stops_retrying_once_its_window_has_passed() {
         let t0 = Instant::now();
         let mut policy = Policy::new(KeepMicReady::ForFiveMinutes);
-        policy.released(t0);
+        policy.released(t0, true);
         policy.failed(t0);
         let late = t0 + LINGER + MIN;
         assert_eq!(policy.tick(late), None);
@@ -1057,7 +1232,7 @@ mod tests {
         for mode in modes {
             let mut policy = Policy::new(mode);
             let mut now = t0;
-            policy.released(now);
+            policy.released(now, true);
             policy.failed(now);
             for step in 0..50 {
                 let Some(at) = policy.deadline() else { break };
@@ -1128,7 +1303,6 @@ mod tests {
         let (events, requests) = mpsc::channel();
         let ready = ReadyMic {
             tap: Arc::default(),
-            mode: Arc::new(Mutex::new(KeepMicReady::WhileRunning)),
             events,
         };
         (ready, requests)
@@ -1149,6 +1323,27 @@ mod tests {
     fn recorded_bytes(shared: &Shared) -> usize {
         let pipeline = shared.pipeline.lock().unwrap();
         pipeline.chunks.iter().map(|c| c.0.len()).sum::<usize>() + pipeline.partial.len()
+    }
+
+    fn recorded_samples(shared: &Shared) -> Vec<i16> {
+        let pipeline = shared.pipeline.lock().unwrap();
+        let bytes: Vec<u8> = pipeline
+            .chunks
+            .iter()
+            .flat_map(|c| c.0.iter().copied())
+            .chain(pipeline.partial.iter().copied())
+            .collect();
+        bytes
+            .chunks_exact(2)
+            .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+            .collect()
+    }
+
+    fn new_capture() -> (
+        super::super::CpalActiveCapture,
+        mpsc::Receiver<super::super::Control>,
+    ) {
+        super::super::tests::capture_with_pipeline(super::super::tests::pipeline().0)
     }
 
     #[test]
@@ -1209,7 +1404,10 @@ mod tests {
         let audio = capture.finish().await.unwrap();
         assert_eq!(audio.pcm_s16le_mono_16khz().len(), 5_600 * 2);
         assert!(matches!(requests.try_recv(), Ok(Msg::Attached)));
-        assert!(matches!(requests.try_recv(), Ok(Msg::Released)));
+        assert!(matches!(
+            requests.try_recv(),
+            Ok(Msg::Released { heard: true, .. })
+        ));
         drop(capture);
         assert!(requests.try_recv().is_err(), "released once");
         // The stream stays open and goes back to the ring.
@@ -1264,8 +1462,11 @@ mod tests {
         go_live(&ready, 16_000, 1);
         let (attempt, _) = ready.live().unwrap();
         ready.join(&capture.shared, attempt).unwrap();
-        let detached = ready.tap.retire_and_detach().unwrap();
-        assert!(Arc::ptr_eq(&detached, &capture.shared));
+        ready.tap.retire_and_fail(&blocked());
+        // Failed before the call returns: a release that stops it now finds
+        // the failure, never a clean finish.
+        assert!(capture.shared.pipeline.lock().unwrap().failure.is_some());
+        assert!(ready.tap.state.lock().unwrap().recording.is_none());
         ready.tap.deliver(attempt, &[0.5; 1_600]);
         assert_eq!(
             recorded_bytes(&capture.shared),
@@ -1278,10 +1479,112 @@ mod tests {
     fn a_silent_or_closed_stream_sends_the_press_cold() {
         let (ready, _requests) = ready_mic();
         assert_eq!(ready.live().err(), Some("not ready"));
-        *ready.mode.lock().unwrap() = KeepMicReady::Off;
-        assert_eq!(ready.live().err(), Some("setting is off"));
         go_live(&ready, 48_000, 2);
         ready.tap.state.lock().unwrap().last_audio = None;
         assert_eq!(ready.live().err(), Some("ready stream silent"));
+    }
+
+    #[test]
+    fn admission_follows_the_setting_the_five_minutes_and_freshness() {
+        let (ready, _requests) = ready_mic();
+        go_live(&ready, 16_000, 1);
+        let mut state = ready.tap.state.lock().unwrap();
+        let now = Instant::now();
+        assert_eq!(state.admits(now), Ok(()));
+        // The last callback is older than the live window: stale.
+        assert_eq!(state.admits(now + LIVE_WINDOW), Err("ready stream silent"));
+        state.mode = KeepMicReady::Off;
+        assert_eq!(state.admits(now), Err("setting is off"));
+        state.mode = KeepMicReady::ForFiveMinutes;
+        assert_eq!(state.admits(now), Err("idle for 5 minutes"), "never used");
+        state.last_used = Some(now);
+        assert_eq!(state.admits(now), Ok(()));
+        state.last_audio = Some(now + LINGER);
+        assert_eq!(
+            state.admits(now + LINGER),
+            Err("idle for 5 minutes"),
+            "the window ended, even with the stream still open"
+        );
+    }
+
+    #[test]
+    fn a_press_after_off_returns_never_attaches() {
+        let (capture, _commands) = new_capture();
+        let (ready, requests) = ready_mic();
+        go_live(&ready, 16_000, 1);
+        let (attempt, _) = ready.live().unwrap();
+        // The keeper has not yet heard of Off: the stream is still live.
+        if cfg!(target_os = "macos") {
+            // The Mac ignores the setting; only the admission is tested.
+            ready.tap.state.lock().unwrap().mode = KeepMicReady::Off;
+        } else {
+            ready.set_mode(KeepMicReady::Off);
+            assert!(matches!(
+                requests.try_recv(),
+                Ok(Msg::Mode(KeepMicReady::Off))
+            ));
+        }
+        assert_eq!(ready.join(&capture.shared, attempt), Err("setting is off"));
+        assert!(ready.tap.state.lock().unwrap().recording.is_none());
+        assert!(ready.tap.retire_if_idle(), "so the close goes ahead");
+    }
+
+    #[test]
+    fn a_press_whose_stream_went_quiet_while_checking_goes_cold() {
+        let (capture, _commands) = new_capture();
+        let (ready, _requests) = ready_mic();
+        go_live(&ready, 16_000, 1);
+        let (attempt, _) = ready.live().unwrap();
+        ready.tap.state.lock().unwrap().last_audio = None;
+        assert_eq!(
+            ready.join(&capture.shared, attempt),
+            Err("ready stream silent")
+        );
+    }
+
+    #[test]
+    fn quitting_stops_any_attach_at_once() {
+        let (capture, _commands) = new_capture();
+        let (ready, requests) = ready_mic();
+        go_live(&ready, 16_000, 1);
+        let (attempt, _) = ready.live().unwrap();
+        ready.shutdown();
+        assert!(matches!(requests.try_recv(), Ok(Msg::Shutdown)));
+        assert_eq!(ready.live().err(), Some("app closing"));
+        assert_eq!(ready.join(&capture.shared, attempt), Err("app closing"));
+        assert!(ready.tap.closing());
+    }
+
+    #[test]
+    fn speech_a_cold_capture_heard_never_reaches_the_next_press() {
+        let (ready, requests) = ready_mic();
+        go_live(&ready, 16_000, 1);
+        // Before the cold press: dropped when it begins.
+        ready.tap.deliver(0, &[0.25; 1_600]);
+        ready.cold_began();
+        // The ready stream recovers during the cold Recording and hears the
+        // same speech, which is then cancelled.
+        ready.tap.deliver(0, &[0.75; 4_000]);
+        ready.released(true, false);
+        assert!(matches!(
+            requests.try_recv(),
+            Ok(Msg::Released { heard: false, .. })
+        ));
+        assert_eq!(ready.tap.state.lock().unwrap().cold, 0);
+        // After the release: the only audio the next press may get.
+        ready.tap.deliver(0, &[-0.5; 800]);
+
+        let (next, _commands) = new_capture();
+        let (attempt, _) = ready.live().unwrap();
+        assert_eq!(
+            ready.join(&next.shared, attempt),
+            Ok(Duration::from_millis(50))
+        );
+        let samples = recorded_samples(&next.shared);
+        assert_eq!(samples.len(), 800);
+        assert!(
+            samples.iter().all(|&sample| sample < 0),
+            "only the audio after the release"
+        );
     }
 }
