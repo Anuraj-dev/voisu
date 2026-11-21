@@ -54,7 +54,24 @@
     }
   });
 
+  // Windows only: how Voisu transcribes, and for Local which tier on which
+  // device.
+  const transcription = $derived.by(() => {
+    const local = ui.app.local;
+    if (!local) return null;
+    if (local.cloudUntilDownloaded) return { value: 'Cloud until the model finishes' };
+    if (ui.app.mode !== 'local') return { value: 'Cloud' };
+    const tier = local.tiers.find((t) => t.id === local.activeTier);
+    const gpu = local.engineDevice ? local.engineDevice !== 'cpu' : local.onGpu;
+    const device = gpu ? 'GPU' : 'CPU';
+    return {
+      value: `Local · ${tier?.name ?? 'no model'} · ${device}`,
+      title: tier ? `${tier.name} (${tier.modelName}) on ${gpu ? local.device : 'the CPU'}` : '',
+    };
+  });
+
   const glance = $derived([
+    ...(transcription ? [{ label: 'Transcription', ...transcription }] : []),
     { label: 'Delivery', value: ui.app.autoPaste ? 'Pastes automatically' : 'Copies to clipboard' },
     { label: 'Writing', value: ui.app.tone === 'informal' ? 'Informal' : 'Formal' },
   ]);
@@ -95,7 +112,7 @@
   {#each glance as item (item.label)}
     <div>
       <dt>{item.label}</dt>
-      <dd>{item.value}</dd>
+      <dd title={item.title || item.value}>{item.value}</dd>
     </div>
   {/each}
 </dl>
@@ -169,7 +186,8 @@
   }
   .glance {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
+    grid-auto-flow: column;
+    grid-auto-columns: minmax(0, 1fr);
     margin: 0 0 14px;
     border: 1px solid var(--overlay-2);
     border-radius: var(--radius);

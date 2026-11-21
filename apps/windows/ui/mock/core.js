@@ -93,21 +93,65 @@ const state = {
   // Twelve seconds in, so the timer reads 0:12.
   phase: screen === 'recording' ? { state: 'recording', elapsedMs: 12_000 } : null,
   mode: 'cloud',
-  // Local mode is Windows only. `?local=installed` starts with the model on
-  // disk; otherwise Dictation offers the download.
-  local: mac
-    ? null
-    : {
-        available: true,
-        installed: params.get('local') === 'installed',
-        downloading: false,
-        downloaded: 0,
-        total: 264_829_639,
-        error: null,
-      },
+  // Local mode is Windows only. `?local=fast` (or `accurate`, `both`) starts
+  // with that model on disk; otherwise Dictation offers the download.
+  // `&gpu=1` finds a GPU.
+  local: mac ? null : mockLocal(params.get('local'), params.get('gpu') === '1'),
 };
+
+function mockLocal(onDisk, onGpu) {
+  const has = (id) => onDisk === 'both' || onDisk === id || (id === 'fast' && onDisk === 'installed');
+  const local = {
+    available: true,
+    detecting: false,
+    device: onGpu ? 'NVIDIA GeForce RTX 5050 Laptop GPU' : 'CPU',
+    onGpu,
+    model: 'auto',
+    autoTier: onGpu ? 'accurate' : 'fast',
+    activeTier: null,
+    tiers: [
+      { id: 'accurate', name: 'Accurate', modelName: 'distil-large-v3.5', installed: has('accurate'), size: 818_658_033 },
+      { id: 'fast', name: 'Fast', modelName: 'small.en', installed: has('fast'), size: 264_829_639 },
+    ],
+    engine: 'off',
+    engineDevice: null,
+    installed: false,
+    downloading: null,
+    downloaded: 0,
+    total: 0,
+    error: null,
+    cloudUntilDownloaded: false,
+  };
+  refreshLocal(local);
+  return local;
+}
+
+// What the backend derives: sizes still to fetch, notes, the tier Auto runs.
+function refreshLocal(local) {
+  const clip = 352_078;
+  for (const t of local.tiers) {
+    t.bytes = t.installed ? 0 : t.size - (local.tiers.some((o) => o.installed) ? clip : 0);
+    t.note =
+      t.id === 'accurate'
+        ? local.onGpu
+          ? 'Accurate recommended on your GPU'
+          : 'Accurate is much slower on the CPU; Fast is recommended without a GPU.'
+        : null;
+  }
+  local.installed = local.tiers.some((t) => t.installed);
+  const tier = (id) => local.tiers.find((t) => t.id === id);
+  const preferred = local.model === 'auto' ? local.autoTier : local.model;
+  local.activeTier = !local.installed
+    ? null
+    : local.model !== 'auto' || tier(preferred).installed
+      ? preferred
+      : local.tiers.find((t) => t.installed).id;
+}
+
 // A fake download: about five seconds end to end; Cancel keeps its place.
 let downloadTimer = null;
+// Whether the running download turns Local on; choosing Cloud clears it.
+let downloadWantsLocal = false;
 const transcript = inSetup
   ? null
   : "Can we move the design review to Thursday at three? I'll send the updated mockups before then.";
@@ -130,25 +174,63 @@ const COMMANDS = {
   },
   set_auto_paste: ({ enabled }) => (state.autoPaste = enabled),
   set_mode: ({ mode }) => {
-    if (mode === 'local' && !state.local?.installed) throw 'Download the Local model first.';
+    const local = state.local;
+    if (mode === 'local' && !local?.installed) {
+      if (!local?.downloading) throw 'Download the Local model first.';
+      local.cloudUntilDownloaded = true;
+      downloadWantsLocal = true;
+      emit('state-changed', null);
+      return 'cloud';
+    }
     state.mode = mode;
-    if (state.local) state.local.error = null;
+    if (local) {
+      local.error = null;
+      if (mode === 'cloud') {
+        local.cloudUntilDownloaded = false;
+        downloadWantsLocal = false;
+      }
+      Object.assign(local, mode === 'local' ? { engine: 'ready', engineDevice: local.onGpu ? 'vulkan:0' : 'cpu' } : { engine: 'off', engineDevice: null });
+    }
     emit('state-changed', null);
     return mode;
   },
-  download_local_model: () =>
+  set_local_model: ({ model }) => {
+    const local = state.local;
+    const tier = local.tiers.find((t) => t.id === model);
+    if (tier && !tier.installed) throw `Download ${tier.name} first.`;
+    local.model = model;
+    refreshLocal(local);
+    emit('state-changed', null);
+    return model;
+  },
+  download_local_model: ({ model, switchToLocal }) =>
     new Promise((resolve) => {
       const local = state.local;
-      Object.assign(local, { downloading: true, error: null });
+      const tier = local.tiers.find((t) => t.id === (model === 'auto' ? local.autoTier : model));
+      Object.assign(local, {
+        downloading: tier.id,
+        downloaded: tier.size - tier.bytes,
+        total: tier.size,
+        error: null,
+        cloudUntilDownloaded: false,
+      });
+      downloadWantsLocal = switchToLocal;
       emit('state-changed', null);
       downloadTimer = setInterval(() => {
         if (!local.downloading) {
           clearInterval(downloadTimer);
+          local.cloudUntilDownloaded = false;
+          emit('state-changed', null);
           return resolve('cancelled');
         }
         local.downloaded = Math.min(local.total, local.downloaded + local.total / 20);
         if (local.downloaded >= local.total) {
-          Object.assign(local, { downloading: false, installed: true });
+          tier.installed = true;
+          local.downloading = null;
+          local.model = model;
+          if (downloadWantsLocal) state.mode = 'local';
+          local.cloudUntilDownloaded = false;
+          refreshLocal(local);
           clearInterval(downloadTimer);
           resolve('installed');
         }
@@ -156,12 +238,15 @@ const COMMANDS = {
       }, 250);
     }),
   cancel_local_download: () => {
-    state.local.downloading = false;
+    state.local.downloading = null;
     emit('state-changed', null);
   },
   remove_local_model: () => {
     state.mode = 'cloud';
-    Object.assign(state.local, { installed: false, downloaded: 0, error: null });
+    const local = state.local;
+    for (const t of local.tiers) t.installed = false;
+    Object.assign(local, { downloaded: 0, error: null, engine: 'off', engineDevice: null });
+    refreshLocal(local);
     emit('state-changed', null);
   },
   set_tone: ({ tone }) => (state.tone = tone),

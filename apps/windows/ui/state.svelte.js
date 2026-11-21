@@ -44,8 +44,10 @@ export const ui = $state({
     phase: null,
     // 'cloud' | 'local'; always 'cloud' on macOS.
     mode: 'cloud',
-    // Windows only: { available, installed, downloading, downloaded, total,
-    // error }; null on macOS, which offers no Local mode.
+    // Windows only: { available, detecting, device, onGpu, model, autoTier,
+    // activeTier, tiers: [{ id, name, modelName, installed, bytes, note }],
+    // engine, engineDevice, installed, downloading, downloaded, total, error,
+    // cloudUntilDownloaded }; null on macOS, which offers no Local mode.
     local: null,
   },
   // False until the first get_state, so nothing renders on guessed state.

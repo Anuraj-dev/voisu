@@ -174,7 +174,7 @@
     </button>
     {#if ui.app.local?.available}
       <button type="button" class="link" disabled={busy} onclick={useLocal}>
-        No keys? Transcribe on this PC instead
+        No keys? Transcribe on this PC instead{ui.app.local.onGpu ? `, on your ${ui.app.local.device}` : ''}
       </button>
     {/if}
   {/if}

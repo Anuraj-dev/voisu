@@ -60,12 +60,27 @@
   const mb = (bytes) => Math.round(bytes / 1_000_000);
   let modeBusy = $state(false);
 
-  // Set by Download, cleared by choosing Cloud: a download that finishes
-  // after the user picked Cloud leaves Cloud on.
-  let wantLocal = false;
+  const tier = (id) => local?.tiers.find((t) => t.id === id);
+  const MODEL_CHOICES = [
+    { id: 'auto', label: 'Auto' },
+    { id: 'fast', label: 'Fast' },
+    { id: 'accurate', label: 'Accurate' },
+  ];
+  // A choice whose model isn't downloaded waits here for the user to agree
+  // to its download; null shows the saved setting.
+  let pendingModel = $state(null);
+  const shownModel = $derived(pendingModel ?? local?.model ?? 'auto');
+  // The tier a choice runs on this PC.
+  const tierFor = (id) => tier(id === 'auto' ? local.autoTier : id);
+  const shownTier = $derived(local ? tierFor(shownModel) : null);
+  const activeTier = $derived(local?.activeTier ? tier(local.activeTier) : null);
+  // Auto runs the other downloaded tier until this PC's own is downloaded.
+  const offerAutoTier = $derived(
+    local?.installed && local.model === 'auto' && !pendingModel && !tier(local.autoTier).installed,
+  );
+  const fellBackToCpu = $derived(local?.onGpu && local.engine === 'ready' && local.engineDevice === 'cpu');
 
   async function chooseMode(mode) {
-    if (mode === 'cloud') wantLocal = false;
     if (modeBusy) return;
     modeBusy = true;
     errors.mode = '';
@@ -78,20 +93,38 @@
     }
   }
 
-  // Consent is this click: nothing downloads until the user asks. A
-  // finished download switches to Local, which is what it was for, unless
-  // the user chose Cloud meanwhile. A failure lands in local.error through
-  // the state refresh.
-  async function download() {
+  // Auto works once any tier is downloaded; a named tier needs its own.
+  async function chooseModel(id) {
+    if (modeBusy) return;
     errors.mode = '';
-    wantLocal = true;
-    let outcome;
-    try {
-      outcome = await invoke('download_local_model');
-    } catch (e) {
+    const ready = id === 'auto' ? local.installed : tier(id).installed;
+    if (!ready) {
+      pendingModel = id;
       return;
     }
-    if (outcome === 'installed' && wantLocal) await chooseMode('local');
+    pendingModel = null;
+    modeBusy = true;
+    try {
+      ui.app.local.model = await invoke('set_local_model', { model: id });
+    } catch (e) {
+      errors.mode = typeof e === 'string' ? e : 'Could not change the Local model.';
+    } finally {
+      modeBusy = false;
+    }
+  }
+
+  // Consent is this click, beside the size it fetches: nothing downloads
+  // until the user asks. The backend applies the choice once it installs,
+  // and turns Local on for a first download unless Cloud is chosen
+  // meanwhile. A failure lands in local.error through the state refresh.
+  async function download(model) {
+    errors.mode = '';
+    pendingModel = null;
+    try {
+      await invoke('download_local_model', { model, switchToLocal: !local.installed });
+    } catch (e) {
+      // Shown from local.error.
+    }
   }
 
   async function cancelDownload() {
@@ -106,6 +139,7 @@
     if (modeBusy) return;
     modeBusy = true;
     errors.mode = '';
+    pendingModel = null;
     try {
       await invoke('remove_local_model');
     } catch (e) {
@@ -309,17 +343,21 @@
         <span class="row-text">
           <span>Transcribe with</span>
           <span class="hint">
-            {app.mode === 'local'
-              ? 'Local: on this PC. Nothing you say leaves it.'
-              : 'Cloud: Deepgram and Groq. Fastest, needs your keys.'}
+            {#if local.cloudUntilDownloaded}
+              Using Cloud until the model finishes. Local turns on when it has downloaded.
+            {:else if app.mode === 'local'}
+              Local: on this PC. Nothing you say leaves it.
+            {:else}
+              Cloud: Deepgram and Groq. Fastest, needs your keys.
+            {/if}
           </span>
         </span>
         <div class="presets">
           <button
             type="button"
             class="chip"
-            class:on={app.mode === 'cloud'}
-            aria-pressed={app.mode === 'cloud'}
+            class:on={app.mode === 'cloud' && !local.cloudUntilDownloaded}
+            aria-pressed={app.mode === 'cloud' && !local.cloudUntilDownloaded}
             disabled={modeBusy}
             onclick={() => chooseMode('cloud')}
           >
@@ -328,10 +366,10 @@
           <button
             type="button"
             class="chip"
-            class:on={app.mode === 'local'}
-            aria-pressed={app.mode === 'local'}
-            disabled={modeBusy || !local.installed}
-            title={local.installed ? '' : 'Download the Local model first.'}
+            class:on={app.mode === 'local' || local.cloudUntilDownloaded}
+            aria-pressed={app.mode === 'local' || local.cloudUntilDownloaded}
+            disabled={modeBusy || !(local.installed || local.downloading)}
+            title={local.installed || local.downloading ? '' : 'Download a Local model first.'}
             onclick={() => chooseMode('local')}
           >
             Local
@@ -341,39 +379,104 @@
     </div>
     {#if !local.available}
       <p class="hint">Local mode isn't available in this build of Voisu.</p>
-    {:else if local.downloading}
-      <div class="block" aria-live="polite">
-        <div class="row">
-          <span class="row-text">
-            <span>Downloading the Local model</span>
-            <span class="hint">{mb(local.downloaded)} of {mb(local.total)} MB. Stopping keeps what's done.</span>
-          </span>
-          <button type="button" class="pill" onclick={cancelDownload}>Cancel</button>
-        </div>
-        <progress max={local.total} value={local.downloaded} aria-label="Local model download"></progress>
-      </div>
-    {:else if local.installed}
-      <div class="row">
-        <span class="row-text">
-          <span>Local model</span>
-          <span class="hint">Fast, English. {mb(local.total)} MB on this PC.</span>
-        </span>
-        <button type="button" class="pill" disabled={modeBusy} onclick={removeModel}>Remove</button>
-      </div>
     {:else}
       <div class="block">
-        <span class="row-text">
-          <span>Transcribe on this PC</span>
-          <span class="hint">
-            Downloads a {mb(local.total)} MB English model once, then works offline. It runs on the processor, so
-            the Transcript comes a few seconds after you stop, longer on older PCs; a recent 4-core or better CPU
-            with AVX2 works best. Cloud stays available.
+        <div class="row">
+          <span class="row-text">
+            <span>Local model</span>
+            <span class="hint">
+              {#if local.detecting}
+                Checking this PC for a GPU…
+              {:else if local.onGpu}
+                GPU found: {local.device}. Auto picks Accurate.
+              {:else}
+                No GPU found, so it runs on the processor. Auto picks Fast.
+              {/if}
+            </span>
           </span>
-        </span>
-        <button type="button" class="primary small" onclick={download}>
-          {local.downloaded ? 'Resume download' : `Download ${mb(local.total)} MB`}
-        </button>
+          <div class="presets">
+            {#each MODEL_CHOICES as choice (choice.id)}
+              <button
+                type="button"
+                class="chip"
+                class:on={shownModel === choice.id}
+                aria-pressed={shownModel === choice.id}
+                disabled={modeBusy || !!local.downloading}
+                onclick={() => chooseModel(choice.id)}
+              >
+                {choice.label}
+              </button>
+            {/each}
+          </div>
+        </div>
+        {#if shownTier?.note && !offerAutoTier}
+          <p class="hint" class:warn={!local.onGpu}>
+            {#if !local.onGpu}<span aria-hidden="true">!</span>{/if}
+            {shownTier.note}
+          </p>
+        {/if}
+        {#if app.mode === 'local' && activeTier && !local.downloading}
+          <p class="hint" aria-live="polite">
+            {#if local.engine === 'ready'}
+              {activeTier.name} ({activeTier.modelName}) is loaded on {local.engineDevice === 'cpu' ? 'the CPU' : local.device}.
+            {:else if local.engine === 'starting'}
+              Loading {activeTier.name} ({activeTier.modelName})…
+            {/if}
+            {#if fellBackToCpu}The GPU couldn't run it, so it uses the CPU.{/if}
+          </p>
+        {/if}
       </div>
+      {#if local.downloading}
+        <div class="block" aria-live="polite">
+          <div class="row">
+            <span class="row-text">
+              <span>Downloading {tier(local.downloading).name} ({tier(local.downloading).modelName})</span>
+              <span class="hint">{mb(local.downloaded)} of {mb(local.total)} MB. Stopping keeps what's done.</span>
+            </span>
+            <button type="button" class="pill" onclick={cancelDownload}>Cancel</button>
+          </div>
+          <progress max={local.total} value={local.downloaded} aria-label="Local model download"></progress>
+        </div>
+      {:else if (!local.installed || pendingModel) && shownTier}
+        <div class="block">
+          <span class="row-text">
+            <span>Download {shownTier.name} ({shownTier.modelName})</span>
+            <span class="hint">
+              {mb(shownTier.bytes)} MB, once; then it works offline. English only.
+              {#if !local.onGpu}It runs on the processor, so the Transcript comes a few seconds after you stop; a
+                recent 4-core or better CPU with AVX2 works best.{/if}
+              Cloud stays available.
+            </span>
+          </span>
+          <div class="actions">
+            <button type="button" class="primary small" onclick={() => download(shownModel)}>
+              Download {mb(shownTier.bytes)} MB
+            </button>
+            {#if pendingModel && local.installed}
+              <button type="button" class="pill" onclick={() => (pendingModel = null)}>Not now</button>
+            {/if}
+          </div>
+        </div>
+      {:else if offerAutoTier}
+        <div class="row">
+          <span class="row-text">
+            <span>{tier(local.autoTier).name} ({tier(local.autoTier).modelName}) suits this PC</span>
+            <span class="hint">Auto uses {activeTier?.name} until you download it.</span>
+          </span>
+          <button type="button" class="pill" onclick={() => download('auto')}>
+            Download {mb(tier(local.autoTier).bytes)} MB
+          </button>
+        </div>
+      {/if}
+      {#if local.installed && !local.downloading}
+        <div class="row">
+          <span class="row-text">
+            <span>On this PC</span>
+            <span class="hint">{local.tiers.filter((t) => t.installed).map((t) => t.name).join(' and ')}.</span>
+          </span>
+          <button type="button" class="pill" disabled={modeBusy} onclick={removeModel}>Remove</button>
+        </div>
+      {/if}
     {/if}
     <ErrorLine message={errors.mode || local.error} />
     {#if local.error && app.mode === 'local'}
