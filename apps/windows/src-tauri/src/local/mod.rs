@@ -718,35 +718,48 @@ pub enum DownloadOutcome {
     Cancelled,
 }
 
-/// Downloads the tier `model` picks on this PC, with progress as
-/// `STATE_CHANGED`. Once it installs, `model` becomes the tier setting and,
-/// with `switch_to_local`, Local turns on, unless the user chose otherwise
-/// meanwhile. A cancelled download keeps its `.part` file so the next one
-/// resumes. An error is the message to show; cancelling is not an error.
+/// What a download asks for: the tier to fetch, exactly the one the consent
+/// showed, and the setting to apply once it installs. `auto` stays `auto`
+/// whichever tier it fetches; a named tier fetches only itself.
+fn download_request(tier: &str, model: &str) -> Option<(LocalTier, LocalModel)> {
+    let tier = pinned_tier(LocalModel::from_value(tier)?)?;
+    let model = LocalModel::from_value(model)?;
+    pinned_tier(model)
+        .is_none_or(|pinned| pinned == tier)
+        .then_some((tier, model))
+}
+
+/// Downloads `tier`, which must still fetch the `bytes` the consent showed,
+/// with progress as `STATE_CHANGED`. Once it installs, `model` becomes the
+/// tier setting and, with `switch_to_local`, Local turns on, unless the user
+/// chose otherwise meanwhile. A cancelled download keeps its `.part` file so
+/// the next one resumes. An error is the message to show; cancelling is not
+/// an error.
 #[tauri::command]
 pub async fn download_local_model(
     app: AppHandle,
+    tier: String,
+    bytes: u64,
     model: String,
     switch_to_local: bool,
 ) -> Result<DownloadOutcome, String> {
     if worker_path(&app).is_none() {
         return Err(LocalError::WorkerMissing.message().into());
     }
-    let model = LocalModel::from_value(&model).ok_or("Voisu doesn't know that Local model.")?;
-    let probe_app = app.clone();
-    let detected =
-        tokio::task::spawn_blocking(move || probe_app.state::<LocalState>().detection.wait())
-            .await
-            .unwrap_or(Detected::Cpu);
-    let tier = LocalTier::resolve(model, detected.on_gpu());
+    let (tier, model) =
+        download_request(&tier, &model).ok_or("Voisu doesn't know that Local model.")?;
     let dir = crate::paths::local_model_dir();
     let total = total_bytes(tier);
-    let missing = missing_bytes(&dir, tier);
     let state = app.state::<LocalState>();
-    let cancel = {
+    let (cancel, missing) = {
         let mut status = state.status.lock().unwrap();
         if status.download.is_some() {
             return Err("A Local model is already downloading.".into());
+        }
+        // Never more than the user agreed to.
+        let missing = missing_bytes(&dir, tier);
+        if missing != bytes {
+            return Err("The download size changed. Check it and try again.".into());
         }
         let cancel = Arc::new(download::Cancel::default());
         *status = Status {
@@ -760,7 +773,7 @@ pub async fn download_local_model(
             cloud_notice_shown: false,
             error: None,
         };
-        cancel
+        (cancel, missing)
     };
     let _ = app.emit(crate::STATE_CHANGED, ());
     tracing::info!(
@@ -1006,5 +1019,26 @@ mod tests {
         assert_eq!(active_tier(Fast, true, only_accurate), T::Fast);
         assert_eq!(pinned_tier(Auto), None);
         assert_eq!(pinned_tier(Fast), Some(T::Fast));
+    }
+
+    #[test]
+    fn a_download_fetches_the_tier_shown_and_keeps_auto() {
+        use LocalModel::{Accurate, Auto, Fast};
+        use LocalTier as T;
+        assert_eq!(download_request("fast", "auto"), Some((T::Fast, Auto)));
+        assert_eq!(
+            download_request("accurate", "auto"),
+            Some((T::Accurate, Auto))
+        );
+        assert_eq!(
+            download_request("accurate", "accurate"),
+            Some((T::Accurate, Accurate))
+        );
+        assert_eq!(download_request("fast", "fast"), Some((T::Fast, Fast)));
+        // Never resolved here: the target is always concrete.
+        assert_eq!(download_request("auto", "auto"), None);
+        // A named tier fetches only itself.
+        assert_eq!(download_request("accurate", "fast"), None);
+        assert_eq!(download_request("large", "auto"), None);
     }
 }

@@ -203,10 +203,12 @@ const COMMANDS = {
     emit('state-changed', null);
     return model;
   },
-  download_local_model: ({ model, switchToLocal }) =>
-    new Promise((resolve) => {
+  download_local_model: ({ tier: id, bytes, model, switchToLocal }) =>
+    new Promise((resolve, reject) => {
       const local = state.local;
-      const tier = local.tiers.find((t) => t.id === (model === 'auto' ? local.autoTier : model));
+      const tier = local.tiers.find((t) => t.id === id);
+      if (!tier || (model !== 'auto' && model !== id)) return reject("Voisu doesn't know that Local model.");
+      if (tier.bytes !== bytes) return reject('The download size changed. Check it and try again.');
       Object.assign(local, {
         downloading: tier.id,
         downloaded: tier.size - tier.bytes,

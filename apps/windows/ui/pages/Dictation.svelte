@@ -73,6 +73,7 @@
   // The tier a choice runs on this PC.
   const tierFor = (id) => tier(id === 'auto' ? local.autoTier : id);
   const shownTier = $derived(local ? tierFor(shownModel) : null);
+  const autoUnknown = $derived(shownModel === 'auto' && !!local?.detecting);
   const activeTier = $derived(local?.activeTier ? tier(local.activeTier) : null);
   // Auto runs the other downloaded tier until this PC's own is downloaded.
   const offerAutoTier = $derived(
@@ -114,14 +115,20 @@
   }
 
   // Consent is this click, beside the size it fetches: nothing downloads
-  // until the user asks. The backend applies the choice once it installs,
-  // and turns Local on for a first download unless Cloud is chosen
+  // until the user asks. It fetches exactly the tier and size shown, and
+  // `model` is the setting applied once it installs (Auto stays Auto). The
+  // backend turns Local on for a first download unless Cloud is chosen
   // meanwhile. A failure lands in local.error through the state refresh.
-  async function download(model) {
+  async function download(model, shown) {
     errors.mode = '';
     pendingModel = null;
     try {
-      await invoke('download_local_model', { model, switchToLocal: !local.installed });
+      await invoke('download_local_model', {
+        tier: shown.id,
+        bytes: shown.bytes,
+        model,
+        switchToLocal: !local.installed,
+      });
     } catch (e) {
       // Shown from local.error.
     }
@@ -449,7 +456,14 @@
             </span>
           </span>
           <div class="actions">
-            <button type="button" class="primary small" onclick={() => download(shownModel)}>
+            <!-- Until the GPU probe answers, Auto's tier and size aren't known. -->
+            <button
+              type="button"
+              class="primary small"
+              disabled={autoUnknown}
+              title={autoUnknown ? 'Checking this PC for a GPU…' : ''}
+              onclick={() => download(shownModel, shownTier)}
+            >
               Download {mb(shownTier.bytes)} MB
             </button>
             {#if pendingModel && local.installed}
@@ -463,7 +477,7 @@
             <span>{tier(local.autoTier).name} ({tier(local.autoTier).modelName}) suits this PC</span>
             <span class="hint">Auto uses {activeTier?.name} until you download it.</span>
           </span>
-          <button type="button" class="pill" onclick={() => download('auto')}>
+          <button type="button" class="pill" onclick={() => download('auto', tier(local.autoTier))}>
             Download {mb(tier(local.autoTier).bytes)} MB
           </button>
         </div>
