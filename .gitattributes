@@ -1,2 +1,6 @@
 # Windows runners check out with core.autocrlf=true; bash scripts must keep LF.
 *.sh text eol=lf
+# The vendored whisper.cpp tree stays byte-identical to the pinned release on
+# every OS: no CRLF conversion on Windows checkouts. Tests read its sources
+# with include_str! and match LF line structure.
+crates/voisu-whisper-sys/whisper.cpp/** -text
