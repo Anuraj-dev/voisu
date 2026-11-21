@@ -1,8 +1,9 @@
 [
   {
-    "version": "1.3.0",
+    "version": "1.5.0",
     "date": "2026-11-21",
     "items": [
+      { "kind": "new", "text": "Local mode: transcribe on this PC, with no keys or internet. Turn it on in Dictation.", "platforms": ["windows"] },
       { "kind": "improved", "text": "Dictation now starts the moment you press: Voisu keeps the microphone on. Change it in Dictation, then Microphone.", "platforms": ["windows"] }
     ]
   },
