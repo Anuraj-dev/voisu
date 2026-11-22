@@ -8,8 +8,8 @@ Install Voisu on the user's computer, start it, and hand over to the user at the
 
 ## Rules for the agent
 
-1. **Never ask for API keys in the chat.** Do not request, accept, read, print, log, or store the user's Deepgram or Groq keys. Do not pass them as command arguments, environment variables or files. The user types them into Voisu's own prompt: `voisu setup` in their own terminal on Linux, or the Voisu settings window on Windows and Mac. If the user pastes a key into the chat anyway, don't use it. Tell them to revoke it in the provider's console and create a new one.
-2. **Don't run `voisu setup` yourself.** It opens full-screen setup screens that need a real terminal for hidden key entry. Ask the user to run it in a terminal window of their own, not through you.
+1. **Never ask for API keys in the chat.** Do not request, accept, read, print, log, or store the user's Deepgram or Groq keys. Do not pass them as command arguments, environment variables or files. The user types them into Voisu's own prompt: `voisu` in their own terminal on Linux (a fresh install opens on setup), or the Voisu settings window on Windows and Mac. If the user pastes a key into the chat anyway, don't use it. Tell them to revoke it in the provider's console and create a new one.
+2. **Don't run `voisu` or `voisu setup` yourself.** They open full-screen setup screens that need a real terminal for hidden key entry. Ask the user to run it in a terminal window of their own, not through you.
 3. **Show before you run.** Before each `sudo` command, show it and say why it's needed. If `sudo` can't prompt for a password in your shell, ask the user to run that exact command in their own terminal, then carry on.
 4. **Stop at every "HUMAN" step.** Tell the user exactly what to do, wait until they say it's done, then verify.
 5. **Use only the commands in this file.** Don't edit desktop config files by hand, install other key remappers, or give Voisu root or `uinput` access. Voisu never needs them.
@@ -78,7 +78,7 @@ systemctl --user enable --now voisu-overlay.service
 
 **HUMAN: choose the Trigger Key.** On KDE Plasma and GNOME, a desktop dialog appears the first time the daemon starts. Tell the user to pick a key in it and approve. The choice persists.
 
-**HUMAN: add API keys.** Ask the user to open their own terminal and run `voisu setup`. It asks for the Groq and Deepgram keys and checks each with its provider. Keys come from https://console.groq.com/keys and https://console.deepgram.com. Wait for them to finish.
+**HUMAN: add API keys.** Ask the user to open their own terminal and run `voisu`; a fresh install opens on setup. It asks for the Groq and Deepgram keys and checks each with its provider. Keys come from https://console.groq.com/keys and https://console.deepgram.com. Wait for them to finish.
 
 Then go to **Verify on Linux**.
 
@@ -90,7 +90,7 @@ yay -S voisu-bin
 
 `voisu` (build from source) conflicts with `voisu-bin`, so install only one. If `yay` is missing, ask the user which AUR helper they use. Don't install one without asking.
 
-**HUMAN: run setup.** Ask the user to run `voisu setup` in their own terminal. It asks for the API keys and checks them. On Hyprland it also binds the Trigger Key (Caps Lock by default, or Right Alt if they decline or Caps Lock is taken) and starts Voisu's services.
+**HUMAN: run setup.** Ask the user to run `voisu` in their own terminal; a fresh install opens on setup. It asks for the API keys and checks them. On Hyprland (including Omarchy) it also binds the Trigger Key (Caps Lock by default, or Right Alt if they decline or Caps Lock is taken) and starts Voisu's services.
 
 Then go to **Verify on Linux**.
 
@@ -115,7 +115,7 @@ echo 'deb [signed-by=/etc/apt/keyrings/voisu-archive-keyring.asc arch=amd64] htt
 sudo apt-get update && sudo apt-get install -y voisu
 ```
 
-**HUMAN: run setup.** Ask the user to run `voisu setup` in their own terminal. It asks for the API keys, enables the daemon and the native GNOME overlay, and sets Ctrl+Space as the Trigger Key by default. If setup says so, the user must log out and back in, or reboot. Wait for them to come back before you verify.
+**HUMAN: run setup.** Ask the user to run `voisu` in their own terminal; a fresh install opens on setup. It asks for the API keys, enables the daemon and the native GNOME overlay, and sets Ctrl+Space as the Trigger Key by default. If setup says so, the user must log out and back in, or reboot. Wait for them to come back before you verify.
 
 Then go to **Verify on Linux**.
 

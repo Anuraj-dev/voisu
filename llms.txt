@@ -2,7 +2,7 @@
 
 > Voisu is free, MIT-licensed voice dictation for Linux (Fedora, Arch, Debian/Ubuntu), Windows 10/11 and macOS 13+ on Apple Silicon. Press a key, speak, and the Transcript is pasted where you were typing. It uses your own Deepgram and Groq API keys and has no account, server or analytics of its own.
 
-Agents installing Voisu for a user: follow the agent install guide below. Never ask the user to paste API keys into the chat; they type them into Voisu's own setup (`voisu setup` on Linux, the settings window on Windows and Mac).
+Agents installing Voisu for a user: follow the agent install guide below. Never ask the user to paste API keys into the chat; they type them into Voisu's own setup (`voisu` on Linux, which opens on setup the first time, the settings window on Windows and Mac).
 
 ## Agents
 
@@ -15,7 +15,7 @@ Agents installing Voisu for a user: follow the agent install guide below. Never 
 - [Set up on Mac](https://anuraj-dev.github.io/voisu/docs/macos-setup.html): Gatekeeper Open Anyway, the Microphone, Accessibility and Input Monitoring permissions, keys in the Keychain
 - [Install with an agent](https://anuraj-dev.github.io/voisu/docs/agents.html): copyable prompts for Claude Code, Codex and other terminal agents
 - [Dictating](https://anuraj-dev.github.io/voisu/docs/using.html): gestures, the overlay pill's states, where text goes, recovering a Transcript
-- [Providers & API keys](https://anuraj-dev.github.io/voisu/docs/providers.html): what Deepgram and Groq do, getting and storing keys, Local transcription (Linux only for now)
+- [Providers & API keys](https://anuraj-dev.github.io/voisu/docs/providers.html): what Deepgram and Groq do, getting and storing keys, Local transcription (Linux and Windows)
 - [Settings & commands](https://anuraj-dev.github.io/voisu/docs/settings.html): the Windows and Mac settings window and tray, the Linux interface's Settings rows, switching to Local, every Linux `voisu` command, file locations
 - [Troubleshooting](https://anuraj-dev.github.io/voisu/docs/troubleshooting.html): Trigger Key, portals, keys, microphone, failed pastes, SmartScreen, bug reports
 
