@@ -36,7 +36,7 @@ It is a tray app on Windows, a menu bar app on macOS, and a set of systemd user 
 - **Spoken punctuation and layout.** Say "new paragraph", "dash dash", "quote … unquote" or "first … second …" and it is formatted locally, on every platform.
 - **Hold to talk, or go hands-free.** On Windows and macOS, hold the Trigger Key and let go, or double-tap for hands-free. `Esc` cancels. On Linux, press to start and press again to stop.
 - **Your words, your tone.** Teach Voisu the names and terms it should spell your way, and choose formal or informal writing.
-- **Local transcription on Linux and Windows.** Run a whisper.cpp model on your own computer, offline, after a Consented Install. On Linux, pick Accurate for a GPU or Fast for a computer without one; the model stays loaded, so every Recording starts at once. On Windows, Local is opt-in, uses the Fast model on the CPU, and works best on a recent 4-core CPU ([details](docs/windows.md#local-mode-opt-in)). Nothing downloads until you agree, and a download that stops picks up where it left off.
+- **Local transcription on Linux and Windows.** Run a whisper.cpp model on your own computer, offline, after a Consented Install. On Linux, pick Accurate for a GPU or Fast for a computer without one; the model stays loaded, so every Recording starts at once. On Windows, Local is opt-in, with the same Accurate and Fast models on your GPU or CPU ([details](docs/windows.md#local-mode-opt-in)). Nothing downloads until you agree, and a download that stops picks up where it left off.
 - **An Overlay you can place.** A small pill with live sound bars shows while you dictate. Drag it anywhere on screen, save with ✓ or cancel with ✗, and Reset puts it back at the bottom centre. On Linux this needs KDE Plasma or Hyprland, where the pill also follows the monitor you are working on.
 - **Stays up to date.** The Windows and macOS apps update themselves and show what's new after each update. On Linux, Voisu checks once a day and shows *Update available* on Home.
 - **A command for everything on Linux.** Every setting in the interface is also a plain `voisu` command, so a script or a coding agent can install and check it.
@@ -49,7 +49,7 @@ It is a tray app on Windows, a menu bar app on macOS, and a set of systemd user 
 | **Windows** 10 and 11, x64 | [Voisu-Setup-x64.exe](https://github.com/Anuraj-dev/voisu/releases/latest/download/Voisu-Setup-x64.exe) |
 | **macOS** 13 or newer, Apple Silicon | [Voisu-macOS-arm64.dmg](https://github.com/Anuraj-dev/voisu/releases/latest/download/Voisu-macOS-arm64.dmg) |
 | **Fedora** | `sudo dnf copr enable anuraj-dev/voisu && sudo dnf install voisu` |
-| **Arch** | `yay -S voisu-bin` |
+| **Arch, Omarchy** | `yay -S voisu-bin`, then run `voisu` |
 | **Debian / Ubuntu** 26.04 LTS, amd64 | [Signed apt repository](docs/linux.md#install) |
 
 ### Windows
@@ -73,7 +73,9 @@ systemctl --user enable --now voisu.service
 voisu                 # a fresh install opens on setup
 ```
 
-Fedora KDE Plasma on Wayland is the primary target. GNOME, Hyprland and X11 desktops work too. The [Linux guide](docs/linux.md) covers the Trigger Key on each desktop, Local transcription, updates and troubleshooting.
+Fedora KDE Plasma on Wayland is the primary target. GNOME, Hyprland and X11 desktops work too.
+
+On Hyprland and Omarchy, skip the `systemctl` line and just run `voisu`. Its first-run setup saves your keys, binds Caps Lock as the Trigger Key (Right Alt if you decline), turns on Paste through your Hyprland paste shortcut (Omarchy's universal paste included), and starts Voisu's services. The [Linux guide](docs/linux.md) covers the Trigger Key on each desktop, Local transcription, updates and troubleshooting.
 
 The Windows and macOS apps update themselves from GitHub Releases. On Linux, `voisu update` goes through the package manager that installed Voisu.
 
@@ -81,7 +83,7 @@ The Windows and macOS apps update themselves from GitHub Releases. On Linux, `vo
 
 Nothing. Voisu is free and MIT licensed, with no account and nothing to subscribe to.
 
-Cloud transcription runs on two free API keys, one from Groq and one from Deepgram. Setup checks each key as you save it. On Linux you can skip the cloud and transcribe on your own computer instead.
+Cloud transcription runs on two free API keys, one from Groq and one from Deepgram. Setup checks each key as you save it. On Linux and Windows you can skip the cloud and transcribe on your own computer instead.
 
 ## Documentation
 
