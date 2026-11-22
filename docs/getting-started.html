@@ -88,7 +88,7 @@
 
 <h2 id="before">Before you start</h2>
 <ul>
-  <li><strong>A supported system.</strong> Windows 10 or 11 (x64), or Linux: Fedora, Arch, or Debian/Ubuntu. Fedora KDE Plasma on Wayland is the primary Linux target; GNOME, Hyprland and X11 desktops work with the differences noted below.</li>
+  <li><strong>A supported system.</strong> Windows 10 or 11 (x64), macOS 13 or newer on Apple Silicon, or Linux: Fedora, Arch, or Debian/Ubuntu. Fedora KDE Plasma on Wayland is the primary Linux target; GNOME, Hyprland (including Omarchy) and X11 desktops work with the differences noted below.</li>
   <li><strong>Two API keys.</strong> Create one at <a href="https://console.groq.com/keys">Groq</a> and one at <a href="https://console.deepgram.com">Deepgram</a>. <a href="providers.html">Providers &amp; API keys</a> explains what each one does. You pay the providers directly; Voisu adds no charge.</li>
 </ul>
 
@@ -158,15 +158,15 @@
       </li>
       <li><p><strong>Choose your Trigger Key.</strong> On KDE Plasma and GNOME, your desktop shows a dialog the first time the daemon starts. Pick the key there; the choice persists.</p></li>
       <li>
-        <p><strong>Add your keys.</strong> Setup asks for both and checks them with each provider. Afterwards, run <code>voisu</code> any time to see whether Voisu is ready and to change settings.</p>
-        <div class="code"><pre><span class="p">$ </span>voisu setup</pre></div>
+        <p><strong>Add your keys.</strong> Setup asks for both and checks them with each provider. A fresh install opens on setup; afterwards <code>voisu</code> shows whether Voisu is ready and lets you change settings.</p>
+        <div class="code"><pre><span class="p">$ </span>voisu</pre></div>
       </li>
     </ol>
   </div>
 
   <div class="tabpanel" role="tabpanel" id="arch" aria-labelledby="tab-arch" tabindex="0">
     <h3 class="panel-title">Arch</h3>
-    <p class="meta">Arch Linux · AUR</p>
+    <p class="meta">Arch Linux and Omarchy · AUR</p>
     <ol class="steps">
       <li>
         <p><strong>Install the package.</strong></p>
@@ -174,9 +174,9 @@
         <p>To build from source instead, install <code>voisu</code>. The two packages conflict, so pick one.</p>
       </li>
       <li>
-        <p><strong>Run setup.</strong> It asks for your API keys and checks them with each provider. Afterwards, run <code>voisu</code> any time to see whether Voisu is ready and to change settings.</p>
-        <div class="code"><pre><span class="p">$ </span>voisu setup</pre></div>
-        <p>On Hyprland there is no shortcut dialog, so setup binds the Trigger Key for you: <kbd>Caps Lock</kbd> if you accept the default, or <kbd>Right Alt</kbd> if you decline or Caps Lock is already bound. It also starts Voisu's services. Using Caps Lock as the Trigger Key stops it toggling caps on that key.</p>
+        <p><strong>Open Voisu.</strong> A fresh install opens on setup, which asks for your API keys and checks them with each provider. A fresh install opens on setup; afterwards <code>voisu</code> shows whether Voisu is ready and lets you change settings.</p>
+        <div class="code"><pre><span class="p">$ </span>voisu</pre></div>
+        <p>On Hyprland and Omarchy there is no shortcut dialog, so setup binds the Trigger Key for you: <kbd>Caps Lock</kbd> if you accept the default, or <kbd>Right Alt</kbd> if you decline or Caps Lock is already bound. It also turns on Paste, which presses the paste shortcut from your Hyprland config (Omarchy's universal paste included), and starts Voisu's services. Using Caps Lock as the Trigger Key stops it toggling caps on that key.</p>
       </li>
     </ol>
   </div>
@@ -211,7 +211,7 @@
       </li>
       <li>
         <p><strong>Run setup.</strong></p>
-        <div class="code"><pre><span class="p">$ </span>voisu setup</pre></div>
+        <div class="code"><pre><span class="p">$ </span>voisu</pre></div>
         <p>Setup asks for your API keys, enables the daemon and the native GNOME overlay, and uses <kbd>Ctrl</kbd>&nbsp;<kbd>Space</kbd> as the Trigger Key by default. If it asks, log out and back in, or reboot.</p>
       </li>
     </ol>

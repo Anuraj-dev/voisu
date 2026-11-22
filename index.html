@@ -172,8 +172,8 @@
         </article>
 
         <article class="card">
-          <h3>Local on Linux, if you like</h3>
-          <p>Switch to Local and your speech never leaves the computer. Voisu runs a whisper.cpp model on your GPU or CPU after asking before a one-time download. Local models are Linux only for now.</p>
+          <h3>Local, if you like</h3>
+          <p>Switch to Local and your speech never leaves the computer. Voisu runs a whisper.cpp model on your GPU or CPU after asking before a one-time download. Local runs on Linux and Windows; the Mac uses Cloud.</p>
         </article>
 
         <article class="card">
@@ -198,7 +198,7 @@
     <div class="wrap install">
       <div class="section-head">
         <h2 id="install-title">Pick your system</h2>
-        <p>Every channel installs the same Voisu. After installing, <code>voisu setup</code> (Linux) or the settings window (Windows and Mac) asks for your API keys and you're ready.</p>
+        <p>Every channel installs the same Voisu. After installing, <code>voisu</code> (Linux) or the settings window (Windows and Mac) asks for your API keys and you're ready.</p>
       </div>
 
       <div class="tabs" data-tabs>
@@ -226,7 +226,7 @@
           <p class="small">Enable the user daemon, then add your API keys. The first time you dictate, your desktop asks you to confirm the shortcut; that choice sticks.</p>
           <div class="code"><pre><span class="p">$ </span>systemctl --user daemon-reload
 <span class="p">$ </span>systemctl --user enable --now voisu.service
-<span class="p">$ </span>voisu setup</pre></div>
+<span class="p">$ </span>voisu</pre></div>
           <p class="small">Optional overlay (install <code>voisu-overlay</code> first):</p>
           <div class="code"><pre><span class="p">$ </span>systemctl --user enable --now voisu-overlay.service</pre></div>
           </div>
@@ -235,7 +235,7 @@
 
         <div class="tabpanel" role="tabpanel" id="install-arch" aria-labelledby="tab-arch" tabindex="0">
           <h3 class="panel-title">Arch</h3>
-          <p class="meta">Arch Linux · AUR, prebuilt or from source</p>
+          <p class="meta">Arch Linux and Omarchy · AUR, prebuilt or from source</p>
           <div class="procedure">
           <div class="step">
           <p class="step-label"><span class="n">1</span>Install</p>
@@ -244,8 +244,8 @@
           </div>
           <div class="step">
           <p class="step-label"><span class="n">2</span>Finish setup</p>
-          <p class="small">On Hyprland, setup saves your API keys, writes the trigger binding and starts Voisu's services.</p>
-          <div class="code"><pre><span class="p">$ </span>voisu setup</pre></div>
+          <p class="small">On Hyprland and Omarchy, the setup that <code>voisu</code> opens saves your API keys, writes the trigger binding and starts Voisu's services.</p>
+          <div class="code"><pre><span class="p">$ </span>voisu</pre></div>
           </div>
           </div>
         </div>
@@ -281,7 +281,7 @@
           <div class="step">
           <p class="step-label"><span class="n">2</span>Finish setup</p>
           <p class="small">Setup asks for your API keys, enables the daemon and the native GNOME overlay, and uses <kbd>Ctrl</kbd>&nbsp;<kbd>Space</kbd> by default. If it asks, log out and back in, or reboot.</p>
-          <div class="code"><pre><span class="p">$ </span>voisu setup</pre></div>
+          <div class="code"><pre><span class="p">$ </span>voisu</pre></div>
           </div>
           </div>
         </div>
