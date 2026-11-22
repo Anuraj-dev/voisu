@@ -1,6 +1,6 @@
 # Voisu on Linux
 
-Fedora, Arch, Debian and Ubuntu, on KDE Plasma, GNOME, Hyprland and X11 desktops. Voisu runs as systemd **user** services with the `voisu` terminal interface and `voisu` commands. Transcription is Cloud (Deepgram and Groq), or Local on your own GPU or CPU.
+Fedora, Arch, Debian and Ubuntu, on KDE Plasma, GNOME, Hyprland (including Omarchy) and X11 desktops. Voisu runs as systemd **user** services with the `voisu` terminal interface and `voisu` commands. Transcription is Cloud (Deepgram and Groq), or Local on your own GPU or CPU.
 
 Every command is listed in the [command reference](commands.md).
 
@@ -100,7 +100,7 @@ A few changes apply only when Voisu restarts. The row says so, and `r` restarts 
 
 ### Switch to Local, step by step
 
-Local transcription runs on Linux only. The Windows and macOS apps use Cloud.
+These steps are for Linux. Windows has its own opt-in Local mode (see the [Windows guide](windows.md#local-mode-opt-in)); the macOS app uses Cloud.
 
 1. Run `voisu` and open **Settings** (`2`).
 2. If Local is already installed, pick **Engine → Local** and you are done. If not, Voisu says *Local isn't ready yet. Choose Run setup to install it.*
@@ -176,7 +176,7 @@ After 20 dictations spread over at least 3 days, Voisu sends one desktop notific
 ## Trigger Key by desktop
 
 - **KDE Plasma and GNOME:** a system dialog appears the first time the daemon starts. Choose a Trigger Key there, and it persists.
-- **Hyprland:** there is no Global Shortcuts dialog. `voisu setup` installs a compositor bind: Caps Lock (`code:66`) after a default-yes prompt, or Right Alt (`code:108`) if you decline or Caps Lock is already bound. It never auto-installs Left Alt and never overwrites an exact unmanaged binding. Caps Lock as the Trigger Key also disables lock-toggle on that key.
+- **Hyprland and Omarchy:** there is no Global Shortcuts dialog. `voisu setup` installs a compositor bind: Caps Lock (`code:66`) after a default-yes prompt, or Right Alt (`code:108`) if you decline or Caps Lock is already bound. It never auto-installs Left Alt and never overwrites an exact unmanaged binding. Caps Lock as the Trigger Key also disables lock-toggle on that key.
 
   Hyprland's portal has no RemoteDesktop interface, so Paste puts the Transcript on the clipboard and asks Hyprland to press the paste shortcut from your config:
 
