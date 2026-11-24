@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        1.5.0
+Version:        1.5.1
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -206,6 +206,10 @@ install -D -m 0644 packaging/icons/voisu.svg %{buildroot}%{_datadir}/icons/hicol
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Tue Nov 24 2026 Voisu maintainers <voisu@example.invalid> - 1.5.1-1
+- fix(deps): update url to 2.5.9 for RUSTSEC-2026-0592 (#364)
+- docs(readme): name Omarchy support and fix stale Local claims (#361)
+
 * Sat Nov 21 2026 Voisu maintainers <voisu@example.invalid> - 1.5.0-1
 - Maintenance release.
 
