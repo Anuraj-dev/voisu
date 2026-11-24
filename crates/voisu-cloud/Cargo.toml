@@ -1,6 +1,6 @@
 [package]
 name = "voisu-cloud"
-version = "1.5.1"
+version = "1.5.2"
 description = "Portable cloud transcription pipeline for Voisu"
 edition.workspace = true
 license.workspace = true
