@@ -10,6 +10,8 @@ mod chord;
 mod engine;
 #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 mod gesture;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod hook_health;
 mod local;
 mod logging;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]

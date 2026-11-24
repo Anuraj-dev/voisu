@@ -9,8 +9,11 @@
 //! arrives the same way, as a message [`set_chord`] posts.
 //!
 //! The hook is reinstalled on session unlock, on resume from sleep, and by a
-//! health check when input arrived but the callback went quiet, which is how
-//! a silently removed hook shows.
+//! health check when the hook stops receiving keys, which is how a silently
+//! removed hook shows. Input newer than the last callback only makes the hook
+//! suspect, because mouse input counts too; the check then injects a tagged
+//! probe key the callback swallows, and reinstalls only if the probe never
+//! arrives (see [`crate::hook_health`]).
 
 use std::cell::RefCell;
 use std::io;
@@ -33,15 +36,16 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetForegroundWindow,
-    GetMessageW, GetWindowThreadProcessId, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED,
-    LLKHF_INJECTED, MSG, PBT_APMRESUMEAUTOMATIC, PostThreadMessageW, RegisterClassW, SetTimer,
-    SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WINDOW_EX_STYLE, WM_APP, WM_KEYDOWN,
-    WM_POWERBROADCAST, WM_SYSKEYDOWN, WM_TIMER, WM_WTSSESSION_CHANGE, WNDCLASSW, WS_OVERLAPPED,
-    WTS_SESSION_UNLOCK,
+    GetMessageW, GetWindowThreadProcessId, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, KillTimer,
+    LLKHF_EXTENDED, LLKHF_INJECTED, MSG, PBT_APMRESUMEAUTOMATIC, PostThreadMessageW,
+    RegisterClassW, SetTimer, SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL,
+    WINDOW_EX_STYLE, WM_APP, WM_KEYDOWN, WM_POWERBROADCAST, WM_SYSKEYDOWN, WM_TIMER,
+    WM_WTSSESSION_CHANGE, WNDCLASSW, WS_OVERLAPPED, WTS_SESSION_UNLOCK,
 };
 use windows::core::w;
 
 use crate::chord::{ChordTracker, Key, MASK_TAG, MASK_VK, ModMask, Modifier, Side, VK_PACKET};
+use crate::hook_health::{HealthAction, HookHealth, PROBE_TAG, PROBE_WAIT_MS};
 use crate::trigger::Trigger;
 use crate::trigger_key::{TriggerChord, scan_code};
 
@@ -67,8 +71,8 @@ const WM_INJECT_MASK: u32 = WM_APP + 1;
 const WM_SET_CHORD: u32 = WM_APP + 2;
 const HEALTH_TIMER: usize = 1;
 const HEALTH_INTERVAL_MS: u32 = 5_000;
-/// Input newer than the last callback by this much means the hook is gone.
-const SILENT_HOOK_MS: u32 = 30_000;
+/// One-shot: checks whether the probe key reached the callback.
+const PROBE_TIMER: usize = 2;
 
 /// Tick of the most recent callback, read by the health check.
 static LAST_CALLBACK: AtomicU32 = AtomicU32::new(0);
@@ -95,6 +99,8 @@ thread_local! {
     /// Only the hook thread touches this: the callback, the window procedure
     /// and the message loop all run there.
     static STATE: RefCell<Option<HookState>> = const { RefCell::new(None) };
+    /// The health check's probe state; the window procedure owns it.
+    static HEALTH: RefCell<HookHealth> = RefCell::new(HookHealth::default());
 }
 
 /// Starts the hook thread for `chord` and returns once the hook is
@@ -286,6 +292,7 @@ fn reinstall() -> io::Result<()> {
         }
         LAST_CALLBACK.store(GetTickCount(), Ordering::Relaxed);
     }
+    HEALTH.with(|health| health.borrow_mut().reset());
     Ok(())
 }
 
@@ -352,10 +359,12 @@ unsafe extern "system" fn watcher_proc(
         WM_POWERBROADCAST if wparam.0 as u32 == PBT_APMRESUMEAUTOMATIC => {
             reinstall_logged("resumed");
         }
-        WM_TIMER if wparam.0 == HEALTH_TIMER => {
-            if hook_went_silent() {
-                reinstall_logged("hook stopped receiving input");
+        WM_TIMER if wparam.0 == HEALTH_TIMER || wparam.0 == PROBE_TIMER => {
+            if wparam.0 == PROBE_TIMER {
+                // SAFETY: stops this window's own one-shot timer.
+                let _ = unsafe { KillTimer(Some(hwnd), PROBE_TIMER) };
             }
+            check_health(hwnd);
             // Picks up a false alarm the callback cleared.
             report_health();
         }
@@ -365,21 +374,50 @@ unsafe extern "system" fn watcher_proc(
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
-/// True when the user produced input well after the callback last ran.
-/// Mouse-only use also trips it; a spare reinstall is harmless.
-fn hook_went_silent() -> bool {
+/// Probes a suspect hook and reinstalls it only when the probe goes unseen.
+fn check_health(hwnd: HWND) {
     let mut info = LASTINPUTINFO {
         cbSize: size_of::<LASTINPUTINFO>() as u32,
         dwTime: 0,
     };
     // SAFETY: `info` is a live, correctly sized LASTINPUTINFO.
     if !unsafe { GetLastInputInfo(&mut info) }.as_bool() {
-        return false;
+        return;
     }
+    // SAFETY: reads the system tick count.
+    let now = unsafe { GetTickCount() };
     let last_callback = LAST_CALLBACK.load(Ordering::Relaxed);
-    let input_after = info.dwTime.wrapping_sub(last_callback);
-    // Wrapping tick arithmetic: "after" only within half the range.
-    input_after > SILENT_HOOK_MS && input_after < u32::MAX / 2
+    let action = HEALTH.with(|health| health.borrow_mut().check(now, info.dwTime, last_callback));
+    match action {
+        HealthAction::None => {}
+        HealthAction::SendProbe => {
+            inject_probe();
+            // SAFETY: a one-shot timer on this thread's own window.
+            unsafe { SetTimer(Some(hwnd), PROBE_TIMER, PROBE_WAIT_MS, None) };
+        }
+        HealthAction::Reinstall => reinstall_logged("hook stopped receiving input"),
+    }
+}
+
+/// A tagged key-up of the unassigned mask key, which the callback swallows,
+/// so no app ever sees it. Windows blocks it when the foreground app runs
+/// elevated; the probe then goes unseen and the hook is reinstalled, as
+/// before probes existed.
+fn inject_probe() {
+    let input = INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(u16::from(MASK_VK)),
+                wScan: 0,
+                dwFlags: KEYEVENTF_KEYUP,
+                time: 0,
+                dwExtraInfo: PROBE_TAG,
+            },
+        },
+    };
+    // SAFETY: one fully initialised keyboard input.
+    unsafe { SendInput(&[input], size_of::<INPUT>() as i32) };
 }
 
 fn inject_mask() {
@@ -500,6 +538,10 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
                 HOOK_LOST.store(false, Ordering::Relaxed);
             }
             let event = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+            // The health check's probe: proof of life, never an app's key.
+            if event.dwExtraInfo == PROBE_TAG && event.flags.contains(LLKHF_INJECTED) {
+                return LRESULT(1);
+            }
             if on_key(event, wparam.0 as u32) {
                 return LRESULT(1);
             }
