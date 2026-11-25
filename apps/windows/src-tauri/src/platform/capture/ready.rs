@@ -39,6 +39,9 @@ const STALL_AFTER: Duration = Duration::from_secs(2);
 /// default mic before it opens one itself.
 const VERIFY_TIMEOUT: Duration = Duration::from_millis(200);
 const RETRY_FIRST: Duration = Duration::from_secs(2);
+/// No ready stream opens this soon after Windows changes the default mic:
+/// new audio clients can fail while the switch settles.
+const CALM: Duration = Duration::from_secs(2);
 const RETRY_MAX: Duration = Duration::from_secs(60);
 
 /// What the keeper should do to the stream, and why (for the log).
@@ -51,6 +54,13 @@ pub(super) enum Command {
 
 /// When the ready stream should exist. Every deadline it reports is cleared
 /// by the [`Policy::tick`] that reaches it, so the keeper never spins.
+///
+/// A default-mic change or a lost device closes the stream rather than
+/// rebuilding it on the keeper thread: right after a switch Windows can
+/// refuse new audio clients (`RPC_E_CHANGED_MODE`), and a keeper that
+/// kept reopening then fought every press for the endpoint. The stream
+/// comes back only after a press has opened the mic itself and heard audio,
+/// and never inside [`CALM`] of the last change.
 #[derive(Debug)]
 pub(super) struct Policy {
     mode: KeepMicReady,
@@ -61,7 +71,14 @@ pub(super) struct Policy {
     /// from here.
     last_used: Option<Instant>,
     retry_at: Option<Instant>,
+    /// Why the open at `retry_at` happens, for the log.
+    retry_reason: &'static str,
     failures: u32,
+    /// No open before this: the last default-mic change was too recent.
+    calm_until: Option<Instant>,
+    /// The device changed under the stream; only a press that heard audio
+    /// brings it back.
+    awaiting_use: bool,
 }
 
 impl Policy {
@@ -72,7 +89,10 @@ impl Policy {
             in_use: false,
             last_used: None,
             retry_at: None,
+            retry_reason: "retry",
             failures: 0,
+            calm_until: None,
+            awaiting_use: false,
         }
     }
 
@@ -104,6 +124,21 @@ impl Policy {
         Some(Command::Close(reason))
     }
 
+    /// Opens now, or once the calm after the last default change is over.
+    fn open_after_calm(&mut self, reason: &'static str, now: Instant) -> Option<Command> {
+        match self.calm_until.filter(|&calm| now < calm) {
+            Some(calm) => {
+                self.retry_at = Some(calm);
+                self.retry_reason = reason;
+                None
+            }
+            None => {
+                self.retry_at = None;
+                Some(Command::Open(reason))
+            }
+        }
+    }
+
     pub(super) fn start(&mut self, _now: Instant) -> Option<Command> {
         (self.mode == KeepMicReady::WhileRunning).then_some(Command::Open("app started"))
     }
@@ -116,7 +151,13 @@ impl Policy {
         self.retry_at = None;
         self.failures = 0;
         match mode {
-            KeepMicReady::WhileRunning => (!self.open).then_some(Command::Open("setting changed")),
+            // The user asked for it: no press needed, but still no open
+            // while the default mic is settling.
+            KeepMicReady::WhileRunning if !self.open => {
+                self.awaiting_use = false;
+                self.open_after_calm("setting changed", now)
+            }
+            KeepMicReady::WhileRunning => None,
             // Five minutes from the last use, not from now: a mic nothing
             // used closes at once. Closed stays closed until the next
             // Recording ends.
@@ -145,24 +186,25 @@ impl Policy {
 
     /// A Recording's capture ended at `ended`, whether it used the ready
     /// stream or opened its own. Only one that `heard` audio counts as a
-    /// use: a press cancelled while the mic opened starts no five minutes.
+    /// use: a press cancelled while the mic opened starts no five minutes,
+    /// and does not bring back a stream a device change closed.
     pub(super) fn released(&mut self, ended: Instant, heard: bool) -> Option<Command> {
         self.in_use = false;
         if heard {
             self.last_used = self.last_used.max(Some(ended));
+            self.awaiting_use = false;
         }
         match self.mode {
             KeepMicReady::Off if self.open => self.close("setting turned off"),
             KeepMicReady::Off => None,
             KeepMicReady::ForFiveMinutes | KeepMicReady::WhileRunning => {
-                if self.open || !self.wants_open(ended) {
+                if self.open || self.awaiting_use || !self.wants_open(ended) {
                     return None;
                 }
                 // A Recording worked or failed in front of the user: try
                 // again now rather than at the back of a long backoff.
-                self.retry_at = None;
                 self.failures = 0;
-                Some(Command::Open("Recording ended"))
+                self.open_after_calm("Recording ended", ended)
             }
         }
     }
@@ -170,6 +212,7 @@ impl Policy {
     pub(super) fn opened(&mut self) {
         self.open = true;
         self.retry_at = None;
+        self.awaiting_use = false;
     }
 
     /// The open stream is delivering audio. Only this ends the backoff: a
@@ -179,11 +222,12 @@ impl Policy {
     }
 
     /// The stream could not open, or died. Returns the wait before the next
-    /// attempt, if one is due.
+    /// attempt, if one is due: never inside the calm after a default
+    /// change, and none at all while waiting for a press.
     pub(super) fn failed(&mut self, now: Instant) -> Option<Duration> {
         self.open = false;
         self.in_use = false;
-        if !self.wants_open(now) {
+        if self.awaiting_use || !self.wants_open(now) {
             self.retry_at = None;
             return None;
         }
@@ -191,17 +235,49 @@ impl Policy {
             .saturating_mul(1 << self.failures.min(5))
             .min(RETRY_MAX);
         self.failures = self.failures.saturating_add(1);
-        self.retry_at = Some(now + delay);
-        Some(delay)
+        let at = self
+            .calm_until
+            .map_or(now + delay, |calm| calm.max(now + delay));
+        self.retry_at = Some(at);
+        self.retry_reason = "retry";
+        Some(at - now)
     }
 
-    /// The stream's device went away or the default mic changed.
-    pub(super) fn lost(&mut self, reason: &'static str) -> Option<Command> {
-        if self.open {
+    /// Windows changed the default mic. `moved` when the open stream is
+    /// already on the new default (a Recording's rebuild got there first).
+    pub(super) fn default_changed(&mut self, now: Instant, moved: bool) -> Option<Command> {
+        if moved {
+            self.calm_until = Some(now + CALM);
+            return None;
+        }
+        self.device_lost("default microphone changed", now)
+    }
+
+    /// The stream's device went away or stopped being the default. An idle
+    /// stream closes and waits for a press. A Recording attached to it is
+    /// rebuilt on the new default at once, as before: closing would cut the
+    /// Recording, and if the rebuild fails the Recording fails as it did.
+    pub(super) fn device_lost(&mut self, reason: &'static str, now: Instant) -> Option<Command> {
+        self.calm_until = Some(now + CALM);
+        self.retry_at = None;
+        self.awaiting_use = true;
+        if self.open && self.in_use {
             return Some(Command::Rebuild(reason));
         }
-        // A mic arriving ends the wait for a retry.
-        self.retry_at.take().map(|_| Command::Open(reason))
+        if self.open { self.close(reason) } else { None }
+    }
+
+    /// The open stream stopped delivering audio with no device change: a
+    /// rebuild, but never inside the calm after a change.
+    pub(super) fn stalled(&mut self, reason: &'static str, now: Instant) -> Option<Command> {
+        match self.calm_until.filter(|&calm| now < calm) {
+            Some(calm) if !self.in_use => {
+                self.retry_at = Some(calm);
+                self.retry_reason = reason;
+                self.close(reason)
+            }
+            _ => Some(Command::Rebuild(reason)),
+        }
     }
 
     pub(super) fn tick(&mut self, now: Instant) -> Option<Command> {
@@ -224,7 +300,8 @@ impl Policy {
             return None;
         }
         self.retry_at = None;
-        self.wants_open(now).then_some(Command::Open("retry"))
+        self.wants_open(now)
+            .then_some(Command::Open(self.retry_reason))
     }
 
     /// The next instant [`Policy::tick`] has work at.
@@ -669,13 +746,19 @@ fn run_keeper(mode: KeepMicReady, ready: &ReadyMic, requests: &mpsc::Receiver<Ms
                 None
             }
             Ok(Msg::Released { ended, heard }) => policy.released(ended, heard),
-            // The stream already moved to this default, after its old mic's
-            // Reopen: one switch, one rebuild.
-            Ok(Msg::DefaultChanged) if keeper.on_current_default() => None,
-            Ok(Msg::DefaultChanged) => policy.lost("default microphone changed"),
+            Ok(Msg::DefaultChanged) => {
+                keeper.sync_attached(&mut policy);
+                // The stream may already be on this default, rebuilt for a
+                // Recording after its old mic's Reopen: one switch, one
+                // rebuild.
+                policy.default_changed(now, keeper.on_current_default())
+            }
             Ok(Msg::Stream(attempt, _)) if !keeper.is_current(attempt) => None,
             Ok(Msg::Stream(_, StreamEvent::Audio)) => None,
-            Ok(Msg::Stream(_, StreamEvent::Reopen)) => policy.lost("microphone went away"),
+            Ok(Msg::Stream(_, StreamEvent::Reopen)) => {
+                keeper.sync_attached(&mut policy);
+                policy.device_lost("microphone went away", now)
+            }
             Ok(Msg::Stream(_, StreamEvent::Fatal(failure))) => {
                 keeper.fail(failure, &mut policy);
                 None
@@ -689,7 +772,7 @@ fn run_keeper(mode: KeepMicReady, ready: &ReadyMic, requests: &mpsc::Receiver<Ms
         let reaction = match reaction {
             None if policy.is_open() && now >= next_health => {
                 next_health = now + HEALTH_CHECK;
-                keeper.check_health(&mut policy)
+                keeper.check_health(&mut policy, now)
             }
             reaction => reaction,
         };
@@ -757,7 +840,7 @@ impl Keeper<'_> {
 
     /// The open stream's health check: access still allowed, audio still
     /// flowing.
-    fn check_health(&mut self, policy: &mut Policy) -> Option<Command> {
+    fn check_health(&mut self, policy: &mut Policy, now: Instant) -> Option<Command> {
         // Access turned off in Windows privacy settings while open: let the
         // mic go rather than hold it against the user's choice.
         if microphone_blocked() {
@@ -780,7 +863,16 @@ impl Keeper<'_> {
             );
             return None;
         }
-        policy.lost("microphone stopped delivering audio")
+        policy.stalled("microphone stopped delivering audio", now)
+    }
+
+    /// A press attached before the device changed, its Attached message
+    /// still queued: the policy learns of it first, so the Recording is
+    /// carried to the new mic rather than kept on the old one.
+    fn sync_attached(&self, policy: &mut Policy) {
+        if self.tap().state.lock().unwrap().recording.is_some() {
+            policy.attached();
+        }
     }
 
     /// The open stream is on the current default mic.
@@ -886,13 +978,17 @@ impl Keeper<'_> {
         self.ready.tap.retire_and_fail(&failure);
         drop(self.stream.take());
         let retry = policy.failed(Instant::now());
-        let retry_in_s = retry.map(|delay| delay.as_secs());
+        let retry_in_ms = retry.map(|delay| delay.as_millis());
         if self.last_failure.as_deref() == Some(failure.diagnostic.as_str()) {
-            tracing::debug!(diagnostic = %failure.diagnostic, ?retry_in_s, "ready microphone still unavailable");
+            tracing::debug!(diagnostic = %failure.diagnostic, ?retry_in_ms, "ready microphone still unavailable");
         } else {
+            let (endpoint, since_default_change_ms) = super::open_failure_context(self.host);
             tracing::warn!(
                 diagnostic = %failure.diagnostic,
-                ?retry_in_s,
+                changed_mode = failure.changed_mode(),
+                %endpoint,
+                ?since_default_change_ms,
+                ?retry_in_ms,
                 "ready microphone unavailable; presses open the microphone on demand"
             );
             self.last_failure = Some(failure.diagnostic);
@@ -1012,7 +1108,7 @@ mod tests {
         let now = Instant::now();
         let mut policy = Policy::new(KeepMicReady::Off);
         assert_eq!(policy.released(now, true), None);
-        assert_eq!(policy.lost("default microphone changed"), None);
+        assert_eq!(policy.default_changed(now, false), None);
         assert_eq!(policy.tick(now + 10 * MIN), None);
         assert_eq!(policy.deadline(), None);
     }
@@ -1164,12 +1260,12 @@ mod tests {
     }
 
     #[test]
-    fn a_lost_stream_is_rebuilt_and_a_failed_one_backs_off() {
+    fn a_stalled_stream_is_rebuilt_and_a_failed_one_backs_off() {
         let t0 = Instant::now();
         let mut policy = opened(KeepMicReady::WhileRunning, t0);
         assert_eq!(
-            policy.lost("microphone went away"),
-            Some(Command::Rebuild("microphone went away"))
+            policy.stalled("microphone stopped delivering audio", t0),
+            Some(Command::Rebuild("microphone stopped delivering audio"))
         );
         let delays: Vec<_> = (0..8).map(|_| policy.failed(t0).unwrap()).collect();
         assert_eq!(delays[0], RETRY_FIRST);
@@ -1194,19 +1290,137 @@ mod tests {
     }
 
     #[test]
-    fn a_new_default_mic_or_a_recording_ends_the_backoff() {
+    fn a_recording_ends_the_backoff_and_a_new_default_mic_waits_for_a_press() {
         let now = Instant::now();
         let mut policy = Policy::new(KeepMicReady::WhileRunning);
-        policy.failed(now);
-        assert_eq!(
-            policy.lost("default microphone changed"),
-            Some(Command::Open("default microphone changed"))
-        );
         policy.failed(now);
         assert_eq!(
             policy.released(now, true),
             Some(Command::Open("Recording ended"))
         );
+        policy.failed(now);
+        assert_eq!(policy.default_changed(now, false), None);
+        assert_eq!(policy.deadline(), None, "the retry is dropped");
+    }
+
+    #[test]
+    fn a_default_change_closes_an_idle_stream_until_a_press_hears_audio() {
+        let t0 = Instant::now();
+        for (lose, reason) in [
+            (
+                (|policy: &mut Policy, now| policy.default_changed(now, false))
+                    as fn(&mut Policy, Instant) -> Option<Command>,
+                "default microphone changed",
+            ),
+            (
+                |policy: &mut Policy, now| policy.device_lost("microphone went away", now),
+                "microphone went away",
+            ),
+        ] {
+            let mut policy = opened(KeepMicReady::WhileRunning, t0);
+            assert_eq!(lose(&mut policy, t0), Some(Command::Close(reason)));
+            assert!(!policy.is_open());
+            assert_eq!(policy.deadline(), None, "{reason}: never reopens alone");
+            assert_eq!(policy.tick(t0 + 10 * MIN), None);
+            assert_eq!(policy.failed(t0 + MIN), None, "{reason}: no backoff");
+            // A press cancelled before audio proves nothing.
+            assert_eq!(policy.released(t0 + MIN, false), None, "{reason}");
+            assert_eq!(
+                policy.released(t0 + MIN, true),
+                Some(Command::Open("Recording ended")),
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_ready_stream_opens_within_the_calm_after_a_change() {
+        let t0 = Instant::now();
+        let mut policy = opened(KeepMicReady::WhileRunning, t0);
+        policy.default_changed(t0, false);
+        // A press right after the switch worked: the stream waits out the
+        // calm, then opens once.
+        let ended = t0 + Duration::from_millis(500);
+        assert_eq!(policy.released(ended, true), None);
+        assert_eq!(policy.deadline(), Some(t0 + CALM));
+        assert_eq!(policy.tick(t0 + CALM - Duration::from_millis(1)), None);
+        assert_eq!(
+            policy.tick(t0 + CALM),
+            Some(Command::Open("Recording ended"))
+        );
+        assert_eq!(policy.deadline(), None);
+
+        // Another switch during the wait starts it over, press and all.
+        let mut policy = opened(KeepMicReady::WhileRunning, t0);
+        policy.default_changed(t0, false);
+        policy.released(ended, true);
+        let again = t0 + Duration::from_secs(1);
+        assert_eq!(policy.default_changed(again, false), None);
+        assert_eq!(policy.deadline(), None);
+        assert_eq!(
+            policy.released(again, true),
+            None,
+            "still inside the new calm"
+        );
+        assert_eq!(policy.deadline(), Some(again + CALM));
+
+        // Turning the setting on is held back too.
+        let mut policy = Policy::new(KeepMicReady::Off);
+        policy.default_changed(t0, false);
+        assert_eq!(policy.set_mode(KeepMicReady::WhileRunning, t0), None);
+        assert_eq!(
+            policy.tick(t0 + CALM),
+            Some(Command::Open("setting changed"))
+        );
+    }
+
+    #[test]
+    fn a_stall_inside_the_calm_closes_and_rebuilds_after_it() {
+        let t0 = Instant::now();
+        let mut policy = opened(KeepMicReady::WhileRunning, t0);
+        // A Recording's rebuild already put the stream on the new default.
+        assert_eq!(policy.default_changed(t0, true), None);
+        assert!(policy.is_open());
+        let stall = t0 + Duration::from_secs(1);
+        assert_eq!(
+            policy.stalled("microphone stopped delivering audio", stall),
+            Some(Command::Close("microphone stopped delivering audio"))
+        );
+        assert_eq!(policy.deadline(), Some(t0 + CALM));
+        assert_eq!(
+            policy.tick(t0 + CALM),
+            Some(Command::Open("microphone stopped delivering audio"))
+        );
+        let failed = t0 + CALM;
+        assert_eq!(policy.failed(failed), Some(RETRY_FIRST));
+        // Outside the calm, a stall rebuilds at once.
+        policy.opened();
+        assert_eq!(
+            policy.stalled("silent", failed + RETRY_MAX),
+            Some(Command::Rebuild("silent"))
+        );
+    }
+
+    #[test]
+    fn a_recording_using_the_stream_is_carried_to_the_new_mic() {
+        let t0 = Instant::now();
+        let mut policy = opened(KeepMicReady::WhileRunning, t0);
+        policy.attached();
+        assert_eq!(
+            policy.default_changed(t0, false),
+            Some(Command::Rebuild("default microphone changed"))
+        );
+        // A stall during the Recording is rebuilt even inside the calm.
+        assert_eq!(
+            policy.stalled("silent", t0),
+            Some(Command::Rebuild("silent"))
+        );
+        // The rebuild failed: the Recording fails and nothing retries until
+        // a press brings the stream back, after the calm.
+        assert_eq!(policy.failed(t0), None);
+        assert_eq!(policy.deadline(), None);
+        assert_eq!(policy.released(t0, true), None);
+        assert_eq!(policy.deadline(), Some(t0 + CALM));
     }
 
     #[test]
