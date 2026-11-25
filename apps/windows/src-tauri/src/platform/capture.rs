@@ -192,6 +192,7 @@ impl CpalCapture {
                     shared,
                     source: Source::Ready,
                     ready: Some(self.ready.clone()),
+                    began: asked,
                     started: attached,
                     pcm: Vec::new(),
                 }));
@@ -239,6 +240,7 @@ impl CpalCapture {
                 worker: Some(worker),
             },
             ready: Some(self.ready.clone()),
+            began: asked,
             started: Instant::now(),
             pcm: Vec::new(),
         });
@@ -256,6 +258,9 @@ struct CpalActiveCapture {
     source: Source,
     /// Told once when this capture ends, so the ready mic can open or close.
     ready: Option<ReadyMic>,
+    /// When the press asked for the mic: a default change after this means
+    /// the audio it heard does not prove the current mic.
+    began: Instant,
     started: Instant,
     pcm: Vec<u8>,
 }
@@ -326,7 +331,7 @@ impl CpalActiveCapture {
                     .unwrap()
                     .first_audio
                     .is_some();
-            ready.released(cold, heard);
+            ready.released(self.began, cold, heard);
         }
     }
 }
@@ -653,9 +658,11 @@ fn run_capture(
             if shared.stop.requested() {
                 return Err(capture_stopped());
             }
+            // Read before the try, so a failure logs the mic it was for.
+            let endpoint = ResolvedInput::default_id(&host);
             let input = if attempt.by_endpoint() {
                 tracing::info!("opening the default microphone by its endpoint");
-                ResolvedInput::resolve_endpoint(&host)
+                ResolvedInput::resolve_endpoint(&host, endpoint.clone())
             } else {
                 ResolvedInput::resolve(&host)
             };
@@ -663,7 +670,7 @@ fn run_capture(
             if let Err(failure) = &opened
                 && !shared.stop.requested()
             {
-                let (endpoint, since_default_change_ms) = open_failure_context(&host);
+                let (endpoint, since_default_change_ms) = open_failure_context(endpoint.as_ref());
                 tracing::warn!(
                     try_number = attempt.number,
                     last = attempt.last,
@@ -757,6 +764,7 @@ fn reopen(
         if shared.stop.requested() {
             return Reopened::Stopped;
         }
+        let endpoint = ResolvedInput::default_id(host);
         let opened = ResolvedInput::resolve(host)
             .and_then(|input| open_stream(input, host, shared, control_tx));
         if shared.stop.requested() {
@@ -768,7 +776,7 @@ fn reopen(
                 return Reopened::Stream(stream);
             }
             Err(failure) if failure.public != NO_MIC || Instant::now() >= deadline => {
-                let (endpoint, since_default_change_ms) = open_failure_context(host);
+                let (endpoint, since_default_change_ms) = open_failure_context(endpoint.as_ref());
                 tracing::warn!(
                     diagnostic = %failure.diagnostic,
                     changed_mode = failure.changed_mode(),
@@ -844,8 +852,10 @@ impl ResolvedInput {
     /// `RPC_E_CHANGED_MODE`; an endpoint opens through `IMMDevice::Activate`.
     /// A stream on it does not follow a later default change (cpal watches
     /// only the default handle): it reopens only if this device goes away.
-    fn resolve_endpoint(host: &cpal::Host) -> Result<Self, Failure> {
-        let id = Self::default_id(host).ok_or_else(|| {
+    /// An accepted trade-off of this fallback. `id` is the default as read
+    /// at the try's start.
+    fn resolve_endpoint(host: &cpal::Host, id: Option<cpal::DeviceId>) -> Result<Self, Failure> {
+        let id = id.ok_or_else(|| {
             Failure::new(
                 BoundaryKind::Capture,
                 "no default input device".into(),
@@ -890,20 +900,21 @@ fn input_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConfig, Fa
 
 /// One try at opening the microphone for a press.
 #[derive(Debug, Clone, Copy)]
-struct OpenTry<'a> {
+struct OpenTry {
     /// 1 for the first try.
     number: usize,
     /// No try follows this one.
     last: bool,
-    /// Why the try before this one failed.
-    previous: Option<&'a Failure>,
+    /// An earlier try of this press was refused with `RPC_E_CHANGED_MODE`,
+    /// even if a later one failed otherwise (no default mic for a moment).
+    changed_mode: bool,
 }
 
-impl OpenTry<'_> {
+impl OpenTry {
     /// The last try opens the default mic by its endpoint when cpal's
     /// default handle was refused with `RPC_E_CHANGED_MODE`.
     fn by_endpoint(&self) -> bool {
-        self.last && self.previous.is_some_and(Failure::changed_mode)
+        self.last && self.changed_mode
     }
 }
 
@@ -913,17 +924,17 @@ impl OpenTry<'_> {
 /// waiting cannot lift it.
 fn open_with_retries<T>(
     retries: &[Duration],
-    mut open: impl FnMut(OpenTry<'_>) -> Result<T, Failure>,
+    mut open: impl FnMut(OpenTry) -> Result<T, Failure>,
     mut wait: impl FnMut(Duration) -> bool,
 ) -> Result<T, Failure> {
     let mut delays = retries.iter().copied();
-    let mut previous: Option<Failure> = None;
+    let mut changed_mode = false;
     for number in 1.. {
         let delay = delays.next();
         let attempt = OpenTry {
             number,
             last: delay.is_none(),
-            previous: previous.as_ref(),
+            changed_mode,
         };
         let failure = match open(attempt) {
             Ok(opened) => return Ok(opened),
@@ -932,10 +943,10 @@ fn open_with_retries<T>(
         let Some(delay) = delay.filter(|_| failure.public != MIC_BLOCKED) else {
             return Err(failure);
         };
+        changed_mode |= failure.changed_mode();
         if !wait(delay) {
             return Err(capture_stopped());
         }
-        previous = Some(failure);
     }
     unreachable!("the tries end with the delays")
 }
@@ -1143,11 +1154,10 @@ fn changed_mode(diagnostic: &str) -> bool {
     diagnostic.contains("0x80010106") || diagnostic.contains("-2147417850")
 }
 
-/// The current default mic's endpoint ID and how long ago Windows last
-/// changed it, for the log of a failed open. Opens no audio client.
-fn open_failure_context(host: &cpal::Host) -> (String, Option<u128>) {
-    let endpoint =
-        ResolvedInput::default_id(host).map_or_else(|| "none".into(), |id| id.to_string());
+/// The endpoint a failed open was for, as read at the try's start, and how
+/// long ago Windows last changed the default mic, for the log.
+fn open_failure_context(endpoint: Option<&cpal::DeviceId>) -> (String, Option<u128>) {
+    let endpoint = endpoint.map_or_else(|| "none".into(), ToString::to_string);
     let since_change = default_watch::since_last_change().map(|since| since.as_millis());
     (endpoint, since_change)
 }
@@ -1229,13 +1239,13 @@ mod tests {
         Failure::new(BoundaryKind::Capture, format!("try {n} failed"), MIC_FAILED)
     }
 
-    /// A try as the opener saw it: number, last, the previous diagnostic.
-    type SeenTry = (usize, bool, Option<String>);
+    /// A try as the opener saw it: number, last, changed mode seen before.
+    type SeenTry = (usize, bool, bool);
 
     /// Runs `open_with_retries` over the real schedule; `outcome` decides
     /// each try. Returns the result, the tries seen and the waits asked for.
     fn run_tries(
-        mut outcome: impl FnMut(&OpenTry<'_>) -> Result<&'static str, Failure>,
+        mut outcome: impl FnMut(&OpenTry) -> Result<&'static str, Failure>,
         mut live: impl FnMut(usize) -> bool,
     ) -> (Result<&'static str, Failure>, Vec<SeenTry>, Vec<Duration>) {
         let mut tries = Vec::new();
@@ -1243,8 +1253,7 @@ mod tests {
         let result = open_with_retries(
             &OPEN_RETRIES,
             |attempt| {
-                let previous = attempt.previous.map(|failure| failure.diagnostic.clone());
-                tries.push((attempt.number, attempt.last, previous));
+                tries.push((attempt.number, attempt.last, attempt.changed_mode));
                 outcome(&attempt)
             },
             |delay| {
@@ -1276,11 +1285,7 @@ mod tests {
         );
         assert_eq!(
             tries,
-            [
-                (1, false, None),
-                (2, false, Some("try 1 failed".into())),
-                (3, true, Some("try 2 failed".into())),
-            ]
+            [(1, false, false), (2, false, false), (3, true, false)]
         );
     }
 
@@ -1328,7 +1333,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_last_try_after_rpc_e_changed_mode_opens_by_endpoint() {
+    fn the_last_try_opens_by_endpoint_once_any_try_saw_rpc_e_changed_mode() {
         let error = cpal::Error::with_message(
             ErrorKind::BackendError,
             "Failed to get audio client: Cannot change thread mode after it is set. (os error -2147417850)",
@@ -1337,33 +1342,35 @@ mod tests {
         assert!(changed.changed_mode());
         assert!(changed.diagnostic.contains("RPC_E_CHANGED_MODE 0x80010106"));
         assert_eq!(changed.public, MIC_FAILED);
-        let other = open_failed(1);
+        let no_mic = Failure::new(
+            BoundaryKind::Capture,
+            "no default input device".into(),
+            NO_MIC,
+        );
 
-        let by_endpoint = |number, last, previous| {
-            OpenTry {
-                number,
-                last,
-                previous,
-            }
-            .by_endpoint()
+        let endpoint_tries = |failures: [&Failure; 2]| {
+            let mut by_endpoint = Vec::new();
+            let _ = run_tries(
+                |attempt| {
+                    by_endpoint.push(attempt.by_endpoint());
+                    Err(failures
+                        .get(attempt.number - 1)
+                        .map_or_else(|| open_failed(3), |&failure| failure.clone()))
+                },
+                |_| true,
+            );
+            by_endpoint
         };
-        assert!(by_endpoint(3, true, Some(&changed)));
-        assert!(
-            !by_endpoint(2, false, Some(&changed)),
-            "not before the last"
+        assert_eq!(endpoint_tries([&changed, &changed]), [false, false, true]);
+        // A moment with no default mic between does not send the last try
+        // back to the default handle.
+        assert_eq!(endpoint_tries([&changed, &no_mic]), [false, false, true]);
+        assert_eq!(endpoint_tries([&no_mic, &changed]), [false, false, true]);
+        assert_eq!(
+            endpoint_tries([&no_mic, &open_failed(2)]),
+            [false, false, false],
+            "only for that error"
         );
-        assert!(!by_endpoint(3, true, Some(&other)), "only for that error");
-        assert!(!by_endpoint(1, true, None));
-
-        let mut endpoint_tries = Vec::new();
-        let _ = run_tries(
-            |attempt| {
-                endpoint_tries.push(attempt.by_endpoint());
-                Err(changed.clone())
-            },
-            |_| true,
-        );
-        assert_eq!(endpoint_tries, [false, false, true]);
     }
 
     #[tokio::test]
@@ -1419,6 +1426,7 @@ mod tests {
                 worker: None,
             },
             ready: None,
+            began: Instant::now(),
             started: Instant::now(),
             pcm: Vec::new(),
         };

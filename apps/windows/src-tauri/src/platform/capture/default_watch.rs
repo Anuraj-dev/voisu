@@ -14,10 +14,17 @@ use std::time::{Duration, Instant};
 
 static LAST_CHANGE: Mutex<Option<Instant>> = Mutex::new(None);
 
-/// How long ago Windows last changed the default microphone while Voisu
-/// ran, for the log of a failed open.
+/// When Windows last changed the default microphone while Voisu ran.
+/// Recorded before the change is signalled, so it can be ahead of the
+/// ready mic's queued message.
+pub(super) fn last_change() -> Option<Instant> {
+    *LAST_CHANGE.lock().unwrap()
+}
+
+/// How long ago Windows last changed the default microphone, for the log
+/// of a failed open.
 pub(super) fn since_last_change() -> Option<Duration> {
-    LAST_CHANGE.lock().unwrap().map(|at| at.elapsed())
+    last_change().map(|at| at.elapsed())
 }
 
 /// Watches until dropped.
