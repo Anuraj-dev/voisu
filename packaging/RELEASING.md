@@ -34,7 +34,8 @@ You no longer bump the version by hand. `.github/workflows/version-bump.yml` run
 every push to `main`: it reads the Conventional Commits merged since the last bump and,
 if any are release-worthy, bumps the version (`feat:` → minor, `fix:`/`perf:` → patch,
 a `!`/`BREAKING CHANGE:` → major) across every synchronized place — the crate
-`Cargo.toml`s, `packaging/voisu.spec` `Version:` + `%changelog`, `Cargo.lock`, and the
+`Cargo.toml`s, `packaging/voisu.spec` `Version:` + `%changelog`, `Cargo.lock`,
+`tools/transcript-quality/Cargo.lock`, and the
 Windows app's `apps/windows/src-tauri/Cargo.toml` + its own `Cargo.lock` — then
 commits `chore(release): bump version to X.Y.Z` back to `main`. **Docs-only merges
 (only `docs:`/`chore:`/`test:`/`ci:`/`style:`/`refactor:`) do not bump.** The tree is

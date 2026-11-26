@@ -19,3 +19,8 @@ Raja decided that worker code is Voisu's own code and updates with the binary. C
 ## Addendum (2026-11-18): whisper.cpp is the one installable model
 
 Setup and the interface now offer and install only `whisper-cpp-distil-large-v3.5-q8-0`, on every host. It runs on the GPU through Vulkan (any vendor) or on the CPU, as `voisu local-device` says. Under `auto`, setup runs the packaged worker's GPU probe before it asks; with no usable GPU the consent summary says it will run on the CPU, and agreeing sets `local-device cpu`, so the CPU choice stays explicit and consented. Under `gpu` the pre-download probe still fails closed. The consent summary replaces "needs an NVIDIA GPU" with the licence and where the model runs. `distil-large-v3.5-int8` and `parakeet-tdt-0.6b-v3` stay in the catalog with `consent_installable: false`: their receipts still verify, run and remove, but no new install of either can start. The installer resolves consent through one catalog lookup over installable entries.
+
+## Update (2026-11-26)
+
+Setup and the interface offer two consented whisper.cpp tiers: Accurate
+(`whisper-cpp-distil-large-v3.5-q8-0`) and Fast (`whisper-cpp-small-en-q8-0`).

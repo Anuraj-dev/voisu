@@ -18,8 +18,8 @@ is selected. Left click opens the panel. Middle click refreshes status.
 
 ## Panel
 
-The panel always lists the development catalog ids (`DEV_MODEL_IDS` in
-`crates/voisu-app/src/local_model/development.rs`):
+The panel lists the ids in `CATALOG_IDS` (`Model.js`), a subset of the app's
+`DEV_MODEL_IDS` (`crates/voisu-app/src/local_model/development.rs`):
 
 - `nemotron-3.5-0.6b`
 - `parakeet-tdt-0.6b-v3`
@@ -45,8 +45,8 @@ closes.
 
 ## Binary
 
-The packaged `/usr/bin/voisu` does not yet have `local-dev`. The widget setting
-`voisuBinary` defaults to:
+The packaged `/usr/bin/voisu` includes `local-dev`, but the widget setting
+`voisuBinary` still defaults to a development release build:
 
 ```text
 /home/raja/Anuraj-dev/voisu/target/release/voisu

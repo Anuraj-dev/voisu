@@ -11,3 +11,8 @@ The default Trigger Key is Ctrl+Win: hold to talk, double-tap for hands-free, Es
 Distribution is free. The installer is a per-user NSIS setup and carries no Authenticode signature, so SmartScreen warns until reputation builds; the install page explains the "Run anyway" step. Updates are still signed, with the free Tauri updater key. Rejected: paid Azure Artifact Signing, which is not free; SignPath OSS, which needs project recognition Voisu does not yet have; a pure-Rust native UI, which needs more installer and updater work; and a terminal setup, which is foreign to Windows users.
 
 Consequences: a keyboard hook in an unsigned binary invites antivirus false positives, so each release is submitted for Defender review. Real-host behavior (hotkeys, paste, microphone) is proven only on Raja's Windows 11 machine, not in CI. Plan: `internal/specs/2026-11-02-windows-cloud-port.md`.
+
+## Update (2026-11-26)
+
+"Windows runs one process" holds for Cloud mode. Local mode adds a resident
+`voisu-local-asr.exe` worker process.

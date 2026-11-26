@@ -16,3 +16,8 @@ reconcile-or-deliver-valid behavior stand as decided. Ground truth:
 `crates/voisu-app/src/system/groq.rs` (`send_audio`, `plan_finalize_chunks`,
 `complete`).
 
+## Update (2026-11-26)
+
+Groq gets one request after stop unless the Recording passes the full-audio limit,
+in which case 60 s windows with 4 s overlap are sent while recording. The Provider
+Deadline is a fixed 15 s, not configurable. Source: `crates/voisu-cloud/src/groq.rs`.

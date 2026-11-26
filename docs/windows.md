@@ -32,12 +32,12 @@ What to expect:
 - **Two models.** **Fast** (whisper small, 265 MB) suits the processor; **Accurate** (distil-large-v3.5, 818 MB) is more accurate and suits a GPU. **Auto** picks Accurate when Voisu finds a GPU and Fast otherwise. If you already have Fast and Voisu finds a GPU, Fast keeps working until you download Accurate. Both are English only and 8-bit.
 - **GPU**: Voisu uses your GPU through Vulkan, which current NVIDIA, AMD and Intel drivers include. Without one, or if the GPU fails, it runs on the processor. Accurate on the processor is much slower; Settings warns you.
 - **Speed**: the Transcript arrives after you stop, not while you speak. The model stays loaded while Local is on, so a Recording only waits for the transcription. On a recent 4-core CPU under Linux, Fast takes about 9 seconds for a minute of speech; Windows has not been measured yet and may be slower. A GPU is much faster. Cloud stays fastest without one.
-- **Hardware**: an x64 CPU with AVX2 (most Intel and AMD CPUs from 2015 on). An older CPU gets a clear error and stays on Cloud. Windows on ARM is not supported. The installer carries everything Local needs, so no Visual C++ Redistributable or Vulkan SDK is required.
+- **Hardware**: an x64 PC. Running on the processor needs an x86-64-v3 CPU (SSE4.2, AVX, AVX2, FMA, F16C and BMI2; most Intel and AMD CPUs from 2015 on); without it, and without a usable GPU, you get a clear error and can switch back to Cloud. Windows on ARM is not supported. The installer carries everything Local needs, so no Visual C++ Redistributable or Vulkan SDK is required.
 - **Home** shows how you transcribe: Cloud, or Local with its model and device.
 - **Spoken punctuation**, boost words and *Informal tone* work as in Cloud. A silent Recording is skipped.
 - **If something goes wrong** (model missing or damaged, the CPU unsupported, the model failing to load, the Local engine stopping repeatedly, or a Recording that takes too long), the overlay says so, Settings opens on the errors you need to act on, and *Switch to Cloud* takes you back. A Recording that takes longer than its time limit (30 seconds plus its own length, and another 90 seconds when the Local engine is still loading its model) is stopped rather than left hanging. Voisu's log is `%LOCALAPPDATA%\Voisu\logs\voisu.*.log` (the GPU found, the model loaded and on which device, each transcription's time); the Local engine's own log is `local-asr.log` beside it.
 
-Local mode is Windows only; the macOS app is Cloud-only.
+The macOS app is Cloud-only. Local mode is also available on [Linux](linux.md).
 
 ---
 

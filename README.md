@@ -27,7 +27,7 @@
 
 Voisu turns speech into text wherever your cursor is: a reply, a doc, or a terminal. If the text can't land there, Voisu keeps it on the clipboard instead of dropping it.
 
-It is a tray app on Windows, a menu bar app on macOS, and a set of systemd user services with a terminal interface on Linux. There is no Voisu account, server or analytics. You bring your own Groq and Deepgram API keys, or use Local transcription on Linux and Windows with no keys at all.
+It is a tray app on Windows, a menu bar app on macOS, and a set of systemd user services with a terminal interface on Linux. There is no Voisu account, server or analytics. You bring your own Groq and Deepgram API keys (Deepgram is optional on Linux), or use Local transcription on Linux and Windows with no keys at all.
 
 ## What you get
 
@@ -39,8 +39,8 @@ It is a tray app on Windows, a menu bar app on macOS, and a set of systemd user 
 - **Local transcription on Linux and Windows.** Run a whisper.cpp model on your own computer, offline, after a Consented Install. On Linux, pick Accurate for a GPU or Fast for a computer without one; the model stays loaded, so every Recording starts at once. On Windows, Local is opt-in, with the same Accurate and Fast models on your GPU or CPU ([details](docs/windows.md#local-mode-opt-in)). Nothing downloads until you agree, and a download that stops picks up where it left off.
 - **An Overlay you can place.** A small pill with live sound bars shows while you dictate. Drag it anywhere on screen, save with ✓ or cancel with ✗, and Reset puts it back at the bottom centre. On Linux this needs KDE Plasma or Hyprland, where the pill also follows the monitor you are working on.
 - **Stays up to date.** The Windows and macOS apps update themselves and show what's new after each update. On Linux, Voisu checks once a day and shows *Update available* on Home.
-- **A command for everything on Linux.** Every setting in the interface is also a plain `voisu` command, so a script or a coding agent can install and check it.
-- **Private by default.** Keys live in your desktop keyring, Windows Credential Manager or the macOS Keychain. Logs and history stay on your machine.
+- **Commands on Linux.** Settings in the interface are also plain `voisu` commands (the Trigger Key row is read-only), so a script or a coding agent can install and check it.
+- **Private by default.** Keys live in your desktop keyring, Windows Credential Manager or the macOS Keychain; if the Linux keyring can't store one, Voisu warns you and uses a private file ([details](SECURITY.md)). Logs and history stay on your machine.
 
 ## Installation
 
@@ -50,7 +50,7 @@ It is a tray app on Windows, a menu bar app on macOS, and a set of systemd user 
 | **macOS** 13 or newer, Apple Silicon | [Voisu-macOS-arm64.dmg](https://github.com/Anuraj-dev/voisu/releases/latest/download/Voisu-macOS-arm64.dmg) |
 | **Fedora** | `sudo dnf copr enable anuraj-dev/voisu && sudo dnf install voisu` |
 | **Arch, Omarchy** | `yay -S voisu-bin`, then run `voisu` |
-| **Debian / Ubuntu** 26.04 LTS, amd64 | [Signed apt repository](docs/linux.md#install) |
+| **Ubuntu** 26.04 LTS, amd64 | [Signed apt repository](docs/linux.md#install) |
 
 ### Windows
 
@@ -83,7 +83,7 @@ The Windows and macOS apps update themselves from GitHub Releases. On Linux, `vo
 
 Nothing. Voisu is free and MIT licensed, with no account and nothing to subscribe to.
 
-Cloud transcription runs on two free API keys, one from Groq and one from Deepgram. Setup checks each key as you save it. On Linux and Windows you can skip the cloud and transcribe on your own computer instead.
+Cloud transcription runs on your own free API keys, from Groq and Deepgram. On Linux you can skip Deepgram and use Groq alone. Setup checks each key as you save it. On Linux and Windows you can skip the cloud and transcribe on your own computer instead.
 
 ## Documentation
 

@@ -143,9 +143,8 @@ and `Release.gpg`. It is **idempotent** and enforces several invariants:
   or mis-signed metadata.
 - **Freshness.** `Release` carries `Valid-Until` = now + `VOISU_APT_VALID_DAYS`
   (default 30). **This means the repo MUST be re-published (re-signed) at least
-  every 30 days or `apt update` starts rejecting it as expired.** Ticket 14 must
-  add a scheduled workflow that re-runs this script to refresh the signature even
-  when there is no new build. Recovery from an expired repo is simply to
+  every 30 days or `apt update` starts rejecting it as expired.** `.github/workflows/apt-refresh.yml`
+  re-signs the current pool every Monday at 04:17 UTC, even with no new build. Recovery from an expired repo is simply to
   re-publish (any run re-stamps `Valid-Until`).
 
 ```sh
@@ -160,10 +159,9 @@ VOISU_APT_GPG_KEY=4149EE3868B36B6007592966D08BCFDC34125B28 \
 Then commit and push the gh-pages worktree. In CI (ticket 14) the private key is
 imported into an ephemeral `GNUPGHOME` and `VOISU_APT_GPG_PASSPHRASE_FILE` points
 at a passphrase file so gpg can sign non-interactively via loopback pinentry. The
-script never prints or writes the private key or passphrase. **Ticket 14 must
-also put the publish job in a GitHub Actions `concurrency` group** so two release
-jobs never race the gh-pages branch (the script's `flock` only serializes runs on
-one machine).
+script never prints or writes the private key or passphrase. The refresh and release publish jobs share the
+`voisu-gh-pages` concurrency group, so they never race the gh-pages branch (the
+script's `flock` only serializes runs on one machine).
 
 Requirements on the publishing host: `apt-utils` (`apt-ftparchive`), `gnupg`,
 `dpkg-dev` (`dpkg-deb`), `coreutils`, `util-linux` (`flock`), `gzip`.
@@ -201,8 +199,8 @@ main checkout is never destructively wiped.**
       branch* → Branch: `gh-pages`, folder `/ (root)` → Save. Confirm the site
       publishes at `https://anuraj-dev.github.io/voisu/`.
 - [ ] **Confirm the signing-key secrets exist** (from ticket 09): repo secrets
-      `GPG_PRIVATE_KEY` and `GPG_PASSPHRASE`. Ticket 14 wires the release
-      workflow that imports them and calls `make-apt-repo.sh`.
+      `GPG_PRIVATE_KEY` and `GPG_PASSPHRASE`. The `publish-apt` job in
+      `.github/workflows/release.yml` imports them and calls `make-apt-repo.sh`.
 - [ ] **Post-deploy smoke test** (once Pages is live). This asserts the served
       key's fingerprint, verifies the signed metadata, does an *isolated* apt
       update against only the Voisu source, and actually resolves + fetches the

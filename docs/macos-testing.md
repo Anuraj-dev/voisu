@@ -31,7 +31,8 @@ Save both files in your **Downloads** folder.
    and press Return.
 
 Why a script? This test build isn't from the App Store, so macOS blocks it when you
-double-click it. The script tells macOS you trust this one app.
+double-click it. The script removes the download quarantine
+attribute from the installed app so it can open.
 
 To install a **newer build** later, run the same line again with the new file.
 

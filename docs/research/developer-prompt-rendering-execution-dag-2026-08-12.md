@@ -1,5 +1,9 @@
 # Developer Prompt Rendering — execution DAG
 
+> **Historical record (note added 2026-11-26).** This plan is complete: do not
+> restart it. As of v1.5.2 developer prompt rendering is on by default and the
+> command is `voisu layout [plain|auto|sections]`.
+
 **Issue:** [#145](https://github.com/Anuraj-dev/voisu/issues/145) · parent map [#133](https://github.com/Anuraj-dev/voisu/issues/133)  
 **Planning baseline:** [#144](https://github.com/Anuraj-dev/voisu/issues/144) — `developer-prompt-rendering-specification-2026-08-12.md` + constants JSON  
 **Status:** **approved** planning DAG (Sol high residual-land: REQUEST_CHANGES → fix → **APPROVE**, findings none, 2026-08-12). Planning only — no product rewrite by this document.  

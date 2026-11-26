@@ -1,5 +1,9 @@
 # Groq reconciliation model benchmark — 2026-08-09
 
+> **Historical record (note added 2026-11-26).** The selected model and open
+> ticket here are superseded. As of v1.5.2 reconciliation defaults to
+> `qwen/qwen3.8-27b` and the guard is implemented.
+
 **Issue:** [#97 Select the safe Groq reconciliation replacement](https://github.com/Anuraj-dev/voisu/issues/97)
 **Companion machine-readable asset:** [`groq-reconciliation-model-benchmark-2026-08-09.json`](./groq-reconciliation-model-benchmark-2026-08-09.json)
 **Mode:** read-only research (no code/GitHub/cargo mutations).

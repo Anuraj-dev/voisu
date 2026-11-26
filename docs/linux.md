@@ -1,6 +1,6 @@
 # Voisu on Linux
 
-Fedora, Arch, Debian and Ubuntu, on KDE Plasma, GNOME, Hyprland (including Omarchy) and X11 desktops. Voisu runs as systemd **user** services with the `voisu` terminal interface and `voisu` commands. Transcription is Cloud (Deepgram and Groq), or Local on your own GPU or CPU.
+Fedora, Arch and Ubuntu 26.04 LTS, on KDE Plasma, GNOME, Hyprland (including Omarchy) and X11 desktops. Voisu runs as systemd **user** services with the `voisu` terminal interface and `voisu` commands. Transcription is Cloud (Deepgram and Groq), or Local on your own GPU or CPU.
 
 Every command is listed in the [command reference](commands.md).
 
@@ -23,7 +23,7 @@ yay -S voisu-bin
 
 `voisu-bin` installs prebuilt binaries, so nothing compiles on your machine. To build from source instead, install `voisu` (`yay -S voisu`). The two packages conflict, so pick one.
 
-**Debian / Ubuntu (apt)**, for Ubuntu 26.04 LTS, amd64:
+**Ubuntu (apt)**, for Ubuntu 26.04 LTS, amd64:
 
 ```sh
 # 1. Add Voisu's signing key.
@@ -151,7 +151,7 @@ Your API keys never go through the agent. Type them into `voisu` in a terminal o
 | AUR `voisu-bin` | `yay -S --needed voisu-bin` (or `paru`). Without an AUR helper it prints the manual `makepkg` steps |
 | AUR `voisu` (source) | Nothing by default. It explains that this package compiles on your machine. `voisu update --switch-to-bin` replaces it with `voisu-bin` |
 | Fedora COPR | `sudo dnf upgrade --refresh voisu` |
-| Debian / Ubuntu apt | `sudo apt-get update`, then `sudo apt-get install --only-upgrade voisu` |
+| Ubuntu apt | `sudo apt-get update`, then `sudo apt-get install --only-upgrade voisu` |
 
 ```sh
 voisu update --check     # installed version vs the latest GitHub Release; changes nothing

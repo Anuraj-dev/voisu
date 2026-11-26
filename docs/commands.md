@@ -6,7 +6,7 @@
 | --- | --- |
 | `voisu` | Open the interface on a terminal. Opens on setup when nothing is set up |
 | `voisu start` / `stop` / `toggle` / `status` | Start and stop a Recording, or see what Voisu is doing |
-| `voisu shortcut` | Show the desktop-approved Trigger Key |
+| `voisu shortcut` | Show the Trigger Key bound through the Global Shortcuts portal |
 | `voisu setup` | Set up step by step: Cloud or Local, keys or Consented Install, Trigger Key |
 | `voisu engine [cloud\|local]` | Transcribe online with Cloud, or on this computer with an installed Local model |
 | `voisu local remove [--yes]` | Remove a Consented Install. `--yes` is required when stdin is not a terminal |
@@ -25,7 +25,7 @@
 | `voisu export <correlation-id>` | Redacted diagnostic export for one Recording |
 | `voisu doctor [--verbose]` | Host readiness diagnostics |
 | `voisu service install` / `start` / `stop` / `restart` / `status` / `uninstall` | Manage the user services |
-| `voisu update [--check\|--dry-run] [--switch-to-bin]` | Update Voisu through its package manager (Linux, see [Update](linux.md#update)) |
+| `voisu update [--dry-run] [--switch-to-bin]` / `voisu update --check` | Update Voisu through its package manager, or only check (`--check` takes no other flag) (Linux, see [Update](linux.md#update)) |
 | `voisu update-check [on\|off]` | Turn the daily update check on or off (Linux, see [Update check](linux.md#update-check)) |
 | `voisu star` | Open Voisu's GitHub page to star it; Voisu stops asking (Linux) |
 | `voisu star-prompt [on\|off]` | Turn the star request on or off (Linux, see [Star prompt](linux.md#star-prompt)) |

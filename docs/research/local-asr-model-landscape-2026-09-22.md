@@ -1,5 +1,10 @@
 # Local ASR model landscape — 2026-09-22
 
+> **Historical record (note added 2026-11-26).** "Current" here means
+> 2026-09-22. As of v1.5.2 the Local tiers are Accurate (distil-large-v3.5
+> q8_0) and Fast (small.en q8_0), run by whisper.cpp; the `whisper-cli` worker
+> is a non-admitted pilot.
+
 ## Executive conclusion
 
 Voisu’s current local artifact is Whisper `base.en`: an English-only, 74M-parameter model. The current worker runs `/usr/bin/whisper-cli` with `--no-gpu`, and the project’s locked bakeoff recorded 12.0% WER on the full held-out set and 6.56% on the public-only subset. It also failed the current critical-content and negative-insertion gates. The exact numbers are project evidence, not a claim about Whisper base.en on every machine or corpus.

@@ -132,7 +132,7 @@ can also build it from any scored run:
 ```sh
 python3 tools/local-asr/benchmark.py records --corpus "$EVAL/corpus.json" \
   --evidence RUN/replay.json --report RUN/report.json \
-  --threads distil-large-v3=8 --incumbent distil-large-v3 --output RUN/run_records.json
+  --threads distil-large-v3.5-int8=8 --incumbent distil-large-v3.5-int8 --output RUN/run_records.json
 ```
 
 There is one record per model, runtime, device/threads and window

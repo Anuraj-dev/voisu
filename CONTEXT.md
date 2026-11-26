@@ -6,8 +6,8 @@ application the user is currently working in.
 ## Language
 
 **Recording**:
-The bounded audio capture that begins with one Trigger Key activation and ends
-with the next activation or a safety limit.
+The bounded audio capture that a Trigger Key gesture starts and ends, or that a
+safety limit ends.
 _Avoid_: Session, clip, voice packet
 
 **Transcript**:
@@ -60,16 +60,16 @@ An experimental candidate that resolves conflicting Source Transcripts by inferr
 _Avoid_: Unrestricted merge, smart correction, AI cleanup
 
 **Structure Cue**:
-An explicit spoken marker that authorizes Voisu to organize following words as a named section. A Recording must begin with one, and later cues must occur at clear speech boundaries; ordinary cue words inside prose are not Structure Cues.
+An explicit spoken marker that authorizes Voisu to organize following words as a named section. Section organization applies only when a Recording begins with one, and later cues must occur at clear speech boundaries; ordinary cue words inside prose are not Structure Cues.
 _Avoid_: Heading keyword, magic word, section-like word
 
 **Trigger Key**:
-The user-approved global shortcut whose first activation starts a Recording and
-whose next activation stops it.
+The user-approved global shortcut that starts and stops a Recording: press, then
+press again on Linux; hold, or double-tap for hands-free, on Windows and macOS.
 _Avoid_: Hold key, push-to-talk key
 
 **Dictionary**:
-The user's own list of words, names and terms that Voisu should spell the user's way. Every Transcript gets exact-match correction: a heard span with the entry's words in order, ignoring case, joined by whitespace or the entry's own separators ("claude code" for "claude-code"), takes the entry's spelling while keeping the heard casing shape; Cloud skips spans Deepgram heard with high confidence. Local Transcripts also get correction by sound: a word or short run of words that sounds like an entry of two or more syllables ("voice you" for "Voisu") is replaced by the entry as written. A run never crosses punctuation, a spaced dash or a line break. A single ordinary English word, a run of everyday words ("way land", "will end"), an acronym, a function word and a capitalized word after the first ("new Vim") are never swapped. A run of ordinary English words, or a single word heard for a short entry ("sofa" for "Sofia") and not capitalized mid-sentence, must sound exactly like the entry, not just close to it. Accepted trade-off: a compound entry spoken as its own two words ("tail wind" for "Tailwind", "jack son" for "Jackson") is swapped, as "deep gram" is for "Deepgram". Cloud Transcripts get exact-match correction only.
+The user's own list of words, names and terms that Voisu should spell the user's way. Every Transcript gets exact-match correction: a heard span with the entry's words in order, ignoring case, joined by whitespace or the entry's own separators ("claude code" for "claude-code"), takes the entry's spelling while keeping the heard casing shape; Cloud skips spans Deepgram heard with high confidence. Local Transcripts also get correction by sound: a word or short run of words that sounds like an entry of two or more syllables ("voice you" for "Voisu") is replaced by the entry as written. A run may cross same-line spaces or a bare hyphen, never other punctuation, a spaced dash or a line break. A single ordinary English word, a run of everyday words ("way land", "will end"), an acronym, a function word and a capitalized word after the first ("new Vim") are never swapped. A run of ordinary English words, or a single word heard for a short entry ("sofa" for "Sofia") and not capitalized mid-sentence, must sound exactly like the entry, not just close to it. Accepted trade-off: a compound entry spoken as its own two words ("tail wind" for "Tailwind", "jack son" for "Jackson") is swapped, as "deep gram" is for "Deepgram". Cloud Transcripts get exact-match correction only.
 _Avoid_: Vocabulary list, glossary, custom words
 
 **Delivery**:
@@ -78,7 +78,8 @@ preservation as the fallback.
 _Avoid_: Paste, output
 
 **Overlay**:
-The separate on-screen status surface that reflects daemon state. A Setup
+The on-screen status surface that reflects Recording state: a separate process
+following the daemon on Linux, a window of the app on Windows and macOS. A Setup
 Profile may require an Overlay when visible Recording feedback is part of that
 desktop's supported experience.
 _Avoid_: Popup, HUD

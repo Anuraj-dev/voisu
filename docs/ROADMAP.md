@@ -1,81 +1,59 @@
 # Voisu Roadmap
 
-Voisu is voice dictation for Linux and Windows. Press the Trigger Key, speak,
-and a validated Transcript is delivered into the focused application. Primary
-Linux target: Fedora KDE Plasma on Wayland; Windows 10/11 runs a Cloud-only
-tray app.
+Voisu is voice dictation for Linux, Windows and macOS. Press the Trigger Key,
+speak, and a validated Transcript is delivered into the focused application.
+Primary Linux target: Fedora KDE Plasma on Wayland. Windows ships a tray app that
+uses Cloud mode by default with opt-in Local mode; the macOS app is Cloud-only.
 
 This document tracks what works today, what is coming next, and the known
 limitations you may hit. For install instructions see the
-[project page](https://anuraj-dev.github.io/voisu/) and `README.md`.
+[project page](https://anuraj-dev.github.io/voisu/) and the
+[README](../README.md).
 
 ## Now
 
 Shipped and working in the current release:
 
-- **Daemon** — runs as a systemd **user** service. Manages Recording lifecycle,
-  the Trigger Key, provider streaming, and Delivery. Works without GTK.
-- **CLI** (`voisu`) — `voisu setup` guided wizard, `voisu doctor` diagnostics,
-  recording control (`start`, `stop`, `toggle`, `status`, `shortcut`),
-  local diagnostics (`history`, `export`), provider keys
-  (`key set` / `key check`), behavior toggles (`deepgram on|off`,
-  `delivery`, `writing`, `layout`), a personal pronunciation dictionary
-  (`dictionary add` / `remove` / `list`), and user-service management
-  (`voisu service install` / `start` / `stop` / `restart` / `status` /
-  `uninstall`). See the command reference in `README.md`.
-- **Cloud providers** — Groq and Deepgram. Deepgram streams the live
-  Recording; Groq receives the full audio at stop (a Recording past the
-  ~two-minute full-audio limit is transcribed in overlapping 60 s chunks
-  instead). Voisu reconciles the two Source Transcripts within a bounded
-  Provider Deadline, using the valid result already available.
-- **Trigger Key via desktop portals** — no raw input-device or privileged
-  `uinput` access on the normal path. On KDE Plasma / GNOME a system dialog
-  appears once and the choice persists.
-- **Delivery modes** — `paste` puts the Transcript on the clipboard and pastes it
+- **Daemon** (Linux): runs as a systemd **user** service. Manages Recording
+  lifecycle, the Trigger Key, provider streaming, and Delivery. Works without GTK.
+- **CLI** (`voisu`, Linux): guided setup, diagnostics, recording control,
+  provider keys, behaviour settings, a personal pronunciation dictionary, Local
+  models and user-service management. See the [command reference](commands.md).
+- **Cloud mode**: Groq and Deepgram. Deepgram streams the live Recording; Groq
+  receives the full audio at stop (a Recording past the full-audio limit is
+  transcribed in overlapping 60 s chunks instead). Voisu reconciles the two
+  Source Transcripts within a bounded Provider Deadline, using the valid result
+  already available.
+- **Local mode** (Linux and Windows): whisper.cpp on your own computer after a
+  Consented Install, with an Accurate and a Fast tier. English only.
+- **Trigger Key** without raw input-device or privileged `uinput` access: the
+  Global Shortcuts portal on Fedora KDE Plasma and GNOME, Voisu's Shell extension
+  on Ubuntu 26.04 GNOME, and a compositor binding on Hyprland. See
+  [Linux](linux.md) for each desktop.
+- **Delivery modes**: `paste` puts the Transcript on the clipboard and pastes it
   into the focused application; `copy` only copies it. If pasting fails, the
   Transcript stays on the clipboard.
-- **Overlay** — optional, separate on-screen status surface (GTK4) reflecting
-  daemon state. Runs as its own user service; on Fedora it is a separate
-  `voisu-overlay` package.
-- **Spoken formatting** — `dash dash`, `slash`, `dot`, `colon slash slash`,
+- **Overlay**: an on-screen status surface. On Linux it is optional (GTK4, its own
+  user service, a separate `voisu-overlay` package on Fedora); the Windows and
+  macOS apps host their own.
+- **Spoken formatting**: `dash dash`, `slash`, `dot`, `colon slash slash`,
   `quote` / `unquote`, `new line` / `new paragraph`, and spoken
   `first` / `second` / `third` steps become real marks and numbered lines.
   Grocery comma lists and “the first time…” stay ordinary sentences. Voisu
   does not invent a `Goal:` heading from the word “goal”. Extra cloud
   polish stays off in the package.
-- **Packaging** — four channels, all live:
+- **Distribution**:
+  - Windows installer and macOS (Apple Silicon) `.dmg` from GitHub Releases
   - Fedora / COPR (`anuraj-dev/voisu`)
   - Arch / AUR (`voisu` from source, `voisu-bin` prebuilt)
-  - Debian / Ubuntu apt repo (GPG-signed, self-hosted on GitHub Pages;
-    targets Ubuntu 26.04 LTS amd64)
-- GitHub Releases (`.deb`, tarball, `SHA256SUMS`)
-
-## Current host status
-
-As of 2026-09-05, the installed source package `voisu` `0.43.2-1` works on
-Raja's Omarchy/Hyprland host. Both user services are enabled and active.
-`voisu doctor --verbose` passes every check. Caps Lock starts and stops
-Recordings, and clipboard Delivery works. The host-only Intent Reconstruction
-gate remains enabled for #205. The #205 response-boundary repair is merged in
-[PR #217](https://github.com/Anuraj-dev/voisu/pull/217), but the experiment
-still needs audio-backed evaluation before any safety or quality claim. No
-active runtime issue is known on this configured host.
-
-The remaining work is release follow-through and transcript-quality experiments.
-It is not a current installation failure.
+  - Ubuntu 26.04 LTS amd64 apt repository (signed, self-hosted on GitHub Pages)
+  - Linux `.deb`, tarball and `SHA256SUMS` on GitHub Releases
 
 ## Next
 
-- Finish audio adjudication and the evidence manifest for the six-recording
-  #205 pilot; the installed-path replay has already exercised all six fixtures.
-- Implement complete-source selection so a shorter but coherent provider result
-  cannot beat a materially fuller safe result.
-- Complete the host-only Intent Reconstruction pilot. Run the 30–50 Recording
-  trial only if that pilot passes.
-- Tune Raja's private vocabulary and use the measured results to decide whether
-  Intent Reconstruction should stay experimental or become ordinary behavior.
-- Move the working Hyprland service setup into the package/setup flow and run the
-  cold-login gate.
+- Prove out-of-box Hyprland support with the clean-account
+  [release gate](hyprland-release-gate.md).
+- Keep improving transcript quality with audio-backed evaluation.
 
 ## Known limitations
 
@@ -85,24 +63,25 @@ It is not a current installation failure.
   hand-rolled unit that omits these can hit namespace/permission errors on a
   fresh home.
 - **Portal behavior differs by desktop:**
-  - **KDE Plasma / GNOME** — Trigger Key dialog appears on first daemon start
-    and persists with a user-chosen key. Text-insertion Delivery works via RemoteDesktop.
-  - **Hyprland** — no shortcut dialog. `voisu setup` installs Caps Lock
+  - **Fedora KDE Plasma / GNOME**: a Trigger Key dialog appears on first daemon
+    start and your choice persists. Text-insertion Delivery works via
+    RemoteDesktop.
+  - **Ubuntu 26.04 GNOME**: the Trigger Key belongs to Voisu's Shell extension.
+  - **Hyprland**: no shortcut dialog. `voisu setup` installs Caps Lock
     (`code:66`) after a default-yes prompt, or Right Alt (`code:108`) on
     decline or conflict. Its portal implements no RemoteDesktop interface, so
     Paste presses the paste shortcut found in the Hyprland config.
   - **Plain wlroots** portals do not implement GlobalShortcuts, so the Trigger
     Key cannot bind without `xdg-desktop-portal-hyprland`.
-  - Run `voisu doctor` if the Trigger Key does not respond — it reports a portal
+  - Run `voisu doctor` if the Trigger Key does not respond; it reports a portal
     without a usable GlobalShortcuts interface.
-- **PipeWire capture.** Audio capture is via PipeWire; `pw-record` ships in the
-  `pipewire-utils` package (Fedora) and `wpctl` in `wireplumber`, which some minimal
-  installs lack.
+- **PipeWire capture.** Linux audio capture is via PipeWire; `pw-record` ships in
+  the `pipewire-utils` package (Fedora) and `wpctl` in `wireplumber`, which some
+  minimal installs lack.
 - **COPR builds only from tags.** The COPR source script self-pins to the
   highest `v*` tag, not `HEAD`. Changes merged to `main` do not reach COPR (or
   any channel) until a new version tag is pushed.
 - **Test flakiness under contended CI.** The `daemon_cli_lifecycle` and
   `service_cli` integration tests are timing-sensitive and can flake on heavily
-  contended runners; work to eliminate the remaining flakes is ongoing.
-- **No local/offline transcription.** Transcription happens at the cloud
-  provider you select (cloud-first by design).
+  contended runners.
+- **macOS is Cloud-only**, and Local models are English only.
