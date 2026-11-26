@@ -21,9 +21,9 @@ Shipped and working in the current release:
   models and user-service management. See the [command reference](commands.md).
 - **Cloud mode**: Groq and Deepgram. Deepgram streams the live Recording; Groq
   receives the full audio at stop (a Recording past the full-audio limit is
-  transcribed in overlapping 60 s chunks instead). Voisu reconciles the two
-  Source Transcripts within a bounded Provider Deadline, using the valid result
-  already available.
+  transcribed in overlapping 60 s chunks instead). A bounded Provider Deadline
+  limits the wait for the two Source Transcripts, using the valid result already
+  available; reconciliation then runs under its own deadline.
 - **Local mode** (Linux and Windows): whisper.cpp on your own computer after a
   Consented Install, with an Accurate and a Fast tier. English only.
 - **Trigger Key** without raw input-device or privileged `uinput` access: the
@@ -53,7 +53,10 @@ Shipped and working in the current release:
 
 - Prove out-of-box Hyprland support with the clean-account
   [release gate](hyprland-release-gate.md).
-- Keep improving transcript quality with audio-backed evaluation.
+- Keep improving transcript quality with audio-backed evaluation. The semantic
+  score for the six-recording pilot
+  ([#205](https://github.com/Anuraj-dev/voisu/issues/205)) is still deferred:
+  it needs references adjudicated by listening to the saved audio.
 
 ## Known limitations
 
@@ -68,9 +71,10 @@ Shipped and working in the current release:
     RemoteDesktop.
   - **Ubuntu 26.04 GNOME**: the Trigger Key belongs to Voisu's Shell extension.
   - **Hyprland**: no shortcut dialog. `voisu setup` installs Caps Lock
-    (`code:66`) after a default-yes prompt, or Right Alt (`code:108`) on
-    decline or conflict. Its portal implements no RemoteDesktop interface, so
-    Paste presses the paste shortcut found in the Hyprland config.
+    (`code:66`) after a default-yes prompt. If you decline or it is already
+    bound, setup offers Right Alt (`code:108`); if you decline that too, or it
+    is also bound, no Trigger Key is installed. Its portal
+    implements no RemoteDesktop interface, so Paste presses the paste shortcut found in the Hyprland config.
   - **Plain wlroots** portals do not implement GlobalShortcuts, so the Trigger
     Key cannot bind without `xdg-desktop-portal-hyprland`.
   - Run `voisu doctor` if the Trigger Key does not respond; it reports a portal

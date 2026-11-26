@@ -75,7 +75,7 @@ voisu                 # a fresh install opens on setup
 
 Fedora KDE Plasma on Wayland is the primary target. GNOME, Hyprland and X11 desktops work too.
 
-On Hyprland and Omarchy, skip the `systemctl` line and just run `voisu`. Its first-run setup saves your keys, binds Caps Lock as the Trigger Key (Right Alt if you decline), turns on Paste through your Hyprland paste shortcut (Omarchy's universal paste included), and starts Voisu's services. The [Linux guide](docs/linux.md) covers the Trigger Key on each desktop, Local transcription, updates and troubleshooting.
+On Hyprland and Omarchy, skip the `systemctl` line and just run `voisu`. Its first-run setup saves your keys, binds Caps Lock as the Trigger Key (it offers Right Alt if you decline), turns on Paste through your Hyprland paste shortcut (Omarchy's universal paste included), and starts Voisu's services. The [Linux guide](docs/linux.md) covers the Trigger Key on each desktop, Local transcription, updates and troubleshooting.
 
 The Windows and macOS apps update themselves from GitHub Releases. On Linux, `voisu update` goes through the package manager that installed Voisu.
 

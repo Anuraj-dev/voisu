@@ -259,8 +259,11 @@ cp -r tools/transcript-quality/corpus.example/* ~/.local/state/voisu/eval-corpus
 ```
 
 Transcript text and delivery fallback reasons stay in the private sidecar.
-The scored run JSON (below) holds metrics, but also `corpus_dir` and each case's
-tags and notes; redact the path and notes before committing or sharing it. `origin: "replay"` is reserved — see the replay section.
+The scored run JSON (below) holds metrics, but also private data. Before
+committing or sharing it, redact `corpus_dir`; each case's `tags` and `notes`;
+`reason`, which can carry a result sidecar's error text or a local path; and
+`id`, which can be a Recording correlation ID. `origin: "replay"` is reserved —
+see the replay section.
 
 ## Adjudicating the six #205 recordings
 

@@ -40,14 +40,14 @@ carries an accessible description.
 ## State treatment
 
 Recording, Processing, Success and no speech are graphic-first, with no visible
-text.
+text apart from the limit warning below.
 
 - Recording: 26 live level bars, 2 px wide with 2 px gaps. In the last minute
-  before the Recording Deadline the pill turns into a text warning, with a red
-  border in the final ten seconds.
+  before the Recording Deadline the pill turns into a text warning. In the final
+  ten seconds the text goes away: amber bars with a red border.
 - Processing: an animated light sweep over the bars.
 - Success: check mark when the Transcript is pasted; hidden after 600 ms.
-- No speech: amber glyph, shown briefly.
+- No speech: amber dotted bar floor, shown briefly.
 - Copied: `Copied · Ctrl+V` in amber when Delivery fell back to the clipboard.
   Hidden after 2 s.
 - Failure: a short text such as `Recording failed`,

@@ -1,8 +1,11 @@
 # Developer Prompt Rendering — execution DAG
 
-> **Historical record (note added 2026-11-26).** This plan is complete: do not
-> restart it. As of v1.5.2 developer prompt rendering is on by default and the
-> command is `voisu layout [plain|auto|sections]`.
+> **Historical record (note added 2026-11-26).** DPR-T8 (#163) was closed on
+> 2026-08-13 after the maintainer confirmed the host smoke and rollout on
+> v0.30.0. That closing note does not record the live Groq fallback check or a
+> signed checklist. Local developer prompt rendering became on by default later
+> (`8e05f6c`, #294). The command is now
+> `voisu layout [plain|auto|sections]`. Do not restart this plan.
 
 **Issue:** [#145](https://github.com/Anuraj-dev/voisu/issues/145) · parent map [#133](https://github.com/Anuraj-dev/voisu/issues/133)  
 **Planning baseline:** [#144](https://github.com/Anuraj-dev/voisu/issues/144) — `developer-prompt-rendering-specification-2026-08-12.md` + constants JSON  

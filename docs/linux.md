@@ -176,7 +176,7 @@ After 20 dictations spread over at least 3 days, Voisu sends one desktop notific
 ## Trigger Key by desktop
 
 - **KDE Plasma and GNOME:** a system dialog appears the first time the daemon starts. Choose a Trigger Key there, and it persists.
-- **Hyprland and Omarchy:** there is no Global Shortcuts dialog. `voisu setup` installs a compositor bind: Caps Lock (`code:66`) after a default-yes prompt, or Right Alt (`code:108`) if you decline or Caps Lock is already bound. It never auto-installs Left Alt and never overwrites an exact unmanaged binding. Caps Lock as the Trigger Key also disables lock-toggle on that key.
+- **Hyprland and Omarchy:** there is no Global Shortcuts dialog. `voisu setup` installs a compositor bind: Caps Lock (`code:66`) after a default-yes prompt, and offers Right Alt (`code:108`) if you decline or Caps Lock is already bound; if you decline that too, or Right Alt is also bound, no Trigger Key is installed. It never auto-installs Left Alt and never overwrites an exact unmanaged binding. Caps Lock as the Trigger Key also disables lock-toggle on that key.
 
   Hyprland's portal has no RemoteDesktop interface, so Paste puts the Transcript on the clipboard and asks Hyprland to press the paste shortcut from your config:
 
