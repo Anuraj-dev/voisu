@@ -1,71 +1,71 @@
 # Voisu Overlay design
 
-This file is the approval gate for Ticket 11. The GTK implementation must not
-introduce visual tokens outside this list.
+The current contract for the Linux GTK Overlay. The shipped values live in
+`crates/voisu-app/src/overlay.rs` and
+`crates/voisu-app/src/bin/voisu-overlay.rs`; change this file with them. The
+Windows and macOS pill (`apps/windows/ui/overlay/overlay.css`) follows the same
+colours.
 
 ## Surface
 
-- Bottom-centred GTK4 Layer Shell surface, 280 px wide by 64 px high.
-- No input region: the surface is click-through, keyboard-unfocusable, and
-  never activates or changes the focused application.
-- Hidden at `Idle`; no timer, pulse, redraw, or animation is scheduled while
-  hidden.
-- The daemon remains the only owner of Recording and Delivery. The Overlay
-  only reads versioned IPC status and may disappear at any time.
+- GTK4 Layer Shell surface with a 320×64 px placement box around a 120×40 px
+  pill. A pill carrying text widens to 320 px at most, on up to two lines.
+- The default position is `(0.5, 0.964)`, as fractions of the screen across and
+  down (bottom centre). The user can move it (`voisu overlay-position`).
+- The status pill is click-through and keyboard-unfocusable, and never changes
+  the focused application. Move mode is the exception: it takes pointer input
+  and, on demand, the keyboard.
+- Hidden at `Idle`. Animation and level sampling stop; daemon status polling
+  continues every 200 ms.
+- The daemon remains the only owner of Recording and Delivery. The Overlay reads
+  daemon status, accepts move-mode requests, and may disappear at any time.
 
 ## Tokens
 
 | Token | Value | Use |
 |---|---|---|
 | Surface | `#17191D` at 96% | capsule background |
-| Recording | `#65D6A0` | active Recording accent |
-| Processing | `#8FB4FF` | processing accent |
-| Success | `#B8E986` | completed Delivery |
-| Failure | `#FF8A8A` | Quality Failure or unavailable daemon |
-| Caution | `#FFB454` | no speech, clipboard-only Delivery |
-| Primary text | `#F4F5F7` | state label |
-| Secondary text | `#B5BAC5` | supporting label |
-| Radius | 32 px | capsule corners |
-| Outer margin | 24 px | bottom and screen edge spacing |
-| Text size | system default, 11 pt | no custom font dependency |
+| Primary | `#F4F5F7` | Recording bars, text |
+| Processing | `#8FB4FF` | Processing, loading |
+| Success | `#65D6A0` | completed Delivery |
+| Failure | `#FF8A8A` | failure text and border; final-seconds limit border |
+| Caution | `#FFB454` | no speech, unavailable, clipboard-only Delivery, approaching limit |
+| Radius | 20 px | capsule corners |
+| Text size | 10 pt, weight 600 | system font; the success glyph is 13 pt |
 
-The minimum text contrast target is 4.5:1 for normal text and 3:1 for large
-state text. The accent is never the only state signal: every state has a text
-label and an accessible description.
+The text contrast target is 4.5:1 for normal text and 3:1 for large state text.
+Colour is never the only state signal: every state differs in shape or text and
+carries an accessible description.
 
 ## State treatment
 
-- Recording: `Recording` label plus a static three-bar voice activity meter.
-  The bars are updated only from observed status and are not a decorative
-  continuous animation.
-- Processing: `Processing` label and a static progress glyph; no spinner is
-  required.
-- Success: check mark the moment the Transcript is pasted, even while the
-  daemon is still finishing up; hidden after 600 ms.
-- Copied: `Copied · Ctrl+V` in amber when direct Delivery fell back to the
-  clipboard; a calm prompt, not a failure. Hidden after 2 s.
-- Failure: `Quality Failure` label (or `Daemon unavailable`) with a static
-  warning glyph, shown briefly, then hidden.
+Recording, Processing, Success and no speech are graphic-first, with no visible
+text apart from the limit warning below.
+
+- Recording: 26 live level bars, 2 px wide with 2 px gaps. In the last minute
+  before the Recording Deadline the pill turns into a text warning. In the final
+  ten seconds the text goes away: amber bars with a red border.
+- Processing: an animated light sweep over the bars.
+- Success: check mark when the Transcript is pasted; hidden after 600 ms.
+- No speech: amber dotted bar floor, shown briefly.
+- Copied: `Copied · Ctrl+V` in amber when Delivery fell back to the clipboard.
+  Hidden after 2 s.
+- Failure: a short text such as `Recording failed`,
+  `Voisu service isn't running` or `Held back text that looked wrong`.
 - Idle: fully hidden.
 
-## Accessibility and motion review
+## Accessibility and motion
 
-The GTK window must set `can_focus=false`, `focusable=false`, and an empty input
-region. GTK `Settings:gtk-enable-animations` and the desktop reduced-motion
-preference are treated as a reduced-motion request: all transitions become
-immediate and the activity meter stays static. High-contrast themes retain the
-same labels, spacing, and contrast targets; no state depends on hue alone.
+When GTK animations are disabled (`gtk-enable-animations`, which carries the
+desktop reduced-motion preference), the Processing sweep stays still. The live
+Recording meter keeps moving, since it shows that audio is arriving. No state
+depends on hue alone.
 
-## Screenshot gate
+## Screenshot record
 
-Before Ticket 11 is closed, capture the Overlay on Fedora KDE Plasma / Wayland
-for Recording, Processing, Success, Failure, and Idle. Critique each capture
-against the tokens above, correct any mismatch, and recapture.
-
-**Completed 2026-07-16 on Fedora KDE Plasma / Wayland.** Round 1 found one
-mismatch: the GTK window background rendered as a visible square-cornered
-rectangle behind the rounded capsule. Corrected with a transparent window
-background so only the 32 px-radius capsule surface is drawn, then all states
-(Recording, Processing, Success, Failure, Daemon unavailable, Idle-hidden)
-were recaptured and pass. Captures are retained in the maintainer's
-release archive.
+**2026-07-16, Fedora KDE Plasma / Wayland, first release design** (since
+replaced by the pill above). Round 1 found one mismatch: the GTK window
+background rendered as a square-cornered rectangle behind the capsule. A
+transparent window background fixed it, and Recording, Processing, Success,
+Failure, Daemon unavailable and Idle-hidden were recaptured and passed. Captures
+are retained in the maintainer's release archive.

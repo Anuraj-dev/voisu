@@ -1,5 +1,12 @@
 # Developer Prompt Rendering — specification
 
+> **Historical record (note added 2026-11-26).** DPR-T8 (#163) was closed on
+> 2026-08-13 after the maintainer confirmed the host smoke and rollout on
+> v0.30.0. That closing note does not record the live Groq fallback check or a
+> signed checklist. Local developer prompt rendering became on by default later
+> (`8e05f6c`, #294). The command is now
+> `voisu layout [plain|auto|sections]`; the older `natural`, `adaptive` and `structured` config values still load.
+
 **Issue:** [#144](https://github.com/Anuraj-dev/voisu/issues/144) · parent map [#133](https://github.com/Anuraj-dev/voisu/issues/133)  
 **Status:** **approved planning baseline** (2026-08-12). Blueprint for #145 and product PRs — does **not** change product code by itself.  
 **Language:** English v1 only  

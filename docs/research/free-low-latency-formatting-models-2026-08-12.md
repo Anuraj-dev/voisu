@@ -1,5 +1,9 @@
 # Free low-latency formatting models for Voisu
 
+> **Historical record (note added 2026-11-26).** The validation bypass
+> reported here as unfixed is fixed: as of v1.5.2 source sanitization runs
+> before validation, and validation before formatting.
+
 **Date:** 2026-08-12  
 **Question:** Can a faster free hosted model plus a better prompt make DPR formatting both useful and fast enough?  
 **Evidence:** current OpenRouter and Hugging Face catalog research, model-owner/runtime documentation, the existing #138/#139/#140 DPR assets, and a fresh one-shot OpenRouter screen from Raja's Fedora host.  

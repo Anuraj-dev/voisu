@@ -1,5 +1,10 @@
 # Smart Writing implementation specification — 2026-08-09
 
+> **Historical record (note added 2026-11-26).** The rollout steps here are
+> done. As of v1.5.2 Writing Mode defaults to Smart, the command is `voisu
+> writing [clean|exact]` (old `smart`/`literal` config values still load), and
+> reconciliation defaults to `qwen/qwen3.8-27b`.
+
 **Issue:** [#103](https://github.com/Anuraj-dev/voisu/issues/103) · parent map [#96](https://github.com/Anuraj-dev/voisu/issues/96)
 **Status:** **approved by Raja 2026-08-09** (Sol medium independent review r4 APPROVE; §0 package
 accepted with free-tier grammar-quota clarification in §7.4). Map #96 implementation may begin.

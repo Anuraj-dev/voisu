@@ -1,18 +1,20 @@
-# Hyprland problems and intended fixes
+# Hyprland problems and intended fixes (historical)
 
-> Confirmed on Raja's Omarchy/Hyprland host. This document defines the product fixes required before Voisu can claim out-of-box Hyprland support.
+> Historical record from August 2026, confirmed on Raja's Omarchy/Hyprland host. The problems and "intended fix" sections describe the packaging of that time; the release gates below still apply.
 
-## Summary
+## Current state
 
-Voisu can record and transcribe on Hyprland, but its default setup is not reliable. The packaged service can lose its login-start job, start without a usable Wayland environment, select an unsupported Delivery mode, and retry a Trigger Key portal flow that Hyprland does not provide.
-
-The intended user experience is one `voisu setup` run. Voisu should detect Hyprland, install session-correct systemd integration, select clipboard Delivery, offer a compositor keybinding, and verify the running daemon.
+`voisu setup` on Hyprland selects Paste Delivery unless you already chose Copy,
+installs a compositor Trigger Key binding and the packaged user units, and checks
+Delivery readiness. The Global Shortcuts portal path is still unsupported there.
+Claiming out-of-box support still needs the clean-account
+[release gate](hyprland-release-gate.md).
 
 ## Confirmed problems
 
 ### P0: packaged service creates an ordering cycle
 
-The packaged daemon unit has:
+The packaged daemon unit of that time had:
 
 ```ini
 After=xdg-desktop-portal.service
@@ -155,21 +157,6 @@ For a Hyprland session, `voisu setup` should:
 
 Setup must be re-runnable. It must preserve provider credentials, dictionary data, diagnostics, Delivery preference, unrelated Hyprland bindings, and other user units.
 
-## Current host configuration
-
-Raja's host currently uses:
-
-- `voisu` 0.38.0-1 (source package, replacing the previous `voisu-bin`).
-- Clipboard Delivery.
-- Caps Lock mapped to `voisu toggle` in `~/.config/hypr/bindings.lua`.
-- `~/.config/systemd/user/voisu.service`, modeled on Omarchy's UWSM graphical-service ordering.
-- `~/.config/systemd/user/voisu-overlay.service.d/override.conf`, which adds graphical readiness to the packaged Overlay unit.
-- Both user units enabled and active.
-
-The effective daemon graph has no `xdg-desktop-portal.service` dependency. `systemd-analyze --user verify`, Hyprland configuration validation, and every current `voisu doctor` row passed after service restart. This is host evidence, not proof that the packaged out-of-box flow is fixed.
-
-Running `voisu service install` may replace or migrate the host-only daemon unit. Until the package implements the intended unit, inspect `FragmentPath`, `After`, and `Wants` after rerunning setup.
-
 ## Release gates
 
 The executable collector and operator-owned evidence procedure live in
@@ -198,19 +185,8 @@ Do not claim Hyprland support until a packaged installation passes all of these 
 - A quiet Voisu D-Bus monitor is expected. The Overlay reads daemon state through its Unix socket.
 - The single Overlay crash does not identify a faulty component without a repeatable trigger or symbolized frame.
 
-## Latest host result
+## Host result, 2026-08-25
 
-On 2026-08-25, Raja built and installed the source package `voisu` `0.38.0-1`
-on the Omarchy/Hyprland host. The daemon and Overlay are enabled and active,
-the daemon has the live Wayland environment, `voisu doctor` passes every
-check, the Trigger Key starts and stops Recordings, and clipboard Delivery
-works. (Left Alt was the mapped key on 2026-08-25; the live binding is Caps
-Lock — see Current host configuration.)
-The six private #205 fixtures also replayed through Deepgram and Groq; all six
-selected Groq without requesting Intent Reconstruction, so Qwen quality and
-safety remain unscored pending audio adjudication.
-
-There is no active runtime issue on this configured host. The remaining items in
-this report are package and setup hardening: preserve the session-correct unit,
-avoid the unsupported portal retry, and prove the behavior through a cold-login
-gate before claiming out-of-box Hyprland support.
+On 2026-08-25 the source package `voisu` `0.38.0-1` passed `voisu doctor` on one
+configured Omarchy/Hyprland host, with Recording and clipboard Delivery working.
+That was host evidence, not proof of the packaged out-of-box flow.

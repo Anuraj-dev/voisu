@@ -1,8 +1,9 @@
 # Contributing to Voisu
 
-Voisu is voice dictation for Linux and Windows, written in Rust. The Linux
-daemon and CLI live in `crates/`; the Windows tray app (Tauri, Cloud-only) lives
-in `apps/windows/`. Primary Linux target: Fedora KDE Plasma on Wayland.
+Voisu is voice dictation for Linux, Windows and macOS, written in Rust. The
+Linux daemon and CLI live in `crates/`; the Tauri app for Windows and macOS lives
+in `apps/windows/`. Local transcription is available on Linux and Windows; macOS
+is Cloud-only. Primary Linux target: Fedora KDE Plasma on Wayland.
 
 ## Build
 
@@ -42,15 +43,17 @@ Run as a normal user — running the suite as root breaks a permission-mode test
   language (Recording, Transcript, Source Transcript, Merge Result, Trigger Key,
   Delivery, Overlay, Recording Deadline, Quality Failure, Provider Deadline).
   Each term lists banned synonyms — do not use them in code, docs, or commits.
-- **Structure.** The daemon and the Overlay are separate processes; the daemon
-  must build and run without GTK.
+- **Structure.** On Linux the daemon and the Overlay are separate processes; the
+  daemon must build and run without GTK.
 
 ## Support constraint
 
 Fedora KDE Plasma on Wayland is the first supported target. Voisu never requires
-raw input-device or privileged `uinput` access on the normal path — the Trigger
-Key and text Delivery go through desktop portals. Do not add features that depend
-on privileged input access on that path.
+raw input-device or privileged `uinput` access on the normal path. Fedora KDE and
+GNOME use desktop portals for the Trigger Key and text Delivery, Ubuntu GNOME uses
+Voisu's Shell extension for the Trigger Key, and Hyprland uses a compositor binding
+and your configured paste shortcut. Do not add features that depend on privileged
+input access.
 
 ## Commits
 
@@ -68,12 +71,20 @@ Do not edit the version by hand — the next auto-bump overwrites it.
 
 ## Pull requests
 
-CI is the oracle (there is no local clippy/lint tooling assumed). A PR must pass:
+Run `tools/dev check` before every push. It runs formatting, Clippy (default,
+Overlay and transcript-quality builds), rustdoc and the workspace library tests;
+`tools/dev check --full` runs the whole suite.
 
-- **Tests + flake gate** — `cargo nextest run --workspace`, then two more
-  voisu-app passes as the flake guard.
-- **Clippy** — `cargo clippy` with `-D warnings` (warnings fail the build).
-- **cargo-audit** — no known-vulnerable dependencies.
+CI is authoritative and runs more. A PR must pass, among other gates:
+
+- **Tests + flake gate**: `cargo nextest run --workspace`, then two more
+  voisu-app passes as the flake guard, plus doctests.
+- **Feature and packaging checks**: feature-gated and standalone suites and the
+  packaging shell suites.
+- **Clippy** with `-D warnings` (warnings fail the build).
+- **cargo-audit** with `--deny warnings`; the advisories it ignores are listed in
+  `.github/workflows/ci.yml`.
+- **PR title** in Conventional Commits form.
 
 Keep PRs to a single vertical slice with its tests. Build scripts under
 `packaging/` require a clean, committed checkout.

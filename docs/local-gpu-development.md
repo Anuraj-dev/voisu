@@ -1,6 +1,6 @@
 # Local GPU development and ASR evaluation
 
-This is a private development workflow for the local ASR candidates. It does not select a production model, alter the frozen #267 corpus, or upload audio and transcript text. Keep every output path in a private local directory; the JSON files contain absolute audio paths, adjudicated references, and raw model text.
+This is a private development workflow for the local ASR candidates. It does not select a production model or alter the frozen #267 corpus. The local ASR benchmark keeps data local; the optional Cloud STT and Cloud LLM sections send audio and transcript text to the providers you choose, so use only corpora you are allowed to send. Keep every output path in a private local directory; the JSON files contain absolute audio paths, adjudicated references, and raw model text.
 
 The benchmark treats English and Latin-script Hinglish as separate languages. A Hinglish reference preserves Hindi words written in Latin letters; it is not an English translation. Strict WER uses Unicode normalization, case folding, punctuation removal, and tokenization only. It never transliterates or asks an LLM to rewrite text. An optional versioned token map produces a second spelling-normalized measure beside strict WER.
 

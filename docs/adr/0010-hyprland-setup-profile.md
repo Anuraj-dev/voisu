@@ -15,3 +15,9 @@ The shipped daemon and Overlay units are corrected at package level so setup
 does not need to leave a hidden user-unit replacement behind. Existing exact
 key bindings are never overwritten automatically, and a failed Hyprland reload
 restores the previous configuration.
+
+## Update (2026-11-26)
+
+Setup selects Paste Delivery unless the user already chose Copy; `clipboard` is a
+legacy value. The Transcript still reaches the clipboard first, and stays there
+when no paste is verified.

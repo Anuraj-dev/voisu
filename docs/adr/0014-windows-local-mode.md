@@ -9,3 +9,10 @@ Windows offers the Linux tiers with the Linux rule: Auto runs Accurate (`distil-
 Rejected: bundling the model, which would add 264 to 818 MB to every install; a Windows-only engine such as DirectML or ONNX, which would be a second runtime to pin and maintain; and CUDA, which would tie the GPU path to one vendor and a large runtime, where Vulkan ships in every current GPU driver. Spawning a worker per Recording was replaced by the resident worker: reloading Accurate for every Recording costs seconds the user waits for. macOS shares the Tauri app but stays cloud-only; Local is compiled in only on Windows.
 
 Consequences: the release was merged without a real-Windows test. Decode speed with MSVC-built ggml, on the CPU or through Vulkan, is unmeasured, the GPU path depends on the user's driver, and CPUs without AVX2/FMA/F16C/BMI2 cannot use Local. The second unsigned exe is submitted for Defender review like the app. Plan: `internal/specs/2026-11-21-windows-local-model.md`.
+
+## Update (2026-11-26)
+
+Corrections: macOS compiles the Local module but does not offer Local mode. The
+AVX2/FMA/F16C/BMI2 floor applies to decoding on the CPU; the Vulkan path is built
+for plain x86-64. A worker that is still preparing gets the prepare deadline on top
+of the 30 s plus audio length.

@@ -1,5 +1,10 @@
 # Windows: user-chosen Trigger Key (research note)
 
+> **Historical record (note added 2026-11-26).** The custom recorder and
+> commit delay proposed here are superseded. As of v1.5.2 the Windows picker
+> is preset-only (Ctrl+Win, Ctrl+`, Right Ctrl, Caps Lock, Ctrl+Shift+Space)
+> and a press starts at once.
+
 > 2026-11-03 · research only, no code changed · for voisu-d4 (implementer) and voisu-79 (lead).
 > Tags: **[C]** confirmed from a cited source or from Voisu source, **[I]** inference, **[U]** unverified and needs the Win11 real-host gate.
 

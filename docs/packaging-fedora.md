@@ -71,9 +71,9 @@ Install the base RPM, and install `voisu-overlay` only when GTK feedback is
 wanted:
 
 ```sh
-sudo dnf install ./dist/rpm/voisu-0.1.0-*.rpm
+sudo dnf install ./dist/rpm/voisu-[0-9]*.rpm
 # optional:
-sudo dnf install ./dist/rpm/voisu-overlay-0.1.0-*.rpm
+sudo dnf install ./dist/rpm/voisu-overlay-*.rpm
 ```
 
 Set up readiness and credentials as the desktop user. Credentials go through
@@ -175,7 +175,7 @@ After an RPM upgrade, after adding the optional Overlay subpackage, or when an
 old Ticket 09 installation exists, rerun the user-owned setup command:
 
 ```sh
-sudo dnf upgrade ./dist/rpm/voisu-0.1.0-*.rpm
+sudo dnf upgrade ./dist/rpm/voisu-[0-9]*.rpm
 voisu service install
 voisu service status
 ```
@@ -212,9 +212,9 @@ The exact RPM artifact is checked headlessly and, on Fedora, against the
 desktop using:
 
 ```sh
-packaging/fedora-smoke.sh dist/rpm/voisu-0.1.0-<release>.x86_64.rpm <tested-commit>
+packaging/fedora-smoke.sh dist/rpm/voisu-<version>-<release>.x86_64.rpm <tested-commit>
 VOISU_FEDORA_LIVE_SMOKE=1 packaging/fedora-smoke.sh \
-  dist/rpm/voisu-0.1.0-<release>.x86_64.rpm <tested-commit>
+  dist/rpm/voisu-<version>-<release>.x86_64.rpm <tested-commit>
 ```
 
 The first invocation verifies RPM ownership, declared dependency names,
@@ -244,5 +244,5 @@ interactive KDE/Wayland release-evidence checks, including portal
 approval, direct Delivery, clipboard fallback, login start, and upgrade/removal
 behavior. These checks are intentionally not run by the default build.
 
-APT/DEB packaging is explicitly out of scope for this Fedora release and is a
-subsequent milestone; no Debian artifacts or packaging metadata belong here.
+The tagged release workflow also builds a `.deb` and publishes the signed apt
+repository; see [`packaging/apt/README.md`](../packaging/apt/README.md).

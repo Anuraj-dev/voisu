@@ -1,6 +1,6 @@
 # Voisu on Linux
 
-Fedora, Arch, Debian and Ubuntu, on KDE Plasma, GNOME, Hyprland (including Omarchy) and X11 desktops. Voisu runs as systemd **user** services with the `voisu` terminal interface and `voisu` commands. Transcription is Cloud (Deepgram and Groq), or Local on your own GPU or CPU.
+Fedora, Arch and Ubuntu 26.04 LTS, on KDE Plasma, GNOME, Hyprland (including Omarchy) and X11 desktops. Voisu runs as systemd **user** services with the `voisu` terminal interface and `voisu` commands. Transcription is Cloud (Deepgram and Groq), or Local on your own GPU or CPU.
 
 Every command is listed in the [command reference](commands.md).
 
@@ -23,7 +23,7 @@ yay -S voisu-bin
 
 `voisu-bin` installs prebuilt binaries, so nothing compiles on your machine. To build from source instead, install `voisu` (`yay -S voisu`). The two packages conflict, so pick one.
 
-**Debian / Ubuntu (apt)**, for Ubuntu 26.04 LTS, amd64:
+**Ubuntu (apt)**, for Ubuntu 26.04 LTS, amd64:
 
 ```sh
 # 1. Add Voisu's signing key.
@@ -151,7 +151,7 @@ Your API keys never go through the agent. Type them into `voisu` in a terminal o
 | AUR `voisu-bin` | `yay -S --needed voisu-bin` (or `paru`). Without an AUR helper it prints the manual `makepkg` steps |
 | AUR `voisu` (source) | Nothing by default. It explains that this package compiles on your machine. `voisu update --switch-to-bin` replaces it with `voisu-bin` |
 | Fedora COPR | `sudo dnf upgrade --refresh voisu` |
-| Debian / Ubuntu apt | `sudo apt-get update`, then `sudo apt-get install --only-upgrade voisu` |
+| Ubuntu apt | `sudo apt-get update`, then `sudo apt-get install --only-upgrade voisu` |
 
 ```sh
 voisu update --check     # installed version vs the latest GitHub Release; changes nothing
@@ -176,7 +176,7 @@ After 20 dictations spread over at least 3 days, Voisu sends one desktop notific
 ## Trigger Key by desktop
 
 - **KDE Plasma and GNOME:** a system dialog appears the first time the daemon starts. Choose a Trigger Key there, and it persists.
-- **Hyprland and Omarchy:** there is no Global Shortcuts dialog. `voisu setup` installs a compositor bind: Caps Lock (`code:66`) after a default-yes prompt, or Right Alt (`code:108`) if you decline or Caps Lock is already bound. It never auto-installs Left Alt and never overwrites an exact unmanaged binding. Caps Lock as the Trigger Key also disables lock-toggle on that key.
+- **Hyprland and Omarchy:** there is no Global Shortcuts dialog. `voisu setup` installs a compositor bind: Caps Lock (`code:66`) after a default-yes prompt, and offers Right Alt (`code:108`) if you decline or Caps Lock is already bound; if you decline that too, or Right Alt is also bound, no Trigger Key is installed. It never auto-installs Left Alt and never overwrites an exact unmanaged binding. Caps Lock as the Trigger Key also disables lock-toggle on that key.
 
   Hyprland's portal has no RemoteDesktop interface, so Paste puts the Transcript on the clipboard and asks Hyprland to press the paste shortcut from your config:
 

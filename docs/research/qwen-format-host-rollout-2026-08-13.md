@@ -1,5 +1,8 @@
 # Qwen formatter — flagged host rollout (2026-08-13)
 
+> **Historical record (note added 2026-11-26).** As of v1.5.2 the packaged unit
+> sets `VOISU_ENABLE_DPR=1` and leaves Qwen formatting off.
+
 **Status:** process documentation. The Qwen small-edit formatter stays **off**
 by default. This file does not enable it, and it does not record host
 pass/fail counts.
@@ -65,8 +68,9 @@ VOISU_ENABLE_QWEN_FORMAT=1
 ### Fedora systemd user drop-in
 
 The packaged daemon unit is `/usr/lib/systemd/user/voisu.service`. It starts
-`/usr/bin/voisu-daemon --systemd`. It does **not** set either flag. Use a
-user drop-in so the package stays flag-off and rollback is a file delete.
+`/usr/bin/voisu-daemon --systemd`. It sets `VOISU_ENABLE_DPR=1` and leaves
+Qwen formatting off. Use a user drop-in so the package keeps Qwen off and
+rollback is a file delete.
 
 ```sh
 mkdir -p ~/.config/systemd/user/voisu.service.d
