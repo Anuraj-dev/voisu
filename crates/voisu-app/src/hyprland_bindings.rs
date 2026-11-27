@@ -448,7 +448,7 @@ pub fn hyprland_binding_is_installed(payload: &Value, key: &str, command: &str) 
                 continue;
             }
 
-            let dispatcher = binding.get("dispatcher").and_then(Value::as_str);
+            let dispatcher = live_dispatcher(binding);
             let argument = binding_argument(binding).map(str::trim);
             let native_exec = dispatcher == Some("exec")
                 && binding
@@ -492,10 +492,30 @@ fn binding_argument(binding: &Value) -> Option<&str> {
     })
 }
 
+/// The live `dispatcher` of a `hyprctl binds -j` row. Hyprland before 0.57
+/// reports a Lua callback as `__lua`; 0.57 reports it as `function: 0x<addr>`.
+/// Both mean the same thing, so this returns `__lua` for either.
+fn live_dispatcher(binding: &Value) -> Option<&str> {
+    let dispatcher = binding.get("dispatcher").and_then(Value::as_str)?;
+    let is_lua_function = dispatcher
+        .strip_prefix("function: 0x")
+        .is_some_and(|address| {
+            !address.is_empty() && address.chars().all(|c| c.is_ascii_hexdigit())
+        });
+    Some(if is_lua_function { "__lua" } else { dispatcher })
+}
+
 fn live_binding_identity(binding: &Value, dispatcher: &str) -> Option<String> {
     let argument = binding_argument(binding)?.trim();
     match dispatcher {
-        "__lua" => argument.parse::<u64>().ok().map(|_| argument.to_owned()),
+        // 0.57 also reports the callback address; include it so a replaced
+        // callback that reuses the registry slot is still a different binding.
+        "__lua" => argument.parse::<u64>().ok().map(|_| {
+            match binding.get("dispatcher").and_then(Value::as_str) {
+                Some(raw) if raw.starts_with("function: 0x") => format!("{raw}#{argument}"),
+                _ => argument.to_owned(),
+            }
+        }),
         "exec" => Some(argument.to_owned()),
         _ => None,
     }
@@ -671,7 +691,7 @@ pub fn discover_paste_action(
     let live = live_bindings.as_array()?;
 
     for binding in live {
-        let Some(dispatcher) = binding.get("dispatcher").and_then(Value::as_str) else {
+        let Some(dispatcher) = live_dispatcher(binding) else {
             continue;
         };
         let Some(live_binding_identity) = live_binding_identity(binding, dispatcher) else {
@@ -824,7 +844,7 @@ fn live_binding_matches_source(live: &Value, source: &LuaBinding) -> bool {
     let Some((source_modmask, source_key)) = shortcut_parts(&source.key) else {
         return false;
     };
-    let dispatcher = live.get("dispatcher").and_then(Value::as_str);
+    let dispatcher = live_dispatcher(live);
     let live_key = live.get("key").and_then(Value::as_str).unwrap_or_default();
     // Current Hyprland reports Lua binds with an empty key and often
     // modmask 0. The physical chord is recovered from the matching source
@@ -1909,7 +1929,11 @@ fn parse_lua_chunk(source: &str, managed: bool) -> Result<Vec<LuaBinding>, Strin
             continue;
         }
         match parse_bind_arguments(&tokens[index + 4..]) {
-            Ok(Some((key, description, command, dispatcher, dispatcher_arguments))) => {
+            Ok(Some((key, description, command, mut dispatcher, mut dispatcher_arguments))) => {
+                if let Some((helper, arguments)) = bound_field_helper(&tokens, index) {
+                    dispatcher = Some(helper);
+                    dispatcher_arguments = Some(arguments);
+                }
                 bindings.push(LuaBinding {
                     key,
                     description,
@@ -1932,6 +1956,89 @@ fn parse_lua_chunk(source: &str, managed: bool) -> Result<Vec<LuaBinding>, Strin
         }
     }
     Ok(bindings)
+}
+
+/// Omarchy 4.6 stores its paste helper in a field before binding it:
+///
+/// ```lua
+/// o.universal_paste = universal_clipboard_shortcut("CTRL", "V", "CTRL SHIFT", "V")
+/// o.bind("SUPER + V", "Universal paste", o.universal_paste)
+/// ```
+///
+/// For an `o.bind` at `bind_index` whose third argument is exactly `o.<field>`,
+/// returns the helper name and string arguments of the last assignment to that
+/// field earlier in the same chunk. That assignment is the value the bind
+/// captured. It must be a plain `<helper>("..", ...)` call that ends the
+/// statement; any other shape, or no earlier assignment, returns `None` so the
+/// binding stays unverified.
+fn bound_field_helper(tokens: &[LuaToken], bind_index: usize) -> Option<(String, Vec<String>)> {
+    let field = match tokens.get(bind_index + 4..bind_index + 11)? {
+        [
+            LuaToken::String(_),
+            LuaToken::Symbol(','),
+            LuaToken::String(_),
+            LuaToken::Symbol(','),
+            LuaToken::Identifier(object),
+            LuaToken::Symbol('.'),
+            LuaToken::Identifier(field),
+        ] if object == "o" => field,
+        _ => return None,
+    };
+    if !matches!(tokens.get(bind_index + 11), Some(LuaToken::Symbol(')'))) {
+        return None;
+    }
+
+    let assignment = (0..bind_index).rev().find(|&start| {
+        matches!(
+            tokens.get(start..start + 4),
+            Some([
+                LuaToken::Identifier(object),
+                LuaToken::Symbol('.'),
+                LuaToken::Identifier(name),
+                LuaToken::Symbol('='),
+            ]) if object == "o" && name == field
+        ) && !matches!(tokens.get(start + 4), Some(LuaToken::Symbol('=')))
+            && !matches!(
+                start
+                    .checked_sub(1)
+                    .and_then(|previous| tokens.get(previous)),
+                Some(LuaToken::Symbol('.' | ':'))
+            )
+    })?;
+
+    let LuaToken::Identifier(helper) = tokens.get(assignment + 4)? else {
+        return None;
+    };
+    if !matches!(tokens.get(assignment + 5), Some(LuaToken::Symbol('('))) {
+        return None;
+    }
+    let (after_call, arguments) = parse_dispatcher_arguments(tokens, assignment + 5).ok()?;
+    let arguments = arguments?;
+    // The lexer drops operators and brackets, so only accept a call followed by
+    // the start of another statement; anything else may continue the expression.
+    let ends_statement = match tokens.get(after_call) {
+        Some(LuaToken::Identifier(next)) if next == "o" || next == "hl" => {
+            matches!(tokens.get(after_call + 1), Some(LuaToken::Symbol('.')))
+        }
+        Some(LuaToken::Identifier(next)) => matches!(
+            next.as_str(),
+            "local" | "function" | "return" | "if" | "for" | "while" | "do" | "repeat" | "end"
+        ),
+        _ => false,
+    };
+    // A block boundary between the assignment and the bind means the assignment
+    // may sit in a branch, loop or function body Lua never ran.
+    let crosses_block = tokens[after_call.min(bind_index)..bind_index]
+        .iter()
+        .any(|token| {
+            matches!(token, LuaToken::Identifier(word) if matches!(
+                word.as_str(),
+                "if" | "then" | "else" | "elseif" | "end" | "for" | "while" | "do"
+                    | "repeat" | "until" | "function" | "goto" | "return"
+            ))
+        });
+    (ends_statement && !crosses_block && after_call <= bind_index)
+        .then(|| (helper.clone(), arguments))
 }
 
 fn occupies_preferred_trigger_key(key: &str) -> bool {
@@ -2131,7 +2238,30 @@ fn lex_lua(source: &str) -> Result<Vec<LuaToken>, String> {
             tokens.push(LuaToken::Number(number));
             continue;
         }
-        if matches!(character, '.' | '(' | ')' | ',' | '{' | '}' | '=' | ':') {
+        if matches!(
+            character,
+            '.' | '('
+                | ')'
+                | ','
+                | '{'
+                | '}'
+                | '='
+                | ':'
+                | '['
+                | ']'
+                | '+'
+                | '-'
+                | '*'
+                | '/'
+                | '%'
+                | '^'
+                | '#'
+                | '<'
+                | '>'
+                | '~'
+                | '&'
+                | '|'
+        ) {
             tokens.push(LuaToken::Symbol(character));
         }
     }
@@ -3667,6 +3797,135 @@ o.bind("SUPER + V", "Universal paste", universal_clipboard_shortcut("CTRL", "V",
 
         fn live_bindings(&mut self) -> Result<Value, String> {
             Ok(self.bindings.clone())
+        }
+    }
+
+    /// Omarchy 4.6 names the helper as `o.universal_paste` (so scripts can run
+    /// `hyprctl dispatch 'o.universal_paste'`) and binds Super+V to that field.
+    fn omarchy_46_paste_source() -> String {
+        OMARCHY_PASTE_SOURCE.replace(
+            r#"o.bind("SUPER + V", "Universal paste", universal_clipboard_shortcut("CTRL", "V", "SHIFT", "Insert"))"#,
+            r#"o.universal_paste = universal_clipboard_shortcut("CTRL", "V", "CTRL SHIFT", "V")
+o.bind("SUPER + V", "Universal paste", o.universal_paste)"#,
+        )
+    }
+
+    #[test]
+    fn omarchy_46_universal_paste_field_binding_is_verified() {
+        let source = omarchy_46_paste_source();
+        assert!(source.contains("o.universal_paste)"));
+
+        let action = discover_paste_action(&[source.as_str()], &universal_paste_live("V", 64))
+            .expect("Omarchy 4.6 helper bound through o.universal_paste should be verified");
+        assert_eq!(action.shortcut.binding, "SUPER + V");
+        assert_eq!(
+            action.behavior,
+            PasteBehavior::OmarchyUniversal {
+                normal: PasteShortcut {
+                    binding: "CTRL + V".to_owned()
+                },
+                terminal: PasteShortcut {
+                    binding: "CTRL + SHIFT + V".to_owned()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn field_binding_through_skipped_or_disguised_assignment_stays_unverified() {
+        let helper = r#"universal_clipboard_shortcut("CTRL", "V", "CTRL SHIFT", "V")"#;
+        let bind = r#"o.bind("SUPER + V", "Universal paste", o.universal_paste)"#;
+        for replacement in [
+            format!(
+                "o.universal_paste = function() end\nif false then\n  o.universal_paste = {helper}\nend\n{bind}"
+            ),
+            format!(
+                "o.universal_paste = function() end\nlocal callbacks = {{}}\ncallbacks[o.universal_paste] = {helper}\n{bind}"
+            ),
+            format!("o.universal_paste = {helper} + o.replacement\n{bind}"),
+        ] {
+            let source = OMARCHY_PASTE_SOURCE.replace(
+                r#"o.bind("SUPER + V", "Universal paste", universal_clipboard_shortcut("CTRL", "V", "SHIFT", "Insert"))"#,
+                &replacement,
+            );
+            assert!(source.contains("o.universal_paste)"));
+            assert!(
+                !matches!(
+                    discover_paste_action(&[source.as_str()], &universal_paste_live("V", 64))
+                        .map(|action| action.behavior),
+                    Some(PasteBehavior::OmarchyUniversal { .. })
+                ),
+                "must not verify: {replacement}"
+            );
+        }
+    }
+
+    #[test]
+    fn hyprland_057_identity_changes_with_the_callback_address() {
+        let row = |address: &str| serde_json::json!({"dispatcher": format!("function: 0x{address}"), "arg": "94"});
+        assert_ne!(
+            live_binding_identity(&row("55f0f8202070"), "__lua"),
+            live_binding_identity(&row("55f0f8202080"), "__lua"),
+        );
+    }
+
+    #[test]
+    fn hyprland_057_function_dispatcher_counts_as_a_lua_binding() {
+        let source = omarchy_46_paste_source();
+        let live = serde_json::json!([{
+            "key": "V",
+            "modmask": 64,
+            "description": "Universal paste",
+            "dispatcher": "function: 0x55f0f8202070",
+            "arg": "94"
+        }]);
+
+        let action = discover_paste_action(&[source.as_str()], &live)
+            .expect("Hyprland 0.57 reports Lua callbacks as function: 0x<addr>");
+        assert_eq!(action.shortcut.binding, "SUPER + V");
+        assert_eq!(action.live_binding_identity, "function: 0x55f0f8202070#94");
+    }
+
+    #[test]
+    fn field_binding_without_a_preceding_helper_assignment_stays_unverified() {
+        let base = omarchy_46_paste_source();
+        let assignment =
+            r#"o.universal_paste = universal_clipboard_shortcut("CTRL", "V", "CTRL SHIFT", "V")"#;
+        let bind = r#"o.bind("SUPER + V", "Universal paste", o.universal_paste)"#;
+        let live = universal_paste_live("V", 64);
+
+        // Field never assigned.
+        let unassigned = base.replace(assignment, "");
+        // Assigned only after the bind, so the bind captured nil.
+        let assigned_late = base.replace(
+            &format!("{assignment}\n{bind}"),
+            &format!("{bind}\n{assignment}"),
+        );
+        // Last assignment before the bind is not the helper.
+        let reassigned = base.replace(
+            bind,
+            &format!("o.universal_paste = function() os.execute(\"x\") end\n{bind}"),
+        );
+        // A different field than the one assigned.
+        let other_field = base.replace(
+            bind,
+            r#"o.bind("SUPER + V", "Universal paste", o.other_paste)"#,
+        );
+
+        // The helper call continues into a larger expression.
+        let continued = base.replace(assignment, &format!("{assignment} .. \"x\""));
+
+        for source in [
+            unassigned,
+            assigned_late,
+            reassigned,
+            other_field,
+            continued,
+        ] {
+            assert!(
+                discover_paste_action(&[source.as_str()], &live).is_none(),
+                "unexpectedly verified:\n{source}"
+            );
         }
     }
 
