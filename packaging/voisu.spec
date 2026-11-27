@@ -1,5 +1,5 @@
 Name:           voisu
-Version:        1.5.2
+Version:        1.5.3
 %{!?voisu_commit:%global voisu_commit unknown}
 # Release is computed by the build scripts and baked in as %%global voisu_release
 # (see packaging/rpm-lib.sh for the unified policy). ONE spec, all channels:
@@ -206,6 +206,9 @@ install -D -m 0644 packaging/icons/voisu.svg %{buildroot}%{_datadir}/icons/hicol
 %{_userunitdir}/voisu-overlay.service
 
 %changelog
+* Fri Nov 27 2026 Voisu maintainers <voisu@example.invalid> - 1.5.3-1
+- fix(linux): restore paste on Omarchy 4.6 and Hyprland 0.57 (#366)
+
 * Tue Nov 24 2026 Voisu maintainers <voisu@example.invalid> - 1.5.2-1
 - fix(windows): probe the Trigger Key hook before reinstalling it (#363)
 
