@@ -508,7 +508,14 @@ fn live_dispatcher(binding: &Value) -> Option<&str> {
 fn live_binding_identity(binding: &Value, dispatcher: &str) -> Option<String> {
     let argument = binding_argument(binding)?.trim();
     match dispatcher {
-        "__lua" => argument.parse::<u64>().ok().map(|_| argument.to_owned()),
+        // 0.57 also reports the callback address; include it so a replaced
+        // callback that reuses the registry slot is still a different binding.
+        "__lua" => argument.parse::<u64>().ok().map(|_| {
+            match binding.get("dispatcher").and_then(Value::as_str) {
+                Some(raw) if raw.starts_with("function: 0x") => format!("{raw}#{argument}"),
+                _ => argument.to_owned(),
+            }
+        }),
         "exec" => Some(argument.to_owned()),
         _ => None,
     }
@@ -2019,7 +2026,19 @@ fn bound_field_helper(tokens: &[LuaToken], bind_index: usize) -> Option<(String,
         ),
         _ => false,
     };
-    (ends_statement && after_call <= bind_index).then(|| (helper.clone(), arguments))
+    // A block boundary between the assignment and the bind means the assignment
+    // may sit in a branch, loop or function body Lua never ran.
+    let crosses_block = tokens[after_call.min(bind_index)..bind_index]
+        .iter()
+        .any(|token| {
+            matches!(token, LuaToken::Identifier(word) if matches!(
+                word.as_str(),
+                "if" | "then" | "else" | "elseif" | "end" | "for" | "while" | "do"
+                    | "repeat" | "until" | "function" | "goto" | "return"
+            ))
+        });
+    (ends_statement && !crosses_block && after_call <= bind_index)
+        .then(|| (helper.clone(), arguments))
 }
 
 fn occupies_preferred_trigger_key(key: &str) -> bool {
@@ -2219,7 +2238,30 @@ fn lex_lua(source: &str) -> Result<Vec<LuaToken>, String> {
             tokens.push(LuaToken::Number(number));
             continue;
         }
-        if matches!(character, '.' | '(' | ')' | ',' | '{' | '}' | '=' | ':') {
+        if matches!(
+            character,
+            '.' | '('
+                | ')'
+                | ','
+                | '{'
+                | '}'
+                | '='
+                | ':'
+                | '['
+                | ']'
+                | '+'
+                | '-'
+                | '*'
+                | '/'
+                | '%'
+                | '^'
+                | '#'
+                | '<'
+                | '>'
+                | '~'
+                | '&'
+                | '|'
+        ) {
             tokens.push(LuaToken::Symbol(character));
         }
     }
@@ -3790,6 +3832,44 @@ o.bind("SUPER + V", "Universal paste", o.universal_paste)"#,
     }
 
     #[test]
+    fn field_binding_through_skipped_or_disguised_assignment_stays_unverified() {
+        let helper = r#"universal_clipboard_shortcut("CTRL", "V", "CTRL SHIFT", "V")"#;
+        let bind = r#"o.bind("SUPER + V", "Universal paste", o.universal_paste)"#;
+        for replacement in [
+            format!(
+                "o.universal_paste = function() end\nif false then\n  o.universal_paste = {helper}\nend\n{bind}"
+            ),
+            format!(
+                "o.universal_paste = function() end\nlocal callbacks = {{}}\ncallbacks[o.universal_paste] = {helper}\n{bind}"
+            ),
+            format!("o.universal_paste = {helper} + o.replacement\n{bind}"),
+        ] {
+            let source = OMARCHY_PASTE_SOURCE.replace(
+                r#"o.bind("SUPER + V", "Universal paste", universal_clipboard_shortcut("CTRL", "V", "SHIFT", "Insert"))"#,
+                &replacement,
+            );
+            assert!(source.contains("o.universal_paste)"));
+            assert!(
+                !matches!(
+                    discover_paste_action(&[source.as_str()], &universal_paste_live("V", 64))
+                        .map(|action| action.behavior),
+                    Some(PasteBehavior::OmarchyUniversal { .. })
+                ),
+                "must not verify: {replacement}"
+            );
+        }
+    }
+
+    #[test]
+    fn hyprland_057_identity_changes_with_the_callback_address() {
+        let row = |address: &str| serde_json::json!({"dispatcher": format!("function: 0x{address}"), "arg": "94"});
+        assert_ne!(
+            live_binding_identity(&row("55f0f8202070"), "__lua"),
+            live_binding_identity(&row("55f0f8202080"), "__lua"),
+        );
+    }
+
+    #[test]
     fn hyprland_057_function_dispatcher_counts_as_a_lua_binding() {
         let source = omarchy_46_paste_source();
         let live = serde_json::json!([{
@@ -3803,7 +3883,7 @@ o.bind("SUPER + V", "Universal paste", o.universal_paste)"#,
         let action = discover_paste_action(&[source.as_str()], &live)
             .expect("Hyprland 0.57 reports Lua callbacks as function: 0x<addr>");
         assert_eq!(action.shortcut.binding, "SUPER + V");
-        assert_eq!(action.live_binding_identity, "94");
+        assert_eq!(action.live_binding_identity, "function: 0x55f0f8202070#94");
     }
 
     #[test]
