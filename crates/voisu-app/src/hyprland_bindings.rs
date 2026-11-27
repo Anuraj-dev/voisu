@@ -448,7 +448,7 @@ pub fn hyprland_binding_is_installed(payload: &Value, key: &str, command: &str) 
                 continue;
             }
 
-            let dispatcher = binding.get("dispatcher").and_then(Value::as_str);
+            let dispatcher = live_dispatcher(binding);
             let argument = binding_argument(binding).map(str::trim);
             let native_exec = dispatcher == Some("exec")
                 && binding
@@ -490,6 +490,19 @@ fn binding_argument(binding: &Value) -> Option<&str> {
             .and_then(|arg| arg.get("arg"))
             .and_then(Value::as_str)
     })
+}
+
+/// The live `dispatcher` of a `hyprctl binds -j` row. Hyprland before 0.57
+/// reports a Lua callback as `__lua`; 0.57 reports it as `function: 0x<addr>`.
+/// Both mean the same thing, so this returns `__lua` for either.
+fn live_dispatcher(binding: &Value) -> Option<&str> {
+    let dispatcher = binding.get("dispatcher").and_then(Value::as_str)?;
+    let is_lua_function = dispatcher
+        .strip_prefix("function: 0x")
+        .is_some_and(|address| {
+            !address.is_empty() && address.chars().all(|c| c.is_ascii_hexdigit())
+        });
+    Some(if is_lua_function { "__lua" } else { dispatcher })
 }
 
 fn live_binding_identity(binding: &Value, dispatcher: &str) -> Option<String> {
@@ -671,7 +684,7 @@ pub fn discover_paste_action(
     let live = live_bindings.as_array()?;
 
     for binding in live {
-        let Some(dispatcher) = binding.get("dispatcher").and_then(Value::as_str) else {
+        let Some(dispatcher) = live_dispatcher(binding) else {
             continue;
         };
         let Some(live_binding_identity) = live_binding_identity(binding, dispatcher) else {
@@ -824,7 +837,7 @@ fn live_binding_matches_source(live: &Value, source: &LuaBinding) -> bool {
     let Some((source_modmask, source_key)) = shortcut_parts(&source.key) else {
         return false;
     };
-    let dispatcher = live.get("dispatcher").and_then(Value::as_str);
+    let dispatcher = live_dispatcher(live);
     let live_key = live.get("key").and_then(Value::as_str).unwrap_or_default();
     // Current Hyprland reports Lua binds with an empty key and often
     // modmask 0. The physical chord is recovered from the matching source
@@ -3774,6 +3787,23 @@ o.bind("SUPER + V", "Universal paste", o.universal_paste)"#,
                 },
             }
         );
+    }
+
+    #[test]
+    fn hyprland_057_function_dispatcher_counts_as_a_lua_binding() {
+        let source = omarchy_46_paste_source();
+        let live = serde_json::json!([{
+            "key": "V",
+            "modmask": 64,
+            "description": "Universal paste",
+            "dispatcher": "function: 0x55f0f8202070",
+            "arg": "94"
+        }]);
+
+        let action = discover_paste_action(&[source.as_str()], &live)
+            .expect("Hyprland 0.57 reports Lua callbacks as function: 0x<addr>");
+        assert_eq!(action.shortcut.binding, "SUPER + V");
+        assert_eq!(action.live_binding_identity, "94");
     }
 
     #[test]
